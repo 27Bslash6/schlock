@@ -1,0 +1,60 @@
+name: Bug Report
+description: Something isn't working as expected
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill out what you can.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Brief description of the bug
+      placeholder: schlock blocked a safe command / allowed a dangerous command / crashed
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command (if applicable)
+      description: The bash command involved
+      placeholder: rm -rf /tmp/test
+      render: bash
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error output
+      description: Any relevant output from stderr or audit log
+      render: text
+
+  - type: dropdown
+    id: risk-preset
+    attributes:
+      label: Risk preset
+      options:
+        - permissive
+        - balanced (default)
+        - paranoid
+        - custom
+
+  - type: input
+    id: version
+    attributes:
+      label: schlock version
+      placeholder: "0.1.0"
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: macOS 14 / Ubuntu 22.04 / Windows 11 WSL

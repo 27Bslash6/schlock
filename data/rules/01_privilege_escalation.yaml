@@ -1,0 +1,16 @@
+# Category: Privilege Escalation
+# Risk Levels: BLOCKED
+# Description: Commands that escalate privileges beyond current user context
+
+rules:
+  - name: sudo_use
+    description: Requires explicit approval for elevated privileges
+    risk_level: BLOCKED
+    patterns: ['\bsudo\b']
+    alternatives: ["Request admin approval"]
+
+  - name: privilege_escalation_variants
+    description: Alternative privilege escalation commands beyond sudo
+    risk_level: BLOCKED
+    patterns: ['\bsu\b', '\bpkexec\b', '\bdoas\b', '\bgksudo\b', '\bkdesu\b', '\bkdesudo\b', '\bchroot\b.{0,100}(bash|sh|/bin)']
+    alternatives: ["Use sudo with proper authentication", "Request admin approval"]

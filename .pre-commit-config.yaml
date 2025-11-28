@@ -1,0 +1,67 @@
+# Pre-commit hooks for schlock
+# See https://pre-commit.com for more information
+
+repos:
+  # Ruff - Fast Python linter and formatter (includes security checks)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.4
+    hooks:
+      # Linter (includes flake8, isort, pyupgrade, and bandit security rules)
+      - id: ruff
+        args: [--fix]
+        types_or: [python, pyi]
+        exclude: ^\.claude-plugin/vendor/
+      # Formatter
+      - id: ruff-format
+        types_or: [python, pyi]
+        exclude: ^\.claude-plugin/vendor/
+
+  # Python-specific checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        exclude: ^\.claude-plugin/vendor/
+      - id: check-json
+        exclude: ^\.claude-plugin/vendor/
+      - id: check-toml
+        exclude: ^\.claude-plugin/vendor/
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+        exclude: ^\.claude-plugin/vendor/
+      - id: check-merge-conflict
+        exclude: ^\.claude-plugin/vendor/
+      - id: check-case-conflict
+        exclude: ^\.claude-plugin/vendor/
+      - id: detect-private-key
+        exclude: ^\.claude-plugin/vendor/
+      - id: end-of-file-fixer
+        exclude: ^\.claude-plugin/vendor/
+      - id: trailing-whitespace
+        exclude: ^\.claude-plugin/vendor/
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+        exclude: ^\.claude-plugin/vendor/
+
+  # Type checking with basedpyright (faster than mypy)
+  - repo: local
+    hooks:
+      - id: basedpyright
+        name: basedpyright
+        entry: basedpyright
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: [src/schlock]
+        exclude: ^\.claude-plugin/vendor/
+
+  # Commit message linting (conventional commits)
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.3.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+
+# Global configuration
+default_language_version:
+  python: python3

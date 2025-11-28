@@ -1,0 +1,50 @@
+# Code Formatting Tools Configuration
+# Defines formatter tools, file extensions, and commands for auto-formatting
+
+formatters:
+  ruff:
+    extensions:
+      - ".py"
+      - ".pyi"
+    command: "ruff format {file}"
+    project_config:
+      - "pyproject.toml"
+      - "ruff.toml"
+      - ".ruff.toml"
+    description: "Python code formatter (Rust-based, fast alternative to black)"
+    notes: "Respects pyproject.toml [tool.ruff] settings automatically"
+
+  cargo:
+    extensions:
+      - ".rs"
+    command: "cargo fmt"
+    project_config:
+      - "Cargo.toml"
+      - "rustfmt.toml"
+      - ".rustfmt.toml"
+    description: "Rust code formatter (uses rustfmt)"
+    notes: "Formats entire project, not individual files. Requires Cargo.toml in project root."
+
+  prettier:
+    extensions:
+      - ".ts"
+      - ".tsx"
+      - ".js"
+      - ".jsx"
+      - ".json"
+      - ".yaml"
+      - ".yml"
+      - ".md"
+      - ".css"
+      - ".scss"
+      - ".html"
+    command: "prettier --write {file}"
+    project_config:
+      - ".prettierrc"
+      - ".prettierrc.json"
+      - ".prettierrc.yml"
+      - ".prettierrc.yaml"
+      - ".prettierrc.js"
+      - "prettier.config.js"
+    description: "Multi-language code formatter (JS/TS/JSON/YAML/Markdown/CSS/HTML)"
+    notes: "Respects .prettierrc and prettier.config.js settings automatically"

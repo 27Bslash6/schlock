@@ -1,0 +1,10 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks
+
+title = "schlock gitleaks config"
+
+[allowlist]
+  description = "Test fixtures for secret scrubbing functionality"
+  paths = [
+    '''tests/test_audit_scrubbing\.py''',
+  ]

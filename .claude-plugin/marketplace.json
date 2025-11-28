@@ -1,0 +1,26 @@
+{
+  "name": "27b",
+  "owner": {
+    "name": "27B.io",
+    "email": "hello@27b.io"
+  },
+  "metadata": {
+    "description": "27B.io plugin marketplace - Security and productivity tools for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "schlock",
+      "source": "./",
+      "description": "LLM command safety validator. Blocks dangerous bash commands and Claude advertising spam.",
+      "version": "0.1.0",
+      "author": {
+        "name": "27B.io"
+      },
+      "homepage": "https://github.com/27Bslash6/schlock",
+      "license": "WTFPL",
+      "keywords": ["safety", "validation", "bash", "hooks", "security"],
+      "category": "security"
+    }
+  ]
+}

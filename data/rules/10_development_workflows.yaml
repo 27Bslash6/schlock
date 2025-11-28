@@ -1,0 +1,182 @@
+# Category: Development Workflows
+# Risk Levels: HIGH, MEDIUM, LOW, SAFE
+# Description: Common development operations and package management
+
+rules:
+  # HIGH
+  - name: git_force_push
+    description: Force push overwrites remote history
+    risk_level: HIGH
+    patterns: ['git\s+push[^;|&]{0,100}--force(?!-with-lease)', 'git\s+push[^;|&]{0,100}\s-f(\s|$)']
+    alternatives: ["Use --force-with-lease"]
+
+  - name: git_hard_reset
+    description: Hard reset destroys uncommitted work
+    risk_level: HIGH
+    patterns: ['git\s+reset\s+--hard']
+    alternatives: ["Use git stash first"]
+
+  - name: database_drop
+    description: Dropping databases is irreversible
+    risk_level: HIGH
+    patterns: ['DROP\s+DATABASE', 'DROP\s+TABLE']
+    alternatives: ["Backup first"]
+
+  - name: npm_global
+    description: Global installs pollute system
+    risk_level: HIGH
+    patterns: ['npm\s+install\s+-g']
+    alternatives: ["Use local dependencies"]
+
+  - name: pip_system
+    description: System Python installs break tools
+    risk_level: HIGH
+    patterns: ['pip\s+install\s+(?![^;|&]{0,100}--user)']
+    alternatives: ["Use venv"]
+
+  - name: package_installation_system
+    description: System-wide package installation
+    risk_level: MEDIUM
+    patterns: ['apt\s+install(?!\s+.{0,50}--dry-run)', 'apt-get\s+install(?!\s+.{0,50}--dry-run)', 'yum\s+install', 'dnf\s+install', 'zypper\s+(install|in)', 'pacman\s+-S', 'snap\s+install', 'flatpak\s+install']
+    alternatives: ["Use containerized environments", "Document dependencies", "Use virtual environments"]
+
+  - name: compiler_and_binary_execution
+    description: Compiling and executing arbitrary binaries
+    risk_level: MEDIUM
+    patterns: ['gcc\s+.{0,100}\.c\s+.{0,50}&&\s*\./', 'g\+\+\s+.{0,100}\.cpp\s+.{0,50}&&\s*\./', 'javac\s+.{0,100}\.java\s+.{0,50}&&\s*java', 'go\s+run\s+', 'rustc\s+.{0,100}\.rs\s+.{0,50}&&\s*\./', 'make\s+&&\s*\./', 'cmake\s+.{0,100}&&\s*make\s+&&']
+    alternatives: ["Review source code first", "Use sandboxed environments", "Scan for malware"]
+
+  - name: aws_resource_deletion
+    description: Prevent accidental AWS resource deletion
+    risk_level: HIGH
+    patterns: ['aws\s+.{0,100}\s+delete', 'aws\s+.{0,100}\s+terminate', 'terraform\s+destroy']
+    alternatives: ["Use AWS console with MFA", "Create snapshot/backup first"]
+
+  # MEDIUM
+  - name: single_delete
+    description: Deleting files without backup
+    risk_level: MEDIUM
+    patterns: ['^rm\s+[^-]']
+    alternatives: ["Backup first"]
+
+  - name: git_push
+    description: Pushing to remote
+    risk_level: MEDIUM
+    patterns: ['^git\s+push\b']
+    alternatives: ["Review with git log"]
+
+  - name: git_merge
+    description: Can create conflicts
+    risk_level: MEDIUM
+    patterns: ['git\s+merge']
+    alternatives: ["Clean working directory"]
+
+  - name: git_rebase
+    description: Rewrites history
+    risk_level: MEDIUM
+    patterns: ['git\s+rebase']
+    alternatives: ["Only rebase local commits"]
+
+  - name: chmod_exec
+    description: Making files executable
+    risk_level: MEDIUM
+    patterns: ['chmod\s+\+x']
+    alternatives: ["Ensure file is trusted"]
+
+  - name: resource_intensive_operations
+    description: Warn about resource-intensive operations
+    risk_level: MEDIUM
+    patterns: ['find\s+/\s+', 'grep\s+-r\s+.{0,100}\s+/', 'du\s+-h\s+/']
+    alternatives: ["Limit search scope", "Use more specific paths"]
+
+  # LOW
+  - name: git_commit
+    description: Committing changes
+    risk_level: LOW
+    patterns: ['^git\s+commit']
+    alternatives: []
+
+  - name: npm_install
+    description: Installing npm packages
+    risk_level: LOW
+    patterns: ['^npm\s+install']
+    alternatives: []
+
+  - name: pip_requirements
+    description: Installing Python requirements
+    risk_level: LOW
+    patterns: ['pip.{0,50}-r\s+requirements']
+    alternatives: []
+
+  - name: yarn_install
+    description: Installing yarn dependencies
+    risk_level: LOW
+    patterns: ['^yarn\s+install']
+    alternatives: []
+
+  - name: cargo_build
+    description: Building Rust project
+    risk_level: LOW
+    patterns: ['^cargo\s+build']
+    alternatives: []
+
+  - name: make_build
+    description: Running make
+    risk_level: LOW
+    patterns: ['^make\b']
+    alternatives: []
+
+  - name: docker_build
+    description: Building Docker image
+    risk_level: LOW
+    patterns: ['^docker\s+build']
+    alternatives: []
+
+  - name: docker_run
+    description: Running container
+    risk_level: LOW
+    patterns: ['^docker\s+run\s+(?!.{0,200}--privileged)']
+    alternatives: []
+
+  - name: curl_download
+    description: Downloading with curl
+    risk_level: LOW
+    patterns: ['^curl\s+-[OL]']
+    alternatives: []
+
+  - name: wget_download
+    description: Downloading with wget
+    risk_level: LOW
+    patterns: ['^wget\s+https']
+    alternatives: []
+
+  # SAFE
+  - name: git_log
+    description: Viewing git log
+    risk_level: SAFE
+    patterns: ['^git\s+log']
+    alternatives: []
+
+  - name: list_files
+    description: Listing files
+    risk_level: SAFE
+    patterns: ['^ls\b']
+    alternatives: []
+
+  - name: pwd_cmd
+    description: Print working directory
+    risk_level: SAFE
+    patterns: ['^pwd$']
+    alternatives: []
+
+  - name: simple_echo
+    description: Echo simple text
+    risk_level: SAFE
+    patterns: ['^echo\s+[\w\s]+$']
+    alternatives: []
+
+  - name: cat_read
+    description: Reading file contents
+    risk_level: SAFE
+    patterns: ['^cat\s+[\w/]+\.txt$']
+    alternatives: []

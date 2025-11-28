@@ -1,0 +1,10 @@
+# Category: Log Tampering
+# Risk Levels: HIGH
+# Description: Commands that manipulate system logs and audit trails
+
+rules:
+  - name: log_tampering
+    description: System log manipulation hides malicious activity
+    risk_level: HIGH
+    patterns: ['>\s*/var/log/[^|&;]{1,200}', 'rm\s+.{0,100}/var/log/[^|&;]{1,200}', 'truncate\s+.{0,100}/var/log/', 'echo\s+.{0,100}>\s*/var/log/', 'shred\s+.{0,100}/var/log/', 'history\s+-c', 'unset\s+HISTFILE', 'export\s+HISTSIZE=0', 'ln\s+-sf\s+/dev/null\s+.{0,100}\.bash_history']
+    alternatives: ["Use log rotation tools", "Preserve audit trails", "Use centralized logging"]

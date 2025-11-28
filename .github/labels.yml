@@ -1,0 +1,92 @@
+# Labels for schlock
+# Sync with: gh label import .github/labels.yml
+# Or use: https://github.com/micnncim/action-label-syncer
+
+# Type
+- name: bug
+  color: d73a4a
+  description: Something isn't working
+
+- name: enhancement
+  color: a2eeef
+  description: New feature or improvement
+
+- name: rule-request
+  color: 5319e7
+  description: New or modified security rule
+
+- name: documentation
+  color: 0075ca
+  description: Documentation improvements
+
+- name: question
+  color: d876e3
+  description: Further information requested
+
+# Priority
+- name: priority:critical
+  color: b60205
+  description: Must fix immediately
+
+- name: priority:high
+  color: d93f0b
+  description: Important, fix soon
+
+- name: priority:low
+  color: c2e0c6
+  description: Nice to have
+
+# Status
+- name: triage
+  color: ededed
+  description: Needs initial review
+
+- name: confirmed
+  color: 0e8a16
+  description: Bug confirmed / feature approved
+
+- name: wontfix
+  color: ffffff
+  description: This won't be worked on
+
+- name: duplicate
+  color: cfd3d7
+  description: Already exists
+
+# Area
+- name: area:validation
+  color: fbca04
+  description: Safety validation engine
+
+- name: area:rules
+  color: fbca04
+  description: Security rules
+
+- name: area:audit
+  color: fbca04
+  description: Audit logging
+
+- name: area:config
+  color: fbca04
+  description: Configuration system
+
+- name: area:ad-blocker
+  color: fbca04
+  description: Advertising blocker
+
+- name: area:performance
+  color: fbca04
+  description: Performance related
+
+# Meta
+- name: good first issue
+  color: 7057ff
+  description: Good for newcomers
+
+- name: help wanted
+  color: 008672
+  description: Extra attention needed
+
+- name: breaking
+  color: b60205
+  description: Breaking change

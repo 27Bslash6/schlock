@@ -1,0 +1,75 @@
+# Commit Message Filter Rules
+# Pattern-based filtering to remove unwanted content from commit messages
+
+# Version
+version: "1.0.0"
+
+# Rule Categories
+# Each category can be independently enabled/disabled
+rules:
+  # Advertising patterns (default enabled)
+  advertising:
+    description: "Remove promotional content and advertising from commit messages"
+    enabled: true  # Default: enabled (most users want clean commits)
+    patterns:
+      - pattern: "🤖\\s*Generated with \\[Claude Code\\]\\(https://claude\\.com/claude-code\\)"
+        description: "Claude Code promotional link with emoji"
+        replacement: ""
+
+      - pattern: "Co-Authored-By:\\s*Claude\\s*<noreply@anthropic\\.com>"
+        description: "Claude Code co-author attribution line"
+        replacement: ""
+
+      - pattern: "Generated with Claude Code"
+        description: "Claude Code generation notice (text-only)"
+        replacement: ""
+
+      - pattern: "claude\\.com/claude-code"
+        description: "Claude Code website link"
+        replacement: ""
+
+      - pattern: "noreply@anthropic\\.com"
+        description: "Anthropic noreply email address"
+        replacement: ""
+
+      - pattern: "Co-Authored-By:\\s*Claude(?![\\w])"
+        description: "Claude co-author attribution (generic)"
+        replacement: ""
+
+      - pattern: "\\n*🤖.*Generated with.*\\n*"
+        description: "Any line with robot emoji and 'Generated with'"
+        replacement: "\n"
+
+      - pattern: "\\n*Co-Authored-By:.*Claude.*\\n*"
+        description: "Any Co-Authored-By line mentioning Claude"
+        replacement: "\n"
+
+  # Future categories (disabled by default - templates for users)
+  #
+  # profanity:
+  #   description: "Remove profanity and offensive language"
+  #   enabled: false
+  #   patterns:
+  #     - pattern: "example_pattern"
+  #       description: "Example profanity pattern"
+  #       replacement: "[redacted]"
+  #
+  # compliance:
+  #   description: "Enforce company commit message policies"
+  #   enabled: false
+  #   patterns:
+  #     - pattern: "CONFIDENTIAL"
+  #       description: "Remove confidential markers"
+  #       replacement: ""
+
+# Global filter settings
+settings:
+  # Trim consecutive blank lines after filtering
+  trim_blank_lines: true
+  max_consecutive_blanks: 2
+
+  # Strip trailing whitespace from lines
+  strip_trailing_whitespace: true
+
+  # Minimum message length after filtering (characters)
+  min_message_length: 1
