@@ -1,0 +1,179 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit configuration for schlock - Claude Code safety validation plugin
+# Docs: https://docs.coderabbit.ai/reference/configuration
+
+language: "en-AU"
+early_access: false
+
+reviews:
+  profile: "assertive"  # Security project = more thorough feedback
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  review_status: true
+  commit_status: true
+  collapse_walkthrough: false
+  changed_files_summary: true
+  sequence_diagrams: true
+  poem: false  # Keep reviews professional
+
+  # Focus on security-relevant files
+  path_filters:
+    - "src/**"
+    - "hooks/**"
+    - "data/rules/**"
+    - ".github/**"
+    - "tests/**"
+    - "!**/__pycache__/**"
+    - "!**/.pytest_cache/**"
+    - "!**/node_modules/**"
+    - "!**/*.pyc"
+
+  # Security-specific review instructions by path
+  path_instructions:
+    - path: "src/schlock/core/**"
+      instructions: |
+        SECURITY CRITICAL: This is the validation engine core.
+        - Verify bashlex AST parsing handles all edge cases
+        - Check for command injection vulnerabilities
+        - Ensure fail-safe behavior (deny on error, never allow)
+        - Validate that error handling is comprehensive
+        - No regex shortcuts for security parsing
+
+    - path: "hooks/pre_tool_use.py"
+      instructions: |
+        SECURITY CRITICAL: Main entry point for safety validation.
+        - Must only import from schlock public API
+        - All error paths must deny (never allow on failure)
+        - Audit logging must capture all decisions
+        - Performance matters - this runs on every command
+
+    - path: "data/rules/*.yaml"
+      instructions: |
+        Security rule definitions. Review for:
+        - False positive risk (blocking legitimate commands)
+        - False negative risk (missing dangerous patterns)
+        - Correct risk level assignment (BLOCKED, HIGH, MEDIUM)
+        - Pattern accuracy (no regex when bashlex required)
+
+    - path: ".github/workflows/**"
+      instructions: |
+        CI/CD security review:
+        - Check for hardcoded secrets or credentials
+        - Verify permissions follow least-privilege
+        - Ensure pinned action versions (SHA, not tags)
+        - Review for workflow injection vulnerabilities
+
+    - path: "tests/**"
+      instructions: |
+        Test coverage review:
+        - Security edge cases must have explicit tests
+        - Error paths must be tested
+        - Check for flaky test patterns
+
+  auto_review:
+    enabled: true
+    drafts: false
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "DRAFT"
+    labels: []
+
+  finishing_touches:
+    docstrings:
+      enabled: true
+    unit_tests:
+      enabled: true
+
+  pre_merge_checks:
+    docstring_coverage:
+      mode: "warning"
+      threshold: 70
+    title_check:
+      mode: "warning"
+      requirements: "Title should follow conventional commits format (feat:, fix:, chore:, docs:, test:, refactor:)"
+    description_check:
+      mode: "warning"
+    linked_issue_assessment:
+      mode: "off"
+    custom_checks:
+      - name: "Security Fail-Safe"
+        mode: "warning"
+        instructions: |
+          For any code in src/schlock/core/ or hooks/:
+          - Verify all exception handlers default to DENY/BLOCKED
+          - Ensure no code path can allow a command through on error
+          - Check that audit logging captures failure modes
+
+  # Static analysis tools
+  tools:
+    # Python
+    ruff:
+      enabled: true
+    pylint:
+      enabled: true
+
+    # Shell scripts and bash
+    shellcheck:
+      enabled: true
+
+    # YAML (rules, configs)
+    yamllint:
+      enabled: true
+
+    # GitHub Actions
+    actionlint:
+      enabled: true
+
+    # Secret scanning
+    gitleaks:
+      enabled: true
+
+    # Markdown docs
+    markdownlint:
+      enabled: true
+
+    # Disable unused tools
+    biome:
+      enabled: false
+    eslint:
+      enabled: false
+    hadolint:
+      enabled: false  # No Dockerfiles
+    phpstan:
+      enabled: false
+    swiftlint:
+      enabled: false
+    golangci-lint:
+      enabled: false
+    detekt:
+      enabled: false
+    rubocop:
+      enabled: false
+    clippy:
+      enabled: false
+
+chat:
+  auto_reply: true
+  integrations:
+    jira:
+      enabled: "disabled"
+    linear:
+      enabled: "disabled"
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+    file_patterns:
+      - "**/CLAUDE.md"
+      - "**/CONTRIBUTING.md"
+  learnings:
+    scope: "local"
+  issues:
+    scope: "local"
+  pull_requests:
+    scope: "local"
