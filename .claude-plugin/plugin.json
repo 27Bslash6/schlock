@@ -1,6 +1,6 @@
 {
   "name": "schlock",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "LLM command safety validator for AI coding assistants. Blocks dangerous bash commands and Claude advertising spam.",
   "author": {
     "name": "27B.io",
@@ -8,5 +8,11 @@
   },
   "repository": "https://github.com/27Bslash6/schlock",
   "license": "WTFPL",
-  "keywords": ["safety", "validation", "bash", "hooks", "security"]
+  "keywords": [
+    "safety",
+    "validation",
+    "bash",
+    "hooks",
+    "security"
+  ]
 }
