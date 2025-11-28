@@ -1,0 +1,206 @@
+# Category: Container Security
+# Risk Levels: BLOCKED, HIGH, MEDIUM
+# Description: Commands that bypass container security boundaries
+# Security Reference: CWE-250 (Execution with Unnecessary Privileges)
+
+rules:
+  # ============================================================
+  # Docker Security
+  # ============================================================
+
+  - name: docker_privileged
+    description: Privileged containers can escape
+    risk_level: HIGH
+    patterns: ['docker.{0,200}--privileged']
+    alternatives: ["Use proper security boundaries"]
+
+  - name: container_escape
+    description: Container escape and privilege escalation vectors
+    risk_level: HIGH
+    patterns:
+      # Docker root mount
+      - 'docker.{0,200}-v\s+/:/[a-z/]+'
+      - 'docker.{0,200}--volume\s+/:/[a-z/]+'
+      # Dangerous capabilities
+      - 'docker.{0,200}--cap-add.{0,50}(SYS_ADMIN|ALL|SYS_PTRACE|DAC_READ_SEARCH)'
+      # Security opt bypass
+      - 'docker.{0,200}--security-opt.{0,50}(apparmor=unconfined|seccomp=unconfined|privileged)'
+      # Host namespace access
+      - 'docker.{0,200}--pid.{0,20}host'
+      - 'docker.{0,200}--network.{0,20}host.{0,100}--privileged'
+      - 'docker.{0,200}--userns.{0,20}host'
+      - 'docker.{0,200}--ipc.{0,20}host'
+      # nsenter to host (PID 1)
+      - 'nsenter\s+[^;|&]*--target\s+1'
+      - 'nsenter\s+[^;|&]*-t\s+1'
+      # Podman privileged
+      - 'podman.{0,200}--privileged'
+    alternatives: ["Use proper container security", "Avoid privileged containers", "Use security policies"]
+
+  # ============================================================
+  # Kubernetes Security
+  # ============================================================
+
+  # BLOCKED - Kubernetes secrets theft
+  - name: kubectl_secrets_theft
+    description: Kubernetes secret extraction exposes sensitive credentials
+    risk_level: BLOCKED
+    patterns:
+      # Get secrets with output format (exfiltration)
+      - 'kubectl\s+get\s+secrets?[^;|&]*-o\s+(json|yaml|jsonpath)'
+      - 'kubectl\s+get\s+secret\s+[^;|&]*-o\s+(json|yaml|jsonpath)'
+      # Describe secret (shows values)
+      - 'kubectl\s+describe\s+secrets?'
+      # Direct secret value extraction
+      - 'kubectl\s+get\s+secret[^;|&]*jsonpath[^;|&]*\.data'
+    alternatives:
+      - "Secret access requires security approval"
+      - "Use external secrets operators"
+      - "Rotate secrets after exposure"
+
+  # BLOCKED - Kubernetes RBAC manipulation
+  - name: kubectl_rbac_manipulation
+    description: Kubernetes RBAC privilege escalation
+    risk_level: BLOCKED
+    patterns:
+      # Create cluster-admin binding
+      - 'kubectl\s+create\s+clusterrolebinding[^;|&]*cluster-admin'
+      - 'kubectl\s+create\s+rolebinding[^;|&]*cluster-admin'
+      # Admin role assignments
+      - 'kubectl\s+create\s+clusterrolebinding[^;|&]*admin'
+      # Patch rolebindings
+      - 'kubectl\s+patch[^;|&]*(cluster)?rolebinding'
+      # Edit RBAC resources
+      - 'kubectl\s+edit[^;|&]*(cluster)?(role|rolebinding)'
+    alternatives:
+      - "RBAC changes require security approval"
+      - "Use GitOps for RBAC management"
+      - "Apply least privilege principle"
+
+  # HIGH - kubectl exec (RCE vector)
+  - name: kubectl_exec_dangerous
+    description: kubectl exec provides shell access to containers
+    risk_level: HIGH
+    patterns:
+      # Interactive shell access
+      - 'kubectl\s+exec[^;|&]*-it?[^;|&]*--\s*(/bin/)?(bash|sh|zsh)'
+      - 'kubectl\s+exec[^;|&]*-t?i[^;|&]*--\s*(/bin/)?(bash|sh|zsh)'
+      # exec with privileged flag
+      - 'kubectl\s+exec[^;|&]*--privileged'
+      # Any interactive exec
+      - 'kubectl\s+exec[^;|&]*-it\s+'
+    alternatives:
+      - "kubectl exec provides RCE - requires approval"
+      - "Use kubectl logs for debugging"
+      - "Implement audit logging for exec"
+
+  # HIGH - kubectl debug (node/pod access)
+  - name: kubectl_debug_escape
+    description: kubectl debug can enable node-level access
+    risk_level: HIGH
+    patterns:
+      # Debug node (dangerous - full node access)
+      - 'kubectl\s+debug\s+node/'
+      # Debug with custom image
+      - 'kubectl\s+debug[^;|&]*--image'
+      # Debug with share-processes
+      - 'kubectl\s+debug[^;|&]*--share-processes'
+      # Debug targeting existing container
+      - 'kubectl\s+debug[^;|&]*--target'
+    alternatives:
+      - "kubectl debug provides elevated access - requires approval"
+      - "Use ephemeral containers with restricted images"
+      - "Implement Pod Security Standards"
+
+  # HIGH - kubectl port-forward (lateral movement)
+  - name: kubectl_port_forward
+    description: kubectl port-forward can enable lateral movement
+    risk_level: HIGH
+    patterns:
+      # Port forwarding to services
+      - 'kubectl\s+port-forward[^;|&]*svc/'
+      - 'kubectl\s+port-forward[^;|&]*service/'
+      # Port forwarding to sensitive ports
+      - 'kubectl\s+port-forward[^;|&]*(5432|3306|27017|6379|9200|8500)'
+      # Port forwarding to pods
+      - 'kubectl\s+port-forward\s+pod/'
+    alternatives:
+      - "Port forwarding bypasses network policies"
+      - "Use proper ingress/service mesh"
+      - "Implement network segmentation"
+
+  # HIGH - kubectl cp (data exfiltration)
+  - name: kubectl_cp_dangerous
+    description: kubectl cp can enable data exfiltration from pods
+    risk_level: HIGH
+    patterns:
+      # Copy from pod (exfiltration)
+      - 'kubectl\s+cp\s+[^:]+:[^;|&]+\s+\.'
+      - 'kubectl\s+cp\s+[^:]+:[^;|&]+\s+/'
+      # Copy sensitive paths
+      - 'kubectl\s+cp[^;|&]*:/etc/'
+      - 'kubectl\s+cp[^;|&]*:/var/run/secrets'
+      - 'kubectl\s+cp[^;|&]*:/root/'
+    alternatives:
+      - "kubectl cp can exfiltrate data"
+      - "Review what data is being copied"
+      - "Use proper data access controls"
+
+  # MEDIUM - kubectl apply/create (resource creation)
+  - name: kubectl_resource_creation
+    description: Creating Kubernetes resources that could be dangerous
+    risk_level: MEDIUM
+    patterns:
+      # Creating pods with hostPath
+      - 'kubectl\s+(apply|create)[^;|&]*-f[^;|&]*-\s*<<<'
+      # Creating from URL (supply chain risk)
+      - 'kubectl\s+(apply|create)\s+-f\s+https?://'
+    alternatives:
+      - "Review YAML before applying"
+      - "Use GitOps for resource management"
+      - "Implement admission controllers"
+
+  # ============================================================
+  # Alternative Container Runtimes
+  # ============================================================
+
+  # HIGH - Podman dangerous operations
+  - name: podman_dangerous
+    description: Podman privileged and dangerous operations
+    risk_level: HIGH
+    patterns:
+      # Podman root mount
+      - 'podman[^;|&]*-v\s+/:/[a-z/]+'
+      - 'podman[^;|&]*--volume\s+/:/[a-z/]+'
+      # Dangerous capabilities
+      - 'podman[^;|&]*--cap-add.{0,50}(SYS_ADMIN|ALL)'
+      # Host namespaces
+      - 'podman[^;|&]*--pid.{0,20}host'
+      - 'podman[^;|&]*--userns.{0,20}host'
+    alternatives:
+      - "Use rootless Podman"
+      - "Avoid privileged operations"
+      - "Use proper security boundaries"
+
+  # HIGH - containerd (ctr) dangerous operations
+  - name: containerd_dangerous
+    description: containerd ctr privileged operations
+    risk_level: HIGH
+    patterns:
+      - 'ctr\s+run[^;|&]*--privileged'
+      - 'ctr\s+run[^;|&]*--net-host'
+      - 'ctr\s+task\s+exec'
+    alternatives:
+      - "Use higher-level container runtimes"
+      - "Avoid direct ctr usage"
+
+  # HIGH - CRI-O (crictl) dangerous operations
+  - name: crictl_dangerous
+    description: crictl container inspection and execution
+    risk_level: HIGH
+    patterns:
+      - 'crictl\s+exec[^;|&]*-it'
+      - 'crictl\s+exec[^;|&]*-i[^;|&]*-t'
+    alternatives:
+      - "Use kubectl for container operations"
+      - "crictl is for debugging only"

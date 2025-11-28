@@ -1,0 +1,253 @@
+# Category: Cloud Security
+# Risk Levels: BLOCKED, HIGH, MEDIUM
+# Description: Cloud CLI credential theft, IAM manipulation, secrets access
+# Security Reference: CWE-522 (Insufficiently Protected Credentials), CWE-250 (Execution with Unnecessary Privileges)
+
+rules:
+  # ============================================================
+  # AWS Security
+  # ============================================================
+
+  # BLOCKED - Direct credential theft
+  - name: aws_credential_theft
+    description: AWS credential retrieval and exfiltration
+    risk_level: BLOCKED
+    patterns:
+      # aws configure credential access
+      - 'aws\s+configure\s+get\s+(aws_access_key_id|aws_secret_access_key|aws_session_token)'
+      - 'aws\s+configure\s+list'
+      # STS credential operations
+      - 'aws\s+sts\s+get-session-token'
+      - 'aws\s+sts\s+assume-role(?!\s+[^;|&]*--role-session-name)'  # assume-role without session name is suspicious
+      # Direct credential file access
+      - 'cat\s+[^;|&]*~/\.aws/credentials'
+      - 'cat\s+[^;|&]*\$HOME/\.aws/credentials'
+      - 'cat\s+[^;|&]*/root/\.aws/credentials'
+      # Credential file copy/exfil
+      - 'cp\s+[^;|&]*~/\.aws/credentials'
+      - 'scp\s+[^;|&]*\.aws/credentials'
+      - 'rsync\s+[^;|&]*\.aws/credentials'
+    alternatives:
+      - "AWS credential access requires explicit approval"
+      - "Use IAM roles instead of long-lived credentials"
+      - "Use AWS SSO for temporary credentials"
+
+  # BLOCKED - IAM privilege escalation
+  - name: aws_iam_manipulation
+    description: AWS IAM privilege escalation operations
+    risk_level: BLOCKED
+    patterns:
+      # Creating new access keys (persistence)
+      - 'aws\s+iam\s+create-access-key'
+      - 'aws\s+iam\s+list-access-keys'
+      # Policy attachment (privilege escalation)
+      - 'aws\s+iam\s+attach-user-policy'
+      - 'aws\s+iam\s+attach-role-policy'
+      - 'aws\s+iam\s+attach-group-policy'
+      # Inline policy creation (privilege escalation)
+      - 'aws\s+iam\s+put-user-policy'
+      - 'aws\s+iam\s+put-role-policy'
+      - 'aws\s+iam\s+put-group-policy'
+      # Policy version manipulation
+      - 'aws\s+iam\s+create-policy-version'
+      - 'aws\s+iam\s+set-default-policy-version'
+      # Trust policy manipulation (cross-account)
+      - 'aws\s+iam\s+update-assume-role-policy'
+      # Group membership changes
+      - 'aws\s+iam\s+add-user-to-group'
+      # User creation with admin
+      - 'aws\s+iam\s+create-user'
+    alternatives:
+      - "IAM changes require security approval"
+      - "Use AWS Organizations SCPs for guardrails"
+      - "Follow least privilege principle"
+
+  # BLOCKED - AWS Secrets exfiltration
+  - name: aws_secrets_exfiltration
+    description: AWS Secrets Manager and Parameter Store access
+    risk_level: BLOCKED
+    patterns:
+      # Secrets Manager
+      - 'aws\s+secretsmanager\s+get-secret-value'
+      - 'aws\s+secretsmanager\s+list-secrets'
+      - 'aws\s+secretsmanager\s+describe-secret'
+      # SSM Parameter Store with decryption
+      - 'aws\s+ssm\s+get-parameter[^;|&]*--with-decryption'
+      - 'aws\s+ssm\s+get-parameters[^;|&]*--with-decryption'
+      - 'aws\s+ssm\s+get-parameters-by-path[^;|&]*--with-decryption'
+    alternatives:
+      - "Secrets access requires security review"
+      - "Use IAM policies to restrict secret access"
+      - "Rotate secrets regularly"
+
+  # HIGH - AWS Lambda abuse
+  - name: aws_lambda_abuse
+    description: AWS Lambda function manipulation for code execution
+    risk_level: HIGH
+    patterns:
+      # Lambda invocation
+      - 'aws\s+lambda\s+invoke'
+      # Lambda code modification
+      - 'aws\s+lambda\s+update-function-code'
+      - 'aws\s+lambda\s+create-function'
+      # Lambda permission changes
+      - 'aws\s+lambda\s+add-permission'
+      # Layer manipulation
+      - 'aws\s+lambda\s+publish-layer-version'
+    alternatives:
+      - "Lambda operations require review"
+      - "Use CI/CD pipelines for Lambda deployments"
+      - "Enable Lambda function versioning"
+
+  # HIGH - AWS EC2/compute abuse
+  - name: aws_compute_abuse
+    description: AWS EC2 and compute operations that could be abused
+    risk_level: HIGH
+    patterns:
+      # Instance metadata service (IMDS) access
+      - 'curl\s+[^;|&]*169\.254\.169\.254'
+      - 'wget\s+[^;|&]*169\.254\.169\.254'
+      # EC2 user data (can contain secrets)
+      - 'aws\s+ec2\s+describe-instance-attribute[^;|&]*userData'
+      # Security group manipulation
+      - 'aws\s+ec2\s+authorize-security-group-ingress'
+      - 'aws\s+ec2\s+modify-security-group-rules'
+    alternatives:
+      - "EC2 security group changes require approval"
+      - "Use IMDSv2 for metadata access"
+      - "Review user-data for sensitive content"
+
+  # ============================================================
+  # GCP Security
+  # ============================================================
+
+  # BLOCKED - GCP credential theft
+  - name: gcp_credential_theft
+    description: GCP credential and token access
+    risk_level: BLOCKED
+    patterns:
+      # Access token retrieval
+      - 'gcloud\s+auth\s+print-access-token'
+      - 'gcloud\s+auth\s+print-identity-token'
+      # Credential file access
+      - 'gcloud\s+auth\s+application-default\s+print-access-token'
+      - 'cat\s+[^;|&]*application_default_credentials\.json'
+      # Service account key creation
+      - 'gcloud\s+iam\s+service-accounts\s+keys\s+create'
+      - 'gcloud\s+iam\s+service-accounts\s+keys\s+list'
+    alternatives:
+      - "GCP credential access requires approval"
+      - "Use Workload Identity instead of service account keys"
+      - "Rotate service account keys regularly"
+
+  # BLOCKED - GCP Secrets access
+  - name: gcp_secrets_access
+    description: GCP Secret Manager access
+    risk_level: BLOCKED
+    patterns:
+      - 'gcloud\s+secrets\s+versions\s+access'
+      - 'gcloud\s+secrets\s+list'
+    alternatives:
+      - "Secret access requires security review"
+      - "Use IAM conditions to restrict access"
+
+  # HIGH - GCP IAM manipulation
+  - name: gcp_iam_manipulation
+    description: GCP IAM privilege escalation
+    risk_level: HIGH
+    patterns:
+      # Role binding changes
+      - 'gcloud\s+[^;|&]*add-iam-policy-binding'
+      - 'gcloud\s+projects\s+add-iam-policy-binding'
+      # Service account impersonation
+      - 'gcloud\s+[^;|&]*--impersonate-service-account'
+    alternatives:
+      - "IAM changes require security approval"
+      - "Use Cloud Audit Logs for monitoring"
+
+  # ============================================================
+  # Azure Security
+  # ============================================================
+
+  # BLOCKED - Azure credential theft
+  - name: azure_credential_theft
+    description: Azure credential and token access
+    risk_level: BLOCKED
+    patterns:
+      # Access token retrieval
+      - 'az\s+account\s+get-access-token'
+      # Credential file access
+      - 'cat\s+[^;|&]*\.azure/accessTokens\.json'
+      - 'cat\s+[^;|&]*\.azure/azureProfile\.json'
+      # Service principal credential access
+      - 'az\s+ad\s+sp\s+credential\s+list'
+      - 'az\s+ad\s+sp\s+credential\s+reset'
+    alternatives:
+      - "Azure credential access requires approval"
+      - "Use Managed Identities instead of service principals"
+      - "Use Azure Key Vault for secrets"
+
+  # BLOCKED - Azure Key Vault secrets
+  - name: azure_keyvault_secrets
+    description: Azure Key Vault secret access
+    risk_level: BLOCKED
+    patterns:
+      - 'az\s+keyvault\s+secret\s+show'
+      - 'az\s+keyvault\s+secret\s+list'
+      - 'az\s+keyvault\s+secret\s+download'
+    alternatives:
+      - "Key Vault access requires security review"
+      - "Use RBAC to restrict vault access"
+
+  # HIGH - Azure RBAC manipulation
+  - name: azure_rbac_manipulation
+    description: Azure RBAC privilege escalation
+    risk_level: HIGH
+    patterns:
+      # Role assignments
+      - 'az\s+role\s+assignment\s+create'
+      - 'az\s+role\s+definition\s+create'
+      # Subscription access
+      - 'az\s+account\s+set\s+--subscription'
+    alternatives:
+      - "RBAC changes require security approval"
+      - "Use PIM for just-in-time access"
+
+  # ============================================================
+  # Multi-Cloud / Generic
+  # ============================================================
+
+  # HIGH - Cloud metadata services (SSRF vector)
+  - name: cloud_metadata_access
+    description: Cloud metadata service access (potential SSRF)
+    risk_level: HIGH
+    patterns:
+      # AWS IMDS
+      - 'curl\s+[^;|&]*169\.254\.169\.254'
+      - 'wget\s+[^;|&]*169\.254\.169\.254'
+      # GCP metadata
+      - 'curl\s+[^;|&]*metadata\.google\.internal'
+      - 'curl\s+[^;|&]*169\.254\.169\.254/computeMetadata'
+      # Azure IMDS
+      - 'curl\s+[^;|&]*169\.254\.169\.254/metadata'
+    alternatives:
+      - "Metadata service access should use proper SDKs"
+      - "Enable IMDSv2 on AWS"
+      - "Use Workload Identity where possible"
+
+  # MEDIUM - Cloud CLI identity commands (recon)
+  - name: cloud_identity_recon
+    description: Cloud identity reconnaissance commands
+    risk_level: MEDIUM
+    patterns:
+      # AWS
+      - 'aws\s+sts\s+get-caller-identity'
+      # GCP
+      - 'gcloud\s+auth\s+list'
+      - 'gcloud\s+config\s+list'
+      # Azure
+      - 'az\s+account\s+show'
+      - 'az\s+account\s+list'
+    alternatives:
+      - "Identity commands may reveal account information"
+      - "Review need for identity enumeration"

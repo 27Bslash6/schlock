@@ -1,0 +1,153 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "schlock"
+version = "0.1.0"
+description = "Claude Code plugin for LLM command safety validation"
+readme = "README.md"
+license = { text = "WTFPL" }
+authors = [
+    { name = "Ray Walker", email = "schlock@27b.io" }
+]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: Public Domain",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Security",
+]
+dependencies = [
+    "bashlex>=0.18",
+    "pyyaml>=6.0",
+    "platformdirs>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1.0",
+    "basedpyright>=1.0.0",
+    "types-pyyaml",
+]
+
+[project.urls]
+Homepage = "https://github.com/27Bslash6/schlock"
+Repository = "https://github.com/27Bslash6/schlock"
+Issues = "https://github.com/27Bslash6/schlock/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/schlock"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "benchmark: Performance benchmark tests (may vary with system load)",
+]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+
+[tool.coverage.run]
+source = ["src/schlock"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/.venv/*",
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
+[tool.ruff]
+line-length = 129
+target-version = "py39"
+src = ["src", "tests", "hooks", "commands", "skills"]
+exclude = [
+    ".venv",
+    ".git",
+    "__pycache__",
+    ".claude-plugin/vendor",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "Q",      # flake8-quotes
+    "RET",    # flake8-return
+    "TID",    # flake8-tidy-imports
+    "PTH",    # flake8-use-pathlib
+    "ERA",    # eradicate
+    "PL",     # pylint
+    "PERF",   # perflint
+    "S",      # flake8-bandit (security)
+]
+ignore = [
+    "PLR0913",  # Too many arguments
+    "PLR2004",  # Magic value comparisons
+    "B904",     # Exception chaining (we use custom exceptions with original_error)
+    "PERF203",  # try-except in loop (config validation, not performance critical)
+    "PERF401",  # list.extend (stylistic, no real performance impact here)
+    "PTH123",   # Path.open() (open() is fine for our use case)
+    "SIM102",   # Nested if (clearer with separate conditions for validation)
+    "S603",     # subprocess-without-shell-equals-true (we validate commands)
+    "S607",     # start-process-with-partial-path (expected behavior)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402"]
+"tests/**/*.py" = ["S101", "PLR2004", "E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+# line-ending managed by .gitattributes for cross-platform compatibility
+
+[tool.basedpyright]
+include = ["src", "tests", "hooks", "commands", "skills"]
+pythonVersion = "3.9"
+typeCheckingMode = "standard"
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownLambdaType = false

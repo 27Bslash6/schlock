@@ -1,0 +1,58 @@
+# Category: File Destruction
+# Risk Levels: BLOCKED, HIGH
+# Description: Commands that can destroy files and directory trees
+
+rules:
+  # BLOCKED
+  - name: fork_bomb
+    description: Fork bomb crashes system by spawning infinite processes
+    risk_level: BLOCKED
+    patterns: [':\(\)\{.{0,200}:\|:&\};:', ':\(\)\s*\{.{0,200}:\s*\|\s*:\s*&\s*\}\s*;?\s*:']
+    alternatives: ["NEVER run fork bombs"]
+
+  - name: system_destruction
+    description: Complete filesystem destruction
+    risk_level: BLOCKED
+    patterns: ['rm\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]{0,100}\s+(\/|\/\*|\$HOME|~)(\s|$)', 'rm\s+(\/|\/\*)\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)']
+    alternatives: ["Specify exact files instead"]
+
+  # HIGH
+  - name: recursive_delete
+    description: Recursive delete can destroy directory trees
+    risk_level: HIGH
+    patterns: ['rm\s+-r', 'find.{0,200}-delete']
+    alternatives: ["Use rm -ri for interactive"]
+
+  - name: find_exec_rm
+    description: Can delete many files
+    risk_level: HIGH
+    patterns: ['find.{0,200}-exec\s+rm']
+    alternatives: ["Review results first"]
+
+  - name: file_truncation
+    description: File truncation can instantly destroy data
+    risk_level: HIGH
+    patterns: ["^\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", ":\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", "true\\s+>\\s+(?!/dev/null)[^|&;]{1,200}", "truncate\\s+.{0,100}(-s|--size)\\s*0", "echo\\s+-n\\s+>\\s+(?!/dev/null)[^|&;]{1,200}", "printf\\s+[\"']\\s*[\"']?\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", "tee\\s+(?!.{0,50}-a)(?!/dev/null)[^|&;]{1,200}"]
+    alternatives: ["Use proper log rotation", "Backup before truncating", "Use >> for append"]
+
+  - name: vcs_directory_deletion
+    description: Deleting version control directories destroys project history
+    risk_level: HIGH
+    patterns:
+      # .git directory deletion
+      - 'rm\s+[^;|&]*\.git(/|\s|$)'
+      - 'rm\s+[^;|&]*-[rf]+[^;|&]*\.git(/|\s|$)'
+      # .hg (Mercurial), .svn (Subversion)
+      - 'rm\s+[^;|&]*\.(hg|svn)(/|\s|$)'
+      - 'rm\s+[^;|&]*-[rf]+[^;|&]*\.(hg|svn)(/|\s|$)'
+    alternatives:
+      - "Use 'git clean -fd' to remove untracked files"
+      - "Backup .git directory before deletion"
+      - "Use 'git stash' to save uncommitted changes"
+      - "Consider if you really need to delete version history"
+
+  - name: archive_operations
+    description: Archive operations that could extract malicious files
+    risk_level: MEDIUM
+    patterns: ['tar\s+.{0,100}(-x|--extract).{0,100}/', 'unzip\s+.{0,100}-o', 'gunzip\s+.{0,100}-f', '7z\s+x\s+.{0,100}-y', 'rar\s+x\s+.{0,100}-o\+']
+    alternatives: ["Extract to safe directory", "Review archive contents first", "Use sandboxed extraction"]

@@ -1,0 +1,60 @@
+name: Rule Request
+description: Suggest a new security rule or modification to an existing one
+labels: ["rule-request", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Suggest a security rule to add, modify, or remove.
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Request type
+      options:
+        - Add new rule
+        - Modify existing rule
+        - Remove/downgrade rule
+        - False positive report
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command pattern
+      description: The command(s) this rule should match
+      placeholder: |
+        aws s3 rm --recursive
+        gsutil rm -r
+      render: bash
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Suggested severity
+      options:
+        - BLOCKED (prevent execution)
+        - HIGH (prompt user)
+        - MEDIUM (log warning)
+        - LOW (informational)
+        - SAFE (whitelist)
+
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Why?
+      description: Why should this rule exist or be changed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Safer alternatives (for new rules)
+      description: What should users do instead?
+      placeholder: |
+        - Use --dryrun flag first
+        - Specify exact path instead of recursive

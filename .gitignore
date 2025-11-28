@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.coverage
+.pytest_cache/
+.tox/
+htmlcov/
+coverage.json
+.hypothesis/
+
+# Type Checking & Linting
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.dmypy.json
+dmypy.json
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+*.bak
+*.backup
+
+# Spec Workflow
+.spec-workflow/
+.snapshots/
+
+# IMPORTANT: .claude-plugin/vendor/ IS committed (vendored dependencies)
+# Do NOT add .claude-plugin/vendor/ to this file
+
+# Development files (excluded from public releases)
+.claude/

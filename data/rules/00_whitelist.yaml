@@ -1,0 +1,21 @@
+# Category: Whitelist
+# Risk Levels: SAFE (override)
+# Description: Commands that are explicitly whitelisted and always allowed
+
+# Safe whitelisted patterns that override all other rules
+whitelist:
+  # Core safe commands
+  - ^git\s+status
+  - ^ls\b
+  - ^pwd$
+
+  # Safe directory cleanup operations (common developer workflows)
+  - ^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/.*)?$
+  - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)
+
+  # Safe /tmp operations (testing/temporary files)
+  - ^chmod\s+[0-7]{3}\s+/tmp/
+  - ^chmod\s+-R\s+[0-7]{3}\s+/tmp/
+
+# Note: This file has no rules section, only whitelist patterns
+rules: []

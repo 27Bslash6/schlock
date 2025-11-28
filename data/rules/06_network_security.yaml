@@ -1,0 +1,28 @@
+# Category: Network Security
+# Risk Levels: HIGH
+# Description: Commands that expose network services or create backdoors
+
+rules:
+  - name: network_backdoor
+    description: Prevent network backdoor creation via netcat/socat
+    risk_level: BLOCKED
+    patterns: ['nc\s+[^;|&]{0,100}-e\s+', 'ncat\s+[^;|&]{0,100}--exec', 'socat[^;|&]{0,100}EXEC:', 'netcat\s+[^;|&]{0,100}-e']
+    alternatives: ["Use proper remote access tools", "Set up SSH with key authentication", "Use VPN for remote access"]
+
+  - name: network_service_exposure
+    description: Exposing network services can create security holes
+    risk_level: HIGH
+    patterns: ['python[23]?\s+-m\s+(http\.server|SimpleHTTPServer)', 'php\s+-S\s+[0-9.:\[\]]{1,50}', 'ruby\s+-run\s+-e\s+httpd', 'busybox\s+httpd', 'nc\s+.{0,100}-l.{0,100}-p?\s*[0-9]{1,5}', 'ncat\s+.{0,100}--listen', 'socat\s+.{0,100}TCP-LISTEN:', 'ssh\s+.{0,100}-[RLD]\s*[0-9]{1,5}:']
+    alternatives: ["Use proper web servers with authentication", "Limit to localhost", "Use firewalls"]
+
+  - name: open_network_ports
+    description: Prevent opening dangerous network ports
+    risk_level: HIGH
+    patterns: ['iptables.{0,200}ACCEPT', 'ufw\s+allow', 'firewall-cmd.{0,100}--add-port']
+    alternatives: ["Use security groups", "Implement proper ACLs"]
+
+  - name: data_exfiltration
+    description: Data exfiltration patterns
+    risk_level: HIGH
+    patterns: ['curl\s+.{0,100}(-F|--form).{0,100}@', 'curl\s+.{0,100}(--upload-file|-T)', 'wget\s+.{0,100}--post-file', 'tar\s+.{0,100}\|\s*.{0,50}(nc|ncat|socat|ssh)', 'base64\s+.{0,100}\|\s*.{0,50}curl', 'openssl\s+enc.{0,100}\|\s*.{0,50}(nc|curl)', 'zip\s+-P.{0,100}\|\s*.{0,50}curl', 'scp\s+.{0,200}@.{0,100}:', 'rsync\s+.{0,200}@.{0,100}:']
+    alternatives: ["Use secure file transfer", "Verify destination", "Use encryption"]

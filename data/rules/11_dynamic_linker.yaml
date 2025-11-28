@@ -1,0 +1,88 @@
+# Category: Dynamic Linker Attacks
+# Risk Levels: BLOCKED, HIGH
+# Description: LD_PRELOAD and library path manipulation for privilege escalation
+# Security Reference: CWE-426 (Untrusted Search Path), CWE-78 (OS Command Injection)
+
+rules:
+  # BLOCKED - LD_PRELOAD is a rootkit technique
+  - name: ld_preload_attack
+    description: LD_PRELOAD library injection enables rootkit-style privilege escalation
+    risk_level: BLOCKED
+    patterns:
+      # Export variants
+      - 'export\s+LD_PRELOAD\s*='
+      # Direct invocation with LD_PRELOAD
+      - '\bLD_PRELOAD\s*=\s*[^\s;|&]+'
+      # sudo with LD_PRELOAD (privilege escalation)
+      - 'sudo\s+[^;|&]*LD_PRELOAD\s*='
+      - 'su\s+[^;|&]*LD_PRELOAD\s*='
+      # Writing to /etc/ld.so.preload (persistent rootkit)
+      - '>\s*/etc/ld\.so\.preload'
+      - '>>\s*/etc/ld\.so\.preload'
+      - 'echo[^;|&]*>\s*/etc/ld\.so\.preload'
+      - 'tee\s+[^;|&]*/etc/ld\.so\.preload'
+    alternatives:
+      - "LD_PRELOAD is a rootkit technique - requires security review"
+      - "Modification of /etc/ld.so.preload is BLOCKED"
+      - "If legitimate debugging need, use strace or ltrace instead"
+
+  # HIGH - Library path manipulation
+  - name: library_path_manipulation
+    description: Dynamic linker path manipulation can enable library injection attacks
+    risk_level: HIGH
+    patterns:
+      # LD_LIBRARY_PATH with suspicious paths
+      - 'export\s+LD_LIBRARY_PATH\s*='
+      - '\bLD_LIBRARY_PATH\s*=\s*/tmp'
+      - '\bLD_LIBRARY_PATH\s*=\s*/dev/shm'
+      - '\bLD_LIBRARY_PATH\s*=\s*/var/tmp'
+      # macOS equivalents
+      - 'export\s+DYLD_INSERT_LIBRARIES\s*='
+      - 'export\s+DYLD_LIBRARY_PATH\s*='
+      - '\bDYLD_INSERT_LIBRARIES\s*='
+      - '\bDYLD_LIBRARY_PATH\s*='
+      # Other dangerous linker variables
+      - 'export\s+LD_AUDIT\s*='
+      - 'export\s+LD_DEBUG\s*='
+    alternatives:
+      - "Library path manipulation can enable privilege escalation"
+      - "Use system library paths only"
+      - "Consider using rpath instead of LD_LIBRARY_PATH"
+
+  # HIGH - Linker configuration modification
+  - name: linker_config_modification
+    description: Modifying linker configuration can persist library injection
+    risk_level: HIGH
+    patterns:
+      # /etc/ld.so.conf modification
+      - '>\s*/etc/ld\.so\.conf'
+      - '>>\s*/etc/ld\.so\.conf'
+      - 'echo[^;|&]*>>\s*/etc/ld\.so\.conf'
+      - 'tee\s+[^;|&]*/etc/ld\.so\.conf'
+      # /etc/ld.so.conf.d/ modification
+      - '>\s*/etc/ld\.so\.conf\.d/'
+      - '>>\s*/etc/ld\.so\.conf\.d/'
+      # ldconfig manipulation
+      - 'ldconfig\s+-[^;|&]*-p'  # Print cache (recon)
+    alternatives:
+      - "Linker configuration changes require system administrator approval"
+      - "Use package managers to install libraries properly"
+
+  # HIGH - Creating shared libraries in suspicious locations
+  - name: suspicious_shared_library
+    description: Creating shared libraries in world-writable or user locations for injection
+    risk_level: HIGH
+    patterns:
+      # Compiling shared libraries to /tmp or /dev/shm
+      - 'gcc[^;|&]*-shared[^;|&]*-o\s*/tmp/'
+      - 'gcc[^;|&]*-shared[^;|&]*-o\s*/dev/shm/'
+      - 'gcc[^;|&]*-fPIC[^;|&]*-o\s*/tmp/[^;|&]*\.so'
+      - 'g\+\+[^;|&]*-shared[^;|&]*-o\s*/tmp/'
+      # Moving .so files to suspicious locations
+      - 'cp\s+[^;|&]*\.so\s+/tmp/'
+      - 'mv\s+[^;|&]*\.so\s+/tmp/'
+      - 'cp\s+[^;|&]*\.so\s+/dev/shm/'
+    alternatives:
+      - "Install libraries via package managers"
+      - "Use proper library installation paths (/usr/local/lib)"
+      - "Shared libraries in /tmp indicate potential injection attack"

@@ -1,0 +1,70 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.14']
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: uv sync --dev
+
+    - name: Lint
+      run: uv run ruff check . && uv run ruff format --check .
+
+    - name: Test
+      run: uv run pytest --cov=src/schlock --cov-report=xml --cov-report=term
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v4
+
+    - name: pip-audit
+      run: uv export --no-hashes | uvx pip-audit -r /dev/stdin
+
+    - name: osv-scanner
+      run: |
+        curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
+        chmod +x osv-scanner
+        ./osv-scanner --lockfile=uv.lock || true
+
+    - name: semgrep
+      uses: semgrep/semgrep-action@v1
+      with:
+        config: p/security-audit p/python
+
+    - name: gitleaks
+      uses: gitleaks/gitleaks-action@v2.3.9
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
