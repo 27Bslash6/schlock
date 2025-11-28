@@ -5,6 +5,13 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.1.0...schlock-v0.2.0) (2025-11-28)
+
+
+### Features
+
+* initial release ([c5aa335](https://github.com/27Bslash6/schlock/commit/c5aa335d89dfaae0a93066b86f2543b4878b72cf))
+
 ## [Unreleased]
 
 ## [0.1.0] - 2025-11-28
