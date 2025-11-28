@@ -354,9 +354,6 @@ Transform schlock into comprehensive AI coding assistant safety:
 
 ## Appendix: Related Documents
 
-## Appendix: Related Documents
-
-- **Development Guide**: [docs/DEVELOPMENT.md](DEVELOPMENT.md)
-- **Configuration Guide**: [docs/CONFIGURATION.md](CONFIGURATION.md)
-- **Contributing Guide**: [docs/CONTRIBUTING.md](CONTRIBUTING.md)
-- **Installation Guide**: [docs/INSTALLING.md](INSTALLING.md)
+- **Development & Contributing**: [CONTRIBUTING.md](../CONTRIBUTING.md)
+- **Configuration Guide**: [CONFIGURATION.md](CONFIGURATION.md)
+- **Installation Guide**: [INSTALLING.md](INSTALLING.md)

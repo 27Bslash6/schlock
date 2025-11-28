@@ -70,8 +70,7 @@ Config files: `release-please-config.json`, `.release-please-manifest.json`
 - **docs/CHANGELOG.md** - Release history
 
 **Developer Documentation**:
-- **CONTRIBUTING.md** - Contributor guide
-- **docs/DEVELOPMENT.md** - Dev workflow, testing, module boundaries
+- **CONTRIBUTING.md** - Development workflow, testing, contributing
 - **docs/QA_TOOLING.md** - QA tools and workflow guide
 
 ## Package Metadata
