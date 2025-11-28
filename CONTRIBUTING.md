@@ -7,43 +7,43 @@
 git clone https://github.com/27Bslash6/schlock.git
 cd schlock
 
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install development dependencies
-pip install -e ".[dev]"
+# Install development dependencies (uv recommended)
+uv pip install -e ".[dev]"
 
 # Install pre-commit hooks (required)
-pip install pre-commit
+uv pip install pre-commit
 pre-commit install
 
 # Run tests
-make test
+uv run pytest
 ```
 
 ## Project Structure
 
 ```
 schlock/
-├── src/schlock/              # Core validation engine
-│   ├── parser.py            # Bashlex AST parsing
-│   ├── rules.py             # Security rule engine
-│   ├── validator.py         # Main validation pipeline
-│   ├── cache.py             # Thread-safe LRU cache
-│   ├── audit.py             # Audit logging
-│   ├── commit_filter.py     # Claude advertising blocker
-│   ├── wizard.py            # Setup wizard
-│   ├── config_writer.py     # Config generation
-│   ├── exceptions.py        # Custom exceptions
-│   └── env_detector.py      # Environment detection (unused in v0.1.0)
+├── src/schlock/
+│   ├── core/                # Validation engine
+│   │   ├── parser.py        # Bashlex AST parsing
+│   │   ├── rules.py         # Security rule engine
+│   │   ├── validator.py     # Main validation pipeline
+│   │   └── cache.py         # Thread-safe LRU cache
+│   ├── integrations/        # Optional features
+│   │   ├── audit.py         # Audit logging
+│   │   ├── commit_filter.py # Advertising blocker
+│   │   └── shellcheck.py    # ShellCheck integration
+│   ├── setup/               # Configuration utilities
+│   │   ├── wizard.py        # Setup wizard
+│   │   ├── config_writer.py # Config generation
+│   │   └── env_detector.py  # Environment detection
+│   └── exceptions.py        # Custom exceptions
 ├── hooks/                   # Claude Code hooks
-│   └── pre_tool_use.py      # Safety validation + audit logging
-├── data/                    # Default configurations
-│   ├── safety_rules.yaml    # Security rules
-│   ├── commit_filter_rules.yaml # Advertising blocker patterns
-│   └── formatting_tools.yaml# Formatter tool definitions (unused)
-├── tests/                   # Test suite
+│   └── pre_tool_use.py      # Safety validation entry point
+├── data/
+│   ├── rules/               # Security rules (multi-file)
+│   ├── commit_filter_rules.yaml
+│   └── safety_rules.yaml
+├── tests/                   # 821 tests
 └── .claude-plugin/          # Plugin manifest
 ```
 
@@ -51,7 +51,7 @@ schlock/
 
 1. **Create feature branch**: `git checkout -b feature/your-feature`
 2. **Make changes**: Follow coding standards below
-3. **Run tests**: `make test` (must pass)
+3. **Run tests**: `uv run pytest` (must pass)
 4. **Update docs**: If adding features
 5. **Submit PR**: Target `main` branch
 
@@ -62,14 +62,11 @@ schlock/
 **Use pre-commit hooks** (industry standard for automatic formatting):
 
 ```bash
-# Install pre-commit
-pip install pre-commit
-
-# Install hooks
+# Install hooks (already done if you ran setup)
 pre-commit install
 
 # Format manually
-ruff format .
+uv run ruff format .
 ```
 
 **Note**: schlock's built-in formatter feature is **non-functional** in v0.1.0 because Claude Code does not support PostToolUse hooks for plugins. The `/schlock:setup` wizard only configures the advertising blocker. Use standard pre-commit hooks for code formatting.
@@ -80,6 +77,26 @@ ruff format .
 - **Linter**: `ruff check` (0 warnings required)
 - **Type hints**: Required for all public APIs
 - **Docstrings**: Required for all modules, classes, public functions
+
+### Naming Conventions
+
+| Type | Convention | Example |
+|------|------------|---------|
+| Python modules | `snake_case.py` | `commit_filter.py` |
+| Hook handlers | `pre_tool_use.py` | |
+| Slash commands | `schlock-[command].md` | `schlock-setup.md` |
+| Test files | `test_[module].py` | `test_validator.py` |
+| Classes/Types | `PascalCase` | `ValidationResult` |
+| Functions/Methods | `snake_case` | `validate_command` |
+| Constants | `UPPER_SNAKE_CASE` | `RISK_LEVEL` |
+| Private members | `_leading_underscore` | `_cache` |
+
+### Code Size Guidelines
+
+- **File size**: Max 500 lines, target 200-300
+- **Function size**: Max 50 lines, target 10-20
+- **Class methods**: Max 10 public methods, target 3-5
+- **Nesting depth**: Max 3 levels, target 1-2 (guard clauses preferred)
 
 ### Testing Philosophy
 
@@ -103,22 +120,32 @@ ruff format .
 
 ```bash
 # Full suite
-make test
+uv run pytest
 
 # Specific module
-pytest tests/test_validator.py -v
+uv run pytest tests/test_validator.py -v
 
 # Coverage report
-pytest --cov=src/schlock --cov-report=html
+uv run pytest --cov=src/schlock --cov-report=html
 open htmlcov/index.html
 
 # Benchmarks
-pytest tests/test_benchmarks.py -v -s
+uv run pytest tests/test_benchmarks.py -v -s
 ```
 
 ## Adding Security Rules
 
-Edit `data/safety_rules.yaml`:
+Rules are organized by category in `data/rules/`:
+
+```
+00_whitelist.yaml       # Safe commands
+01_privilege_escalation.yaml
+02_file_destruction.yaml
+03_credential_theft.yaml
+...
+```
+
+Add rules to the appropriate category file:
 
 ```yaml
 rules:
@@ -131,12 +158,12 @@ rules:
       - 'Suggested safe alternative'
 ```
 
-**Risk level policy**:
-- **BLOCKED**: Prevent execution (rm -rf /, sudo rm, chmod 000)
-- **HIGH**: Warn but allow (git push --force, chmod 777)
-- **MEDIUM**: Log but allow (curl | sh, wildcard expansions)
-- **LOW**: Informational (dd, large finds)
-- **SAFE**: Explicitly safe commands
+**Risk levels**:
+- **BLOCKED**: Always deny (rm -rf /, chmod 000)
+- **HIGH**: Prompt user (git push --force, chmod 777)
+- **MEDIUM**: Log only (curl | sh, eval)
+- **LOW**: Informational (dd, find /)
+- **SAFE**: Explicitly safe
 
 **Testing new rules**:
 
@@ -150,20 +177,29 @@ def test_new_rule():
 
 ## Module Boundaries
 
-**Core security modules** (runtime-critical):
-- `parser.py`: Bashlex AST parsing, command extraction
-- `rules.py`: Security rule engine, risk assessment
-- `validator.py`: Main validation pipeline, caching
+**`core/`** — Validation engine (runtime-critical):
+- `parser.py`: Bashlex AST parsing
+- `rules.py`: Security rule engine
+- `validator.py`: Main validation pipeline
 - `cache.py`: Thread-safe LRU cache
-- `commit_filter.py`: Claude advertising blocker
 
-**Wizard modules** (interactive, non-runtime):
-- `wizard.py`: Setup wizard flow
-- `config_writer.py`: YAML config generation
-- `env_detector.py`: Environment detection (unused in v0.1.0)
-- `exceptions.py`: Custom exceptions
+**`integrations/`** — Optional features:
+- `audit.py`: JSONL audit logging
+- `commit_filter.py`: Advertising blocker
+- `shellcheck.py`: ShellCheck integration
 
-**Design principle**: Core modules have zero wizard dependencies. Wizard modules may depend on core modules.
+**`setup/`** — Configuration utilities:
+- `wizard.py`: Interactive setup
+- `config_writer.py`: YAML generation
+- `env_detector.py`: Environment detection
+
+**Dependency rule**: Lower layers never import from higher layers.
+
+```
+hooks/ → integrations/ → core/ → external (bashlex, pyyaml)
+              ↓
+           setup/
+```
 
 ## Performance Guidelines
 

@@ -3,8 +3,12 @@
 **A safety net for Claude Code** — Intercepts dangerous bash commands before they execute.
 
 [![Tests](https://img.shields.io/badge/tests-821_passing-brightgreen)](tests/)
-[![Coverage](https://img.shields.io/badge/coverage-90%25-brightgreen)](docs/TESTING.md)
+[![Coverage](https://img.shields.io/badge/coverage-90%25-brightgreen)](CONTRIBUTING.md)
 [![License](https://img.shields.io/badge/license-WTFPL-blue)](https://www.wtfpl.net/)
+
+**Features**: AST-based parsing (not regex) · 60+ security rules · 3 risk presets · Audit logging · Commit ad-blocker
+
+[Quick Start](#quick-start) · [How It Works](#how-it-works) · [Configuration](#configuration) · [Docs](#documentation)
 
 ---
 
@@ -14,10 +18,10 @@ You're using Claude Code with `Bash(*)` permissions because you want it to actua
 
 ```
 Claude: I'll clean up those temp files for you.
-Claude: Bash(`rm -rf /tmp/project-*`)
+Claude: Bash(`rm -rf project-*`)
 ```
 
-And you're thinking: *"Wait, which directory am I in? What else matches that glob? Did I have anything important in there?"*
+While you're thinking: *"Wait, which directory am I in? What else matches that glob? Did I have anything important in there?"* it's already too late.
 
 Or worse:
 
@@ -47,6 +51,25 @@ Claude: Bash(`rm -rf /`)
 ```
 
 Claude sees the rejection and adjusts. Your filesystem survives. You sleep at night.
+
+---
+
+## Quick Start
+
+```bash
+# In Claude Code
+/plugin marketplace add 27Bslash6/schlock
+/plugin install schlock@schlock
+
+# Optional
+/schlock:setup
+```
+
+That's it. Safety validation is automatic. The setup wizard configures to your liking.
+
+**Zero friction**: <1ms validation on most commands. You won't notice it's there.
+
+**Team installation**: Add to `.claude/settings.json` and commit — teammates get it automatically when they trust the repo. See [docs/INSTALLING.md](docs/INSTALLING.md).
 
 ---
 
@@ -92,37 +115,6 @@ Every command is classified into a risk level:
 What happens at each level depends on your [risk tolerance preset](#risk-tolerance). By default (balanced), BLOCKED commands are denied, HIGH commands prompt for confirmation, and everything else is allowed.
 
 See [`data/rules/`](data/rules/) for the complete ruleset (60+ rules across multiple categories).
-
----
-
-## Bonus: No More Claude Spam
-
-Tired of this in every commit?
-
-```
-🤖 Generated with [Claude Code](https://claude.ai/code)
-
-Co-Authored-By: Claude <noreply@anthropic.com>
-```
-
-schlock's **advertising blocker** catches these patterns and blocks the commit, so you can remove them before they pollute your git history.
-
----
-
-## Installation
-
-```bash
-# In Claude Code
-/plugin marketplace add 27Bslash6/schlock
-/plugin install schlock@schlock
-
-# Optional
-/schlock:setup
-```
-
-That's it. Safety validation is automatic. The setup wizard configures to your liking.
-
-**Team installation**: Add to `.claude/settings.json` and commit — teammates get it automatically when they trust the repo. See [docs/INSTALLING.md](docs/INSTALLING.md).
 
 ---
 
@@ -193,9 +185,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for advanced options and team
 
 ---
 
-## Is This Actually Secure?
-
-**No.** And we're upfront about that.
+## Limitations
 
 schlock is **defense-in-depth**, not a security boundary. It catches obvious mistakes and dangerous patterns. It won't stop:
 

@@ -341,6 +341,5 @@ load_rules()
 ## See Also
 
 - **[CONFIGURATION.md](CONFIGURATION.md)**: User configuration and customization
-- **[DEVELOPMENT.md](DEVELOPMENT.md)**: Development workflow and architecture
-- **[CONTRIBUTING.md](../CONTRIBUTING.md)**: Contributing guidelines
+- **[CONTRIBUTING.md](../CONTRIBUTING.md)**: Development workflow and contributing guidelines
 - **[README.md](../README.md)**: Project overview and quick start
