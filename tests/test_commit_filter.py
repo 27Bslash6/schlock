@@ -6,6 +6,7 @@ Includes FIX 6: Multiple -m flags bypass test.
 import time
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config
@@ -661,6 +662,7 @@ class TestCategoryControl:
 class TestPerformance:
     """Test performance requirements."""
 
+    @pytest.mark.slow
     def test_git_commit_filtering_performance(self):
         """Git commit filtering completes in <20ms."""
         config = load_filter_config()
@@ -675,6 +677,7 @@ class TestPerformance:
         assert result.was_modified  # Verify it actually filtered
         assert duration < 0.02  # <20ms
 
+    @pytest.mark.slow
     def test_non_git_command_overhead(self):
         """Non-git command overhead is <2ms."""
         config = load_filter_config()
