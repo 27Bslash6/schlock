@@ -32,6 +32,26 @@ class TestGitCommandDetection:
         assert not filter_instance.is_git_commit_command("git status")
         assert not filter_instance.is_git_commit_command("git push")
 
+    def test_detects_compound_command_with_git_add(self):
+        """Detects git commit in compound command: git add && git commit."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        assert filter_instance.is_git_commit_command("git add . && git commit -m 'test'")
+
+    def test_detects_compound_command_with_cd(self):
+        """Detects git commit in compound command: cd && git commit."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        assert filter_instance.is_git_commit_command("cd project && git commit -m 'test'")
+
+    def test_detects_compound_command_with_semicolon(self):
+        """Detects git commit in compound command: git add; git commit."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        assert filter_instance.is_git_commit_command("git add .; git commit -m 'test'")
+
+    def test_detects_compound_command_triple_chain(self):
+        """Detects git commit in triple-chained command."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        assert filter_instance.is_git_commit_command("cd project && git add -A && git commit -m 'test'")
+
 
 class TestMessageExtraction:
     """Test commit message extraction from commands."""
@@ -83,6 +103,101 @@ class TestMessageExtraction:
         cmd = 'git commit -m "Title" -m "Body paragraph 1" -m "Body paragraph 2"'
         msg = filter_instance.extract_commit_message(cmd)
         assert msg == "Title\n\nBody paragraph 1\n\nBody paragraph 2"
+
+    def test_extracts_message_from_compound_command(self):
+        """Extracts message from compound command: git add && git commit."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        msg = filter_instance.extract_commit_message('git add . && git commit -m "test message"')
+        assert msg == "test message"
+
+    def test_extracts_message_from_triple_chain(self):
+        """Extracts message from triple-chained command."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        msg = filter_instance.extract_commit_message('cd project && git add -A && git commit -m "feature: add thing"')
+        assert msg == "feature: add thing"
+
+    def test_extracts_heredoc_message_content(self):
+        """Extracts actual message content from heredoc format, not the $(cat...) wrapper."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        heredoc_cmd = '''git commit -m "$(cat <<'EOF'
+Multi-line
+message
+EOF
+)"'''
+        msg = filter_instance.extract_commit_message(heredoc_cmd)
+        # Should extract the message content, not the $(cat...) wrapper
+        assert msg == "Multi-line\nmessage"
+        assert "$(cat" not in msg
+
+    def test_heredoc_with_advertising_filtered(self):
+        """Heredoc format with advertising should be detected and filtered."""
+        config = {
+            "enabled": True,
+            "rules": {
+                "advertising": {
+                    "enabled": True,
+                    "patterns": [
+                        {"pattern": "Generated with Claude Code", "description": "Claude ad", "replacement": ""},
+                    ],
+                }
+            },
+        }
+        filter_instance = CommitMessageFilter(config)
+        heredoc_cmd = '''git commit -m "$(cat <<'EOF'
+Add feature
+
+Generated with Claude Code
+EOF
+)"'''
+        result = filter_instance.filter_commit_message(heredoc_cmd)
+        assert result.was_modified
+        assert "Generated with Claude Code" not in result.cleaned_message
+
+
+class TestBashlexEdgeCases:
+    """Test bashlex-specific edge cases and parsing robustness."""
+
+    def test_nested_escaped_quotes(self):
+        """Handles messages with escaped quotes inside."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        cmd = r'git commit -m "Message with \"escaped\" quotes"'
+        msg = filter_instance.extract_commit_message(cmd)
+        assert msg is not None
+        assert "escaped" in msg
+
+    def test_message_with_backslash(self):
+        """Handles messages with backslashes."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        cmd = r'git commit -m "Path: C:\\Users\\test"'
+        msg = filter_instance.extract_commit_message(cmd)
+        assert msg is not None
+
+    def test_bashlex_parse_failure_fails_open(self):
+        """Malformed bash that bashlex can't parse returns original command."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        # Unclosed quote - should fail-open
+        cmd = 'git commit -m "unclosed'
+        result = filter_instance.filter_commit_message(cmd)
+        # Should not crash, should fail-open
+        assert result.cleaned_command == cmd  # Original returned
+
+    def test_empty_message(self):
+        """Handles empty message gracefully."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        cmd = 'git commit -m ""'
+        msg = filter_instance.extract_commit_message(cmd)
+        # Empty string is valid extraction (not None)
+        assert msg == ""
+
+    def test_size_limit_prevents_dos(self):
+        """Commands exceeding size limit are handled gracefully."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        # 100KB message (exceeds 64KB limit)
+        huge_msg = "A" * (100 * 1024)
+        cmd = f'git commit -m "{huge_msg}"'
+        result = filter_instance.filter_commit_message(cmd)
+        # Should fail-open without hanging
+        assert result.cleaned_command == cmd  # Original returned
 
 
 class TestMessageCleaning:
@@ -205,6 +320,45 @@ class TestCommandReconstruction:
 
         assert "\\n" in reconstructed  # Newline should be literal \n
 
+    def test_preserves_compound_command_prefix(self):
+        """Preserves git add prefix in compound command."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        original = 'git add . && git commit -m "test"'
+        cleaned_msg = "cleaned message"
+
+        reconstructed = filter_instance.reconstruct_command(original, cleaned_msg)
+
+        assert "git add ." in reconstructed
+        assert "&&" in reconstructed
+        assert "git commit" in reconstructed
+        assert "cleaned message" in reconstructed
+
+    def test_preserves_triple_chain_command(self):
+        """Preserves cd && git add prefix in triple-chained command."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        original = 'cd project && git add -A && git commit -m "test"'
+        cleaned_msg = "cleaned"
+
+        reconstructed = filter_instance.reconstruct_command(original, cleaned_msg)
+
+        assert "cd project" in reconstructed
+        assert "git add -A" in reconstructed
+        assert "git commit" in reconstructed
+        assert "cleaned" in reconstructed
+
+    def test_preserves_semicolon_compound_command(self):
+        """Preserves semicolon-separated compound command."""
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+        original = 'git add .; git commit -m "test"'
+        cleaned_msg = "cleaned"
+
+        reconstructed = filter_instance.reconstruct_command(original, cleaned_msg)
+
+        assert "git add ." in reconstructed
+        assert ";" in reconstructed
+        assert "git commit" in reconstructed
+        assert "cleaned" in reconstructed
+
 
 class TestFilterOrchestration:
     """Test complete filter_commit_message() flow."""
@@ -304,6 +458,61 @@ class TestFilterOrchestration:
         assert "Clean feature" in result.cleaned_message
         # Should have filtered the advertising from combined message
         assert "advertising" in result.categories_matched
+
+    def test_compound_command_with_advertising_blocked(self):
+        """FIX 7: Compound command with advertising should be detected and blocked."""
+        config = {
+            "enabled": True,
+            "rules": {
+                "advertising": {
+                    "enabled": True,
+                    "patterns": [
+                        {
+                            "pattern": "Co-Authored-By:\\s*Claude\\s*<noreply@anthropic\\.com>",
+                            "description": "Claude co-author",
+                            "replacement": "",
+                        },
+                    ],
+                }
+            },
+        }
+        filter_instance = CommitMessageFilter(config)
+
+        # This is the EXACT pattern that bypassed the filter
+        cmd = '''git add src/foo.ts && git commit -m "refactor: do thing\\n\\nCo-Authored-By: Claude <noreply@anthropic.com>"'''
+        result = filter_instance.filter_commit_message(cmd)
+
+        assert result.was_modified, "Compound command should trigger filter"
+        assert "Co-Authored-By" not in result.cleaned_message
+        assert "advertising" in result.categories_matched
+        # Critical: compound command prefix must be preserved
+        assert "git add" in result.cleaned_command
+        assert "&&" in result.cleaned_command
+
+    def test_triple_chain_command_with_advertising(self):
+        """FIX 7: Triple-chained command with advertising should filter correctly."""
+        config = {
+            "enabled": True,
+            "rules": {
+                "advertising": {
+                    "enabled": True,
+                    "patterns": [
+                        {"pattern": "Generated with Claude Code", "description": "Claude ad", "replacement": ""},
+                    ],
+                }
+            },
+        }
+        filter_instance = CommitMessageFilter(config)
+
+        cmd = 'cd project && git add -A && git commit -m "feature: add thing\\n\\nGenerated with Claude Code"'
+        result = filter_instance.filter_commit_message(cmd)
+
+        assert result.was_modified
+        assert "Generated with Claude Code" not in result.cleaned_message
+        # Preserve all parts of compound command
+        assert "cd project" in result.cleaned_command
+        assert "git add -A" in result.cleaned_command
+        assert "git commit" in result.cleaned_command
 
 
 class TestErrorHandling:
