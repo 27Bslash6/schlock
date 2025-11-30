@@ -6,6 +6,26 @@ pattern-based rules.
 
 The filter is designed to be fail-open - if filtering encounters errors,
 the original commit is allowed (usability over perfection, not security-critical).
+
+ARCHITECTURE NOTE: Commit Filter vs Security Validator
+=======================================================
+This module uses bashlex parsing for commit message extraction.
+It is INTENTIONALLY SEPARATE from core/parser.py (security validator).
+
+KEY DIFFERENCES:
+1. Failure Mode:
+   - commit_filter.py: FAIL-OPEN (pass through on error)
+   - core/parser.py: FAIL-CLOSED (block on error)
+
+2. Purpose:
+   - commit_filter.py: Cosmetic filtering (advertising removal)
+   - core/parser.py: Safety validation (prevent dangerous commands)
+
+3. Error Handling:
+   - commit_filter.py: Catch exceptions, return None, allow command
+   - core/parser.py: Raise ParseError, deny command execution
+
+DO NOT merge these parsers. Different failure semantics require separate code paths.
 """
 
 import logging
@@ -14,7 +34,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import bashlex
+import bashlex.errors
+
 logger = logging.getLogger(__name__)
+
+# Size limit to prevent DoS via huge commands (64KB is generous for commit messages)
+MAX_COMMAND_SIZE = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -128,26 +154,87 @@ class CommitMessageFilter:
                 continue
 
     def is_git_commit_command(self, command: str) -> bool:
-        """Check if command is a git commit.
+        """Check if command contains a git commit.
+
+        Handles compound commands like:
+        - git commit -m "msg"
+        - git add . && git commit -m "msg"
+        - cd project && git add -A && git commit -m "msg"
+        - git add .; git commit -m "msg"
 
         Args:
             command: Bash command string
 
         Returns:
-            True if command starts with 'git commit'
+            True if command contains 'git commit'
         """
-        # Simple check: starts with "git commit"
-        stripped = command.strip()
-        return stripped.startswith("git commit")
+        # Check for 'git commit' anywhere in the command
+        # Use word boundary to avoid matching 'git-commit' or 'git_commit'
+        return bool(re.search(r"\bgit\s+commit\b", command))
 
     def extract_commit_message(self, command: str) -> Optional[str]:
-        """Extract commit message from git command.
+        """Extract commit message from git command using dual-mode parsing.
+
+        Uses bashlex AST parsing as primary method with regex fallback.
+        This hybrid approach provides robustness while maintaining backward
+        compatibility with edge cases bashlex can't handle (e.g., heredocs).
 
         Supports formats:
         - git commit -m "message"
         - git commit -m 'message'
         - git commit -m "message" -m "another paragraph"
         - git commit -m "$(cat <<'EOF'\\nmessage\\nEOF\\n)"
+        - git add && git commit -m "message" (compound commands)
+
+        Args:
+            command: Git commit command
+
+        Returns:
+            Extracted message or None if not found (fail-open signal)
+
+        Implementation:
+            1. Check size limit (DoS prevention)
+            2. Try bashlex extraction (handles compound commands robustly)
+            3. Fall back to regex (handles heredoc and edge cases)
+            4. Return None if both fail (fail-open)
+        """
+        # Size limit check (DoS prevention per Security Specialist)
+        if len(command) > MAX_COMMAND_SIZE:
+            logger.warning(
+                f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} bytes). Skipping extraction (fail-open)."
+            )
+            return None
+
+        # Try bashlex first (handles compound commands, proper AST parsing)
+        try:
+            message = self._extract_via_bashlex(command)
+            if message is not None:
+                logger.debug("Extracted message via bashlex")
+                return message
+        except bashlex.errors.ParsingError as e:
+            logger.debug(f"Bashlex parse failed: {e}. Trying regex fallback.")
+        except (AttributeError, KeyError, IndexError) as e:
+            logger.warning(f"Bashlex AST traversal error: {e}. Trying regex fallback.")
+        except Exception as e:
+            logger.warning(f"Unexpected bashlex error: {e}. Trying regex fallback.")
+
+        # Fallback to regex (handles heredoc and other edge cases)
+        try:
+            message = self._extract_via_regex(command)
+            if message is not None:
+                logger.debug("Extracted message via regex fallback")
+                return message
+        except Exception as e:
+            logger.warning(f"Regex extraction failed: {e}")
+
+        # Both methods failed → fail-open (return None)
+        return None
+
+    def _extract_via_bashlex(self, command: str) -> Optional[str]:
+        """Extract commit message using bashlex AST parsing.
+
+        Parses the command into an AST and finds -m arguments within
+        git commit command nodes. Handles compound commands correctly.
 
         Args:
             command: Git commit command
@@ -155,12 +242,83 @@ class CommitMessageFilter:
         Returns:
             Extracted message or None if not found
 
-        Implementation:
-            Extracts ALL -m messages and concatenates them with double newlines.
-            This prevents advertising bypass via multiple -m flags.
+        Raises:
+            bashlex.errors.ParsingError: If bashlex can't parse the command
+
+        Note:
+            bashlex handles escape sequences differently than expected.
+            When it sees `\\n` in double quotes, it strips the backslash.
+            We use position info to extract the RAW message from the original
+            command, then handle `\\n` → newline conversion ourselves.
         """
-        # Pattern 1: Find ALL -m "message" or -m 'message' occurrences
-        # Use finditer to get all matches, not just first
+        parts = bashlex.parse(command)
+        messages: list[str] = []
+
+        def extract_msg_from_node(msg_node: Any) -> str:
+            """Extract message from AST node using position info."""
+            if hasattr(msg_node, "pos"):
+                start, end = msg_node.pos
+                raw_msg = command[start:end]
+                # Strip quotes if present
+                if raw_msg and raw_msg[0] in "\"'" and raw_msg[-1] == raw_msg[0]:
+                    raw_msg = raw_msg[1:-1]
+                return raw_msg.replace("\\n", "\n")
+            # Fallback to bashlex-parsed word
+            return msg_node.word.replace("\\n", "\n")
+
+        def visit(node: Any) -> None:
+            """Recursively visit AST nodes to find git commit messages."""
+            if hasattr(node, "kind") and node.kind == "command":
+                words = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
+
+                # Check if this is 'git commit'
+                if len(words) >= 2 and words[0].word == "git" and words[1].word == "commit":
+                    i = 0
+                    while i < len(words):
+                        word_node = words[i]
+                        if word_node.word == "-m" and i + 1 < len(words):
+                            messages.append(extract_msg_from_node(words[i + 1]))
+                            i += 2  # Skip past -m and message
+                        else:
+                            i += 1
+
+            # Recurse into compound commands (&&, ||, ;, |)
+            for attr in ["parts", "list", "command"]:
+                child = getattr(node, attr, None)
+                if child is None:
+                    continue
+                for item in child if isinstance(child, list) else [child]:
+                    visit(item)
+
+        for part in parts:
+            visit(part)
+
+        if not messages:
+            return None
+
+        # Combine all messages with paragraph breaks
+        return "\n\n".join(messages)
+
+    def _extract_via_regex(self, command: str) -> Optional[str]:
+        """Extract commit message using regex patterns (fallback method).
+
+        Handles formats that bashlex can't parse, including heredocs.
+
+        Args:
+            command: Git commit command
+
+        Returns:
+            Extracted message or None if not found
+        """
+        # Pattern 1: Heredoc format (check FIRST - more specific pattern)
+        # Match: -m "$(cat <<'EOF'\nMESSAGE\nEOF\n)"
+        heredoc_match = re.search(r'-m\s+"?\$\(cat\s+<<\'EOF\'\n(.+?)\nEOF\n\)"?', command, re.DOTALL)
+        if heredoc_match:
+            return heredoc_match.group(1)
+
+        # Pattern 2: Standard -m "message" or -m 'message'
+        # Use finditer to get ALL -m flags (prevents bypass via multiple -m)
+        # Note: This pattern doesn't handle escaped quotes well - bashlex is preferred
         matches = list(re.finditer(r'-m\s+(["\'])(.+?)\1', command, re.DOTALL))
 
         if matches:
@@ -168,11 +326,10 @@ class CommitMessageFilter:
             messages = [m.group(2).replace("\\n", "\n") for m in matches]
             return "\n\n".join(messages)
 
-        # Pattern 2: -m "$(cat <<'EOF'...)" (heredoc in subshell)
-        # Match: -m "$(cat <<'EOF'\nMESSAGE\nEOF\n)"
-        heredoc_match = re.search(r'-m\s+"?\$\(cat\s+<<\'EOF\'\n(.+?)\nEOF\n\)"?', command, re.DOTALL)
-        if heredoc_match:
-            return heredoc_match.group(1)
+        # Pattern 3: Empty message -m ""
+        empty_match = re.search(r'-m\s+(["\'])\1', command)
+        if empty_match:
+            return ""
 
         # No message found
         return None
@@ -223,36 +380,67 @@ class CommitMessageFilter:
     def reconstruct_command(self, original_command: str, cleaned_message: str) -> str:
         """Reconstruct git command with cleaned message.
 
-        Uses escaped double-quotes format for compatibility with bashlex.
+        Uses in-place replacement to preserve compound command structure.
+        Handles commands like: git add && git commit -m "msg"
 
         Args:
-            original_command: Original git commit command
+            original_command: Original git commit command (may be compound)
             cleaned_message: Filtered commit message
 
         Returns:
-            Git command with cleaned message
+            Command with cleaned message (preserves compound structure)
 
         Format:
             git commit -m "message with \"escaped\" quotes"
 
         This format:
         - Escapes double quotes and backslashes
-        - Preserves newlines as literal \n
+        - Preserves newlines as literal \\n
         - Compatible with bashlex parser
+        - Preserves compound command structure (&&, ||, ;)
         """
-        # Extract git commit flags (everything before -m)
-        # Example: "git commit --no-verify -m ..." -> "git commit --no-verify"
-        match = re.match(r"(git commit[^-]*(?:--[a-z-]+\s+)*)", original_command)
-        prefix = match.group(1).rstrip() if match else "git commit"
-
         # Escape the message for double-quote context
-        # Escape backslashes first, then quotes
         escaped_message = cleaned_message.replace("\\", "\\\\").replace('"', '\\"')
         # Convert actual newlines to literal \n for bash
         escaped_message = escaped_message.replace("\n", "\\n")
 
-        # Reconstruct with escaped message
-        return f'{prefix} -m "{escaped_message}"'
+        # Pattern to match -m with quoted string (double or single quotes)
+        m_pattern = re.compile(r'-m\s+(["\'])(.+?)\1', re.DOTALL)
+
+        # Find all -m arguments
+        matches = list(m_pattern.finditer(original_command))
+
+        if not matches:
+            # No -m found - shouldn't happen if we got here, but failsafe
+            logger.warning("No -m pattern found in command, cannot reconstruct")
+            return original_command
+
+        # Strategy: Replace first -m arg with cleaned message, remove subsequent -m args
+        # Work backwards to preserve string positions
+        result = original_command
+
+        if len(matches) == 1:
+            # Single -m: simple replacement
+            match = matches[0]
+            replacement = f'-m "{escaped_message}"'
+            result = result[: match.start()] + replacement + result[match.end() :]
+        else:
+            # Multiple -m flags: replace first, remove rest
+            # Work backwards to preserve positions
+            for match in reversed(matches[1:]):
+                # Remove subsequent -m args (and leading whitespace)
+                start = match.start()
+                # Trim leading whitespace
+                while start > 0 and result[start - 1] in " \t":
+                    start -= 1
+                result = result[:start] + result[match.end() :]
+
+            # Now replace the first one
+            first = matches[0]
+            replacement = f'-m "{escaped_message}"'
+            result = result[: first.start()] + replacement + result[first.end() :]
+
+        return result
 
     def filter_commit_message(self, command: str) -> FilterResult:  # noqa: PLR0911 - Multiple patterns require multiple exits
         """Filter commit message in git command.

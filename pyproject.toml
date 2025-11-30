@@ -56,6 +56,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
     "benchmark: Performance benchmark tests (may vary with system load)",
+    "slow: Tests with time-based assertions (may be flaky on slow CI runners)",
 ]
 addopts = [
     "-ra",
