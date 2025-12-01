@@ -5,6 +5,20 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.0...schlock-v0.2.1) (2025-12-01)
+
+
+### Bug Fixes
+
+* **commit-filter:** add bashlex AST parsing with regex fallback ([#8](https://github.com/27Bslash6/schlock/issues/8)) ([e9d37c8](https://github.com/27Bslash6/schlock/commit/e9d37c89545d2cce6825638ec11a3725da95424a))
+
+
+### Documentation
+
+* enhance README and add ShellCheck integration details ([#15](https://github.com/27Bslash6/schlock/issues/15)) ([833c0a9](https://github.com/27Bslash6/schlock/commit/833c0a96059a00d937f66e95ae51bb253d4090e3))
+* update documentation and restructure project layout ([#6](https://github.com/27Bslash6/schlock/issues/6)) ([0c83377](https://github.com/27Bslash6/schlock/commit/0c833771aa4ade5417ca1605e433781ad6f07823))
+* update README badges for tests and coverage ([#16](https://github.com/27Bslash6/schlock/issues/16)) ([c9d7fc1](https://github.com/27Bslash6/schlock/commit/c9d7fc13af0ef6ee0e7e32048622954d3032ccb5))
+
 ## [0.2.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.1.0...schlock-v0.2.0) (2025-11-28)
 
 
