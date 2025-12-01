@@ -62,6 +62,13 @@ repos:
       - id: conventional-pre-commit
         stages: [commit-msg]
 
+  # Prevent direct commits to main branch
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, main, --branch, master]
+
 # Global configuration
 default_language_version:
   python: python3
