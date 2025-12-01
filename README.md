@@ -67,6 +67,18 @@ Claude sees the rejection and adjusts. Your filesystem survives. You sleep at ni
 
 That's it. Safety validation is automatic. The setup wizard configures to your liking.
 
+**Recommended**: Install [ShellCheck](https://www.shellcheck.net/) for enhanced security detection:
+
+```bash
+# macOS
+brew install shellcheck
+
+# Linux
+apt-get install shellcheck  # or: dnf install ShellCheck
+```
+
+ShellCheck catches command injection, format string vulnerabilities, and the infamous "MongoDB disaster" pattern (`rm -rf $EMPTY_VAR/*` → `rm -rf /*`). schlock integrates automatically when ShellCheck is available.
+
 **Zero friction**: <1ms validation on most commands. You won't notice it's there.
 
 **Team installation**: Add to `.claude/settings.json` and commit — teammates get it automatically when they trust the repo. See [docs/INSTALLING.md](docs/INSTALLING.md).
@@ -168,6 +180,23 @@ risk_tolerance:
 - `allow` — Execute without prompting
 - `ask` — Prompt user for confirmation
 - `deny` — Block execution, Claude must find another way
+
+### ShellCheck Integration
+
+If ShellCheck is installed, enable integration for enhanced security analysis:
+
+```yaml
+shellcheck:
+  enabled: true
+  severity: info        # info, warning, or error
+  security_only: true   # Only flag security-relevant issues
+```
+
+This catches vulnerabilities that AST parsing alone can't detect:
+- **SC2114/SC2115**: System destruction (`rm -rf $var/*` where `$var` is empty)
+- **SC2086/SC2046**: Command injection via unquoted variables
+- **SC2059**: Format string vulnerabilities in `printf`
+- **SC2156**: Filename injection in `find -exec`
 
 ### Advertising Blocker
 

@@ -60,27 +60,27 @@ class ShellCheckFinding:
 
 
 # Security-relevant SC codes that should elevate risk level
-# These indicate potential command injection or unsafe practices
+# These indicate potential command injection, code execution, or system destruction
+# Reference: https://www.shellcheck.net/wiki/
 SECURITY_RELEVANT_CODES = {
-    # Command injection vectors
+    # Command injection via unquoted variables/substitutions
     2086,  # Double quote to prevent globbing and word splitting
     2087,  # Quote this to prevent word splitting
     2090,  # Quotes/backslashes will be treated literally
-    2091,  # Remove surrounding $() to avoid executing output
-    2094,  # Make sure not to read and write the same file
+    2091,  # Remove surrounding $() to avoid executing output as commands
     2095,  # Use double quotes to prevent globbing
-    # Eval and indirect execution
-    2046,  # Quote this to prevent word splitting (same as 2086 context)
-    2116,  # Useless echo? Instead of 'cmd $(echo foo)', just use 'cmd foo'
-    # Potential injection
-    2001,  # Useless cat. Consider 'cmd < file' instead (can hide injection)
-    2002,  # Useless cat. Consider '<file cmd' (can hide injection)
-    2006,  # Use $(..) instead of legacy `..` (backtick issues)
-    2012,  # Use $( ) instead of legacy ` ` (backtick issues)
-    # Dangerous commands
-    2115,  # Use "$*" or "$@" instead of listing parameters separately
-    2145,  # Argument mixes string and array. Use * or @ for arrays
-    2155,  # Declare and assign separately to avoid masking return values
+    2046,  # Quote command substitutions to prevent word splitting
+    # Legacy syntax with injection risks
+    2006,  # Use $(..) instead of legacy backticks (parsing issues)
+    # System destruction prevention (the "MongoDB disaster" rules)
+    2114,  # Warning: deletes a system directory
+    2115,  # Use "${var:?}" to ensure this never expands to /*
+    # Path/filename injection
+    2156,  # Injecting filenames is fragile and insecure. Use parameters.
+    # Format string vulnerabilities
+    2059,  # Don't use variables in printf format string. Use %s.
+    # Privilege escalation
+    2117,  # To run commands as another user, use su -c or sudo
 }
 
 
