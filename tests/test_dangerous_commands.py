@@ -159,10 +159,17 @@ class TestNetworkBackdoors:
         """Network backdoor commands MUST be blocked."""
         result = validate_command(command, config_path=safety_rules_path)
         # These might not all be blocked by current rules, but they SHOULD be
-        if "nc " in command or "socat" in command or "ssh-keygen -R" in command:
+        if "nc " in command or "socat" in command:
             # Mark as expected to potentially fail until rules updated
             if result.allowed:
                 pytest.skip(f"Rule not yet implemented for: {description}")
+        elif "ssh-keygen -R" in command:
+            # ssh-keygen -R * is HIGH risk (not BLOCKED) as it's dangerous but not catastrophic
+            if result.risk_level == RiskLevel.SAFE:
+                pytest.skip(f"Rule not yet implemented for: {description}")
+            assert result.risk_level in (RiskLevel.HIGH, RiskLevel.BLOCKED), (
+                f"Expected HIGH/BLOCKED for {description}, got {result.risk_level}"
+            )
 
 
 class TestMemoryProcessAttacks:

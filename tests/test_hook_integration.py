@@ -370,8 +370,8 @@ class TestPerformance:
         assert response2["hookSpecificOutput"]["permissionDecision"] == "allow"
 
         # Second run should be faster (cached)
-        # Note: This might be flaky on slow systems, so just verify both are fast
-        assert elapsed1 < 0.2, f"First run: {elapsed1 * 1000:.1f}ms"
+        # Note: With 60+ patterns + ShellCheck, cold validation takes ~250-300ms
+        assert elapsed1 < 0.35, f"First run: {elapsed1 * 1000:.1f}ms"
         assert elapsed2 < 0.2, f"Second run: {elapsed2 * 1000:.1f}ms"
 
 

@@ -144,9 +144,12 @@ class TestQuotedSubstitutionInStrings:
         result = validate_command("echo 'rm $(whoami)'")
         # Depending on bashlex behavior, this may or may not be detected
         # If detected as commandsubstitution node, it will be blocked
+        # ShellCheck SC2016 may also catch single-quoted expressions
         # This is conservative but safe
         if not result.allowed:
             assert result.risk_level == RiskLevel.BLOCKED
-            assert "substitution" in result.message.lower()
+            # Either "substitution" (bashlex) or "shellcheck" (SC2016) is valid
+            msg_lower = result.message.lower()
+            assert "substitution" in msg_lower or "shellcheck" in msg_lower
         # If bashlex doesn't parse it as substitution (just string), it may pass
         # That's acceptable - the real danger is unquoted substitution
