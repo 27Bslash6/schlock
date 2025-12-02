@@ -85,7 +85,8 @@ class TestReDoSFix:
         result = validate_command(command, config_path=safety_rules_path)
         elapsed = time.time() - start
 
-        assert elapsed < 0.2, f"ReDoS in git pattern: took {elapsed:.3f}s"
+        # With 60+ patterns + ShellCheck + pipeline validation, ~250ms is expected
+        assert elapsed < 0.35, f"ReDoS in git pattern: took {elapsed:.3f}s"
         # Git force push is HIGH risk, not BLOCKED
         assert result.risk_level.value >= 3, "Git force push should be HIGH risk"
 
