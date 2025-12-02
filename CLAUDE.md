@@ -12,7 +12,7 @@
 
 **Distribution**: Plugin-only (NOT PyPI). Leverages Claude Code's automatic team installation.
 
-**Status**: v0.1.0 production ready. 821 tests passing, 90% coverage.
+**Status**: v0.2.1 production. 821 tests passing, 90% coverage.
 
 ## Critical Design Principles
 

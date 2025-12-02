@@ -1,359 +1,180 @@
 # schlock Product Roadmap
 
-*Last Updated: 2025-11-07*
+*Last Updated: 2025-12-01*
 
-This roadmap outlines the evolution of schlock from initial release (v0.1.0) through future enhancements. Priorities are driven by user feedback and real-world usage patterns.
+This roadmap outlines schlock's evolution. Priorities are driven by user feedback and real-world usage.
 
 ---
 
-## Current Status: v0.1.0 (Release Candidate)
+## Current Status: v0.2.1
 
-**Status**: Feature-complete. Specs 1-7 implemented (53 tasks). Spec 8 (Testing & Documentation) in progress.
+**Released**: 2025-12-01
 
 **Core Capabilities**:
-- ✅ Safety validation (40 rules, bashlex AST parsing)
-- ✅ Audit logging (JSONL format, always-on)
-- ✅ Claude advertising blocker (optional, recommended)
-- ✅ Hook integration (pre_tool_use)
-- ✅ Setup wizard (`/schlock:setup` - configures ad blocker only)
-- ✅ Manual validation (`/schlock:validate`, `safety-validator` skill)
-- ✅ Layered configuration (plugin → user → project)
+- Safety validation (60+ rules, bashlex AST parsing)
+- Risk tolerance presets (permissive, balanced, paranoid)
+- ShellCheck integration (optional)
+- Audit logging (JSONL, always-on)
+- Claude advertising blocker (optional)
+- Setup wizard (`/schlock:setup`)
+- Manual validation (`/schlock:validate`, `safety-validator` skill)
+- Layered configuration (plugin → user → project)
 
 **Known Limitations**:
-- **Code formatter integration**: Non-functional in v0.1.0. Claude Code does not support PostToolUse hooks for plugins. Use [pre-commit hooks](https://pre-commit.com/) for code formatting (industry standard). Formatter code remains in codebase for potential future compatibility.
+- **No per-rule overrides**: Can't customize individual rule severity
+- **No code quality rules**: Only security-focused rules exist
+- **Code formatter**: Non-functional (Claude Code doesn't support PostToolUse hooks)
 
 ---
 
-## Release Strategy
+## Release History
 
-### Phase 1: Initial Release (v0.1.x) - **CURRENT**
+### v0.2.1 (2025-12-01)
+- Fix: Commit filter bashlex AST parsing with regex fallback
+- Docs: README badges, ShellCheck integration details
 
-**Goal**: Get schlock into users' hands. Validate core value proposition.
-
-#### v0.1.0 - Initial Release (Q4 2024)
-- [x] Core safety validation with 40 security rules
-- [x] Claude advertising blocker (optional)
-- [x] Code formatter system (optional)
-- [x] Interactive setup wizard
-- [ ] 90%+ test coverage
-- [ ] Complete documentation
-- [ ] CI/CD pipeline
-
-**Success Criteria**: 100+ installations, <5% false positive rate, >95% installation success
-
-#### v0.1.1-0.1.5 - Stabilization (Q1 2025)
-**Focus**: Bug fixes, performance tuning, documentation improvements
-
-**Candidates for 0.1.x**:
-- Additional safety rules based on user reports
-- Performance optimizations (cache tuning, parsing efficiency)
-- Documentation clarifications
-- Windows/PowerShell edge cases
-- Installation reliability improvements
-
-**Trigger**: User feedback reveals bugs or usability issues
+### v0.2.0 (2025-11-28)
+- Initial public release
+- 60+ security rules across 5 severity levels
+- Risk tolerance presets
+- ShellCheck integration
+- Advertising blocker
+- Audit logging
+- 821 tests, 90% coverage
 
 ---
 
-### Phase 2: Quality & Community (v0.2.x) - **NEXT**
+## Upcoming: v0.3.0 - Rule Customization & Code Quality
 
-**Goal**: Improve accuracy, build community feedback loops, enable team adoption.
+**Goal**: Enable per-rule customization and add code quality anti-pattern detection.
 
-#### v0.2.0 - False Positive Management (Q1 2025)
-**Priority**: HIGH (false positives kill trust)
+**Priority**: HIGH (original inspiration for the plugin)
+
+### Features
+
+#### 1. Rule Categories
+Separate security rules from code quality rules:
+
+```yaml
+rule_categories:
+  security: true      # Always on (hardcoded, non-negotiable)
+  code_quality: true  # Default on, user can disable
+```
+
+- **security**: Dangerous commands (rm -rf, credential exposure, etc.)
+- **code_quality**: LLM anti-patterns that bypass developer intent
+
+#### 2. Per-Rule Overrides
+Customize individual rule behavior:
+
+```yaml
+rule_overrides:
+  git_bulk_staging:
+    risk_level: BLOCKED  # Upgrade from HIGH
+  git_commit_all:
+    risk_level: MEDIUM   # Downgrade from HIGH
+  some_annoying_rule:
+    enabled: false       # Disable entirely
+```
+
+#### 3. Code Quality Rules
+Block sloppy LLM behaviors:
+
+| Rule | Pattern | Why |
+|------|---------|-----|
+| `git_bulk_staging` | `git add -A`, `git add .`, `git add --all` | Bulk staging bypasses file review |
+| `git_commit_all` | `git commit -a` | Auto-staging bypasses explicit staging |
+| `git_discard_all` | `git checkout .`, `git restore .` | Discards all changes without review |
+| `git_clean_aggressive` | `git clean -fd` (without dry-run) | Nukes untracked without preview |
+| `git_stash_all` | `git stash --all`, `git stash -u` | Stashes everything without review |
+
+Default risk level: **HIGH** (prompts in balanced mode, users can override to BLOCKED)
+
+### Implementation Scope
+
+| Component | Change |
+|-----------|--------|
+| `src/schlock/core/rules.py` | Add `category` field to SecurityRule |
+| `src/schlock/core/validator.py` | Category filtering + per-rule overrides |
+| `src/schlock/setup/config_writer.py` | New config schema |
+| `data/rules/13_code_quality.yaml` | New rules file |
+| `hooks/pre_tool_use.py` | Load category/override config |
+| `/schlock:setup` wizard | Ask about code quality preference |
+
+**Estimated effort**: 2-3 days
+
+---
+
+## Future: v0.4.0 - False Positive Management
+
+**Goal**: Build feedback loops for rule accuracy improvement.
 
 **Features**:
-- False positive feedback system
-  - GitHub issue template for structured reports
-  - `/schlock-report-fp` command for quick feedback
-  - Automatic command/rule context capture
-  - Link to GitHub issue creation with pre-filled data
-- Rule refinement based on feedback
-  - Quarterly review of false positive reports
-  - Rule accuracy improvements
-  - Documentation of edge cases
-- Enhanced rule documentation
-  - Rationale for each rule
-  - Known false positive scenarios
-  - Suggested workarounds
+- `/schlock:report-fp` command for quick feedback
+- GitHub issue template with auto-filled context
+- Rule accuracy tracking
+- Enhanced rule documentation (rationale, known edge cases)
 
-**Success Criteria**: <3% false positive rate, 50+ feedback submissions, 80% of reports actionable
+**Trigger**: After v0.3.0 ships and generates user feedback
 
-**Development Time**: 2-3 weeks
+---
 
-#### v0.2.1 - Ruleset Versioning Foundation (Q1 2025)
-**Priority**: MEDIUM (enables future auto-updates)
+## Future: v0.5.0 - Ruleset Versioning
+
+**Goal**: Enable safe ruleset updates without breaking configs.
 
 **Features**:
-- Versioned ruleset format (`data/safety_rules.yaml` schema v2)
-- Version tracking in config
+- Versioned ruleset schema
 - Migration path documentation
-- Breaking change policy
-- Ruleset compatibility checks
+- `/schlock:update-rules` command
+- Breaking change notifications
 
-**Success Criteria**: Clean upgrades with no config breakage
-
-**Development Time**: 1-2 weeks
-
-#### v0.2.2 - Team Adoption Enhancements (Q2 2025)
-**Priority**: MEDIUM (organizational value)
-
-**Features**:
-- Team policy templates (conservative, moderate, permissive)
-- Organization-level config examples
-- Shared rule library documentation
-- Best practices guide for team deployment
-- Validation audit logs for compliance
-
-**Success Criteria**: 20+ organizations enable auto-install
-
-**Development Time**: 2-3 weeks
-
----
-
-### Phase 3: Intelligence & Automation (v0.3.x - v0.5.x)
-
-**Goal**: Learn from usage patterns, improve accuracy dynamically, enable advanced workflows.
-
-#### v0.3.0 - Anonymous Telemetry (Q2 2025) ⚠️ Privacy-First
-**Priority**: MEDIUM (data-driven improvements)
-
-**Features**:
-- Opt-in telemetry system
-  - Rule trigger frequency (no command content)
-  - Performance metrics (validation timing, cache hit rates)
-  - Override patterns (which rules users bypass most)
-  - Tool/shell distribution (bash, zsh, fish, etc.)
-- Privacy guarantees
-  - Zero command content collection
-  - Hashed/anonymized identifiers
-  - Local-first processing
-  - Clear opt-in consent flow
-- Analytics dashboard (public aggregate stats)
-  - Most triggered rules
-  - Common false positive patterns
-  - Performance benchmarks by platform
-
-**Success Criteria**: >30% opt-in rate, clear privacy policy, zero sensitive data leaks
-
-**Development Time**: 3-4 weeks
-
-**Blockers**: Legal review, privacy policy, data retention policy
-
-#### v0.4.0 - Automatic Ruleset Updates (Q3 2025)
-**Priority**: MEDIUM (stay current with threats)
-
-**Features**:
-- Ruleset update mechanism
-  - `/schlock-update-rules` command
-  - Check for new rule versions
-  - Preview changes before applying
-  - Explicit opt-in (never auto-apply)
-- Versioned rule distribution
-  - Semantic versioning for rulesets
-  - Breaking change notifications
-  - Rollback capability
-- Update notifications
-  - Alert when new rulesets available
-  - Changelog display in CLI
-  - Critical security update flagging
-
-**Success Criteria**: >50% of users update within 30 days of release, zero breaking changes
-
-**Development Time**: 2-3 weeks
-
-**Dependencies**: v0.2.1 (versioning foundation)
-
-#### v0.5.0 - Adaptive Rules (Q3-Q4 2025)
-**Priority**: LOW (experimental)
-
-**Features**:
-- Machine learning for context-aware validation
-  - Learn from user override patterns
-  - Project-specific risk profiles
-  - Adaptive thresholds based on user behavior
-- Smart suggestions
-  - Safer alternative commands
-  - Context-aware warnings
-  - Personalized risk explanations
-
-**Success Criteria**: 20% reduction in false positives through adaptation
-
-**Development Time**: 6-8 weeks
-
-**Blockers**: Requires telemetry data (v0.3.0), complex ML pipeline
-
----
-
-### Phase 4: Ecosystem & Scale (v1.x+) - **FUTURE**
-
-**Goal**: Platform maturity, ecosystem integration, enterprise features.
-
-#### v1.0.0 - Production Hardening (2026)
-
-**Maturity Goals**:
-- 500+ active installations
-- <2% false positive rate
-- 100ms p99 validation latency
-- 100% backwards compatibility guarantee
-- Enterprise support tier available
-
-**Features**:
-- Advanced rule engine (multi-command analysis)
-- Cross-shell support (zsh, fish, PowerShell)
-- Integration API for other AI coding tools
-- Performance optimizations for large codebases
-- Comprehensive audit logging
-
-**Success Criteria**: 1000+ GitHub stars, stable API, production adoption by 50+ organizations
-
-#### v1.1.0 - Community Rules Marketplace (2026+)
-**Priority**: TBD (validate demand first)
-
-**Features**:
-- Domain-specific rule libraries
-  - Docker/container security rules
-  - Kubernetes/cloud rules
-  - Database operation rules
-  - Web development rules
-- Community contribution system
-  - Rule submission workflow
-  - Peer review process
-  - Trust scoring system
-  - Version management
-- Marketplace infrastructure
-  - Rule discovery/search
-  - Installation from marketplace
-  - Automatic updates for subscribed rulesets
-  - Rating/feedback system
-
-**Success Criteria**: 50+ community-contributed rules, 200+ marketplace users
-
-**Development Time**: 8-12 weeks
-
-**Blockers**: Requires governance model, moderation resources, liability framework
-
-#### v1.2.0 - Standalone PyPI Package (2026+)
-**Trigger**: 10+ GitHub issues requesting standalone usage with proven use cases
-
-**Features**:
-- Extract core validation engine to `pip install schlock`
-- Standalone CLI: `schlock validate "command"`
-- Python API for programmatic usage
-- Plugin depends on PyPI package
-- CI/CD integration guides
-
-**Success Criteria**: 1000+ PyPI downloads/month, 5+ third-party integrations
-
-**Development Time**: 4-6 weeks
-
----
-
-## Future Vision (2027+)
-
-### LLM Safety Platform
-
-Transform schlock into comprehensive AI coding assistant safety:
-
-**Expanded Validation**:
-- Code suggestions (beyond commands)
-- File operations (read/write/delete)
-- API calls and network requests
-- Environment variable access
-- Multi-AI-tool support (Copilot, Cursor, Windsurf, etc.)
-
-**Enterprise Features**:
-- Centralized policy management
-- Team dashboards and analytics
-- Real-time monitoring across organizations
-- Compliance reporting (SOC2, ISO27001)
-- SSO/SAML integration
-
-**Intelligence Layer**:
-- Anomaly detection (unusual command patterns)
-- Risk profiling by AI model
-- Historical trend analysis
-- Predictive threat modeling
-
-**Ecosystem Integration**:
-- Security scanning tools (Semgrep, Snyk)
-- SIEM integration
-- Incident response workflows
-- Threat intelligence feeds
+**Trigger**: When rule changes would break existing configs
 
 ---
 
 ## Deferred / Not Planned
 
-**Why Not Now**:
-- **Freemium Model**: Wait for enterprise demand signals
-- **Web Dashboard**: CLI-first approach sufficient for v1.x
-- **Mobile App**: No use case identified
-- **Browser Extension**: Scope creep, maintenance burden
-- **Real-time Collaboration**: Complex, unclear value
+| Feature | Reason |
+|---------|--------|
+| Code formatter | Claude Code doesn't support PostToolUse hooks |
+| Telemetry | Privacy concerns, unclear value |
+| Web dashboard | CLI-first is sufficient |
+| PyPI package | No demand signal yet |
+| ML-based adaptive rules | Overkill for current scale |
 
-**Revisit When**: User requests + proven demand + clear ROI
+**Revisit when**: Clear user demand + proven ROI
 
 ---
 
 ## Decision Framework
 
-### Feature Prioritization
+### Priority Levels
 
-**High Priority** (ship next minor version):
-- Blocks v1.0 release
-- Addresses false positives
-- Improves user trust
-- Clear user demand (10+ requests)
+- **HIGH**: Blocks adoption, addresses core pain points, clear user demand
+- **MEDIUM**: Enhances existing workflows, enables team adoption
+- **LOW**: Speculative value, complex implementation
 
-**Medium Priority** (ship within 6 months):
-- Enhances existing workflows
-- Enables team adoption
-- Proven value from competitors
-- Moderate user demand (5-10 requests)
+### Version Bump Triggers
 
-**Low Priority** (research/experiment):
-- Speculative value
-- Complex implementation
-- Unclear ROI
-- Low user demand (<5 requests)
-
-**Not Planned**:
-- No clear use case
-- Scope creep risk
-- Maintenance burden > value
-- Better solved by third parties
-
-### Trigger Conditions
-
-**Version Bump Triggers**:
-- **Patch (0.1.x)**: Bug fixes, documentation, performance
-- **Minor (0.x.0)**: New features, backwards compatible
-- **Major (x.0.0)**: Breaking changes, API redesign
-
-**Implementation Triggers**:
-- **User Demand**: 10+ GitHub issues/requests
-- **Competition**: Competitor ships similar feature
-- **Security**: Critical threat emerges
-- **Compliance**: Regulatory requirement
-- **Performance**: Latency/scale issues
+- **Patch (0.x.Y)**: Bug fixes, docs, performance
+- **Minor (0.X.0)**: New features, backwards compatible
+- **Major (X.0.0)**: Breaking changes (not planned before 1.0)
 
 ---
 
-## Feedback & Contributions
+## Feedback
 
-**How to Influence Roadmap**:
-1. **GitHub Issues**: Feature requests, use case descriptions
-2. **False Positive Reports**: Help improve rule accuracy
-3. **Community Discussion**: Join GitHub Discussions
-4. **Pull Requests**: Code contributions welcome
-
-**Roadmap Updates**: Quarterly review based on user feedback, telemetry data (if opted in), and ecosystem changes.
+**How to influence roadmap**:
+1. GitHub Issues: Feature requests, bug reports
+2. False positive reports: Help improve rule accuracy
+3. Pull requests: Code contributions welcome
 
 ---
 
-## Appendix: Related Documents
+## Related Documents
 
-- **Development & Contributing**: [CONTRIBUTING.md](../CONTRIBUTING.md)
-- **Configuration Guide**: [CONFIGURATION.md](CONFIGURATION.md)
-- **Installation Guide**: [INSTALLING.md](INSTALLING.md)
+- [CONTRIBUTING.md](../CONTRIBUTING.md) - Development workflow
+- [CONFIGURATION.md](CONFIGURATION.md) - Configuration guide
+- [INSTALLING.md](INSTALLING.md) - Installation guide
+- [CHANGELOG.md](CHANGELOG.md) - Release history
