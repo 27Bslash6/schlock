@@ -69,7 +69,7 @@ pre-commit install
 uv run ruff format .
 ```
 
-**Note**: schlock's built-in formatter feature is **non-functional** in v0.1.0 because Claude Code does not support PostToolUse hooks for plugins. The `/schlock:setup` wizard only configures the advertising blocker. Use standard pre-commit hooks for code formatting.
+**Note**: schlock's built-in formatter feature is **non-functional** because Claude Code does not support PostToolUse hooks for plugins. Use standard pre-commit hooks for code formatting.
 
 ### Python Style
 

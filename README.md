@@ -7,7 +7,7 @@
 [![codecov](https://codecov.io/github/27bslash6/schlock/graph/badge.svg?token=LWEX0I3SNE)](https://codecov.io/github/27bslash6/schlock)
 [![License](https://img.shields.io/badge/license-WTFPL-blue)](https://www.wtfpl.net/)
 
-**Features**: AST-based parsing (not regex) · 60+ security rules · 3 risk presets · Audit logging · Commit ad-blocker
+**Features**: AST-based parsing (plus regex) · 60+ security rules · 3 risk presets · Audit logging · Commit ad-blocker
 
 [Quick Start](#quick-start) · [How It Works](#how-it-works) · [Configuration](#configuration) · [Docs](#documentation)
 

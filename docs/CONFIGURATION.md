@@ -2,7 +2,7 @@
 
 This document describes how to configure schlock features, customize safety rules, and integrate with your development workflow.
 
-> **⚠️ Note on Code Formatting**: The `formatter` configuration options documented below are **non-functional** in v0.1.0 because Claude Code does not support PostToolUse hooks for plugins. For code formatting, use [pre-commit hooks](https://pre-commit.com/) (industry standard). The formatter configuration is documented here for reference and future compatibility.
+> **⚠️ Note on Code Formatting**: The `formatter` configuration options documented below are **non-functional** because Claude Code does not support PostToolUse hooks for plugins. For code formatting, use [pre-commit hooks](https://pre-commit.com/) (industry standard).
 
 ## Table of Contents
 
@@ -63,20 +63,17 @@ Each rule has:
 - `message`: User-facing warning message
 - `alternatives`: Suggested safer alternatives (optional)
 
-### Example Rule Override (Coming Soon)
+### Rule Overrides (Coming in v0.3.0)
 
-> **Note**: Rule customization is not yet implemented in v0.1.0. This feature is planned for v0.2.0.
+> **Note**: Per-rule customization is planned for v0.3.0. See [ROADMAP.md](ROADMAP.md) for details.
 >
 > Planned syntax:
 > ```yaml
-> safety_rules:
->   # Override severity for specific rule
->   RULE_042:
->     severity: LOW  # Downgrade from HIGH
->
->   # Disable rule entirely
->   RULE_013:
->     enabled: false
+> rule_overrides:
+>   git_bulk_staging:
+>     risk_level: BLOCKED  # Upgrade from HIGH
+>   some_annoying_rule:
+>     enabled: false       # Disable entirely
 > ```
 
 ### Current Workarounds
@@ -155,11 +152,11 @@ commit_filter:
       enabled: false  # Keep filter enabled but allow advertising
 ```
 
-### Custom Patterns (v0.2.0)
+### Custom Patterns (Future)
 
-> **Note**: Custom pattern rules are planned for v0.2.0.
+> **Note**: Custom commit filter patterns may be added in a future release if there's demand.
 >
-> Future syntax:
+> Potential syntax:
 > ```yaml
 > commit_filter:
 >   enabled: true

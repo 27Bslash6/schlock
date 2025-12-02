@@ -8,7 +8,7 @@ argument-hint: (no arguments)
 
 Welcome! I'll help you configure schlock's safety validation in 4 simple steps.
 
-> **schlock v0.2.0** now includes ShellCheck integration and configurable risk tolerance!
+> **schlock v0.2.1** includes ShellCheck integration and configurable risk tolerance!
 
 This wizard generates `.claude/hooks/schlock-config.yaml` that you can share with your team via git.
 
