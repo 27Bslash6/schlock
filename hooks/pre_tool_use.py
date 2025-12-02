@@ -427,8 +427,8 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         if filter_instance:
             filter_result = filter_instance.filter_commit_message(command)
 
-            # DENY if advertising was found
-            if filter_result.was_modified:
+            # DENY if advertising patterns were matched (not just whitespace changes)
+            if filter_result.patterns_removed:
                 logger.warning(
                     f"[commit-filter] BLOCKED commit with advertising "
                     f"(categories: {', '.join(filter_result.categories_matched)})"
@@ -439,7 +439,7 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                 for pattern_info in filter_result.patterns_removed:
                     patterns_list.append(f"  - {pattern_info['description']}")
 
-                patterns_text = "\n".join(patterns_list) if patterns_list else "  - Claude advertising content"
+                patterns_text = "\n".join(patterns_list)
 
                 denial_message = (
                     f"BLOCKED: Commit contains advertising/unwanted content\n\n"
