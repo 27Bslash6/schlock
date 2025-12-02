@@ -5,6 +5,13 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.1...schlock-v0.2.2) (2025-12-02)
+
+
+### Bug Fixes
+
+* prevent false positives in commit filter when message has whitespace ([#20](https://github.com/27Bslash6/schlock/issues/20)) ([d02f826](https://github.com/27Bslash6/schlock/commit/d02f826f7a841e2774444808a384499b57d88b18))
+
 ## [0.2.1](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.0...schlock-v0.2.1) (2025-12-01)
 
 
