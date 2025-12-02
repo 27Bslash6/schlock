@@ -34,6 +34,69 @@ rules:
     patterns: ['pip\s+install\s+(?![^;|&]{0,100}--user)']
     alternatives: ["Use venv"]
 
+  # ============================================================
+  # Supply Chain Attacks (P0 Critical Gap)
+  # ============================================================
+
+  - name: package_install_untrusted_source
+    description: Installing packages from URLs or git repos can execute malicious code
+    risk_level: HIGH
+    patterns:
+      # npm from git/URLs
+      - 'npm\s+install\s+[^;|&]*(git\+|github:|gitlab:|bitbucket:)'
+      - 'npm\s+install\s+[^;|&]*https?://'
+      - 'npm\s+i\s+[^;|&]*(git\+|github:|gitlab:)'
+      # yarn from git/URLs
+      - 'yarn\s+add\s+[^;|&]*(git\+|github:|gitlab:)'
+      - 'yarn\s+add\s+[^;|&]*https?://'
+      # pnpm from git/URLs
+      - 'pnpm\s+(add|install)\s+[^;|&]*(git\+|github:)'
+      # bun from git/URLs
+      - 'bun\s+(add|install)\s+[^;|&]*(git\+|github:)'
+      # pip from git/URLs
+      - 'pip\s+install\s+[^;|&]*git\+https?://'
+      - 'pip\s+install\s+[^;|&]*https?://[^;|&]*\.(whl|tar\.gz)'
+      - 'pip\s+install\s+[^;|&]*--index-url\s+https?://'
+      # pipx from URLs
+      - 'pipx\s+install\s+[^;|&]*git\+https?://'
+      # cargo from git
+      - 'cargo\s+install\s+[^;|&]*--git\s+'
+      - 'cargo\s+install\s+[^;|&]*--path\s+/tmp/'
+      # gem from git/URLs
+      - 'gem\s+install\s+[^;|&]*--source\s+https?://'
+      - 'gem\s+install\s+[^;|&]*\.gem'
+      # go install (always fetches)
+      - 'go\s+install\s+[^;|&]*@'
+      - 'go\s+get\s+'
+      # deno from URLs
+      - 'deno\s+install\s+[^;|&]*https?://'
+      - 'deno\s+run\s+[^;|&]*https?://'
+    alternatives:
+      - "Verify package authenticity before installing"
+      - "Use lockfiles and integrity checks"
+      - "Review source code from unknown repositories"
+
+  - name: build_from_source
+    description: Building from source can execute arbitrary code
+    risk_level: HIGH
+    patterns:
+      # make install (installs to system)
+      - 'make\s+install'
+      - 'make\s+[^;|&]*&&\s*make\s+install'
+      # configure and install
+      - '\./configure\s+[^;|&]*&&\s*make'
+      # cmake install
+      - 'cmake\s+--install'
+      - 'cmake\s+[^;|&]*&&\s*make\s+install'
+      # ninja install
+      - 'ninja\s+install'
+      # meson install
+      - 'meson\s+install'
+    alternatives:
+      - "Use package managers when available"
+      - "Review build scripts before running"
+      - "Install to user directory with PREFIX"
+
   - name: package_installation_system
     description: System-wide package installation
     risk_level: MEDIUM

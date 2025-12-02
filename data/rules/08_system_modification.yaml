@@ -64,3 +64,33 @@ rules:
     risk_level: MEDIUM
     patterns: ['useradd\s+.{0,100}-G\s+.{0,100}(sudo|wheel|admin)', 'usermod\s+.{0,100}-a\s+-G\s+.{0,100}(sudo|wheel|admin)', 'passwd\s+-d', 'passwd\s+root', 'visudo', 'echo.{0,200}>>\s*/etc/sudoers', 'adduser\s+.{0,100}--disabled-password']
     alternatives: ["Use proper user management", "Document user changes", "Use LDAP/SSO"]
+
+  # ============================================================
+  # GAP-010: DNS Hijacking
+  # ============================================================
+
+  - name: dns_hijacking
+    description: DNS manipulation enables phishing and C2 redirection
+    risk_level: BLOCKED
+    patterns:
+      # /etc/hosts manipulation
+      - '>\s*/etc/hosts'
+      - '>>\s*/etc/hosts'
+      - 'echo[^;|&]*>>\s*/etc/hosts'
+      - 'cat[^;|&]*>\s*/etc/hosts'
+      # /etc/resolv.conf manipulation
+      - '>\s*/etc/resolv\.conf'
+      - 'echo[^;|&]*>\s*/etc/resolv\.conf'
+      - 'cat[^;|&]*>\s*/etc/resolv\.conf'
+      # systemd-resolved manipulation
+      - 'systemd-resolve\s+--set-dns'
+      - 'resolvectl\s+dns'
+      # macOS DNS manipulation
+      - 'networksetup\s+-setdnsservers'
+      - 'scutil\s+--set\s+DNS'
+      # NetworkManager DNS
+      - 'nmcli\s+[^;|&]*dns'
+    alternatives:
+      - "DNS changes redirect all network traffic"
+      - "Attackers use DNS hijacking for credential phishing"
+      - "Use proper network configuration tools"

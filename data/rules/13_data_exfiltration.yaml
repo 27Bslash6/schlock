@@ -1,0 +1,168 @@
+# Category: Data Exfiltration
+# Risk Levels: BLOCKED, HIGH
+# Description: Commands that exfiltrate sensitive data from browsers, processes, or applications
+
+rules:
+  # ============================================================
+  # Browser Credential Theft
+  # ============================================================
+
+  - name: browser_credential_theft
+    description: Accessing browser credential stores enables account takeover
+    risk_level: BLOCKED
+    patterns:
+      # Chrome/Chromium (macOS)
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*(Application Support|\.config)/(Google Chrome|Chromium|BraveSoftware)/(Default|Profile)/(Cookies|Login Data|History|Web Data)'
+      # Chrome/Chromium (Linux)
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*\.config/(google-chrome|chromium|BraveSoftware)/(Default|Profile)/(Cookies|Login Data|History)'
+      # Firefox (macOS and Linux)
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*(\.mozilla|Application Support)/[Ff]irefox/[^;|&]*\.(sqlite|json)'
+      - 'sqlite3\s+[^;|&]*(cookies\.sqlite|places\.sqlite|logins\.json|formhistory\.sqlite)'
+      # Safari
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*Library/Safari/(Cookies\.binarycookies|History\.db|Bookmarks\.plist)'
+      # Edge (Chromium-based)
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*(Microsoft Edge)/(Default|Profile)/(Cookies|Login Data)'
+    alternatives:
+      - "Browser credentials require explicit user consent"
+      - "Never access browser storage programmatically"
+
+  - name: browser_local_storage_theft
+    description: Browser localStorage and sessionStorage contain session tokens
+    risk_level: BLOCKED
+    patterns:
+      # Chrome/Chromium Local Storage
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*(google-chrome|chromium|Chrome)/[^;|&]*Local Storage'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*(google-chrome|chromium|Chrome)/[^;|&]*leveldb'
+      # Firefox storage
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*firefox/[^;|&]*webappsstore\.sqlite'
+    alternatives:
+      - "Session tokens in browser storage are sensitive"
+      - "Access requires explicit user consent"
+
+  # ============================================================
+  # Electron App Token Theft
+  # ============================================================
+
+  - name: electron_app_token_theft
+    description: Electron apps store tokens in predictable locations
+    risk_level: BLOCKED
+    patterns:
+      # Slack tokens
+      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]*(Slack|slack)/[^;|&]*(storage|leveldb|Local Storage)'
+      # Discord tokens
+      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]*(discord|Discord)/[^;|&]*(leveldb|Local Storage)'
+      # VSCode/Cursor tokens
+      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]*(Code|Cursor)/[^;|&]*(storage|State)'
+      # Generic Electron apps
+      - 'strings\s+[^;|&]*Application Support/[^;|&]*/[^;|&]*leveldb'
+    alternatives:
+      - "Application tokens are sensitive credentials"
+      - "Never extract tokens from Electron app storage"
+
+  # ============================================================
+  # Process Memory Dumping
+  # ============================================================
+
+  - name: process_memory_dump
+    description: Process memory contains decrypted credentials and tokens
+    risk_level: BLOCKED
+    patterns:
+      # gcore - core dump utility
+      - '\bgcore\s+'
+      # /proc memory access
+      - 'cat\s+/proc/[0-9]+/(mem|environ|cmdline|fd)'
+      - 'strings\s+/proc/[0-9]+/'
+      - 'xxd\s+/proc/[0-9]+/'
+      - 'od\s+[^;|&]*/proc/[0-9]+/'
+      # Process memory map
+      - '\bpmap\s+'
+      # Memory dump tools
+      - '\bmemdump\s+'
+      - '\bprocdump\s+'
+    alternatives:
+      - "Process memory access requires explicit approval"
+      - "Memory dumping can expose credentials"
+
+  - name: debugger_attach
+    description: Attaching debuggers to running processes can extract credentials
+    risk_level: HIGH
+    patterns:
+      # GDB attach
+      - 'gdb\s+[^;|&]*(-p|--pid)\s+'
+      - 'gdb\s+[^;|&]*attach\s+'
+      # LLDB attach
+      - 'lldb\s+[^;|&]*(-p|--attach-pid)\s+'
+      - 'lldb\s+[^;|&]*attach\s+'
+      # strace/ltrace attach
+      - 'strace\s+[^;|&]*-p\s+'
+      - 'ltrace\s+[^;|&]*-p\s+'
+    alternatives:
+      - "Debugger attachment requires confirmation"
+      - "Consider using logging instead of live debugging"
+
+  # ============================================================
+  # Application Token/Cache Theft
+  # ============================================================
+
+  - name: cloud_cache_theft
+    description: Cloud CLI tools cache credentials in predictable locations
+    risk_level: BLOCKED
+    patterns:
+      # AWS CLI cache
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.aws/cli/cache/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.aws/sso/cache/'
+      # Kubernetes cache
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.kube/cache/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.kube/http-cache/'
+      # GCloud
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.config/gcloud/[^;|&]*(credentials|access_tokens)'
+      # Azure
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.azure/[^;|&]*(accessTokens|msal_token_cache)'
+    alternatives:
+      - "Cloud credential caches contain sensitive tokens"
+      - "Use cloud provider CLI for authorized access"
+
+  - name: package_manager_token_theft
+    description: Package manager auth tokens enable supply chain attacks
+    risk_level: BLOCKED
+    patterns:
+      # npm tokens
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.npm/_authToken'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.npmrc[^;|&]*authToken'
+      # PyPI tokens
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.pypirc'
+      # Cargo/crates.io
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.cargo/credentials'
+      # Gem/RubyGems
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.gem/credentials'
+      # Docker registry
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.docker/config\.json'
+    alternatives:
+      - "Package manager tokens enable publishing malicious packages"
+      - "Never exfiltrate registry credentials"
+
+  # ============================================================
+  # GAP-004: Clipboard Credential Theft
+  # ============================================================
+
+  - name: clipboard_credential_theft
+    description: Clipboard often contains passwords, tokens, and keys
+    risk_level: BLOCKED
+    patterns:
+      # macOS clipboard
+      - '\bpbpaste\b'
+      # Linux X11 clipboard
+      - 'xclip\s+[^;|&]*(-o|--output)'
+      - 'xclip\s+-selection'
+      - 'xsel\s+[^;|&]*(--output|-o)'
+      - 'xsel\s+--clipboard'
+      # Wayland clipboard
+      - '\bwl-paste\b'
+      # Tmux buffers (may contain copied passwords)
+      - 'tmux\s+(show-buffer|save-buffer|list-buffers)'
+      - 'tmux\s+capture-pane'
+      # Screen buffers
+      - 'screen\s+-X\s+hardcopy'
+    alternatives:
+      - "Clipboard access exposes copied credentials"
+      - "Users frequently copy passwords to clipboard"

@@ -1,5 +1,5 @@
 # Category: Log Tampering
-# Risk Levels: HIGH
+# Risk Levels: BLOCKED, HIGH
 # Description: Commands that manipulate system logs and audit trails
 
 rules:
@@ -8,3 +8,31 @@ rules:
     risk_level: HIGH
     patterns: ['>\s*/var/log/[^|&;]{1,200}', 'rm\s+.{0,100}/var/log/[^|&;]{1,200}', 'truncate\s+.{0,100}/var/log/', 'echo\s+.{0,100}>\s*/var/log/', 'shred\s+.{0,100}/var/log/', 'history\s+-c', 'unset\s+HISTFILE', 'export\s+HISTSIZE=0', 'ln\s+-sf\s+/dev/null\s+.{0,100}\.bash_history']
     alternatives: ["Use log rotation tools", "Preserve audit trails", "Use centralized logging"]
+
+  # ============================================================
+  # GAP-001: Extended History Manipulation
+  # ============================================================
+
+  - name: history_evasion_extended
+    description: Advanced history manipulation to hide malicious commands
+    risk_level: BLOCKED
+    patterns:
+      # HISTFILE redirection to /dev/null
+      - 'HISTFILE\s*=\s*/dev/null'
+      - 'HISTFILE\s*=\s*[''"]?/dev/null'
+      - 'export\s+HISTFILE\s*=\s*/dev/null'
+      # HISTFILESIZE manipulation
+      - 'HISTFILESIZE\s*=\s*0'
+      - 'export\s+HISTFILESIZE\s*=\s*0'
+      # Direct history file truncation
+      - '>\s*~/?\.(bash_history|zsh_history|zsh-history)'
+      - 'cat\s+/dev/null\s*>\s*~/?\.(bash_history|zsh_history)'
+      # Other shell histories
+      - '>\s*~/?\.(zsh_history|fish_history|ash_history)'
+      - 'rm\s+[^;|&]*\.(bash_history|zsh_history|fish_history)'
+      # Shell option manipulation
+      - 'set\s+\+o\s+history'
+      - 'shopt\s+-u\s+histappend'
+    alternatives:
+      - "History manipulation indicates malicious intent"
+      - "Audit trails should be preserved"
