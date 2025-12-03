@@ -97,6 +97,34 @@ rules:
       - "Review build scripts before running"
       - "Install to user directory with PREFIX"
 
+  - name: homebrew_tap_install
+    description: Installing from third-party Homebrew taps executes code from arbitrary GitHub repos
+    risk_level: HIGH
+    patterns:
+      # brew install from tap (user/repo/formula format)
+      # Character class includes dots for GitHub usernames like "user.org" (FINDING-003)
+      - 'brew\s+install\s+[^;|&]*[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+'
+      - 'brew\s+install\s+[^;|&]*--cask\s+[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+'
+      # brew tap adds arbitrary GitHub repos as package sources
+      - 'brew\s+tap\s+[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+'
+    alternatives:
+      - "Verify the tap repository before adding"
+      - "Use official Homebrew formulae when available"
+      - "Review the formula source code"
+
+  - name: homebrew_install
+    description: Homebrew install downloads and executes install scripts
+    risk_level: MEDIUM
+    patterns:
+      # Regular brew install (official formulae)
+      - 'brew\s+install\s+(?![^;|&]*[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)'
+      - 'brew\s+install\s+--cask\s+(?![^;|&]*[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)'
+      # brew upgrade can change binaries
+      - 'brew\s+upgrade'
+    alternatives:
+      - "Review what will be installed with 'brew info'"
+      - "Check formula source with 'brew cat'"
+
   - name: package_installation_system
     description: System-wide package installation
     risk_level: MEDIUM
