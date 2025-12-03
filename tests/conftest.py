@@ -23,22 +23,18 @@ def data_dir(plugin_root):
 
 @pytest.fixture
 def safety_rules_path(data_dir):
-    """Path to safety_rules.yaml configuration file.
+    """Path to rules directory for validation tests.
 
-    DEPRECATED: Use rules_dir_path for new tests.
-    This loads from the single file, not the rules directory.
+    Points to data/rules/ directory containing the canonical rule set.
+    The validator's load_rules() detects directories and loads appropriately.
     """
-    return str(data_dir / "safety_rules.yaml")
+    return str(data_dir / "rules")
 
 
 @pytest.fixture
-def rules_dir_path(data_dir):
-    """Path to data/rules/ directory with organized rule files.
-
-    Use this for tests that need the full rule set from the
-    organized rules directory (11_dynamic_linker.yaml, etc.)
-    """
-    return str(data_dir / "rules")
+def rules_dir_path(safety_rules_path):
+    """Alias for safety_rules_path for clarity in tests."""
+    return safety_rules_path
 
 
 @pytest.fixture

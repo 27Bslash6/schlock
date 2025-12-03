@@ -1,13 +1,13 @@
-"""Security benchmark suite for schlock.
+"""Detection accuracy suite for schlock.
 
 Tests schlock's detection capabilities against known attack patterns,
 bypass techniques, and measures false positive rates.
 
 Usage:
-    pytest tests/benchmark.py -v
-    python tests/benchmark.py
-    python tests/benchmark.py --category obfuscation
-    python tests/benchmark.py --verbose
+    pytest tests/accuracy.py -v
+    python tests/accuracy.py
+    python tests/accuracy.py --category obfuscation
+    python tests/accuracy.py --verbose
 """
 
 import argparse

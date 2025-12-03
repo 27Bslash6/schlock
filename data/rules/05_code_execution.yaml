@@ -5,9 +5,19 @@
 rules:
   # BLOCKED
   - name: remote_execution
-    description: Downloading and executing code is dangerous
+    description: Downloading and executing code is dangerous - classic rootkit vector
     risk_level: BLOCKED
-    patterns: ['curl.{0,200}\|\s*bash', 'wget.{0,200}\|\s*sh']
+    patterns:
+      # Common download tools piped to shell interpreters
+      - '(curl|wget|fetch|aria2c|http|https).{0,200}\|\s*(bash|sh|zsh|dash|ksh|eval)'
+      # Text browsers that can dump to stdout
+      - '(lynx|links|elinks|w3m)\s+[^|]*(-dump|-source).{0,100}\|\s*(bash|sh|zsh|eval)'
+      # Network tools receiving and executing
+      - '(nc|netcat|ncat|socat).{0,200}\|\s*(bash|sh|zsh|eval)'
+      # Perl LWP tools (GET, lwp-request, lwp-download)
+      - '(GET|lwp-request)\s+https?://.{0,100}\|\s*(bash|sh|zsh|eval)'
+      # Reverse order: shell reading from process substitution
+      - '(bash|sh|zsh)\s+<\(.{0,50}(curl|wget|fetch|nc|netcat)'
     alternatives: ["Download first, inspect, then run"]
 
   - name: source_remote_script
@@ -66,6 +76,54 @@ rules:
     risk_level: HIGH
     patterns: ['launchctl\s+(load|unload|bootout|disable)', 'defaults\s+write\s+.{0,200}(com\.apple|NSGlobalDomain)', 'defaults\s+delete', 'dscl\s+.{0,100}(create|delete|passwd)', 'security\s+(delete-keychain|unlock-keychain|set-keychain-settings)', 'spctl\s+--master-disable', 'csrutil\s+disable', 'nvram\s+']
     alternatives: ["Use System Preferences", "Document system changes", "Require admin approval"]
+
+  # ============================================================
+  # Keychain/Credential Store Theft (P0 Critical Gap)
+  # ============================================================
+
+  - name: macos_keychain_theft
+    description: macOS Keychain contains all stored passwords and certificates
+    risk_level: BLOCKED
+    patterns:
+      # Find and extract passwords
+      - 'security\s+find-generic-password'
+      - 'security\s+find-internet-password'
+      # Dump entire keychain
+      - 'security\s+dump-keychain'
+      - 'security\s+dump-trust-settings'
+      # Export keys/certificates
+      - 'security\s+export[^;|&]*-k'
+      - 'security\s+find-certificate[^;|&]*-p'
+      # Show keychain info
+      - 'security\s+show-keychain-info'
+      # Access keychain files directly
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*Library/Keychains/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.keychain'
+    alternatives:
+      - "Keychain access requires explicit user consent"
+      - "Use Keychain Access.app for authorized access"
+      - "Never exfiltrate keychain contents"
+
+  - name: linux_keyring_theft
+    description: Linux keyring/secret storage contains stored credentials
+    risk_level: BLOCKED
+    patterns:
+      # GNOME Keyring
+      - 'secret-tool\s+lookup'
+      - 'secret-tool\s+search'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.local/share/keyrings/'
+      # pass password manager
+      - 'pass\s+show'
+      - 'pass\s+[^;|&]*-c'
+      # GPG private keys
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.gnupg/private-keys'
+      - 'gpg\s+[^;|&]*--export-secret-keys'
+      # KWallet
+      - 'kwallet-query\s+'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.local/share/kwalletd/'
+    alternatives:
+      - "Credential store access requires explicit consent"
+      - "Use system tools for authorized access"
 
   - name: windows_script_execution
     description: Windows-specific script execution vectors

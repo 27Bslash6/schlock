@@ -228,17 +228,25 @@ class RuleEngine:
         return engine
 
     def _load_rules(self) -> None:
-        """Load and validate rules from YAML file.
+        """Load and validate rules from YAML file or directory.
+
+        Automatically detects if path is a directory and loads all YAML files,
+        or loads a single file if path points to a file.
 
         Raises:
-            ConfigurationError: If file doesn't exist, YAML is invalid,
+            ConfigurationError: If path doesn't exist, YAML is invalid,
                                 or regex patterns don't compile
         """
         if not self.rules_path.exists():
             raise ConfigurationError(
-                f"Rules file not found: {self.rules_path}",
+                f"Rules path not found: {self.rules_path}",
                 file_path=str(self.rules_path),
             )
+
+        # Auto-detect directory vs file
+        if self.rules_path.is_dir():
+            self._load_rules_from_directory(self.rules_path)
+            return
 
         try:
             with open(self.rules_path) as f:
@@ -437,19 +445,27 @@ class RuleEngine:
         """
         return any(pattern.search(command) for pattern in self.whitelist_patterns)
 
-    def match_command(self, command: str, string_literals: Optional[list[tuple]] = None) -> RuleMatch:
+    def match_command(
+        self,
+        command: str,
+        string_literals: Optional[list[tuple]] = None,
+        heredoc_ranges: Optional[list[tuple]] = None,
+    ) -> RuleMatch:
         """Match command against all rules, return highest risk.
 
         Matching algorithm:
         1. Check whitelist first (returns SAFE if matched)
         2. Match against all rules, collect all matches
         3. Skip matches that fall inside quoted string literals (AST context)
-        4. Return highest risk level match
+        4. Skip matches inside non-shell heredocs (text, not executed)
+        5. Return highest risk level match
 
         Args:
             command: Command string to validate
             string_literals: Optional list of (start, end) positions for quoted strings
                            from AST analysis. Matches inside these ranges are ignored.
+            heredoc_ranges: Optional list of (start, end, is_shell) tuples for heredocs.
+                          Matches inside non-shell heredocs are ignored (just text).
 
         Returns:
             RuleMatch with highest risk level from all matching rules
@@ -486,6 +502,11 @@ class RuleEngine:
                     # Check if match is inside a quoted string literal
                     if string_literals and self._is_in_string_literal(match, string_literals):
                         # Skip this match - it's in a quoted string that won't execute
+                        continue
+
+                    # Check if match is inside a non-shell heredoc (text, not executed)
+                    if heredoc_ranges and self._is_in_non_shell_heredoc(match, heredoc_ranges):
+                        # Skip this match - it's in heredoc content that won't execute
                         continue
 
                     # Rule matched - check if higher risk than current
@@ -530,3 +551,28 @@ class RuleEngine:
 
         # Both start AND end must be within the same string literal
         return any(literal_start <= match_start and match_end <= literal_end for literal_start, literal_end in string_literals)
+
+    def _is_in_non_shell_heredoc(self, match: re.Match, heredoc_ranges: list[tuple]) -> bool:
+        """Check if a regex match falls within a non-shell heredoc.
+
+        SECURITY: Heredoc content going to non-shell commands (like cat, echo) is just
+        text output - it won't be executed. Only heredocs going to shells (bash, sh, etc.)
+        should trigger pattern matches.
+
+        Args:
+            match: Regex match object
+            heredoc_ranges: List of (start, end, is_shell) tuples for heredocs
+
+        Returns:
+            True if match is inside a heredoc going to a NON-shell command (safe to ignore)
+        """
+        match_start = match.start()
+        match_end = match.end()
+
+        for start, end, is_shell in heredoc_ranges:
+            # If match is inside this heredoc range
+            if start <= match_start and match_end <= end:
+                # If it's NOT going to a shell, we can safely ignore this match
+                if not is_shell:
+                    return True
+        return False

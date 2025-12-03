@@ -1,12 +1,12 @@
-"""Tests for security benchmark suite."""
+"""Tests for detection accuracy suite."""
 
 import sys
 from pathlib import Path
 
-# Add tests directory to path for benchmark import
+# Add tests directory to path for accuracy module import
 sys.path.insert(0, str(Path(__file__).parent))
 
-from benchmark import (
+from accuracy import (
     BENCHMARK_CASES,
     BenchmarkCase,
     BenchmarkResult,
@@ -131,7 +131,7 @@ class TestBenchmarkCLI:
         import subprocess  # noqa: PLC0415 - Test isolation
 
         result = subprocess.run(
-            ["python", "tests/benchmark.py"],
+            ["python", "tests/accuracy.py"],
             check=False,
             capture_output=True,
             text=True,
@@ -143,7 +143,7 @@ class TestBenchmarkCLI:
         import subprocess  # noqa: PLC0415 - Test isolation
 
         result = subprocess.run(
-            ["python", "tests/benchmark.py", "--list-categories"],
+            ["python", "tests/accuracy.py", "--list-categories"],
             check=False,
             capture_output=True,
             text=True,
@@ -156,7 +156,7 @@ class TestBenchmarkCLI:
         import subprocess  # noqa: PLC0415 - Test isolation
 
         result = subprocess.run(
-            ["python", "tests/benchmark.py", "--verbose", "-c", "legitimate"],
+            ["python", "tests/accuracy.py", "--verbose", "-c", "legitimate"],
             check=False,
             capture_output=True,
             text=True,

@@ -122,7 +122,7 @@ rules:
     def test_nonexistent_file_raises_error(self, tmp_path):
         """Nonexistent rules file raises ConfigurationError."""
         missing_file = tmp_path / "nonexistent.yaml"
-        with pytest.raises(ConfigurationError, match="Rules file not found"):
+        with pytest.raises(ConfigurationError, match="Rules path not found"):
             RuleEngine(missing_file)
 
     def test_invalid_yaml_root_raises_error(self, tmp_path):
@@ -132,13 +132,13 @@ rules:
         with pytest.raises(ConfigurationError, match="YAML root must be a dictionary"):
             RuleEngine(bad_yaml)
 
-    def test_file_read_error_raises_configuration_error(self, tmp_path):
-        """File read errors raise ConfigurationError."""
-        # Create a directory instead of a file to trigger read error
-        bad_path = tmp_path / "bad_file.yaml"
-        bad_path.mkdir()
-        with pytest.raises(ConfigurationError, match="Failed to read rules file"):
-            RuleEngine(bad_path)
+    def test_empty_directory_raises_configuration_error(self, tmp_path):
+        """Empty rules directory raises ConfigurationError."""
+        # Create an empty directory - RuleEngine auto-detects directories
+        empty_dir = tmp_path / "empty_rules_dir"
+        empty_dir.mkdir()
+        with pytest.raises(ConfigurationError, match="No YAML files found"):
+            RuleEngine(empty_dir)
 
     def test_empty_rules_logs_warning(self, tmp_path, caplog):
         """Empty rules YAML logs warning."""

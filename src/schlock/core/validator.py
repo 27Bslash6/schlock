@@ -13,10 +13,15 @@ from pathlib import Path
 from typing import Optional
 
 from schlock.exceptions import ConfigurationError, ParseError
+from schlock.integrations.shellcheck import (
+    get_security_findings,
+    is_shellcheck_available,
+    run_shellcheck,
+)
 
 from .cache import ValidationCache
 from .parser import BashCommandParser
-from .rules import RiskLevel, RuleEngine
+from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 
 logger = logging.getLogger(__name__)
 
@@ -58,20 +63,15 @@ class ValidationResult:
 
 
 def load_rules(config_path: Optional[str] = None) -> RuleEngine:
-    """Load rules with configuration layering.
+    """Load rules from the canonical data/rules/ directory.
 
     Configuration layers (later overrides earlier):
-    1. Plugin defaults: data/rules/ directory or data/safety_rules.yaml (required)
+    1. Plugin defaults: data/rules/ directory (required)
     2. User overrides: Platform-specific config directory (optional, future feature)
     3. Project overrides: .claude/hooks/schlock-config.yaml (optional)
 
-    Loading priority:
-    1. If config_path provided, use it (testing/override)
-    2. If data/rules/ directory exists, load from multiple files (NEW)
-    3. Otherwise, fall back to data/safety_rules.yaml (backward compatibility)
-
     Args:
-        config_path: Optional path to rules file (for testing)
+        config_path: Optional path to rules file or directory (for testing/override)
 
     Returns:
         RuleEngine loaded with merged configuration
@@ -80,31 +80,25 @@ def load_rules(config_path: Optional[str] = None) -> RuleEngine:
         ConfigurationError: If plugin defaults are missing or invalid
     """
     if config_path:
-        # Testing/override path
+        # Testing/override path - handle both file and directory
+        path = Path(config_path)
+        if path.is_dir():
+            return RuleEngine.from_directory(path)
         return RuleEngine(config_path)
 
-    # Default: check for multi-file structure first
+    # Default: load from data/rules/ directory
     # Path: core/validator.py -> core -> schlock -> src -> project_root
     project_root = Path(__file__).parent.parent.parent.parent
     rules_dir = project_root / "data" / "rules"
 
-    if rules_dir.exists() and rules_dir.is_dir():
-        # Multi-file loading (NEW)
-        logger.info(f"Loading rules from directory: {rules_dir}")
-        return RuleEngine.from_directory(rules_dir)
-
-    # Fall back to single file (BACKWARD COMPATIBILITY)
-    default_rules = project_root / "data" / "safety_rules.yaml"
-
-    if not default_rules.exists():
+    if not rules_dir.exists() or not rules_dir.is_dir():
         raise ConfigurationError(
-            f"Plugin defaults not found. Expected either {rules_dir}/ or {default_rules}. "
-            "This is a fatal error - plugin installation may be corrupted.",
-            file_path=str(default_rules),
+            f"Plugin defaults not found at {rules_dir}/. This is a fatal error - plugin installation may be corrupted.",
+            file_path=str(rules_dir),
         )
 
-    logger.info(f"Loading rules from file: {default_rules}")
-    return RuleEngine(default_rules)
+    logger.info(f"Loading rules from directory: {rules_dir}")
+    return RuleEngine.from_directory(rules_dir)
 
 
 def _check_special_cases(command: str) -> Optional[ValidationResult]:
@@ -248,7 +242,7 @@ def _validate_heredoc_command(
         return None
 
 
-def validate_command(  # noqa: PLR0911 - Multiple validation paths require multiple exits
+def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
     command: str,
     config_path: Optional[str] = None,
 ) -> ValidationResult:
@@ -313,6 +307,10 @@ def validate_command(  # noqa: PLR0911 - Multiple validation paths require multi
             # Extract string literals for context-aware matching
             string_literals = parser.extract_string_literals(command, ast)
 
+            # Extract heredoc ranges - matches inside non-shell heredocs should be ignored
+            # 'cat << EOF' just outputs text, 'bash << EOF' executes it
+            heredoc_ranges = parser.extract_heredoc_ranges(command, ast)
+
             # Check for dangerous constructs (command/process substitution, eval)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
             if dangerous_constructs:
@@ -352,8 +350,73 @@ def validate_command(  # noqa: PLR0911 - Multiple validation paths require multi
         # Step 5: Load rules and match with AST context
         try:
             engine = load_rules(config_path)
-            # Pass string literals to enable context-aware matching
-            match = engine.match_command(command, string_literals=string_literals)
+
+            # SECURITY CRITICAL: Extract and validate each command segment independently
+            # This prevents bypass via piping/chaining dangerous commands after whitelisted ones
+            # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
+            segments = parser.extract_command_segments(command, ast)
+
+            # Track all matched rules for audit logging (used when multiple segments)
+            all_matched_rules = []
+
+            # If we have multiple segments, validate each one
+            if len(segments) > 1:
+                highest_risk = RiskLevel.SAFE
+                highest_match = None
+
+                for segment in segments:
+                    # Parse segment to get its string literals
+                    try:
+                        seg_ast = parser.parse(segment)
+                        seg_literals = parser.extract_string_literals(segment, seg_ast)
+                    except (ParseError, ValueError):
+                        seg_literals = []
+
+                    seg_match = engine.match_command(segment, string_literals=seg_literals)
+
+                    if seg_match.matched and seg_match.rule:
+                        all_matched_rules.append(seg_match.rule.name)
+
+                    # Track highest risk across all segments
+                    if seg_match.risk_level > highest_risk:
+                        highest_risk = seg_match.risk_level
+                        highest_match = seg_match
+
+                # Use highest risk found, or SAFE if none
+                if highest_match:
+                    match = RuleMatch(
+                        matched=True,
+                        rule=highest_match.rule,
+                        risk_level=highest_risk,
+                        message=highest_match.message,
+                        alternatives=highest_match.alternatives,
+                    )
+                else:
+                    match = engine.match_command(command, string_literals=string_literals)
+                    all_matched_rules = []
+            else:
+                # Single segment - validate both original and reconstructed command
+                # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')
+                # We must match against both to catch escape-based evasion attempts
+                match = engine.match_command(
+                    command,
+                    string_literals=string_literals,
+                    heredoc_ranges=heredoc_ranges,
+                )
+
+                # Also check reconstructed command (catches escaped characters)
+                # SECURITY: Reconstruction strips quotes, which is useful for detecting
+                # escape sequences like 'rm\ -rf\ /' → 'rm -rf /', but we must NOT
+                # use it if the original match was inside a string literal (would cause false positives)
+                reconstructed = parser.reconstruct_command(ast)
+                if reconstructed and reconstructed != command:
+                    # Only check reconstructed if there are no string literals that would explain the difference
+                    # (i.e., difference is due to escapes, not quotes)
+                    if not string_literals:
+                        recon_match = engine.match_command(reconstructed, string_literals=[])
+                        # Use higher risk match
+                        if recon_match.risk_level > match.risk_level:
+                            match = recon_match
         except ConfigurationError as e:
             return ValidationResult(
                 allowed=False,
@@ -365,13 +428,43 @@ def validate_command(  # noqa: PLR0911 - Multiple validation paths require multi
             )
             # Don't cache config errors
 
-        # Step 6: Build ValidationResult
+        # Step 6: ShellCheck integration (if available)
+        # ShellCheck can catch issues our regex patterns miss, like $'' expansions
+        # SC2114: "Warning: deletes a system directory" catches rm -r$''f /
+        shellcheck_elevated = False
+        security_findings: list = []  # Initialize for type checker
+        if is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
+            findings = run_shellcheck(command)
+            security_findings = get_security_findings(findings)
+            if security_findings:
+                # Elevate to BLOCKED if ShellCheck found security issues
+                shellcheck_elevated = True
+                # If our regex patterns matched, use that rule; otherwise create synthetic
+                shellcheck_rule = match.rule or SecurityRule(
+                    name=f"shellcheck_{security_findings[0].code}",
+                    description=f"ShellCheck {security_findings[0].sc_code}: {security_findings[0].message}",
+                    risk_level=RiskLevel.BLOCKED,
+                    patterns=[],
+                    alternatives=[f"See {security_findings[0].wiki_url}"],
+                )
+                match = RuleMatch(
+                    matched=True,
+                    rule=shellcheck_rule,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"ShellCheck: {security_findings[0].message}",
+                    alternatives=[f"See {security_findings[0].wiki_url}"],
+                )
+
+        # Step 7: Build ValidationResult
         # BLOCKED commands are not allowed
         allowed = match.risk_level != RiskLevel.BLOCKED
         exit_code = 0 if allowed else 1
 
         # Extract matched rule names for audit logging
-        matched_rules = [match.rule.name] if match.matched and match.rule else []
+        # When multiple segments matched, use all_matched_rules; otherwise use the single match
+        matched_rules = all_matched_rules or ([match.rule.name] if match.matched and match.rule else [])
+        if shellcheck_elevated and security_findings:
+            matched_rules.append(f"shellcheck:{security_findings[0].sc_code}")
 
         result = ValidationResult(
             allowed=allowed,

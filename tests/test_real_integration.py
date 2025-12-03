@@ -1,7 +1,7 @@
 """Real integration tests using actual components (NO MOCKS).
 
 These tests verify the complete validation pipeline works end-to-end:
-- Load ACTUAL data/safety_rules.yaml
+- Load ACTUAL data/rules/ directory
 - Parse with ACTUAL bashlex (no mocks)
 - Test full validation pipeline
 - Verify dangerous commands blocked, safe commands allowed
@@ -19,14 +19,14 @@ class TestRealIntegration:
     """Integration tests with real components."""
 
     def test_real_rules_load(self):
-        """Verify actual safety_rules.yaml loads successfully."""
+        """Verify actual data/rules/ directory loads successfully."""
         project_root = Path(__file__).parent.parent
-        rules_path = project_root / "data" / "safety_rules.yaml"
+        rules_dir = project_root / "data" / "rules"
 
-        assert rules_path.exists(), f"Rules file not found: {rules_path}"
+        assert rules_dir.exists(), f"Rules directory not found: {rules_dir}"
 
-        # Load with RuleEngine (no mocks)
-        engine = RuleEngine(str(rules_path))
+        # Load with RuleEngine from directory (no mocks)
+        engine = RuleEngine.from_directory(rules_dir)
 
         # Should have loaded rules
         assert len(engine.rules) > 0, "No rules loaded"
@@ -193,9 +193,9 @@ class TestRealIntegration:
     def test_real_pattern_count(self):
         """Verify we have comprehensive rule coverage."""
         project_root = Path(__file__).parent.parent
-        rules_path = project_root / "data" / "safety_rules.yaml"
+        rules_dir = project_root / "data" / "rules"
 
-        engine = RuleEngine(str(rules_path))
+        engine = RuleEngine.from_directory(rules_dir)
 
         # Count rules by risk level
         blocked_rules = [r for r in engine.rules if r.risk_level == RiskLevel.BLOCKED]
