@@ -32,13 +32,23 @@ jobs:
       run: uv run ruff check . && uv run ruff format --check .
 
     - name: Test
-      run: uv run pytest --cov=src/schlock --cov-report=xml --cov-report=term
+      run: uv run pytest --cov=src/schlock --cov-report=xml --cov-report=term --junitxml=junit.xml -o junit_family=legacy
 
     - name: Upload coverage
       uses: codecov/codecov-action@v5
       with:
         files: ./coverage.xml
         use_oidc: true
+        fail_ci_if_error: false
+
+    - name: Upload test results to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v5
+      with:
+        files: ./junit.xml
+        report_type: test_results
+        use_oidc: true
+        flags: python-${{ matrix.python-version }}
         fail_ci_if_error: false
 
   security:
