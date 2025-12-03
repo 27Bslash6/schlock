@@ -35,9 +35,6 @@ rules:
       - 'nsenter\s+[^;|&]*-t\s+1'
       # Podman privileged
       - 'podman.{0,200}--privileged'
-      # Kubectl privileged operations
-      - 'kubectl\s+exec[^;|&]*--privileged'
-      - 'kubectl\s+run[^;|&]*--privileged'
     alternatives: ["Use proper container security", "Avoid privileged containers", "Use security policies"]
 
   # ============================================================

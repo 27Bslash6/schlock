@@ -596,7 +596,7 @@ class TestP0ContainerEscape:
             "docker run --security-opt apparmor=unconfined image",
             "docker run --pid host ubuntu",
             "docker run --privileged --network host ubuntu",
-            "kubectl run test --privileged --image=ubuntu",
+            # NOTE: kubectl run/exec don't have --privileged flag (it's a pod spec setting)
             "nsenter --target 1 --mount --uts --ipc --net --pid",
             "podman run --privileged fedora",
         ],

@@ -31,8 +31,10 @@ def safety_rules_path(data_dir):
     return str(data_dir / "rules")
 
 
-# Alias for clarity - both point to the same directory
-rules_dir_path = safety_rules_path
+@pytest.fixture
+def rules_dir_path(safety_rules_path):
+    """Alias for safety_rules_path for clarity in tests."""
+    return safety_rules_path
 
 
 @pytest.fixture

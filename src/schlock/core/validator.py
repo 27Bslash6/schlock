@@ -356,11 +356,13 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
             segments = parser.extract_command_segments(command, ast)
 
+            # Track all matched rules for audit logging (used when multiple segments)
+            all_matched_rules = []
+
             # If we have multiple segments, validate each one
             if len(segments) > 1:
                 highest_risk = RiskLevel.SAFE
                 highest_match = None
-                all_matched_rules = []
 
                 for segment in segments:
                     # Parse segment to get its string literals
@@ -382,8 +384,6 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
 
                 # Use highest risk found, or SAFE if none
                 if highest_match:
-                    match = highest_match
-                    # Include all matched rules
                     match = RuleMatch(
                         matched=True,
                         rule=highest_match.rule,
@@ -393,6 +393,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     )
                 else:
                     match = engine.match_command(command, string_literals=string_literals)
+                    all_matched_rules = []
             else:
                 # Single segment - validate both original and reconstructed command
                 # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')
@@ -460,7 +461,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         exit_code = 0 if allowed else 1
 
         # Extract matched rule names for audit logging
-        matched_rules = [match.rule.name] if match.matched and match.rule else []
+        # When multiple segments matched, use all_matched_rules; otherwise use the single match
+        matched_rules = all_matched_rules or ([match.rule.name] if match.matched and match.rule else [])
         if shellcheck_elevated and security_findings:
             matched_rules.append(f"shellcheck:{security_findings[0].sc_code}")
 
