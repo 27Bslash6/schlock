@@ -296,3 +296,26 @@ class TestCaching:
         second_parser = val_module._global_parser
 
         assert first_parser is second_parser
+
+    def test_rule_engine_invalidated_on_config_change(self, tmp_path):
+        """RuleEngine cache is invalidated when config_path changes."""
+        clear_caches()
+
+        # Create an alternative config file
+        alt_config = tmp_path / "alt_rules.yaml"
+        alt_config.write_text("whitelist:\n  - echo\nblacklist:\n  commands:\n    - name: rm\n")
+
+        # First call with default config
+        validate_command("echo first")
+        first_engine = val_module._global_rule_engine
+        first_path = val_module._global_rule_engine_path
+
+        # Second call with different config path
+        validate_command("echo second", config_path=str(alt_config))
+        second_engine = val_module._global_rule_engine
+        second_path = val_module._global_rule_engine_path
+
+        # Should have different engines for different config paths
+        assert first_engine is not second_engine
+        assert first_path != second_path
+        assert second_path == str(alt_config)

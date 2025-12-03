@@ -8,6 +8,7 @@ handles configuration layering (plugin defaults → user → project).
 import logging
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 # Module-level cache (shared across all validation calls)
 _global_cache = ValidationCache(max_size=1000)
 
+# Thread lock for RuleEngine and Parser caches
+# SECURITY: Prevents race conditions when multiple threads access shared state
+_cache_lock = threading.Lock()
+
 # Module-level RuleEngine cache (avoid reloading YAML + recompiling regex on every call)
 # PERF: Rule loading takes ~160ms - caching reduces cache-miss latency from 180ms to 20ms
 _global_rule_engine: Optional["RuleEngine"] = None
@@ -44,6 +49,8 @@ def _get_rule_engine(config_path: Optional[str] = None) -> "RuleEngine":
     PERF: Caches the RuleEngine to avoid reloading YAML and recompiling
     regex patterns on every validation call (~160ms savings per cache miss).
 
+    Thread-safe: Uses _cache_lock to prevent race conditions.
+
     Args:
         config_path: Optional path to rules (for testing). Different paths
                     get different cached engines.
@@ -53,25 +60,29 @@ def _get_rule_engine(config_path: Optional[str] = None) -> "RuleEngine":
     """
     global _global_rule_engine, _global_rule_engine_path  # noqa: PLW0603
 
-    # Check if we can reuse cached engine
-    if _global_rule_engine is not None and _global_rule_engine_path == config_path:
-        return _global_rule_engine
+    with _cache_lock:
+        # Check if we can reuse cached engine
+        if _global_rule_engine is not None and _global_rule_engine_path == config_path:
+            return _global_rule_engine
 
-    # Load new engine and cache it
-    _global_rule_engine = load_rules(config_path)
-    _global_rule_engine_path = config_path
-    return _global_rule_engine
+        # Load new engine and cache it
+        _global_rule_engine = load_rules(config_path)
+        _global_rule_engine_path = config_path
+        return _global_rule_engine
 
 
 def _get_parser() -> "BashCommandParser":
     """Get cached BashCommandParser.
 
     PERF: Parser is stateless, reuse the same instance.
+    Thread-safe: Uses _cache_lock to prevent race conditions.
     """
     global _global_parser  # noqa: PLW0603
-    if _global_parser is None:
-        _global_parser = BashCommandParser()
-    return _global_parser
+
+    with _cache_lock:
+        if _global_parser is None:
+            _global_parser = BashCommandParser()
+        return _global_parser
 
 
 @dataclass(frozen=True)
