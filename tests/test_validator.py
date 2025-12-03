@@ -8,7 +8,12 @@ import pytest
 import schlock.core.validator as val_module
 from schlock.core import parser
 from schlock.core.rules import RiskLevel
-from schlock.core.validator import ValidationResult, load_rules, validate_command
+from schlock.core.validator import (
+    ValidationResult,
+    clear_caches,
+    load_rules,
+    validate_command,
+)
 from schlock.exceptions import ConfigurationError
 
 
@@ -216,3 +221,78 @@ class TestMatchedRulesField:
         assert isinstance(violations, list)
         if not result.allowed:
             assert len(violations) > 0
+
+
+class TestCaching:
+    """Tests for module-level caching (performance optimization)."""
+
+    def test_clear_caches_clears_validation_cache(self):
+        """clear_caches() clears the validation result cache."""
+        # Validate a command to populate cache
+        validate_command("echo test_cache_clear")
+
+        # Verify it's cached
+        assert val_module._global_cache.get("echo test_cache_clear") is not None
+
+        # Clear caches
+        clear_caches()
+
+        # Verify cache is cleared
+        assert val_module._global_cache.get("echo test_cache_clear") is None
+
+    def test_clear_caches_clears_rule_engine(self):
+        """clear_caches() clears the RuleEngine cache."""
+        # Trigger rule engine load
+        validate_command("echo test_rule_engine")
+
+        # Verify rule engine is cached
+        assert val_module._global_rule_engine is not None
+
+        # Clear caches
+        clear_caches()
+
+        # Verify rule engine is cleared
+        assert val_module._global_rule_engine is None
+        assert val_module._global_rule_engine_path is None
+
+    def test_clear_caches_clears_parser(self):
+        """clear_caches() clears the parser cache."""
+        # Trigger parser load
+        validate_command("echo test_parser")
+
+        # Verify parser is cached
+        assert val_module._global_parser is not None
+
+        # Clear caches
+        clear_caches()
+
+        # Verify parser is cleared
+        assert val_module._global_parser is None
+
+    def test_rule_engine_reused_across_calls(self):
+        """RuleEngine is reused for subsequent calls (performance)."""
+        clear_caches()
+
+        # First call loads rule engine
+        validate_command("echo first")
+        first_engine = val_module._global_rule_engine
+
+        # Second call reuses same engine
+        validate_command("echo second")
+        second_engine = val_module._global_rule_engine
+
+        assert first_engine is second_engine
+
+    def test_parser_reused_across_calls(self):
+        """Parser is reused for subsequent calls (performance)."""
+        clear_caches()
+
+        # First call loads parser
+        validate_command("echo first")
+        first_parser = val_module._global_parser
+
+        # Second call reuses same parser
+        validate_command("echo second")
+        second_parser = val_module._global_parser
+
+        assert first_parser is second_parser
