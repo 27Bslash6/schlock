@@ -2,8 +2,13 @@
 
 import pytest
 
-from schlock.setup.config_writer import WizardChoices
-from schlock.setup.wizard import format_config_review, validate_wizard_choices
+from schlock.setup.config_writer import RISK_PRESETS, WizardChoices
+from schlock.setup.wizard import (
+    format_config_review,
+    format_risk_preset_menu,
+    get_preset_from_choice,
+    validate_wizard_choices,
+)
 
 
 @pytest.fixture
@@ -76,3 +81,80 @@ class TestValidateWizardChoices:
         """validate_wizard_choices should always return a list."""
         errors = validate_wizard_choices(wizard_choices_enabled)
         assert isinstance(errors, list)
+
+    def test_validate_invalid_risk_preset(self):
+        """Invalid risk preset should fail validation."""
+        choices = WizardChoices(ad_blocker_enabled=True, risk_preset="nonexistent")
+        errors = validate_wizard_choices(choices)
+        assert len(errors) > 0
+        assert any("invalid risk preset" in e.lower() for e in errors)
+
+
+class TestFormatRiskPresetMenu:
+    """Test suite for format_risk_preset_menu function."""
+
+    def test_returns_string(self):
+        """Menu should return a string."""
+        menu = format_risk_preset_menu()
+        assert isinstance(menu, str)
+
+    def test_contains_all_presets(self):
+        """Menu should contain all three risk presets."""
+        menu = format_risk_preset_menu()
+        assert "Permissive" in menu
+        assert "Balanced" in menu
+        assert "Paranoid" in menu
+
+    def test_contains_numbered_options(self):
+        """Menu should have numbered options."""
+        menu = format_risk_preset_menu()
+        assert "[1]" in menu
+        assert "[2]" in menu
+        assert "[3]" in menu
+
+    def test_contains_default_marker(self):
+        """Menu should mark the default preset."""
+        menu = format_risk_preset_menu()
+        assert "[DEFAULT]" in menu
+
+    def test_contains_descriptions(self):
+        """Menu should include preset descriptions from RISK_PRESETS."""
+        menu = format_risk_preset_menu()
+        for preset in RISK_PRESETS.values():
+            assert preset["description"] in menu
+
+    def test_header_question(self):
+        """Menu should start with the question."""
+        menu = format_risk_preset_menu()
+        assert menu.startswith("How do you want to handle risky commands?")
+
+
+class TestGetPresetFromChoice:
+    """Test suite for get_preset_from_choice function."""
+
+    def test_choice_1_returns_permissive(self):
+        """Choice 1 should return permissive preset."""
+        assert get_preset_from_choice(1) == "permissive"
+
+    def test_choice_2_returns_balanced(self):
+        """Choice 2 should return balanced preset."""
+        assert get_preset_from_choice(2) == "balanced"
+
+    def test_choice_3_returns_paranoid(self):
+        """Choice 3 should return paranoid preset."""
+        assert get_preset_from_choice(3) == "paranoid"
+
+    def test_invalid_choice_zero_raises(self):
+        """Choice 0 should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid choice"):
+            get_preset_from_choice(0)
+
+    def test_invalid_choice_four_raises(self):
+        """Choice 4 should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid choice"):
+            get_preset_from_choice(4)
+
+    def test_invalid_choice_negative_raises(self):
+        """Negative choice should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid choice"):
+            get_preset_from_choice(-1)
