@@ -5,6 +5,13 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.3...schlock-v0.2.4) (2025-12-03)
+
+
+### Bug Fixes
+
+* **security:** close P0 bypass vectors from security review ([#30](https://github.com/27Bslash6/schlock/issues/30)) ([e58f754](https://github.com/27Bslash6/schlock/commit/e58f7545ac0e65b3550af516bfe37030f7205c85))
+
 ## [0.2.3](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.2...schlock-v0.2.3) (2025-12-03)
 
 
