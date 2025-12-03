@@ -161,11 +161,11 @@ class TestCommitFilterCoverage:
         config = {"enabled": True, "rules": {}}
         filter_instance = CommitMessageFilter(config)
 
-        # Use a command that might cause AttributeError in AST traversal
-        # The filter should gracefully fall back to regex
-        message = filter_instance.extract_commit_message('git commit -m "test message"')
-        # Should still extract via regex fallback if bashlex fails
-        assert message is None or "test message" in message
+        # Force AttributeError in bashlex extraction to test fallback
+        with patch.object(filter_instance, "_extract_via_bashlex", side_effect=AttributeError("forced error")):
+            message = filter_instance.extract_commit_message('git commit -m "test message"')
+            # Should extract via regex fallback
+            assert message == "test message"
 
     def test_extract_commit_message_unexpected_error(self):
         """Unexpected error in bashlex extraction falls back to regex."""
