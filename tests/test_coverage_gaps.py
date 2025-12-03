@@ -183,12 +183,10 @@ class TestCommitFilterCoverage:
         config = {"enabled": True, "rules": {}}
         filter_instance = CommitMessageFilter(config)
 
-        with (
-            patch.object(filter_instance, "_extract_via_bashlex", return_value=None),
-            patch.object(filter_instance, "_extract_via_regex", side_effect=Exception("regex failed")),
-        ):
-            message = filter_instance.extract_commit_message('git commit -m "test"')
-            assert message is None
+        with patch.object(filter_instance, "_extract_via_bashlex", return_value=None):  # noqa: SIM117
+            with patch.object(filter_instance, "_extract_via_regex", side_effect=Exception("regex failed")):
+                message = filter_instance.extract_commit_message('git commit -m "test"')
+                assert message is None
 
     def test_load_filter_config_file_not_found(self, tmp_path):
         """load_filter_config returns empty config when file missing."""
