@@ -5,6 +5,18 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.2...schlock-v0.2.3) (2025-12-03)
+
+
+### Bug Fixes
+
+* add issues:write permission to labels workflow ([#27](https://github.com/27Bslash6/schlock/issues/27)) ([767e072](https://github.com/27Bslash6/schlock/commit/767e072d2b77fa4fc283a6062b5b84a65faa7f38))
+
+
+### Performance Improvements
+
+* cache RuleEngine and BashCommandParser to reduce latency 7x ([#29](https://github.com/27Bslash6/schlock/issues/29)) ([b7bb09c](https://github.com/27Bslash6/schlock/commit/b7bb09cd5adb028dcadca957beab659ffbc73b10))
+
 ## [0.2.2](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.1...schlock-v0.2.2) (2025-12-02)
 
 
