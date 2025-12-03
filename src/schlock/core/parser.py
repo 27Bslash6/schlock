@@ -8,7 +8,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import bashlex
 import bashlex.errors
@@ -353,6 +353,7 @@ class BashCommandParser:
         - Command substitution: $(cmd) or `cmd`
         - Process substitution: <(cmd) or >(cmd)
         - eval/exec commands
+        - Remote code execution via curl/wget piped to shell
 
         Args:
             ast_nodes: List of bashlex AST nodes from parse()
@@ -367,6 +368,10 @@ class BashCommandParser:
             ['command substitution detected']
         """
         dangers = []
+
+        # Check for dangerous pipelines (curl | sh patterns)
+        pipeline_dangers = self._detect_dangerous_pipelines(ast_nodes)
+        dangers.extend(pipeline_dangers)
 
         def visit(node):
             """Recursively visit AST nodes to detect dangerous patterns."""
@@ -386,6 +391,168 @@ class BashCommandParser:
                             dangers.append(f"{part.word} command detected")
 
                 # Recursively visit child nodes
+                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                    if hasattr(node, attr):
+                        child = getattr(node, attr)
+                        if isinstance(child, list):
+                            for item in child:
+                                visit(item)
+                        elif child:
+                            visit(child)
+
+        for node in ast_nodes or []:
+            visit(node)
+
+        return dangers
+
+    def _detect_dangerous_pipelines(self, ast_nodes: list[Any]) -> list[str]:
+        """Detect remote code execution patterns in pipelines via AST.
+
+        SECURITY CRITICAL: Detects patterns like 'curl URL | sh' using AST analysis.
+        This is immune to obfuscation techniques that defeat regex patterns:
+        - Environment variable prefixes: curl ... | VAR=value sh
+        - Redirections: curl ... | sh 2>&1
+        - Arguments: curl ... | bash -c
+        - Whitespace tricks
+
+        The AST-based detection looks at the actual command structure:
+        1. Find pipeline nodes
+        2. Extract first command name (download tool?)
+        3. Extract subsequent command names (shell interpreter?)
+
+        Args:
+            ast_nodes: List of bashlex AST nodes from parse()
+
+        Returns:
+            List of warning messages for detected dangerous pipeline patterns
+        """
+        dangers = []
+
+        # Download tools that fetch remote content
+        download_tools = {
+            "curl",
+            "wget",
+            "fetch",
+            "aria2c",
+            "http",
+            "lynx",
+            "links",
+            "elinks",
+            "w3m",  # Text browsers with -dump
+            "nc",
+            "netcat",
+            "ncat",
+            "socat",  # Network tools
+            "GET",
+            "lwp-request",  # Perl LWP tools
+            # Additional download vectors (FINDING-001)
+            "ftp",
+            "tftp",
+            "sftp",  # FTP variants
+            "scp",
+            "rsync",  # Remote copy tools
+            "git",
+            "svn",
+            "hg",  # VCS tools that can fetch remote content
+        }
+
+        # Shell interpreters that execute piped input
+        shell_interpreters = {
+            "bash",
+            "sh",
+            "zsh",
+            "dash",
+            "ksh",
+            "ash",
+            "fish",
+            "python",
+            "python2",
+            "python3",
+            "perl",
+            "ruby",
+            "node",
+            # Additional interpreters (FINDING-002)
+            "env",  # CRITICAL: env bash executes bash with modified environment
+            "xargs",  # xargs sh executes shell with piped args
+            "lua",
+            "lua5.1",
+            "lua5.2",
+            "lua5.3",
+            "lua5.4",
+            "luajit",
+            "php",
+            "php7",
+            "php8",
+            "Rscript",
+            "R",
+            "julia",
+            "pwsh",
+            "powershell",  # PowerShell Core (cross-platform)
+            "tclsh",
+            "wish",  # Tcl interpreters
+            "gawk",
+            "mawk",
+            "nawk",  # awk variants (can execute via system())
+            "busybox",  # Often contains sh applet
+        }
+
+        def get_command_name(node) -> Optional[str]:
+            """Extract the command name from a command node.
+
+            Handles cases where command has assignments before the command name:
+            e.g., 'VAR=value sh' -> 'sh'
+            """
+            if not hasattr(node, "kind") or node.kind != "command":
+                return None
+            if not hasattr(node, "parts"):
+                return None
+
+            for part in node.parts:
+                # Skip assignment nodes (VAR=value prefixes)
+                if hasattr(part, "kind") and part.kind == "assignment":
+                    continue
+                # Skip redirects
+                if hasattr(part, "kind") and part.kind == "redirect":
+                    continue
+                # Found a word node - this is the command name
+                if hasattr(part, "word"):
+                    # Handle paths like /usr/bin/curl -> curl
+                    return part.word.split("/")[-1]
+
+            return None
+
+        def check_pipeline(node):
+            """Check a pipeline node for dangerous patterns."""
+            if not hasattr(node, "parts"):
+                return
+
+            # Extract command names from pipeline parts
+            commands_in_pipeline = []
+            for part in node.parts:
+                if hasattr(part, "kind"):
+                    if part.kind == "command":
+                        cmd_name = get_command_name(part)
+                        if cmd_name:
+                            commands_in_pipeline.append(cmd_name)
+                    elif part.kind == "pipe":
+                        continue  # Skip pipe operators
+
+            # Check for download -> shell pattern
+            if len(commands_in_pipeline) >= 2:
+                first_cmd = commands_in_pipeline[0]
+                if first_cmd in download_tools:
+                    for subsequent_cmd in commands_in_pipeline[1:]:
+                        if subsequent_cmd in shell_interpreters:
+                            dangers.append(f"remote code execution: {first_cmd} piped to {subsequent_cmd}")
+                            break  # One warning per pipeline is enough
+
+        def visit(node):
+            """Recursively visit AST to find pipeline nodes."""
+            if hasattr(node, "kind"):
+                if node.kind == "pipeline":
+                    check_pipeline(node)
+
+                # Recurse into child nodes
                 for attr in ["parts", "command", "list", "pipe", "compound"]:
                     if hasattr(node, attr):
                         child = getattr(node, attr)
