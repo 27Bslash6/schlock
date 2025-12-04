@@ -1,10 +1,114 @@
 """Wizard helper utilities for schlock setup command.
 
 Provides display formatting and validation functions for the wizard flow.
-All functions are pure (no I/O, no state) for testability.
 """
 
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
 from .config_writer import DEFAULT_RISK_PRESET, RISK_PRESETS, WizardChoices
+
+
+def find_schlock_root() -> Path:  # noqa: PLR0912
+    """Find schlock plugin root directory.
+
+    Works in both development mode (running from repo) and installed mode
+    (plugin installed via Claude Code marketplace).
+
+    Returns:
+        Path to schlock plugin root directory
+
+    Raises:
+        RuntimeError: If schlock installation cannot be found
+
+    Search order:
+        1. Current working directory (development mode)
+        2. Claude Code plugin registry (~/.claude/plugins/installed_plugins.json)
+        3. Claude Code marketplaces directory (~/.claude/plugins/marketplaces/)
+
+    Cross-platform:
+        - Windows: Checks APPDATA, LOCALAPPDATA, and home directory
+        - POSIX: Checks home directory
+    """
+    # Try 1: Development mode (cwd is schlock repo)
+    if (Path.cwd() / "src" / "schlock").exists():
+        return Path.cwd()
+
+    # Determine Claude plugins directory (cross-platform)
+    if os.name == "nt":
+        base_dirs = []
+        if appdata := os.environ.get("APPDATA"):
+            base_dirs.append(Path(appdata) / ".claude" / "plugins")
+        if localappdata := os.environ.get("LOCALAPPDATA"):
+            base_dirs.append(Path(localappdata) / ".claude" / "plugins")
+        base_dirs.append(Path.home() / ".claude" / "plugins")
+    else:
+        base_dirs = [Path.home() / ".claude" / "plugins"]
+
+    # Try 2: Check installed plugins registry
+    for base in base_dirs:
+        registry = base / "installed_plugins.json"
+        if registry.exists():
+            try:
+                data = json.loads(registry.read_text(encoding="utf-8"))
+                for plugin_id, info in data.get("plugins", {}).items():
+                    if plugin_id.startswith("schlock@"):
+                        install_path = Path(info.get("installPath", ""))
+                        # Security: Validate path is within expected directories
+                        try:
+                            resolved = install_path.resolve()
+                            if any(resolved.is_relative_to(b.resolve()) for b in base_dirs if b.exists()):
+                                if (resolved / "src" / "schlock").exists():
+                                    return resolved
+                        except (ValueError, OSError):
+                            continue
+            except (OSError, json.JSONDecodeError):
+                continue
+
+    # Try 3: Search marketplaces directories
+    for base in base_dirs:
+        marketplaces = base / "marketplaces"
+        if marketplaces.exists():
+            try:
+                for marketplace in marketplaces.iterdir():
+                    if (marketplace / "src" / "schlock").exists():
+                        return marketplace
+            except OSError:
+                continue
+
+    raise RuntimeError(
+        "Could not find schlock installation. Is the plugin installed? Run: /plugin marketplace add 27Bslash6/schlock"
+    )
+
+
+def setup_schlock_imports() -> Path:
+    """Configure sys.path for schlock imports and return plugin root.
+
+    This is a convenience function for setup command code blocks.
+    Call this at the start of any Python code that needs schlock imports.
+
+    Returns:
+        Path to schlock plugin root directory
+
+    Example:
+        >>> plugin_root = setup_schlock_imports()
+        >>> from schlock.setup.config_writer import WizardChoices
+    """
+    plugin_root = find_schlock_root()
+    vendor_path = str(plugin_root / ".claude-plugin" / "vendor")
+    src_path = str(plugin_root / "src")
+
+    # Add paths if not already present
+    if vendor_path not in sys.path:
+        sys.path.insert(0, vendor_path)
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+
+    return plugin_root
 
 
 def format_risk_preset_menu() -> str:
@@ -13,17 +117,18 @@ def format_risk_preset_menu() -> str:
     Returns:
         Formatted menu string for risk tolerance selection
 
-    Example:
-        "How do you want to handle risky commands?
-
-         [1] Permissive  - Allow most commands, only block critical threats
-                           (Best for: experienced users, local dev)
-
-         [2] Balanced    - Prompt for HIGH-risk, block critical threats
-                           (Best for: most users) [DEFAULT]
-
-         [3] Paranoid    - Prompt for MEDIUM+, block HIGH and critical
-                           (Best for: production environments, compliance)"
+    Examples:
+        >>> menu = format_risk_preset_menu()
+        >>> "How do you want to handle risky commands?" in menu
+        True
+        >>> "[1] Permissive" in menu
+        True
+        >>> "[2] Balanced" in menu
+        True
+        >>> "[3] Paranoid" in menu
+        True
+        >>> "[DEFAULT]" in menu
+        True
     """
     lines = ["How do you want to handle risky commands?", ""]
 
@@ -50,6 +155,22 @@ def get_preset_from_choice(choice: int) -> str:
 
     Raises:
         ValueError: If choice is out of range
+
+    Examples:
+        >>> get_preset_from_choice(1)
+        'permissive'
+        >>> get_preset_from_choice(2)
+        'balanced'
+        >>> get_preset_from_choice(3)
+        'paranoid'
+        >>> get_preset_from_choice(0)
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid choice: 0. Must be 1, 2, or 3.
+        >>> get_preset_from_choice(4)
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid choice: 4. Must be 1, 2, or 3.
     """
     preset_order = ["permissive", "balanced", "paranoid"]
     if 1 <= choice <= 3:
@@ -66,13 +187,27 @@ def format_config_review(choices: WizardChoices) -> str:
     Returns:
         Formatted summary of configuration
 
-    Example:
-        "Configuration Summary:
-         ✓ Risk Tolerance: balanced (Prompt for HIGH-risk)
-         ✓ Claude Advertising Blocker: Enabled
-         ✓ ShellCheck Integration: Enabled
+    Examples:
+        >>> from schlock.setup.config_writer import WizardChoices
+        >>> choices = WizardChoices(ad_blocker_enabled=True, risk_preset="balanced", shellcheck_enabled=True)
+        >>> review = format_config_review(choices)
+        >>> "Configuration Summary:" in review
+        True
+        >>> "Risk Tolerance: balanced" in review
+        True
+        >>> "Claude Advertising Blocker: Enabled" in review
+        True
+        >>> "ShellCheck Integration: Enabled" in review
+        True
 
-         Config will be written to: .claude/hooks/schlock-config.yaml"
+        >>> choices_disabled = WizardChoices(ad_blocker_enabled=False, risk_preset="paranoid", shellcheck_enabled=False)
+        >>> review = format_config_review(choices_disabled)
+        >>> "Risk Tolerance: paranoid" in review
+        True
+        >>> "Advertising Blocker: Disabled" in review
+        True
+        >>> "ShellCheck Integration: Disabled" in review
+        True
     """
     lines = ["Configuration Summary:"]
 
@@ -109,6 +244,36 @@ def validate_wizard_choices(choices: WizardChoices) -> list[str]:
     Checks:
         - Risk preset must be valid
         - At least ad blocker must be enabled (it's still required for commit filtering)
+
+    Examples:
+        >>> from schlock.setup.config_writer import WizardChoices
+
+        Valid configuration returns empty list:
+        >>> choices = WizardChoices(ad_blocker_enabled=True, risk_preset="balanced")
+        >>> validate_wizard_choices(choices)
+        []
+
+        Invalid risk preset:
+        >>> choices = WizardChoices(ad_blocker_enabled=True, risk_preset="invalid")
+        >>> errors = validate_wizard_choices(choices)
+        >>> len(errors) == 1
+        True
+        >>> "Invalid risk preset" in errors[0]
+        True
+
+        Ad blocker disabled (required):
+        >>> choices = WizardChoices(ad_blocker_enabled=False, risk_preset="balanced")
+        >>> errors = validate_wizard_choices(choices)
+        >>> len(errors) == 1
+        True
+        >>> "must be enabled" in errors[0]
+        True
+
+        Multiple errors:
+        >>> choices = WizardChoices(ad_blocker_enabled=False, risk_preset="invalid")
+        >>> errors = validate_wizard_choices(choices)
+        >>> len(errors) == 2
+        True
     """
     errors: list[str] = []
 

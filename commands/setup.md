@@ -8,9 +8,47 @@ argument-hint: (no arguments)
 
 Welcome! I'll help you configure schlock's safety validation in 4 simple steps.
 
-> **schlock v0.2.1** includes ShellCheck integration and configurable risk tolerance!
-
 This wizard generates `.claude/hooks/schlock-config.yaml` that you can share with your team via git.
+
+---
+
+## Bootstrap Helper
+
+All Python code blocks in this wizard need to import from schlock. Use this bootstrap snippet at the start of each code block:
+
+```python
+# Bootstrap: Find schlock and set up imports
+import sys, json, os
+from pathlib import Path
+
+def _find_schlock():
+    if (Path.cwd() / "src" / "schlock").exists():
+        return Path.cwd()
+    base_dirs = []
+    if os.name == "nt":
+        if v := os.environ.get("APPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+        if v := os.environ.get("LOCALAPPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+    base_dirs.append(Path.home() / ".claude" / "plugins")
+    for base in base_dirs:
+        reg = base / "installed_plugins.json"
+        if reg.exists():
+            try:
+                for pid, info in json.loads(reg.read_text(encoding="utf-8")).get("plugins", {}).items():
+                    if pid.startswith("schlock@"):
+                        p = Path(info.get("installPath", ""))
+                        if (p / "src" / "schlock").exists(): return p
+            except: pass
+    for base in base_dirs:
+        mp = base / "marketplaces"
+        if mp.exists():
+            for m in mp.iterdir():
+                if (m / "src" / "schlock").exists(): return m
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
+
+_root = _find_schlock()
+sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
+sys.path.insert(0, str(_root / "src"))
+```
 
 ---
 
@@ -23,19 +61,22 @@ Risk tolerance controls how schlock handles commands at different risk levels:
 
 **Your Task**: Use the `AskUserQuestion` tool to ask:
 
-```
-Question: "How should schlock handle risky (HIGH-risk) commands?"
-Header: "Risk Tolerance"
-MultiSelect: False
-Options:
-  1. "Balanced (recommended)" - Description: "Prompt for approval on HIGH-risk commands. Best for most users - you'll see a confirmation before risky operations."
-  2. "Permissive" - Description: "Allow HIGH-risk commands without prompting. Best for experienced users who know what they're doing."
-  3. "Paranoid" - Description: "Block HIGH-risk commands entirely, prompt for MEDIUM. Best for production environments or compliance requirements."
+```json
+{
+  "question": "How should schlock handle risky (HIGH-risk) commands?",
+  "header": "Risk Tolerance",
+  "multiSelect": false,
+  "options": [
+    {"label": "Balanced (recommended)", "description": "Prompt for approval on HIGH-risk commands. Best for most users."},
+    {"label": "Permissive", "description": "Allow HIGH-risk commands without prompting. For experienced users."},
+    {"label": "Paranoid", "description": "Block HIGH-risk commands entirely, prompt for MEDIUM. For production/compliance."}
+  ]
+}
 ```
 
 **Store the user's choice** as `risk_preset`:
+- "Balanced (recommended)" → `risk_preset = "balanced"`
 - "Permissive" → `risk_preset = "permissive"`
-- "Balanced" → `risk_preset = "balanced"` (default)
 - "Paranoid" → `risk_preset = "paranoid"`
 
 ---
@@ -46,20 +87,13 @@ The Claude Advertising Blocker removes unwanted messages from git commits:
 - "Generated with [Claude Code](https://claude.com/claude-code)"
 - "Co-Authored-By: Claude <noreply@anthropic.com>"
 
-**Recommendation**: Most users prefer clean commits without advertising.
+**This feature is enabled by default** and keeps your git history clean.
 
-**Your Task**: Use the `AskUserQuestion` tool to ask:
+**Your Task**: Inform the user:
 
-```
-Question: "Enable Claude Advertising Blocker?"
-Header: "Ad Blocker"
-MultiSelect: False
-Options:
-  1. "Enable (recommended)" - Description: "Blocks 'Generated with Claude Code' spam from commits. Keeps your git history clean."
-  2. "Disable" - Description: "Allow Claude advertising in commits. Only choose this if you specifically want to credit Claude."
-```
+> "The Claude Advertising Blocker is enabled. This removes 'Generated with Claude Code' spam from your commits, keeping your git history clean and professional."
 
-**Store the user's choice** as `ad_blocker_enabled` (True for Enable, False for Disable).
+**Set** `ad_blocker_enabled = True`
 
 ---
 
@@ -68,21 +102,48 @@ Options:
 **First, detect if ShellCheck is installed** by running:
 
 ```python
-import sys
+# Bootstrap: Find schlock and set up imports
+import sys, json, os
 from pathlib import Path
 
-project_root = Path.cwd()
-sys.path.insert(0, str(project_root / "src"))
+def _find_schlock():
+    if (Path.cwd() / "src" / "schlock").exists():
+        return Path.cwd()
+    base_dirs = []
+    if os.name == "nt":
+        if v := os.environ.get("APPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+        if v := os.environ.get("LOCALAPPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+    base_dirs.append(Path.home() / ".claude" / "plugins")
+    for base in base_dirs:
+        reg = base / "installed_plugins.json"
+        if reg.exists():
+            try:
+                for pid, info in json.loads(reg.read_text(encoding="utf-8")).get("plugins", {}).items():
+                    if pid.startswith("schlock@"):
+                        p = Path(info.get("installPath", ""))
+                        if (p / "src" / "schlock").exists(): return p
+            except: pass
+    for base in base_dirs:
+        mp = base / "marketplaces"
+        if mp.exists():
+            for m in mp.iterdir():
+                if (m / "src" / "schlock").exists(): return m
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
 
+_root = _find_schlock()
+sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
+sys.path.insert(0, str(_root / "src"))
+
+# Actual logic
 from schlock.integrations.shellcheck import is_shellcheck_available, get_shellcheck_version, get_install_instructions
 
 if is_shellcheck_available():
     version = get_shellcheck_version()
-    print(f"✓ ShellCheck v{version} detected")
+    print(f"ShellCheck v{version} detected")
     shellcheck_available = True
 else:
-    print("✗ ShellCheck not installed")
-    print(f"  Install with: {get_install_instructions()}")
+    print("ShellCheck not installed")
+    print(f"Install with: {get_install_instructions()}")
     shellcheck_available = False
 ```
 
@@ -90,13 +151,16 @@ else:
 
 Use the `AskUserQuestion` tool to ask:
 
-```
-Question: "Enable ShellCheck integration for enhanced security analysis?"
-Header: "ShellCheck"
-MultiSelect: False
-Options:
-  1. "Enable (recommended)" - Description: "Run ShellCheck on commands for additional security analysis. Catches injection vulnerabilities and unsafe patterns."
-  2. "Disable" - Description: "Skip ShellCheck analysis. schlock's built-in rules will still protect you."
+```json
+{
+  "question": "Enable ShellCheck integration for enhanced security analysis?",
+  "header": "ShellCheck",
+  "multiSelect": false,
+  "options": [
+    {"label": "Enable (recommended)", "description": "Run ShellCheck on commands for additional security analysis."},
+    {"label": "Disable", "description": "Skip ShellCheck analysis. schlock's built-in rules still protect you."}
+  ]
+}
 ```
 
 **Store the user's choice** as `shellcheck_enabled` (True for Enable, False for Disable).
@@ -105,23 +169,24 @@ Options:
 
 Use the `AskUserQuestion` tool to ask:
 
-```
-Question: "ShellCheck is not installed. Would you like to install it?"
-Header: "ShellCheck"
-MultiSelect: False
-Options:
-  1. "Yes, show install command" - Description: "Display the installation command for your platform. You can install now or later."
-  2. "Skip for now" - Description: "Continue without ShellCheck. You can enable it later by running /schlock:setup again after installing."
+```json
+{
+  "question": "ShellCheck is not installed. Would you like to install it?",
+  "header": "ShellCheck",
+  "multiSelect": false,
+  "options": [
+    {"label": "Show install command", "description": "Display the installation command for your platform."},
+    {"label": "Skip for now", "description": "Continue without ShellCheck. Run /schlock:setup again after installing."}
+  ]
+}
 ```
 
-**If user selects "Yes, show install command"**:
+**If user selects "Show install command"**:
 - Display the installation command from `get_install_instructions()`
 - Set `shellcheck_enabled = False` (they can re-run wizard after installing)
-- Continue to Step 4
 
 **If user selects "Skip for now"**:
 - Set `shellcheck_enabled = False`
-- Continue to Step 4
 
 ---
 
@@ -132,17 +197,44 @@ Now I'll show you a summary and save the configuration.
 **Your Task (Part A - Display Review)**: Run this Python code to generate the summary:
 
 ```python
-import sys
+# Bootstrap: Find schlock and set up imports
+import sys, json, os
 from pathlib import Path
 
-# Adjust path to match actual project location
-project_root = Path.cwd()
-sys.path.insert(0, str(project_root / "src"))
+def _find_schlock():
+    if (Path.cwd() / "src" / "schlock").exists():
+        return Path.cwd()
+    base_dirs = []
+    if os.name == "nt":
+        if v := os.environ.get("APPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+        if v := os.environ.get("LOCALAPPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+    base_dirs.append(Path.home() / ".claude" / "plugins")
+    for base in base_dirs:
+        reg = base / "installed_plugins.json"
+        if reg.exists():
+            try:
+                for pid, info in json.loads(reg.read_text(encoding="utf-8")).get("plugins", {}).items():
+                    if pid.startswith("schlock@"):
+                        p = Path(info.get("installPath", ""))
+                        if (p / "src" / "schlock").exists(): return p
+            except: pass
+    for base in base_dirs:
+        mp = base / "marketplaces"
+        if mp.exists():
+            for m in mp.iterdir():
+                if (m / "src" / "schlock").exists(): return m
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
 
+_root = _find_schlock()
+sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
+sys.path.insert(0, str(_root / "src"))
+
+# Actual logic
 from schlock.setup.config_writer import WizardChoices, write_config
 from schlock.setup.wizard import format_config_review, validate_wizard_choices
+from schlock.integrations.shellcheck import get_install_instructions
 
-# Build choices from Steps 1-3
+# Build choices from Steps 1-3 (Claude substitutes actual values)
 choices = WizardChoices(
     ad_blocker_enabled=ad_blocker_enabled,
     risk_preset=risk_preset,
@@ -155,11 +247,10 @@ if validation_errors:
     print("Configuration validation failed:")
     for error in validation_errors:
         print(f"  - {error}")
-    print("\nPlease fix these issues and try again.")
-    # STOP - don't proceed
+    print("\nRun /schlock:setup again to restart.")
 else:
-    # Display review
     print(format_config_review(choices))
+    config_valid = True
 ```
 
 **If validation errors exist**:
@@ -170,13 +261,16 @@ else:
 
 **Your Task (Part B - Confirm Write)**: Use the `AskUserQuestion` tool:
 
-```
-Question: "Save this configuration?"
-Header: "Confirm"
-MultiSelect: False
-Options:
-  1. "Yes, save configuration" - Description: "Write config to .claude/hooks/schlock-config.yaml. Existing config will be backed up."
-  2. "Cancel setup" - Description: "Exit without saving. Run /schlock:setup again later to configure."
+```json
+{
+  "question": "Save this configuration?",
+  "header": "Confirm",
+  "multiSelect": false,
+  "options": [
+    {"label": "Yes, save configuration", "description": "Write config to .claude/hooks/schlock-config.yaml."},
+    {"label": "Cancel setup", "description": "Exit without saving. Run /schlock:setup again later."}
+  ]
+}
 ```
 
 **If user selects "Cancel setup"**:
@@ -188,18 +282,61 @@ Options:
 **Your Task (Part C - Write Config)**: Run this Python code:
 
 ```python
+# Bootstrap: Find schlock and set up imports (REQUIRED - each code block is separate)
+import sys, json, os
+from pathlib import Path
+
+def _find_schlock():
+    if (Path.cwd() / "src" / "schlock").exists():
+        return Path.cwd()
+    base_dirs = []
+    if os.name == "nt":
+        if v := os.environ.get("APPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+        if v := os.environ.get("LOCALAPPDATA"): base_dirs.append(Path(v) / ".claude" / "plugins")
+    base_dirs.append(Path.home() / ".claude" / "plugins")
+    for base in base_dirs:
+        reg = base / "installed_plugins.json"
+        if reg.exists():
+            try:
+                for pid, info in json.loads(reg.read_text(encoding="utf-8")).get("plugins", {}).items():
+                    if pid.startswith("schlock@"):
+                        p = Path(info.get("installPath", ""))
+                        if (p / "src" / "schlock").exists(): return p
+            except: pass
+    for base in base_dirs:
+        mp = base / "marketplaces"
+        if mp.exists():
+            for m in mp.iterdir():
+                if (m / "src" / "schlock").exists(): return m
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
+
+_root = _find_schlock()
+sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
+sys.path.insert(0, str(_root / "src"))
+
+# Actual logic
+from schlock.setup.config_writer import WizardChoices, write_config
+from schlock.integrations.shellcheck import get_install_instructions
+
+# Reconstruct choices (Claude substitutes actual values from earlier steps)
+choices = WizardChoices(
+    ad_blocker_enabled=ad_blocker_enabled,
+    risk_preset=risk_preset,
+    shellcheck_enabled=shellcheck_enabled
+)
+
 result = write_config(choices, create_backup_flag=True)
 
 if result.success:
     print(f"Configuration saved to {result.config_path}")
     if result.backup_path:
-        print(f"   (Previous config backed up to {result.backup_path})")
+        print(f"(Previous config backed up to {result.backup_path})")
     print("\nNext steps:")
     print("- Config is active immediately (no restart needed)")
     print("- Share .claude/hooks/ in git for team standardization")
     print("- Run /schlock:setup again anytime to reconfigure")
     if not shellcheck_enabled:
-        print("- Install ShellCheck for enhanced security: " + get_install_instructions())
+        print(f"- Install ShellCheck for enhanced security: {get_install_instructions()}")
 else:
     print(f"Failed to write configuration: {result.error}")
     if result.validation_errors:
@@ -233,11 +370,11 @@ else:
 
 ## Important Notes
 
-1. **Path adjustment**: The example code uses `Path.cwd()` to find project root. Adjust if needed based on environment.
+1. **Each code block is independent**: Python code blocks run in separate processes. Each block must include the bootstrap snippet.
 
-2. **Validation is mandatory**: Always run `validate_wizard_choices()` before writing. Invalid configs must not be written.
+2. **Variable substitution**: Claude stores user choices in context and substitutes them into Python code (e.g., `ad_blocker_enabled`, `risk_preset`, `shellcheck_enabled`).
 
-3. **Progress indicators**: Show "Step X of 4" in section headers.
+3. **Validation is mandatory**: Always run `validate_wizard_choices()` before writing. Invalid configs must not be written.
 
 4. **Risk tolerance presets**:
    - `permissive`: Allow HIGH-risk commands (experienced users)
