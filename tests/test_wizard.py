@@ -235,9 +235,9 @@ class TestFindSchlockRoot:
         ):
             find_schlock_root()
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows path classes only on Windows")
     def test_windows_checks_appdata(self, tmp_path, monkeypatch):
-        """Windows: APPDATA and LOCALAPPDATA should be checked."""
+        """Windows: APPDATA should be checked first."""
         monkeypatch.chdir(tmp_path)
 
         # Create plugin in APPDATA location
@@ -246,7 +246,6 @@ class TestFindSchlockRoot:
         (plugin_path / "src" / "schlock").mkdir(parents=True)
 
         with (
-            patch("schlock.setup.wizard.os.name", "nt"),
             patch.dict("os.environ", {"APPDATA": str(appdata), "LOCALAPPDATA": ""}),
             patch.object(Path, "home", return_value=tmp_path / "home"),
         ):
@@ -254,32 +253,68 @@ class TestFindSchlockRoot:
 
         assert result == plugin_path.resolve()
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
-    def test_windows_path_construction(self, tmp_path, monkeypatch):
-        """Windows env vars should be included in base_dirs when os.name is 'nt'."""
-        # This tests the path construction logic without actually using Windows paths
-        # We verify that when os.name == 'nt', the APPDATA/LOCALAPPDATA paths are checked
-
-        # First, make sure cwd doesn't have src/schlock (otherwise returns early)
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows path classes only on Windows")
+    def test_windows_localappdata_fallback(self, tmp_path, monkeypatch):
+        """Windows: LOCALAPPDATA should be checked if APPDATA fails."""
         monkeypatch.chdir(tmp_path)
 
-        # Create plugin at APPDATA location
-        appdata = tmp_path / "appdata"
-        plugin_path = appdata / ".claude" / "plugins" / "marketplaces" / "27b"
+        # Create plugin in LOCALAPPDATA location
+        localappdata = tmp_path / "localappdata"
+        plugin_path = localappdata / ".claude" / "plugins" / "marketplaces" / "27b"
         (plugin_path / "src" / "schlock").mkdir(parents=True)
 
         with (
-            patch("schlock.setup.wizard.os.name", "nt"),
             patch.dict(
                 "os.environ",
-                {"APPDATA": str(appdata), "LOCALAPPDATA": str(tmp_path / "localappdata")},
+                {"APPDATA": str(tmp_path / "empty_appdata"), "LOCALAPPDATA": str(localappdata)},
             ),
             patch.object(Path, "home", return_value=tmp_path / "home"),
         ):
             result = find_schlock_root()
 
-        # If Windows paths are being checked, we should find the plugin
         assert result == plugin_path.resolve()
+
+    def test_registry_oserror_continues(self, tmp_path, monkeypatch):
+        """Registry read OSError should be handled gracefully."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugins directory structure
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        plugins_dir.mkdir(parents=True)
+
+        # Create registry file that will cause OSError when read
+        registry = plugins_dir / "installed_plugins.json"
+        registry.write_text('{"plugins": {"schlock@27b": {"installPath": "/nonexistent"}}}')
+
+        # Create fallback in marketplace
+        marketplace = plugins_dir / "marketplaces" / "27b"
+        (marketplace / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        # Should fall through to marketplace scan
+        assert result == marketplace.resolve()
+
+    def test_marketplace_oserror_continues(self, tmp_path, monkeypatch):
+        """Marketplace scan OSError should be handled gracefully."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugins directory but make marketplace dir unreadable
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        marketplaces = plugins_dir / "marketplaces"
+        marketplaces.mkdir(parents=True)
+
+        # Create a valid marketplace after the mock raises OSError
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+            pytest.raises(RuntimeError, match="Could not find schlock"),
+        ):
+            find_schlock_root()
 
     def test_registry_invalid_json_continues(self, tmp_path, monkeypatch):
         """Invalid JSON in registry should be skipped gracefully."""
