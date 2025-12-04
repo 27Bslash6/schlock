@@ -25,3 +25,28 @@ jobs:
         id: release
         with:
           token: ${{ steps.app-token.outputs.token }}
+
+      # Sync uv.lock on the release PR branch (before merge)
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.pr }}
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+
+      - uses: astral-sh/setup-uv@v4
+        if: ${{ steps.release.outputs.pr }}
+
+      - name: Sync uv.lock on release PR
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          set -e
+          uv lock
+          if git diff --quiet uv.lock; then
+            echo "uv.lock already in sync"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add uv.lock
+            git commit -m "chore: sync uv.lock"
+            git push
+          fi
