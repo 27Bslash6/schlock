@@ -76,7 +76,13 @@ def find_schlock_root() -> Path:  # noqa: PLR0912
             try:
                 for marketplace in marketplaces.iterdir():
                     if (marketplace / "src" / "schlock").exists():
-                        return marketplace
+                        # Security: Validate path is within expected directories (symlink protection)
+                        try:
+                            resolved = marketplace.resolve()
+                            if any(resolved.is_relative_to(b.resolve()) for b in base_dirs if b.exists()):
+                                return resolved
+                        except (ValueError, OSError):
+                            continue
             except OSError:
                 continue
 
