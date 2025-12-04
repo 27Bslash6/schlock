@@ -5,6 +5,13 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.4...schlock-v0.2.5) (2025-12-04)
+
+
+### Bug Fixes
+
+* **setup:** resolve module import failures on customer systems ([#34](https://github.com/27Bslash6/schlock/issues/34)) ([87de78f](https://github.com/27Bslash6/schlock/commit/87de78f1ac992e5a81f45945192186a077d6a4a8))
+
 ## [0.2.4](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.3...schlock-v0.2.4) (2025-12-03)
 
 
