@@ -1,6 +1,6 @@
 {
   "name": "schlock",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "LLM command safety validator for AI coding assistants. Blocks dangerous bash commands and Claude advertising spam.",
   "author": {
     "name": "27B.io",
