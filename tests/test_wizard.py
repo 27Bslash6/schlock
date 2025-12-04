@@ -1,12 +1,19 @@
 """Tests for wizard helper utilities."""
 
+import json
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 
 from schlock.setup.config_writer import RISK_PRESETS, WizardChoices
 from schlock.setup.wizard import (
+    find_schlock_root,
     format_config_review,
     format_risk_preset_menu,
     get_preset_from_choice,
+    setup_schlock_imports,
     validate_wizard_choices,
 )
 
@@ -158,3 +165,471 @@ class TestGetPresetFromChoice:
         """Negative choice should raise ValueError."""
         with pytest.raises(ValueError, match="Invalid choice"):
             get_preset_from_choice(-1)
+
+
+class TestFindSchlockRoot:
+    """Test suite for find_schlock_root function."""
+
+    def test_development_mode_finds_cwd(self, tmp_path, monkeypatch):
+        """Development mode: cwd with src/schlock should be found."""
+        # Create src/schlock structure
+        (tmp_path / "src" / "schlock").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+
+        result = find_schlock_root()
+        assert result == tmp_path
+
+    def test_registry_lookup_finds_plugin(self, tmp_path, monkeypatch):
+        """Registry lookup: installed_plugins.json should be searched."""
+        # Ensure cwd doesn't have src/schlock
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugin structure under the expected .claude/plugins path
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        plugin_path = plugins_dir / "marketplaces" / "27b"
+        (plugin_path / "src" / "schlock").mkdir(parents=True)
+
+        # Create registry
+        registry = plugins_dir / "installed_plugins.json"
+        registry_data = {
+            "plugins": {
+                "schlock@27b": {
+                    "installPath": str(plugin_path),
+                }
+            }
+        }
+        registry.write_text(json.dumps(registry_data))
+
+        # Mock home to use our tmp_path and patch os.name for non-Windows path
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        assert result == plugin_path.resolve()
+
+    def test_marketplace_scan_finds_plugin(self, tmp_path, monkeypatch):
+        """Marketplace scan: marketplaces directory should be searched."""
+        # Ensure cwd doesn't have src/schlock
+        monkeypatch.chdir(tmp_path)
+
+        # Create marketplace plugin structure
+        marketplace = tmp_path / ".claude" / "plugins" / "marketplaces" / "27b"
+        (marketplace / "src" / "schlock").mkdir(parents=True)
+
+        # Mock home directory
+        with patch.object(Path, "home", return_value=tmp_path), patch("schlock.setup.wizard.os.name", "posix"):
+            result = find_schlock_root()
+
+        assert result == marketplace.resolve()
+
+    def test_raises_when_not_found(self, tmp_path, monkeypatch):
+        """RuntimeError should be raised when schlock is not found."""
+        monkeypatch.chdir(tmp_path)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+            pytest.raises(RuntimeError, match="Could not find schlock"),
+        ):
+            find_schlock_root()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows path classes only on Windows")
+    def test_windows_checks_appdata(self, tmp_path, monkeypatch):
+        """Windows: APPDATA should be checked first."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugin in APPDATA location
+        appdata = tmp_path / "appdata"
+        plugin_path = appdata / ".claude" / "plugins" / "marketplaces" / "27b"
+        (plugin_path / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.dict("os.environ", {"APPDATA": str(appdata), "LOCALAPPDATA": ""}),
+            patch.object(Path, "home", return_value=tmp_path / "home"),
+        ):
+            result = find_schlock_root()
+
+        assert result == plugin_path.resolve()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows path classes only on Windows")
+    def test_windows_localappdata_fallback(self, tmp_path, monkeypatch):
+        """Windows: LOCALAPPDATA should be checked if APPDATA fails."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugin in LOCALAPPDATA location
+        localappdata = tmp_path / "localappdata"
+        plugin_path = localappdata / ".claude" / "plugins" / "marketplaces" / "27b"
+        (plugin_path / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"APPDATA": str(tmp_path / "empty_appdata"), "LOCALAPPDATA": str(localappdata)},
+            ),
+            patch.object(Path, "home", return_value=tmp_path / "home"),
+        ):
+            result = find_schlock_root()
+
+        assert result == plugin_path.resolve()
+
+    def test_registry_oserror_continues(self, tmp_path, monkeypatch):
+        """Registry read OSError should be handled gracefully."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugins directory structure
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        plugins_dir.mkdir(parents=True)
+
+        # Create registry file that will cause OSError when read
+        registry = plugins_dir / "installed_plugins.json"
+        registry.write_text('{"plugins": {"schlock@27b": {"installPath": "/nonexistent"}}}')
+
+        # Create fallback in marketplace
+        marketplace = plugins_dir / "marketplaces" / "27b"
+        (marketplace / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        # Should fall through to marketplace scan
+        assert result == marketplace.resolve()
+
+    def test_marketplace_iterdir_oserror_continues(self, tmp_path, monkeypatch):
+        """Marketplace iterdir() OSError should be handled gracefully."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugins directory with marketplace
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        marketplaces = plugins_dir / "marketplaces"
+        marketplaces.mkdir(parents=True)
+
+        # Mock iterdir to raise OSError
+        original_iterdir = Path.iterdir
+
+        def mock_iterdir(self):
+            if "marketplaces" in str(self):
+                raise OSError("Permission denied")
+            return original_iterdir(self)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+            patch.object(Path, "iterdir", mock_iterdir),
+            pytest.raises(RuntimeError, match="Could not find schlock"),
+        ):
+            find_schlock_root()
+
+    def test_registry_invalid_json_continues(self, tmp_path, monkeypatch):
+        """Invalid JSON in registry should be skipped gracefully."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create invalid registry
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        plugins_dir.mkdir(parents=True)
+        (plugins_dir / "installed_plugins.json").write_text("not valid json")
+
+        # Create fallback in marketplace
+        marketplace = plugins_dir / "marketplaces" / "27b"
+        (marketplace / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        assert result == marketplace.resolve()
+
+    def test_registry_skips_non_schlock_plugins(self, tmp_path, monkeypatch):
+        """Registry should skip plugins that don't start with 'schlock@'."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create registry with non-schlock plugins only
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        plugins_dir.mkdir(parents=True)
+        registry = plugins_dir / "installed_plugins.json"
+        registry_data = {
+            "plugins": {
+                "other-plugin@v1": {"installPath": "/some/path"},
+                "another-plugin@v2": {"installPath": "/other/path"},
+            }
+        }
+        registry.write_text(json.dumps(registry_data))
+
+        # Create fallback in marketplace
+        marketplace = plugins_dir / "marketplaces" / "27b"
+        (marketplace / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        # Should fall through to marketplace
+        assert result == marketplace.resolve()
+
+    def test_registry_skips_schlock_without_src_dir(self, tmp_path, monkeypatch):
+        """Registry should skip schlock entries without src/schlock directory."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create schlock install path WITHOUT src/schlock
+        broken_schlock = tmp_path / ".claude" / "plugins" / "broken_schlock"
+        broken_schlock.mkdir(parents=True)
+
+        # Create registry pointing to broken install
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        registry = plugins_dir / "installed_plugins.json"
+        registry_data = {
+            "plugins": {
+                "schlock@27b": {"installPath": str(broken_schlock)},
+            }
+        }
+        registry.write_text(json.dumps(registry_data))
+
+        # Create fallback in marketplace
+        marketplace = plugins_dir / "marketplaces" / "working"
+        (marketplace / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        # Should fall through to marketplace
+        assert result == marketplace.resolve()
+
+    def test_marketplace_skips_dirs_without_src_schlock(self, tmp_path, monkeypatch):
+        """Marketplace scan should skip directories without src/schlock."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create marketplace with mixed directories
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        marketplaces = plugins_dir / "marketplaces"
+
+        # Directory without src/schlock
+        (marketplaces / "other-plugin").mkdir(parents=True)
+        (marketplaces / "another-plugin" / "lib").mkdir(parents=True)
+
+        # Directory with src/schlock (should be found)
+        (marketplaces / "schlock" / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        assert result == (marketplaces / "schlock").resolve()
+
+    def test_marketplace_rejects_symlink_outside_basedirs(self, tmp_path, monkeypatch):
+        """Marketplace should reject symlinks pointing outside base_dirs."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create target outside base_dirs
+        outside_target = tmp_path / "outside" / "schlock"
+        (outside_target / "src" / "schlock").mkdir(parents=True)
+
+        # Create symlink in marketplace pointing outside
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        marketplaces = plugins_dir / "marketplaces"
+        marketplaces.mkdir(parents=True)
+
+        symlink_path = marketplaces / "bad_symlink"
+        symlink_path.symlink_to(outside_target)
+
+        # Create valid fallback
+        (marketplaces / "good" / "src" / "schlock").mkdir(parents=True)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+        ):
+            result = find_schlock_root()
+
+        # Should skip the symlink and find the good one
+        assert result == (marketplaces / "good").resolve()
+
+    def test_registry_resolve_oserror_continues(self, tmp_path, monkeypatch):
+        """Registry path resolution OSError should skip entry gracefully."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create registry with schlock plugin
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        plugins_dir.mkdir(parents=True)
+        registry = plugins_dir / "installed_plugins.json"
+        registry_data = {
+            "plugins": {
+                "schlock@27b": {"installPath": str(plugins_dir / "schlock")},
+            }
+        }
+        registry.write_text(json.dumps(registry_data))
+
+        # Create fallback in marketplace
+        marketplace = plugins_dir / "marketplaces" / "27b"
+        (marketplace / "src" / "schlock").mkdir(parents=True)
+
+        # Mock resolve() to raise OSError for the registry path
+        original_resolve = Path.resolve
+
+        def mock_resolve(self):
+            if "schlock" in str(self) and "marketplaces" not in str(self):
+                raise OSError("Mocked resolution error")
+            return original_resolve(self)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+            patch.object(Path, "resolve", mock_resolve),
+        ):
+            result = find_schlock_root()
+
+        # Should fall through to marketplace
+        assert result == marketplace.resolve()
+
+    def test_marketplace_resolve_oserror_continues(self, tmp_path, monkeypatch):
+        """Marketplace path resolution OSError should skip entry gracefully."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create marketplace directories
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        marketplaces = plugins_dir / "marketplaces"
+
+        # First marketplace entry (will fail resolution)
+        bad_marketplace = marketplaces / "bad"
+        (bad_marketplace / "src" / "schlock").mkdir(parents=True)
+
+        # Second marketplace entry (will succeed)
+        good_marketplace = marketplaces / "good"
+        (good_marketplace / "src" / "schlock").mkdir(parents=True)
+
+        # Mock resolve() to raise OSError for first marketplace
+        original_resolve = Path.resolve
+        call_count = [0]
+
+        def mock_resolve(self):
+            if "bad" in str(self) and "src" not in str(self):
+                call_count[0] += 1
+                if call_count[0] <= 1:
+                    raise OSError("Mocked resolution error")
+            return original_resolve(self)
+
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+            patch.object(Path, "resolve", mock_resolve),
+        ):
+            result = find_schlock_root()
+
+        # Should find the good marketplace
+        assert result == good_marketplace.resolve()
+
+    def test_registry_path_outside_basedirs_rejected(self, tmp_path, monkeypatch):
+        """Registry paths outside base_dirs should be rejected for security."""
+        monkeypatch.chdir(tmp_path)
+
+        # Create plugin outside expected location
+        outside_path = tmp_path / "somewhere" / "else"
+        (outside_path / "src" / "schlock").mkdir(parents=True)
+
+        # Create registry pointing to it
+        plugins_dir = tmp_path / ".claude" / "plugins"
+        plugins_dir.mkdir(parents=True)
+        registry = plugins_dir / "installed_plugins.json"
+        registry_data = {
+            "plugins": {
+                "schlock@27b": {
+                    "installPath": str(outside_path),
+                }
+            }
+        }
+        registry.write_text(json.dumps(registry_data))
+
+        # Should raise because path is outside base_dirs
+        with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("schlock.setup.wizard.os.name", "posix"),
+            pytest.raises(RuntimeError, match="Could not find schlock"),
+        ):
+            find_schlock_root()
+
+
+class TestSetupSchlockImports:
+    """Test suite for setup_schlock_imports function."""
+
+    def test_returns_plugin_root(self, tmp_path, monkeypatch):
+        """setup_schlock_imports should return plugin root path."""
+        # Create src/schlock structure for development mode
+        (tmp_path / "src" / "schlock").mkdir(parents=True)
+        (tmp_path / ".claude-plugin" / "vendor").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+
+        # Track original sys.path
+        original_path = sys.path.copy()
+
+        try:
+            result = setup_schlock_imports()
+            assert result == tmp_path
+        finally:
+            # Restore sys.path
+            sys.path[:] = original_path
+
+    def test_adds_vendor_to_syspath(self, tmp_path, monkeypatch):
+        """setup_schlock_imports should add vendor path to sys.path."""
+        (tmp_path / "src" / "schlock").mkdir(parents=True)
+        (tmp_path / ".claude-plugin" / "vendor").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+
+        original_path = sys.path.copy()
+
+        try:
+            setup_schlock_imports()
+            vendor_path = str(tmp_path / ".claude-plugin" / "vendor")
+            assert vendor_path in sys.path
+        finally:
+            sys.path[:] = original_path
+
+    def test_adds_src_to_syspath(self, tmp_path, monkeypatch):
+        """setup_schlock_imports should add src path to sys.path."""
+        (tmp_path / "src" / "schlock").mkdir(parents=True)
+        (tmp_path / ".claude-plugin" / "vendor").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+
+        original_path = sys.path.copy()
+
+        try:
+            setup_schlock_imports()
+            src_path = str(tmp_path / "src")
+            assert src_path in sys.path
+        finally:
+            sys.path[:] = original_path
+
+    def test_idempotent_path_insertion(self, tmp_path, monkeypatch):
+        """Calling setup_schlock_imports twice should not duplicate paths."""
+        (tmp_path / "src" / "schlock").mkdir(parents=True)
+        (tmp_path / ".claude-plugin" / "vendor").mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+
+        original_path = sys.path.copy()
+
+        try:
+            setup_schlock_imports()
+            setup_schlock_imports()
+
+            vendor_path = str(tmp_path / ".claude-plugin" / "vendor")
+            src_path = str(tmp_path / "src")
+
+            # Count occurrences
+            vendor_count = sys.path.count(vendor_path)
+            src_count = sys.path.count(src_path)
+
+            assert vendor_count == 1, f"vendor_path appears {vendor_count} times"
+            assert src_count == 1, f"src_path appears {src_count} times"
+        finally:
+            sys.path[:] = original_path
