@@ -5,6 +5,13 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.5...schlock-v0.2.6) (2025-12-06)
+
+
+### Bug Fixes
+
+* allow safe command/process substitution patterns ([#38](https://github.com/27Bslash6/schlock/issues/38)) ([0f95ed4](https://github.com/27Bslash6/schlock/commit/0f95ed4fb36426e6900b01cb002e8a0da1c8889d))
+
 ## [0.2.5](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.4...schlock-v0.2.5) (2025-12-04)
 
 

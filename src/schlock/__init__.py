@@ -15,7 +15,7 @@ Public API:
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import ValidationResult, validate_command
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 __author__ = "27B.io"
 
 __all__ = [
