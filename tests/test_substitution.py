@@ -1643,11 +1643,12 @@ class TestRemainingBranchCoverage:
         # chmod is often a MEDIUM risk command
         ast = parser.parse('echo "$(chmod +x script.sh)"')
         results = validator.validate_all_substitutions(ast)
-        if results:
-            # chmod should trigger some response
-            result = results[0]
-            # Either blocked or flagged
-            assert isinstance(result, SubstitutionValidationResult)
+        # chmod should be detected and flagged
+        assert results, "Expected results for chmod command"
+        result = results[0]
+        assert isinstance(result, SubstitutionValidationResult)
+        # chmod is not whitelisted, so should be flagged with non-SAFE risk
+        assert result.risk_level != RiskLevel.SAFE, f"Expected non-SAFE risk for chmod, got {result.risk_level}"
 
     def test_process_substitution_to_dangerous_command(self, validator):
         """Process substitution to dangerous command in blacklist."""
