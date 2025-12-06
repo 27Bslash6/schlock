@@ -40,11 +40,21 @@ class TestBashCommandParser:
         commands = parser.extract_commands(ast)
         assert expected_cmd in commands
 
-    def test_parse_subshells(self, parser):
-        """Parse subshell command substitution."""
-        ast = parser.parse("rm $(whoami)")
+    def test_has_dangerous_constructs_detects_eval(self, parser):
+        """has_dangerous_constructs detects eval command."""
+        ast = parser.parse("eval 'dangerous'")
         dangers = parser.has_dangerous_constructs(ast)
-        assert "command substitution detected" in dangers
+        assert "eval command detected" in dangers
+
+    def test_has_dangerous_constructs_allows_safe_substitution(self, parser):
+        """has_dangerous_constructs allows safe command substitution.
+
+        Command substitution is handled by YAML rules, not blanket blocking.
+        This allows patterns like $(op read ...) for 1Password.
+        """
+        ast = parser.parse('echo "$(date)"')
+        dangers = parser.has_dangerous_constructs(ast)
+        assert dangers == []  # No blanket blocking
 
     @pytest.mark.parametrize(
         "invalid_command,error_substring",
@@ -98,11 +108,15 @@ class TestBashCommandParser:
             parser.parse("   \t\n  ")
         assert "cannot be whitespace-only" in str(exc.value)
 
-    def test_process_substitution_detection(self, parser):
-        """Detect process substitution constructs."""
+    def test_process_substitution_allowed(self, parser):
+        """Safe process substitution is allowed (not blanket blocked).
+
+        Process substitution is handled by YAML rules, not blanket blocking.
+        This allows safe patterns like diff <(ls dir1) <(ls dir2).
+        """
         ast = parser.parse("diff <(ls dir1) <(ls dir2)")
         dangers = parser.has_dangerous_constructs(ast)
-        assert "process substitution detected" in dangers
+        assert dangers == []  # No blanket blocking
 
 
 class TestDangerousPipelineDetection:

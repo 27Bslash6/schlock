@@ -348,12 +348,16 @@ class BashCommandParser:
     def has_dangerous_constructs(self, ast_nodes: list[Any]) -> list[str]:
         """Detect dangerous shell constructs in AST.
 
-        Checks for constructs that enable command injection or arbitrary
-        code execution:
-        - Command substitution: $(cmd) or `cmd`
-        - Process substitution: <(cmd) or >(cmd)
+        Checks for constructs that enable arbitrary code execution:
         - eval/exec commands
         - Remote code execution via curl/wget piped to shell
+
+        Note: Command substitution $(cmd) and process substitution <(cmd) are
+        NOT flagged here. They are handled by SubstitutionValidator which uses:
+        1. Whitelist of safe commands (op, date, git, pwd, etc.)
+        2. AST structural checks for bypass patterns (brace expansion, variables)
+        3. Recursive validation with depth limit
+        This prevents false positives on 1Password CLI while blocking attacks.
 
         Args:
             ast_nodes: List of bashlex AST nodes from parse()
@@ -363,9 +367,9 @@ class BashCommandParser:
 
         Example:
             >>> parser = BashCommandParser()
-            >>> ast = parser.parse("rm $(whoami)")
+            >>> ast = parser.parse("eval dangerous")
             >>> parser.has_dangerous_constructs(ast)
-            ['command substitution detected']
+            ['eval command detected']
         """
         dangers = []
 
@@ -376,16 +380,8 @@ class BashCommandParser:
         def visit(node):
             """Recursively visit AST nodes to detect dangerous patterns."""
             if hasattr(node, "kind"):
-                # Command substitution: $(cmd) or `cmd`
-                if node.kind == "commandsubstitution":
-                    dangers.append("command substitution detected")
-
-                # Process substitution: <(cmd) or >(cmd)
-                elif node.kind == "processsubstitution":
-                    dangers.append("process substitution detected")
-
                 # Eval/exec commands (arbitrary code execution)
-                elif node.kind == "command" and hasattr(node, "parts"):
+                if node.kind == "command" and hasattr(node, "parts"):
                     for part in node.parts:
                         if hasattr(part, "word") and part.word in ["eval", "exec"]:
                             dangers.append(f"{part.word} command detected")

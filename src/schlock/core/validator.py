@@ -23,6 +23,7 @@ from schlock.integrations.shellcheck import (
 from .cache import ValidationCache
 from .parser import BashCommandParser
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
+from .substitution import SubstitutionValidator
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ _global_cache = ValidationCache(max_size=1000)
 
 # Thread lock for RuleEngine and Parser caches
 # SECURITY: Prevents race conditions when multiple threads access shared state
-_cache_lock = threading.Lock()
+# NOTE: RLock (reentrant lock) allows the same thread to acquire the lock multiple times.
+# This is necessary because _get_substitution_validator() calls _get_parser() and
+# _get_rule_engine(), which also acquire the lock.
+_cache_lock = threading.RLock()
 
 # Module-level RuleEngine cache (avoid reloading YAML + recompiling regex on every call)
 # PERF: Rule loading takes ~160ms - caching reduces cache-miss latency from 180ms to 20ms
@@ -41,6 +45,9 @@ _global_rule_engine_path: Optional[str] = None  # Track config path to invalidat
 
 # Module-level parser cache (BashCommandParser is stateless, reuse it)
 _global_parser: Optional["BashCommandParser"] = None
+
+# Module-level SubstitutionValidator cache
+_global_substitution_validator: Optional["SubstitutionValidator"] = None
 
 
 def _get_rule_engine(config_path: Optional[str] = None) -> "RuleEngine":
@@ -83,6 +90,22 @@ def _get_parser() -> "BashCommandParser":
         if _global_parser is None:
             _global_parser = BashCommandParser()
         return _global_parser
+
+
+def _get_substitution_validator(config_path: Optional[str] = None) -> "SubstitutionValidator":
+    """Get cached SubstitutionValidator.
+
+    PERF: SubstitutionValidator caches whitelist lookups.
+    Thread-safe: Uses _cache_lock to prevent race conditions.
+    """
+    global _global_substitution_validator  # noqa: PLW0603
+
+    with _cache_lock:
+        if _global_substitution_validator is None:
+            parser = _get_parser()
+            engine = _get_rule_engine(config_path)
+            _global_substitution_validator = SubstitutionValidator(parser, engine)
+        return _global_substitution_validator
 
 
 @dataclass(frozen=True)
@@ -366,7 +389,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # 'cat << EOF' just outputs text, 'bash << EOF' executes it
             heredoc_ranges = parser.extract_heredoc_ranges(command, ast)
 
-            # Check for dangerous constructs (command/process substitution, eval)
+            # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
             if dangerous_constructs:
                 return ValidationResult(
@@ -374,8 +397,6 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     risk_level=RiskLevel.BLOCKED,
                     message=f"BLOCKED: Dangerous shell construct detected - {', '.join(dangerous_constructs)}",
                     alternatives=[
-                        "Avoid command substitution $(cmd) or `cmd` - run commands explicitly",
-                        "Avoid process substitution <(cmd) or >(cmd)",
                         "Never use eval or exec - they enable arbitrary code execution",
                         "Run commands directly instead of dynamically generating them",
                     ],
@@ -383,6 +404,26 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     error=None,
                 )
                 # Don't cache (construct may be context-dependent)
+
+            # Validate command/process substitution using AST-based analysis
+            # This uses whitelist-first, recursive validation for security
+            sub_validator = _get_substitution_validator(config_path)
+            sub_results = sub_validator.validate_all_substitutions(ast)
+            for sub_result in sub_results:
+                if not sub_result.allowed:
+                    return ValidationResult(
+                        allowed=False,
+                        risk_level=sub_result.risk_level,
+                        message=f"BLOCKED: {sub_result.message}",
+                        alternatives=[
+                            "Use whitelisted commands in substitution: op, date, git, pwd, whoami, hostname",
+                            "Run the command directly instead of using substitution",
+                            "If this command is safe, request it be added to the whitelist",
+                        ],
+                        exit_code=1,
+                        error=None,
+                    )
+                # Don't cache (substitution content may vary)
         except (ParseError, ValueError) as e:
             # Check if this is a heredoc parse failure (bashlex doesn't support quoted delimiters)
             # e.g., python3 << 'EOF' ... EOF

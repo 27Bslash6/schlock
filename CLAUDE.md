@@ -12,7 +12,7 @@
 
 **Distribution**: Plugin-only (NOT PyPI). Leverages Claude Code's automatic team installation.
 
-**Status**: v0.2.1 production. 821 tests passing, 90% coverage.
+**Status**: v0.2.4 production. 850+ tests passing, 92%+ coverage.
 
 ## Critical Design Principles
 
@@ -21,16 +21,45 @@
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
 
+## SubstitutionValidator Security Model
+
+Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling because:
+1. Regex cannot parse nested/recursive structures
+2. Whitelisted commands may have dangerous modes (e.g., `find -exec`)
+3. Pipelines/chains after safe commands can execute arbitrary code
+
+**Architecture**: Hybrid AST + Whitelist + Recursive Validation
+- Layer 1: Whitelist check (fast path for known-safe patterns)
+- Layer 2: AST-based detection of dangerous constructs
+- Layer 3: Recursive validation of nested substitutions
+- Layer 4: Rule engine validation of inner commands
+
+**Contextual Validation**: Some commands are safe by default but dangerous with specific flags/options:
+
+| Command | Safe Usage | Dangerous Flags/Options |
+|---------|------------|------------------------|
+| `find` | `-name`, `-type`, `-maxdepth` | `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete` |
+| `git` | `status`, `log`, `diff` | `-c alias.X=!cmd`, `-c core.sshCommand`, `-c core.pager`, `-c credential.helper`, `-c diff.external`, `-c merge.tool` |
+| `grep` | Pattern matching | (generally safe) |
+| `locate` | File search | (generally safe) |
+
+**Key Security Learnings** (2025-12 hardening session):
+1. Whitelist commands need ALL dangerous flag/config enumeration
+2. Pipeline to shell (`date | bash`) must be blocked even for whitelisted commands
+3. Command chains (`;`, `&&`, `||`) after whitelisted commands must validate all segments
+4. Git `-c` config options can execute arbitrary commands via alias, core.sshCommand, core.pager
+5. `env` and `command` builtins were removed from whitelist (execute arbitrary commands)
+
 ## Quick Reference
 
 **Core Components**:
 - `.claude-plugin/plugin.json` - Plugin manifest
 - `hooks/pre_tool_use.py` - Safety validation + audit logging
-- `src/schlock/core/` - Validation engine (parser, rules, validator, cache)
+- `src/schlock/core/` - Validation engine (parser, rules, validator, cache, substitution)
 - `src/schlock/integrations/` - Optional features (audit, commit_filter, shellcheck)
 - `src/schlock/setup/` - Configuration utilities (config_writer, wizard, env_detector)
 - `data/rules/` - 60+ security rules (multi-file structure)
-- `tests/` - 821 tests (90% coverage)
+- `tests/` - 850+ tests (92%+ coverage)
 
 **Risk Tolerance Presets**:
 | Preset | BLOCKED | HIGH | MEDIUM | Use Case |
