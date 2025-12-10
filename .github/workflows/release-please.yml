@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # v1 current as of 2025-12-01
-      - uses: actions/create-github-app-token@7e473efe3cb98aa54f8d4bac15400b15fad77d94
+      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf
         id: app-token
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -27,13 +27,13 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       # Sync uv.lock on the release PR branch (before merge)
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: ${{ steps.release.outputs.pr }}
         with:
           token: ${{ steps.app-token.outputs.token }}
           ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v7
         if: ${{ steps.release.outputs.pr }}
 
       - name: Sync uv.lock on release PR
