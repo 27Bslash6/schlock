@@ -71,8 +71,8 @@ class BashCommandParser:
                 continue
             # Found a word node - this is the command name
             if hasattr(part, "word"):
-                # Handle paths like /usr/bin/curl -> curl
-                return part.word.split("/")[-1]
+                cmd = part.word.split("/")[-1]
+                return cmd if cmd else None
 
         return None
 
@@ -464,7 +464,9 @@ class BashCommandParser:
                 if hasattr(part, "kind") and part.kind in ("assignment", "redirect"):
                     continue
                 if hasattr(part, "word"):
-                    words.append(part.word.split("/")[-1])  # Strip path
+                    cmd = part.word.split("/")[-1]
+                    if cmd:  # Skip empty strings
+                        words.append(cmd)
             return words
 
         def visit_children(node, visitor):
