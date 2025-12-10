@@ -39,6 +39,43 @@ class BashCommandParser:
         """Initialize BashCommandParser."""
         pass
 
+    def _get_command_name(self, node) -> Optional[str]:
+        """Extract the command name from a command node.
+
+        SECURITY: Correctly handles prefixes that appear before the command:
+        - Assignment nodes: VAR=value exec bash → returns 'exec'
+        - Redirect nodes: 2>&1 exec bash → returns 'exec'
+        - Path handling: /usr/bin/exec → returns 'exec'
+
+        Args:
+            node: A bashlex AST node
+
+        Returns:
+            The command name (basename), or None if not a command node
+
+        Example:
+            >>> # VAR=x exec bash → 'exec' (assignment skipped)
+            >>> # /usr/bin/curl → 'curl' (path stripped)
+        """
+        if not hasattr(node, "kind") or node.kind != "command":
+            return None
+        if not hasattr(node, "parts"):
+            return None
+
+        for part in node.parts:
+            # Skip assignment nodes (VAR=value prefixes)
+            if hasattr(part, "kind") and part.kind == "assignment":
+                continue
+            # Skip redirects
+            if hasattr(part, "kind") and part.kind == "redirect":
+                continue
+            # Found a word node - this is the command name
+            if hasattr(part, "word"):
+                cmd = part.word.split("/")[-1]
+                return cmd if cmd else None
+
+        return None
+
     def parse(self, command: str) -> list[Any]:
         """Parse command into bashlex AST.
 
@@ -377,24 +414,119 @@ class BashCommandParser:
         pipeline_dangers = self._detect_dangerous_pipelines(ast_nodes)
         dangers.extend(pipeline_dangers)
 
+        # Wrapper commands that pass through execution to subsequent args
+        # SECURITY: 'env exec bash' executes exec despite env being first word
+        # Categories for documentation and maintainability:
+        # - Privilege: sudo, doas, pkexec (escalate privileges)
+        # - Resource: nice, ionice, timeout, nohup, stdbuf, time (control resources)
+        # - Execution: env, command, xargs, parallel (modify execution context)
+        # - Multicall: busybox, toybox (can invoke any applet)
+        # - Namespace: chroot, nsenter, unshare (container/namespace operations)
+        wrapper_commands = {
+            # Privilege escalation
+            "sudo",  # Run as superuser
+            "doas",  # OpenBSD sudo equivalent
+            "pkexec",  # PolicyKit execution
+            # Resource control
+            "nice",  # Adjusts CPU priority
+            "ionice",  # Adjusts I/O priority
+            "timeout",  # Adds time limit
+            "nohup",  # Prevents hangup signals
+            "stdbuf",  # Modifies buffering
+            "time",  # Times execution
+            "chrt",  # Real-time scheduler control
+            "taskset",  # CPU affinity
+            # Execution context
+            "env",  # Modifies environment then executes
+            "command",  # Bypasses shell functions/aliases
+            "xargs",  # Executes command with piped input
+            "parallel",  # GNU parallel execution
+            "setsid",  # New session execution
+            # Multicall binaries
+            "busybox",  # Multi-tool binary (can run any applet)
+            "toybox",  # Lightweight busybox alternative
+            # Namespace/container operations (CRITICAL - escape vectors)
+            "chroot",  # Change root filesystem
+            "nsenter",  # Enter namespaces
+            "unshare",  # Create namespaces
+            "setarch",  # Architecture override
+            "linux32",  # 32-bit mode
+            "linux64",  # 64-bit mode
+        }
+
+        def _get_all_words(node) -> list[str]:
+            """Get ALL words from a command node, skipping assignments/redirects."""
+            words = []
+            if not hasattr(node, "parts"):
+                return words
+            for part in node.parts:
+                # Skip assignment and redirect prefixes
+                if hasattr(part, "kind") and part.kind in ("assignment", "redirect"):
+                    continue
+                if hasattr(part, "word"):
+                    cmd = part.word.split("/")[-1]
+                    if cmd:  # Skip empty strings
+                        words.append(cmd)
+            return words
+
+        def visit_children(node, visitor):
+            """Recursively visit child nodes of an AST node."""
+            for attr in ("parts", "command", "list", "pipe", "compound"):
+                if hasattr(node, attr):
+                    child = getattr(node, attr)
+                    if isinstance(child, list):
+                        for item in child:
+                            visitor(item)
+                    elif child:
+                        visitor(child)
+
         def visit(node):
             """Recursively visit AST nodes to detect dangerous patterns."""
             if hasattr(node, "kind"):
-                # Eval/exec commands (arbitrary code execution)
-                if node.kind == "command" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "word") and part.word in ["eval", "exec"]:
-                            dangers.append(f"{part.word} command detected")
+                # Detect eval/exec as COMMAND NAME only (not arguments)
+                # SECURITY: kubectl exec, docker exec use "exec" as argument
+                # We must NOT flag those - they're container tools, not shell exec.
+                if node.kind == "command":
+                    cmd_name = self._get_command_name(node)
+
+                    # Direct eval/exec invocation
+                    # EXCEPTION: exec used for FD operations is SAFE
+                    # - exec 3>&1 (duplicate FD) - just redirects, no execution
+                    # - exec >logfile (redirect stdout) - just redirects
+                    # - exec bash (replace process) - DANGEROUS
+                    if cmd_name == "exec":
+                        words = _get_all_words(node)
+                        # If exec has no arguments after it, or only redirects remain
+                        # in parts, it's FD manipulation, not process replacement
+                        if len(words) <= 1:
+                            # Just "exec" with redirects - FD manipulation, safe
+                            pass
+                        else:
+                            # exec followed by words - process replacement, dangerous
+                            dangers.append("exec command detected")
+                    elif cmd_name == "eval":
+                        dangers.append("eval command detected")
+
+                    # Wrapper bypass detection: env exec bash, command exec bash, etc.
+                    # SECURITY: Wrappers modify execution context but pass through
+                    # Scan all words looking for exec/eval as a command (not as arg to another tool)
+                    # Allow: sudo kubectl exec (kubectl handles exec as subcommand)
+                    # Block: sudo exec bash (exec IS the command)
+                    elif cmd_name in wrapper_commands:
+                        words = _get_all_words(node)
+                        # Container tools that use "exec" as a subcommand (not shell exec)
+                        container_tools = {"kubectl", "docker", "podman", "nerdctl", "crictl", "ctr"}
+                        # Scan for exec/eval, but skip if preceded by container tool
+                        for word in words[1:]:
+                            if word in container_tools:
+                                break  # Container tool found, exec is its subcommand
+                            if word in ("eval", "exec"):
+                                # Found exec/eval before any container tool
+                                dangers.append(f"wrapper command bypass: {cmd_name} {word}")
+                                break
 
                 # Recursively visit child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
+                visit_children(node, visit)
 
         for node in ast_nodes or []:
             visit(node)
@@ -492,31 +624,6 @@ class BashCommandParser:
             "busybox",  # Often contains sh applet
         }
 
-        def get_command_name(node) -> Optional[str]:
-            """Extract the command name from a command node.
-
-            Handles cases where command has assignments before the command name:
-            e.g., 'VAR=value sh' -> 'sh'
-            """
-            if not hasattr(node, "kind") or node.kind != "command":
-                return None
-            if not hasattr(node, "parts"):
-                return None
-
-            for part in node.parts:
-                # Skip assignment nodes (VAR=value prefixes)
-                if hasattr(part, "kind") and part.kind == "assignment":
-                    continue
-                # Skip redirects
-                if hasattr(part, "kind") and part.kind == "redirect":
-                    continue
-                # Found a word node - this is the command name
-                if hasattr(part, "word"):
-                    # Handle paths like /usr/bin/curl -> curl
-                    return part.word.split("/")[-1]
-
-            return None
-
         def check_pipeline(node):
             """Check a pipeline node for dangerous patterns."""
             if not hasattr(node, "parts"):
@@ -527,7 +634,7 @@ class BashCommandParser:
             for part in node.parts:
                 if hasattr(part, "kind"):
                     if part.kind == "command":
-                        cmd_name = get_command_name(part)
+                        cmd_name = self._get_command_name(part)
                         if cmd_name:
                             commands_in_pipeline.append(cmd_name)
                     elif part.kind == "pipe":
