@@ -612,6 +612,18 @@ class TestP0ContainerEscape:
         result = validate_command("docker run ubuntu echo hello", config_path=safety_rules_path)
         assert result.allowed
 
+    def test_docker_rm_flag_not_false_positive(self, safety_rules_path):
+        """Docker --rm flag should not trigger protect_system_files rule.
+
+        Regression test for false positive where --rm matched as rm command
+        and 2>/dev/null matched as /dev/ path.
+        """
+        # This was incorrectly blocked as "Prevent modifications to system files"
+        cmd = "docker run --rm node:24-alpine npm --version 2>/dev/null"
+        result = validate_command(cmd, config_path=safety_rules_path)
+        assert result.allowed, f"docker --rm should be allowed, got: {result.message}"
+        assert "protect_system_files" not in result.matched_rules
+
 
 class TestP0LogTampering:
     """Test P0: log_tampering rule."""

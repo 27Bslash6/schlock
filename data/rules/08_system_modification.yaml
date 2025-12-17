@@ -7,7 +7,8 @@ rules:
   - name: protect_system_files
     description: Prevent modifications to system files
     risk_level: BLOCKED
-    patterns: ['\b(rm|mv|cp)\s+.{0,200}/(etc|sys|proc|boot|sbin|dev)/', '>\s*/(etc|sys|proc|boot|sbin)/', 'rm\s+/sbin/init', 'rm\s+/dev/', 'chmod.{0,100}/(sbin|dev|usr/lib/systemd)/', 'chmod\s+000\s+/usr/', 'mknod\s+/dev/']
+    # Note: Using (?:^|[\s;&|]) instead of \b to avoid false positives on flags like --rm
+    patterns: ['(?:^|[\s;&|])(rm|mv|cp)\s+.{0,200}/(etc|sys|proc|boot|sbin|dev)/', '>\s*/(etc|sys|proc|boot|sbin)/', '>\s*/dev/(?!null\b)', '(?:^|[\s;&|])rm\s+/sbin/init', '(?:^|[\s;&|])rm\s+/dev/', '(?:^|[\s;&|])chmod.{0,100}/(sbin|dev|usr/lib/systemd)/', '(?:^|[\s;&|])chmod\s+000\s+/usr/', '(?:^|[\s;&|])mknod\s+/dev/']
     alternatives: ["Use configuration management tools", "Request system administrator access"]
 
   - name: recursive_permission_system_dirs
