@@ -208,49 +208,48 @@ DANGEROUS_COMMAND_FLAGS: dict[str, tuple[list[str], str, list[str]]] = {
 
 
 def _check_dangerous_command_flags(
-    command: str,
-    cmd_names: list[str],
+    commands_with_args: list[tuple[str, list[str]]],
 ) -> Optional[ValidationResult]:
-    """Check for dangerous command + flag combinations using AST-extracted names.
+    """Check for dangerous command + flag combinations using pure AST extraction.
 
-    SECURITY CRITICAL: This catches quoted command names that bypass regex patterns.
-    For example, "nc" -e /bin/bash would bypass \\bnc\\s+ patterns but the AST
-    correctly identifies the command as 'nc'.
+    SECURITY CRITICAL: Uses bashlex AST for ALL parsing - both command names AND
+    arguments. This ensures consistent security-critical parsing throughout the
+    validation engine without regex shortcuts.
+
+    Bashlex strips quotes during AST parsing, so:
+    - "nc" -e /bin/bash → command='nc', args=['-e', '/bin/bash']
+    - 'socat' EXEC:/bin/sh → command='socat', args=['EXEC:/bin/sh']
 
     Args:
-        command: Original command string (for flag checking)
-        cmd_names: List of command names extracted from AST (quotes stripped)
+        commands_with_args: List of (command_name, [args]) tuples from AST
 
     Returns:
         ValidationResult if dangerous combo found, None otherwise
     """
-    for cmd_name in cmd_names:
+    for cmd_name, args in commands_with_args:
         # Strip path prefix (e.g., /usr/bin/nc -> nc)
         base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
 
         if base_name in DANGEROUS_COMMAND_FLAGS:
             flags, description, alternatives = DANGEROUS_COMMAND_FLAGS[base_name]
-            # Check if any dangerous flag is present in the raw command
-            for flag in flags:
-                # For flags like EXEC:, check substring
-                # For flags like -e, need to be careful about word boundaries
-                if flag.endswith(":"):
-                    # Protocol-style flag (EXEC:, SYSTEM:) - case insensitive for socat
-                    if flag.lower() in command.lower():
-                        return ValidationResult(
-                            allowed=False,
-                            risk_level=RiskLevel.BLOCKED,
-                            message=f"BLOCKED: {description}",
-                            alternatives=alternatives,
-                            exit_code=1,
-                            error=None,
-                            matched_rules=[f"ast_dangerous_combo:{base_name}"],
-                        )
-                else:
-                    # Flag-style (-e, --exec) - check with word boundary or followed by space/end
-                    # Match flag followed by space, end of string, or another flag
-                    flag_pattern = re.escape(flag) + r"(?:\s|$|['\"])"
-                    if re.search(flag_pattern, command):
+            # Check if any dangerous flag is present in AST-extracted args
+            for arg in args:
+                for flag in flags:
+                    if flag.endswith(":"):
+                        # Protocol-style flag (EXEC:, SYSTEM:) - case insensitive
+                        # Check if arg starts with the protocol prefix
+                        if arg.lower().startswith(flag.lower()):
+                            return ValidationResult(
+                                allowed=False,
+                                risk_level=RiskLevel.BLOCKED,
+                                message=f"BLOCKED: {description}",
+                                alternatives=alternatives,
+                                exit_code=1,
+                                error=None,
+                                matched_rules=[f"ast_dangerous_combo:{base_name}"],
+                            )
+                    # Flag-style (-e, --exec) - exact match from AST
+                    elif arg == flag:
                         return ValidationResult(
                             allowed=False,
                             risk_level=RiskLevel.BLOCKED,
@@ -510,11 +509,12 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     )
                 # Don't cache (substitution content may vary)
 
-            # SECURITY: AST-based dangerous command detection
+            # SECURITY: Pure AST-based dangerous command detection
+            # Uses bashlex AST for BOTH command names AND arguments (no regex shortcuts)
             # This catches quoted command names that bypass regex patterns (e.g., "nc" -e)
             # Must run AFTER parsing but BEFORE regex matching for defense in depth
-            cmd_names = parser.extract_commands(ast)
-            dangerous_check = _check_dangerous_command_flags(command, cmd_names)
+            commands_with_args = parser.extract_commands_with_args(ast)
+            dangerous_check = _check_dangerous_command_flags(commands_with_args)
             if dangerous_check is not None:
                 return dangerous_check
 

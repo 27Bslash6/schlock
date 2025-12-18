@@ -162,6 +162,56 @@ class BashCommandParser:
 
         return commands
 
+    def extract_commands_with_args(self, ast_nodes: list[Any]) -> list[tuple[str, list[str]]]:
+        """Extract all command names with their arguments from AST.
+
+        SECURITY CRITICAL: Returns command name and ALL arguments as extracted
+        by bashlex AST (quotes stripped). This enables pure AST-based validation
+        of dangerous flag combinations without regex pattern matching.
+
+        Args:
+            ast_nodes: List of bashlex AST nodes from parse()
+
+        Returns:
+            List of (command_name, [args]) tuples where args includes all
+            arguments with quotes stripped by bashlex.
+
+        Example:
+            >>> parser = BashCommandParser()
+            >>> ast = parser.parse('"nc" -e /bin/bash host 4444')
+            >>> parser.extract_commands_with_args(ast)
+            [('nc', ['-e', '/bin/bash', 'host', '4444'])]
+        """
+        results: list[tuple[str, list[str]]] = []
+
+        def visit(node):
+            """Recursively visit AST nodes to extract commands with args."""
+            if hasattr(node, "kind"):
+                # Command nodes contain the actual command and arguments
+                if node.kind == "command" and hasattr(node, "parts") and node.parts:
+                    words = []
+                    for part in node.parts:
+                        if hasattr(part, "word"):
+                            words.append(part.word)
+                    if words:
+                        # First word is command, rest are arguments
+                        results.append((words[0], words[1:]))
+
+                # Recursively visit child nodes
+                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                    if hasattr(node, attr):
+                        child = getattr(node, attr)
+                        if isinstance(child, list):
+                            for item in child:
+                                visit(item)
+                        elif child:
+                            visit(child)
+
+        for node in ast_nodes or []:
+            visit(node)
+
+        return results
+
     def extract_command_segments(self, command: str, ast_nodes: list[Any]) -> list[str]:
         """Extract full command segments from pipelines and command lists.
 
