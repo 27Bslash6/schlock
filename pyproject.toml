@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "schlock"
-version = "0.3.0"
+version = "0.3.1"
 description = "Claude Code plugin for LLM command safety validation"
 readme = "README.md"
 license = { text = "WTFPL" }
