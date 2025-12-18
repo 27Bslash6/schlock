@@ -13,26 +13,40 @@ rules:
   - name: system_destruction
     description: Complete filesystem destruction
     risk_level: BLOCKED
-    patterns: ['rm\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]{0,100}\s+(\/|\/\*|\$HOME|~)(\s|$)', 'rm\s+(\/|\/\*)\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)']
+    patterns: ['\brm\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]{0,100}\s+(\/|\/\*|\$HOME|~)(\s|$)', '\brm\s+(\/|\/\*)\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)']
     alternatives: ["Specify exact files instead"]
+
+  - name: hidden_glob_destruction
+    description: rm -rf .* can delete parent directory via .. glob expansion
+    risk_level: BLOCKED
+    patterns:
+      # rm with recursive flags and .* glob
+      - '\brm\s+[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]*\s+\.\*(\s|$)'
+      - '\brm\s+\.\*[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)'
+      # Direct .* at end of rm command
+      - '\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?\.\*\s*$'
+    alternatives:
+      - "On many shells, .* expands to include . and .."
+      - "Use 'rm -rf .[^.]*' to exclude . and .."
+      - "Or list specific hidden files: rm -rf .cache .config"
 
   # HIGH
   - name: recursive_delete
     description: Recursive delete can destroy directory trees
     risk_level: HIGH
-    patterns: ['rm\s+-r', 'find.{0,200}-delete']
+    patterns: ['\brm\s+-r', '\bfind.{0,200}-delete']
     alternatives: ["Use rm -ri for interactive"]
 
   - name: find_exec_rm
     description: Can delete many files
     risk_level: HIGH
-    patterns: ['find.{0,200}-exec\s+rm']
+    patterns: ['\bfind.{0,200}-exec\s+\brm\b']
     alternatives: ["Review results first"]
 
   - name: file_truncation
     description: File truncation can instantly destroy data
     risk_level: HIGH
-    patterns: ["^\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", ":\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", "true\\s+>\\s+(?!/dev/null)[^|&;]{1,200}", "truncate\\s+.{0,100}(-s|--size)\\s*0", "echo\\s+-n\\s+>\\s+(?!/dev/null)[^|&;]{1,200}", "printf\\s+[\"']\\s*[\"']?\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", "tee\\s+(?!.{0,50}-a)(?!/dev/null)[^|&;]{1,200}"]
+    patterns: ["^\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", ":\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", "\\btrue\\s+>\\s+(?!/dev/null)[^|&;]{1,200}", "\\btruncate\\s+.{0,100}(-s|--size)\\s*0", "\\becho\\s+-n\\s+>\\s+(?!/dev/null)[^|&;]{1,200}", "\\bprintf\\s+[\"']\\s*[\"']?\\s*>\\s+(?!/dev/null)[^|&;]{1,200}", "\\btee\\s+(?!.{0,50}-a)(?!/dev/null)[^|&;]{1,200}"]
     alternatives: ["Use proper log rotation", "Backup before truncating", "Use >> for append"]
 
   - name: vcs_directory_deletion
@@ -40,11 +54,11 @@ rules:
     risk_level: HIGH
     patterns:
       # .git directory deletion
-      - 'rm\s+[^;|&]*\.git(/|\s|$)'
-      - 'rm\s+[^;|&]*-[rf]+[^;|&]*\.git(/|\s|$)'
+      - '\brm\s+[^;|&]*\.git(/|\s|$)'
+      - '\brm\s+[^;|&]*-[rf]+[^;|&]*\.git(/|\s|$)'
       # .hg (Mercurial), .svn (Subversion)
-      - 'rm\s+[^;|&]*\.(hg|svn)(/|\s|$)'
-      - 'rm\s+[^;|&]*-[rf]+[^;|&]*\.(hg|svn)(/|\s|$)'
+      - '\brm\s+[^;|&]*\.(hg|svn)(/|\s|$)'
+      - '\brm\s+[^;|&]*-[rf]+[^;|&]*\.(hg|svn)(/|\s|$)'
     alternatives:
       - "Use 'git clean -fd' to remove untracked files"
       - "Backup .git directory before deletion"
@@ -54,5 +68,5 @@ rules:
   - name: archive_operations
     description: Archive operations that could extract malicious files
     risk_level: MEDIUM
-    patterns: ['tar\s+.{0,100}(-x|--extract).{0,100}/', 'unzip\s+.{0,100}-o', 'gunzip\s+.{0,100}-f', '7z\s+x\s+.{0,100}-y', 'rar\s+x\s+.{0,100}-o\+']
+    patterns: ['\btar\s+.{0,100}(-x|--extract).{0,100}/', '\bunzip\s+.{0,100}-o', '\bgunzip\s+.{0,100}-f', '\b7z\s+x\s+.{0,100}-y', '\brar\s+x\s+.{0,100}-o\+']
     alternatives: ["Extract to safe directory", "Review archive contents first", "Use sandboxed extraction"]

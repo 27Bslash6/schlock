@@ -6,29 +6,29 @@ rules:
   - name: disk_destruction_dd
     description: Prevent disk overwriting with dd
     risk_level: BLOCKED
-    patterns: ['dd\s+.{0,200}of=/dev/[sh]d[a-z]', 'dd\s+.{0,200}of=/dev/nvme', 'dd\s+.{0,200}of=/dev/loop', 'dd\s+.{0,200}of=/boot', '>\s*/dev/[sh]d[a-z]', '>\s*/dev/nvme', '>\s*/boot/']
+    patterns: ['\bdd\s+.{0,200}of=/dev/[sh]d[a-z]', '\bdd\s+.{0,200}of=/dev/nvme', '\bdd\s+.{0,200}of=/dev/loop', '\bdd\s+.{0,200}of=/boot', '>\s*/dev/[sh]d[a-z]', '>\s*/dev/nvme', '>\s*/boot/']
     alternatives: ["Never write directly to disk devices", "Use disk management tools carefully", "Create backups first"]
 
   - name: disk_device_manipulation
     description: Additional disk device destruction patterns
     risk_level: BLOCKED
-    patterns: ['cat.{0,100}>\s*/dev/(sd[a-z]|hd[a-z]|nvme|loop|md|vd[a-z])', 'echo.{0,100}>\s*/dev/(sd[a-z]|hd[a-z]|nvme|loop|md|vd[a-z])', 'cp.{0,100}/dev/(sd[a-z]|hd[a-z]|nvme|loop|md)', 'mv.{0,100}/dev/(sd[a-z]|hd[a-z]|nvme|loop|md)', 'truncate.{0,100}/dev/(sd[a-z]|hd[a-z]|nvme)', 'hdparm.{0,100}--user-master.{0,100}--security-erase', 'blkdiscard.{0,100}/dev/', 'fstrim.{0,100}--all']
+    patterns: ['\bcat.{0,100}>\s*/dev/(sd[a-z]|hd[a-z]|nvme|loop|md|vd[a-z])', '\becho.{0,100}>\s*/dev/(sd[a-z]|hd[a-z]|nvme|loop|md|vd[a-z])', '\bcp.{0,100}/dev/(sd[a-z]|hd[a-z]|nvme|loop|md)', '\bmv.{0,100}/dev/(sd[a-z]|hd[a-z]|nvme|loop|md)', '\btruncate.{0,100}/dev/(sd[a-z]|hd[a-z]|nvme)', '\bhdparm.{0,100}--user-master.{0,100}--security-erase', '\bblkdiscard.{0,100}/dev/', '\bfstrim.{0,100}--all']
     alternatives: ["Never write directly to disk devices", "Use disk management tools with extreme caution"]
 
   - name: filesystem_format
     description: Prevent filesystem formatting
     risk_level: BLOCKED
-    patterns: ['mkfs\b', 'mkfs\.[a-z]+\s+/dev/', 'mke2fs\b', 'mkswap\b', 'mkfs\.ext[234]\b', 'mkfs\.xfs\b', 'mkfs\.btrfs\b']
+    patterns: ['\bmkfs\b', '\bmkfs\.[a-z]+\s+/dev/', '\bmke2fs\b', '\bmkswap\b', '\bmkfs\.ext[234]\b', '\bmkfs\.xfs\b', '\bmkfs\.btrfs\b']
     alternatives: ["Format only specific partitions after backup", "Use disk management GUI tools", "Verify device path carefully"]
 
   - name: partition_manipulation
     description: Prevent partition table changes
     risk_level: BLOCKED
-    patterns: ['fdisk\s+/dev/', 'parted\s+.{0,100}\s+/dev/', 'parted\s+/dev/', 'gparted\b', 'sfdisk\b', 'gdisk\b', 'cfdisk\b']
+    patterns: ['\bfdisk\s+/dev/', '\bparted\s+.{0,100}\s+/dev/', '\bparted\s+/dev/', '\bgparted\b', '\bsfdisk\b', '\bgdisk\b', '\bcfdisk\b']
     alternatives: ["Use disk management tools with extreme caution", "Create full disk backup first", "Verify device paths"]
 
   - name: filesystem_wipe
     description: Prevent filesystem signature wiping
     risk_level: BLOCKED
-    patterns: ['wipefs\b', 'blkdiscard\b', 'shred\s+.{0,100}\s+/dev/', 'shred\s+/dev/']
+    patterns: ['\bwipefs\b', '\bblkdiscard\b', '\bshred\s+.{0,100}\s+/dev/', '\bshred\s+/dev/']
     alternatives: ["Never wipe filesystem signatures", "Use secure erase only on specific files", "Verify target carefully"]

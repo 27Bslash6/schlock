@@ -8,7 +8,8 @@ rules:
     description: Prevent modifications to system files
     risk_level: BLOCKED
     # Note: Using (?:^|[\s;&|]) instead of \b to avoid false positives on flags like --rm
-    patterns: ['(?:^|[\s;&|])(rm|mv|cp)\s+.{0,200}/(etc|sys|proc|boot|sbin|dev)/', '>\s*/(etc|sys|proc|boot|sbin)/', '>\s*/dev/(?!null\b)', '(?:^|[\s;&|])rm\s+/sbin/init', '(?:^|[\s;&|])rm\s+/dev/', '(?:^|[\s;&|])chmod.{0,100}/(sbin|dev|usr/lib/systemd)/', '(?:^|[\s;&|])chmod\s+000\s+/usr/', '(?:^|[\s;&|])mknod\s+/dev/']
+    # Note: Using [^>] instead of . to avoid matching through redirects like 2>/dev/null
+    patterns: ['(?:^|[\s;&|])(rm|mv|cp)\s+[^>]{0,200}/(etc|sys|proc|boot|sbin|dev)/', '>\s*/(etc|sys|proc|boot|sbin)/', '>\s*/dev/(?!null\b)', '(?:^|[\s;&|])rm\s+/sbin/init', '(?:^|[\s;&|])rm\s+/dev/', '(?:^|[\s;&|])chmod[^>]{0,100}/(sbin|dev|usr/lib/systemd)/', '(?:^|[\s;&|])chmod\s+000\s+/usr/', '(?:^|[\s;&|])mknod\s+/dev/']
     alternatives: ["Use configuration management tools", "Request system administrator access"]
 
   - name: recursive_permission_system_dirs
@@ -41,6 +42,59 @@ rules:
     risk_level: HIGH
     patterns: ['setfacl\s+.{0,100}-m\s+.{0,100}:rwx', 'setfacl\s+.{0,100}--modify', 'chattr\s+.{0,100}[-+]i', 'chattr\s+.{0,100}[-+]a', 'umask\s+0{1,3}[0-7]?', 'chmod\s+.{0,100}\+s', 'chmod\s+[24]7[0-7]{2}', 'chmod\s+.{0,100}a\+[rwx]+']
     alternatives: ["Use restrictive permissions", "Document permission changes", "Use configuration management"]
+
+  - name: suid_sgid_creation
+    description: SUID/SGID binaries enable privilege escalation
+    risk_level: BLOCKED
+    patterns:
+      # Numeric SUID (4xxx) and SGID (2xxx) modes
+      - '\bchmod\s+[42][0-7]{3}\s+'
+      - '\bchmod\s+[67][0-7]{3}\s+'
+      # Leading-zero octal (04755, 02755, 06755, 07755)
+      - '\bchmod\s+0[4267][0-7]{3}\s+'
+      # Symbolic SUID/SGID
+      - '\bchmod\s+[^;|&]*u\+s'
+      - '\bchmod\s+[^;|&]*g\+s'
+      - '\bchmod\s+[^;|&]*\+s'
+      # install command with SUID/SGID mode
+      - '\binstall\s+[^;|&]*-m\s*0?[4267][0-7]{3}\b'
+    alternatives:
+      - "SUID/SGID binaries are a major privilege escalation vector"
+      - "Use sudo with specific command restrictions instead"
+      - "If required, audit the binary thoroughly first"
+
+  - name: dotfile_persistence
+    description: Modifying shell dotfiles enables persistent backdoors
+    risk_level: HIGH
+    patterns:
+      # Shell RC files (append)
+      - '>>\s*~/?\.(bashrc|bash_profile|zshrc|profile|login)'
+      - '>>\s*\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)'
+      - '\becho\b[^;|&]*>>\s*~/?\.(bashrc|bash_profile|zshrc|profile)'
+      - '\btee\s+(-a\s+)?~/?\.(bashrc|bash_profile|zshrc|profile)'
+      # Shell RC files (overwrite) - (?<!>) ensures we don't double-match >>
+      - '(?<!>)>\s*~/?\.(bashrc|bash_profile|zshrc|profile|login)'
+      - '(?<!>)>\s*\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)'
+      # SSH authorized_keys (append)
+      - '>>\s*~/?\.ssh/authorized_keys'
+      - '>>\s*\$HOME/\.ssh/authorized_keys'
+      - '\becho\b[^;|&]*>>\s*~/?\.ssh/authorized_keys'
+      - '\btee\s+(-a\s+)?~/?\.ssh/authorized_keys'
+      # SSH authorized_keys (overwrite)
+      - '(?<!>)>\s*~/?\.ssh/authorized_keys'
+      - '(?<!>)>\s*\$HOME/\.ssh/authorized_keys'
+      # Environment files (append)
+      - '>>\s*/etc/profile'
+      - '>>\s*/etc/bash\.bashrc'
+      - '>>\s*/etc/environment'
+      # Environment files (overwrite) - (?<!>) ensures we don't double-match >>
+      - '(?<!>)>\s*/etc/profile'
+      - '(?<!>)>\s*/etc/bash\.bashrc'
+      - '(?<!>)>\s*/etc/environment'
+    alternatives:
+      - "Dotfile modifications persist across sessions"
+      - "Attackers use this for backdoor persistence"
+      - "Use proper configuration management instead"
 
   - name: system_service_modification
     description: System configuration and startup modification

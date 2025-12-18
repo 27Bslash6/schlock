@@ -70,10 +70,10 @@ rules:
       # gcore - core dump utility
       - '\bgcore\s+'
       # /proc memory access
-      - 'cat\s+/proc/[0-9]+/(mem|environ|cmdline|fd)'
-      - 'strings\s+/proc/[0-9]+/'
-      - 'xxd\s+/proc/[0-9]+/'
-      - 'od\s+[^;|&]*/proc/[0-9]+/'
+      - '\bcat\s+/proc/[0-9]+/(mem|environ|cmdline|fd)'
+      - '\bstrings\s+/proc/[0-9]+/'
+      - '\bxxd\s+/proc/[0-9]+/'
+      - '\bod\s+[^;|&]*/proc/[0-9]+/'
       # Process memory map
       - '\bpmap\s+'
       # Memory dump tools
@@ -88,14 +88,14 @@ rules:
     risk_level: HIGH
     patterns:
       # GDB attach
-      - 'gdb\s+[^;|&]*(-p|--pid)\s+'
-      - 'gdb\s+[^;|&]*attach\s+'
+      - '\bgdb\s+[^;|&]*(-p|--pid)\s+'
+      - '\bgdb\s+[^;|&]*attach\s+'
       # LLDB attach
-      - 'lldb\s+[^;|&]*(-p|--attach-pid)\s+'
-      - 'lldb\s+[^;|&]*attach\s+'
+      - '\blldb\s+[^;|&]*(-p|--attach-pid)\s+'
+      - '\blldb\s+[^;|&]*attach\s+'
       # strace/ltrace attach
-      - 'strace\s+[^;|&]*-p\s+'
-      - 'ltrace\s+[^;|&]*-p\s+'
+      - '\bstrace\s+[^;|&]*-p\s+'
+      - '\bltrace\s+[^;|&]*-p\s+'
     alternatives:
       - "Debugger attachment requires confirmation"
       - "Consider using logging instead of live debugging"
