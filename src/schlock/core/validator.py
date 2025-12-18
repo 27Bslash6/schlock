@@ -179,6 +179,91 @@ def load_rules(config_path: Optional[str] = None) -> RuleEngine:
     return RuleEngine.from_directory(rules_dir)
 
 
+# SECURITY: Dangerous command + flag combinations that must be blocked regardless of quoting
+# These are commands where specific flags enable arbitrary code execution or backdoors
+# AST-based detection catches quoted commands that bypass regex patterns (e.g., "nc" -e)
+DANGEROUS_COMMAND_FLAGS: dict[str, tuple[list[str], str, list[str]]] = {
+    # Network backdoors - BLOCKED level
+    "nc": (
+        ["-e", "-c"],  # Execute flag variants
+        "Netcat backdoor: -e/-c flags execute arbitrary commands",
+        ["Use SSH for secure remote access", "Use proper remote administration tools"],
+    ),
+    "ncat": (
+        ["--exec", "--sh-exec", "-e", "-c"],
+        "Ncat backdoor: exec flags execute arbitrary commands",
+        ["Use SSH for secure remote access", "Use proper remote administration tools"],
+    ),
+    "netcat": (
+        ["-e", "-c"],
+        "Netcat backdoor: -e/-c flags execute arbitrary commands",
+        ["Use SSH for secure remote access", "Use proper remote administration tools"],
+    ),
+    "socat": (
+        ["EXEC:", "SYSTEM:"],
+        "Socat execution: EXEC/SYSTEM can execute arbitrary commands",
+        ["Use SSH for secure remote access", "Use proper remote administration tools"],
+    ),
+}
+
+
+def _check_dangerous_command_flags(
+    command: str,
+    cmd_names: list[str],
+) -> Optional[ValidationResult]:
+    """Check for dangerous command + flag combinations using AST-extracted names.
+
+    SECURITY CRITICAL: This catches quoted command names that bypass regex patterns.
+    For example, "nc" -e /bin/bash would bypass \\bnc\\s+ patterns but the AST
+    correctly identifies the command as 'nc'.
+
+    Args:
+        command: Original command string (for flag checking)
+        cmd_names: List of command names extracted from AST (quotes stripped)
+
+    Returns:
+        ValidationResult if dangerous combo found, None otherwise
+    """
+    for cmd_name in cmd_names:
+        # Strip path prefix (e.g., /usr/bin/nc -> nc)
+        base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
+
+        if base_name in DANGEROUS_COMMAND_FLAGS:
+            flags, description, alternatives = DANGEROUS_COMMAND_FLAGS[base_name]
+            # Check if any dangerous flag is present in the raw command
+            for flag in flags:
+                # For flags like EXEC:, check substring
+                # For flags like -e, need to be careful about word boundaries
+                if flag.endswith(":"):
+                    # Protocol-style flag (EXEC:, SYSTEM:)
+                    if flag in command:
+                        return ValidationResult(
+                            allowed=False,
+                            risk_level=RiskLevel.BLOCKED,
+                            message=f"BLOCKED: {description}",
+                            alternatives=alternatives,
+                            exit_code=1,
+                            error=None,
+                            matched_rules=[f"ast_dangerous_combo:{base_name}"],
+                        )
+                else:
+                    # Flag-style (-e, --exec) - check with word boundary or followed by space/end
+                    # Match flag followed by space, end of string, or another flag
+                    flag_pattern = re.escape(flag) + r"(?:\s|$|['\"])"
+                    if re.search(flag_pattern, command):
+                        return ValidationResult(
+                            allowed=False,
+                            risk_level=RiskLevel.BLOCKED,
+                            message=f"BLOCKED: {description}",
+                            alternatives=alternatives,
+                            exit_code=1,
+                            error=None,
+                            matched_rules=[f"ast_dangerous_combo:{base_name}"],
+                        )
+
+    return None
+
+
 def _check_special_cases(command: str) -> Optional[ValidationResult]:
     """Check special cases that require dynamic state inspection.
 
@@ -424,6 +509,15 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         error=None,
                     )
                 # Don't cache (substitution content may vary)
+
+            # SECURITY: AST-based dangerous command detection
+            # This catches quoted command names that bypass regex patterns (e.g., "nc" -e)
+            # Must run AFTER parsing but BEFORE regex matching for defense in depth
+            cmd_names = parser.extract_commands(ast)
+            dangerous_check = _check_dangerous_command_flags(command, cmd_names)
+            if dangerous_check is not None:
+                return dangerous_check
+
         except (ParseError, ValueError) as e:
             # Check if this is a heredoc parse failure (bashlex doesn't support quoted delimiters)
             # e.g., python3 << 'EOF' ... EOF

