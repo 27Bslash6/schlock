@@ -5,6 +5,14 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1](https://github.com/27Bslash6/schlock/compare/schlock-v0.3.0...schlock-v0.3.1) (2025-12-18)
+
+
+### Bug Fixes
+
+* avoid --rm matching protect_system_files ([#43](https://github.com/27Bslash6/schlock/issues/43)) ([268fab6](https://github.com/27Bslash6/schlock/commit/268fab6841842033b020c36a8fa6fdff549eaed5))
+* harden security rules against multiple bypass vectors ([#45](https://github.com/27Bslash6/schlock/issues/45)) ([85cc746](https://github.com/27Bslash6/schlock/commit/85cc7469223a101f83680232bfce4ac94d267d77))
+
 ## [0.3.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.2.6...schlock-v0.3.0) (2025-12-10)
 
 
