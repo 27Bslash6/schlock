@@ -191,6 +191,12 @@ class BashCommandParser:
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
                     words = []
                     for part in node.parts:
+                        # Skip assignment nodes (VAR=value prefixes)
+                        if hasattr(part, "kind") and part.kind == "assignment":
+                            continue
+                        # Skip redirects (2>&1, >, <, etc.)
+                        if hasattr(part, "kind") and part.kind == "redirect":
+                            continue
                         if hasattr(part, "word"):
                             words.append(part.word)
                     if words:

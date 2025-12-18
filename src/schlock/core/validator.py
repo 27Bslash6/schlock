@@ -248,8 +248,8 @@ def _check_dangerous_command_flags(
                                 error=None,
                                 matched_rules=[f"ast_dangerous_combo:{base_name}"],
                             )
-                    # Flag-style (-e, --exec) - exact match from AST
-                    elif arg == flag:
+                    # Flag-style (-e, --exec) - exact match or inline syntax (--exec=)
+                    elif arg == flag or (flag.startswith("-") and arg.startswith(f"{flag}=")):
                         return ValidationResult(
                             allowed=False,
                             risk_level=RiskLevel.BLOCKED,

@@ -50,10 +50,14 @@ rules:
       # Numeric SUID (4xxx) and SGID (2xxx) modes
       - '\bchmod\s+[42][0-7]{3}\s+'
       - '\bchmod\s+[67][0-7]{3}\s+'
+      # Leading-zero octal (04755, 02755, 06755, 07755)
+      - '\bchmod\s+0[4267][0-7]{3}\s+'
       # Symbolic SUID/SGID
       - '\bchmod\s+[^;|&]*u\+s'
       - '\bchmod\s+[^;|&]*g\+s'
       - '\bchmod\s+[^;|&]*\+s'
+      # install command with SUID/SGID mode
+      - '\binstall\s+[^;|&]*-m\s*0?[4267][0-7]{3}'
     alternatives:
       - "SUID/SGID binaries are a major privilege escalation vector"
       - "Use sudo with specific command restrictions instead"
@@ -73,10 +77,14 @@ rules:
       - '>>\s*\$HOME/\.ssh/authorized_keys'
       - '\becho\b[^;|&]*>>\s*~/?\.ssh/authorized_keys'
       - '\btee\s+(-a\s+)?~/?\.ssh/authorized_keys'
-      # Environment files
+      # Environment files (append)
       - '>>\s*/etc/profile'
       - '>>\s*/etc/bash\.bashrc'
       - '>>\s*/etc/environment'
+      # Environment files (overwrite) - (?<!>) ensures we don't double-match >>
+      - '(?<!>)>\s*/etc/profile'
+      - '(?<!>)>\s*/etc/bash\.bashrc'
+      - '(?<!>)>\s*/etc/environment'
     alternatives:
       - "Dotfile modifications persist across sessions"
       - "Attackers use this for backdoor persistence"
