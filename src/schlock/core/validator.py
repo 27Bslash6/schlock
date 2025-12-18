@@ -235,8 +235,8 @@ def _check_dangerous_command_flags(
                 # For flags like EXEC:, check substring
                 # For flags like -e, need to be careful about word boundaries
                 if flag.endswith(":"):
-                    # Protocol-style flag (EXEC:, SYSTEM:)
-                    if flag in command:
+                    # Protocol-style flag (EXEC:, SYSTEM:) - case insensitive for socat
+                    if flag.lower() in command.lower():
                         return ValidationResult(
                             allowed=False,
                             risk_level=RiskLevel.BLOCKED,

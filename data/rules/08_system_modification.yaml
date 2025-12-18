@@ -69,9 +69,10 @@ rules:
       - '\becho\b[^;|&]*>>\s*~/?\.(bashrc|bash_profile|zshrc|profile)'
       - '\btee\s+(-a\s+)?~/?\.(bashrc|bash_profile|zshrc|profile)'
       # SSH authorized_keys
-      - '>>\s*~/?\.(ssh/authorized_keys)'
+      - '>>\s*~/?\.ssh/authorized_keys'
       - '>>\s*\$HOME/\.ssh/authorized_keys'
-      - '\becho\b[^;|&]*>>\s*~/?\.(ssh/authorized_keys)'
+      - '\becho\b[^;|&]*>>\s*~/?\.ssh/authorized_keys'
+      - '\btee\s+(-a\s+)?~/?\.ssh/authorized_keys'
       # Environment files
       - '>>\s*/etc/profile'
       - '>>\s*/etc/bash\.bashrc'
