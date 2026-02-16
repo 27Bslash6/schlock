@@ -676,6 +676,17 @@ rules:
         open_port = next(r for r in override_engine.rules if r.name == "open_port")
         assert open_port.risk_level == RiskLevel.BLOCKED
 
+    def test_rule_risk_level_wins_over_category_blocked_upgrade(self, override_engine):
+        """Rule-level risk_level overrides a category upgrade to BLOCKED."""
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"risk_level": "HIGH"}},
+            category_overrides={"network": {"risk_level": "BLOCKED"}},
+        )
+        # open_port was originally MEDIUM, category upgraded to BLOCKED,
+        # but rule-level says HIGH — rule wins because original was not BLOCKED
+        open_port = next(r for r in override_engine.rules if r.name == "open_port")
+        assert open_port.risk_level == RiskLevel.HIGH
+
     def test_rule_enabled_wins_over_category_disabled(self, override_engine):
         """Rule enabled: true takes precedence over category enabled: false."""
         override_engine.apply_overrides(

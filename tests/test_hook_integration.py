@@ -454,19 +454,20 @@ class TestSelfProtectionHook:
         assert "schlock" in response["hookSpecificOutput"]["permissionDecisionReason"].lower()
 
     @pytest.mark.parametrize(
-        "tool_name,file_path",
+        "tool_name,file_path,tool_input_extra",
         [
-            ("Write", "src/main.py"),
-            ("Write", ".claude/hooks/other-config.yaml"),
-            ("Edit", "README.md"),
-            ("Read", ".claude/hooks/schlock-config.yaml"),  # Read is fine
+            ("Write", "src/main.py", {"content": "print('hello')"}),
+            ("Write", ".claude/hooks/other-config.yaml", {"content": "key: value"}),
+            ("Edit", "README.md", {"new_string": "updated", "old_string": "original"}),
+            ("Read", ".claude/hooks/schlock-config.yaml", {}),  # Read is fine
         ],
     )
-    def test_allows_non_config_file_operations(self, tool_name, file_path):
+    def test_allows_non_config_file_operations(self, tool_name, file_path, tool_input_extra):
         """Hook allows file operations that don't target schlock config."""
+        tool_input = {"file_path": file_path, **tool_input_extra}
         input_data = {
             "tool_name": tool_name,
-            "tool_input": {"file_path": file_path},
+            "tool_input": tool_input,
         }
         response = handle_pre_tool_use(input_data)
         # These should NOT be denied by self-protection

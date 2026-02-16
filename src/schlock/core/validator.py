@@ -406,6 +406,16 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
             return _make_self_protection_result(command)
 
     # Check 2: Allowlist — verify all commands touching config paths are read-only
+    # NOTE: Uses regex splitting rather than bashlex AST parsing. This is intentional:
+    # - Self-protection runs pre-parse on the hot path; AST adds ~5ms latency
+    # - AST parsing can itself fail, requiring fallback logic
+    # - The allowlist approach already handles known bypass constructs:
+    #   * Subshells: $(cmd) → first word is "$(cmd", not in allowlist → BLOCKED
+    #   * eval: eval "rm ..." → "eval" not in allowlist → BLOCKED
+    #   * Quoting: config path must appear as literal string for fast-path trigger
+    # - Only variable indirection (f=config; rm "$f") bypasses this check,
+    #   which AST parsing also can't solve (bashlex doesn't resolve variables).
+    #   Mitigated by YAML rules (layer 1) and hook file_path checks (layer 3).
     segments = _SEGMENT_SPLIT_RE.split(command)
     for raw_segment in segments:
         segment = raw_segment.strip()

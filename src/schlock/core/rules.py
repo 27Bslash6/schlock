@@ -262,9 +262,15 @@ class RuleEngine:
                 new_rule = self._apply_single_override(new_rule, cat_override, source=f"category:{rule.category}")
 
             # Phase 2: Rule overrides take precedence
+            # Pass original risk level so rule-level can override category upgrades
             rule_override = rule_overrides.get(rule.name)
             if rule_override and isinstance(rule_override, dict):
-                new_rule = self._apply_single_override(new_rule, rule_override, source=f"rule:{rule.name}")
+                new_rule = self._apply_single_override(
+                    new_rule,
+                    rule_override,
+                    source=f"rule:{rule.name}",
+                    original_risk_level=rule.risk_level,
+                )
 
             # Check if rule was disabled (only originally-BLOCKED rules are protected)
             # Uses `rule` (original) not `new_rule` (post-override) so that rules
@@ -292,13 +298,23 @@ class RuleEngine:
         for rule_name in disabled_rules:
             self.compiled_patterns.pop(rule_name, None)
 
-    def _apply_single_override(self, rule: SecurityRule, override: dict, source: str) -> SecurityRule:
+    def _apply_single_override(
+        self,
+        rule: SecurityRule,
+        override: dict,
+        source: str,
+        original_risk_level: Optional["RiskLevel"] = None,
+    ) -> SecurityRule:
         """Apply a single override dict to a rule, respecting BLOCKED floor.
 
         Args:
             rule: The rule to potentially modify.
             override: Override dict with optional risk_level/enabled keys.
             source: Human-readable source for log messages.
+            original_risk_level: If provided, use this for the BLOCKED floor check
+                instead of rule.risk_level. This allows rule-level overrides to
+                downgrade a rule that was upgraded to BLOCKED by a category override,
+                as long as the original rule was not BLOCKED.
 
         Returns:
             The original or replaced SecurityRule.
@@ -314,8 +330,9 @@ class RuleEngine:
             logger.warning(f"Invalid risk_level {risk_str!r} in {source}, skipping")
             return rule
 
-        # BLOCKED floor: cannot downgrade BLOCKED rules
-        if rule.risk_level == RiskLevel.BLOCKED and new_level < RiskLevel.BLOCKED:
+        # BLOCKED floor: cannot downgrade originally-BLOCKED rules
+        floor_level = original_risk_level if original_risk_level is not None else rule.risk_level
+        if floor_level == RiskLevel.BLOCKED and new_level < RiskLevel.BLOCKED:
             logger.warning(f"Cannot downgrade BLOCKED rule {rule.name!r} via {source}")
             return rule
 
