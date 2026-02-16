@@ -7,9 +7,10 @@ import pytest
 
 import schlock.core.validator as val_module
 from schlock.core import parser
-from schlock.core.rules import RiskLevel
+from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import (
     ValidationResult,
+    _load_rule_overrides,
     clear_caches,
     load_rules,
     validate_command,
@@ -319,3 +320,206 @@ class TestCaching:
         assert first_engine is not second_engine
         assert first_path != second_path
         assert second_path == str(alt_config)
+
+
+class TestRuleOverridesIntegration:
+    """Integration tests for rule override loading from config files."""
+
+    def test_load_rule_overrides_from_project_config(self, tmp_path, monkeypatch):
+        """Load rule_overrides from project-level config."""
+        project_config = tmp_path / ".claude" / "hooks"
+        project_config.mkdir(parents=True)
+        (project_config / "schlock-config.yaml").write_text("""
+rule_overrides:
+  recursive_delete:
+    enabled: false
+""")
+        monkeypatch.chdir(tmp_path)
+        rule_overrides, category_overrides = _load_rule_overrides()
+        assert "recursive_delete" in rule_overrides
+        assert rule_overrides["recursive_delete"]["enabled"] is False
+        assert category_overrides == {}
+
+    def test_load_category_overrides_from_project_config(self, tmp_path, monkeypatch):
+        """Load category_overrides from project-level config."""
+        project_config = tmp_path / ".claude" / "hooks"
+        project_config.mkdir(parents=True)
+        (project_config / "schlock-config.yaml").write_text("""
+category_overrides:
+  network_security:
+    risk_level: HIGH
+""")
+        monkeypatch.chdir(tmp_path)
+        rule_overrides, category_overrides = _load_rule_overrides()
+        assert rule_overrides == {}
+        assert "network_security" in category_overrides
+        assert category_overrides["network_security"]["risk_level"] == "HIGH"
+
+    def test_merge_precedence_project_over_user(self, tmp_path, monkeypatch):
+        """Project config overrides user config at property level."""
+        # User config: disable rule
+        user_config = tmp_path / "user_home" / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        (user_config / "config.yaml").write_text("""
+rule_overrides:
+  some_rule:
+    enabled: false
+    risk_level: LOW
+""")
+
+        # Project config: set risk_level only
+        project_config = tmp_path / "project" / ".claude" / "hooks"
+        project_config.mkdir(parents=True)
+        (project_config / "schlock-config.yaml").write_text("""
+rule_overrides:
+  some_rule:
+    risk_level: HIGH
+""")
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "user_home")
+        monkeypatch.chdir(tmp_path / "project")
+
+        rule_overrides, _ = _load_rule_overrides()
+        # enabled: false from user + risk_level: HIGH from project (overwrites user's LOW)
+        assert rule_overrides["some_rule"]["enabled"] is False
+        assert rule_overrides["some_rule"]["risk_level"] == "HIGH"
+
+    def test_no_config_files_returns_empty(self, tmp_path, monkeypatch):
+        """No config files returns empty dicts."""
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "nonexistent_home")
+        monkeypatch.chdir(tmp_path)
+
+        rule_overrides, category_overrides = _load_rule_overrides()
+        assert rule_overrides == {}
+        assert category_overrides == {}
+
+    def test_invalid_yaml_degrades_gracefully(self, tmp_path, monkeypatch, caplog):
+        """Invalid YAML in config doesn't crash, logs warning."""
+        project_config = tmp_path / ".claude" / "hooks"
+        project_config.mkdir(parents=True)
+        (project_config / "schlock-config.yaml").write_text("invalid: yaml: [")
+
+        monkeypatch.chdir(tmp_path)
+
+        rule_overrides, category_overrides = _load_rule_overrides()
+        assert rule_overrides == {}
+        assert category_overrides == {}
+        assert "Failed to load overrides" in caplog.text
+
+
+class TestSelfProtection:
+    """Test self-protection: LLM cannot modify schlock's own configuration.
+
+    Three defense layers:
+    1. YAML rules (BLOCKED, can't be overridden)
+    2. Hardcoded validator check (_check_self_protection)
+    3. Hook file_path check (tested in test_hook_integration.py)
+    """
+
+    # --- Layer 2: Hardcoded validator check ---
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "rule_overrides:" > .claude/hooks/schlock-config.yaml',
+            "cat > .claude/hooks/schlock-config.yaml << EOF",
+            "tee .claude/hooks/schlock-config.yaml",
+            "cp /tmp/evil.yaml .claude/hooks/schlock-config.yaml",
+            "mv /tmp/evil.yaml .claude/hooks/schlock-config.yaml",
+            "rm .claude/hooks/schlock-config.yaml",
+            "sed -i 's/BLOCKED/LOW/' .claude/hooks/schlock-config.yaml",
+            "truncate -s 0 .claude/hooks/schlock-config.yaml",
+            "chmod 777 .claude/hooks/schlock-config.yaml",
+            'echo "overrides" > ~/.config/schlock/config.yaml',
+            "rm ~/.config/schlock/config.yaml",
+            "tee ~/.config/schlock/config.yaml",
+        ],
+    )
+    def test_blocks_config_write_commands(self, command):
+        """Hardcoded check blocks write operations targeting schlock config."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "self_protection" in str(result.matched_rules)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat .claude/hooks/schlock-config.yaml",
+            "ls -la .claude/hooks/schlock-config.yaml",
+            "grep risk_level .claude/hooks/schlock-config.yaml",
+            "wc -l .claude/hooks/schlock-config.yaml",
+            "head -5 .claude/hooks/schlock-config.yaml",
+            "stat .claude/hooks/schlock-config.yaml",
+            "diff .claude/hooks/schlock-config.yaml /tmp/other.yaml",
+            "jq . .claude/hooks/schlock-config.yaml",
+        ],
+    )
+    def test_allows_config_read_commands(self, command):
+        """Read-only operations on schlock config are allowed."""
+        result = validate_command(command)
+        assert result.allowed, f"Should allow: {command}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Bypass vectors that the old denylist approach would miss
+            "ln -sf /dev/null .claude/hooks/schlock-config.yaml",
+            "dd of=.claude/hooks/schlock-config.yaml",
+            "rsync evil.yaml .claude/hooks/schlock-config.yaml",
+            "python3 -c \"open('.claude/hooks/schlock-config.yaml', 'w')\"",
+            "perl -pi -e 's/BLOCKED/LOW/' .claude/hooks/schlock-config.yaml",
+            "install /tmp/evil.yaml .claude/hooks/schlock-config.yaml",
+            "ln -sf /dev/null ~/.config/schlock/config.yaml",
+            "dd of=~/.config/schlock/config.yaml",
+        ],
+    )
+    def test_blocks_obscure_write_commands(self, command):
+        """Allowlist catches obscure write commands that a denylist would miss."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_self_protection_cannot_be_overridden(self, tmp_path):
+        """Self-protection rules in YAML are BLOCKED and cannot be overridden."""
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "14_self_protection.yaml").write_text(r"""
+rules:
+  - name: schlock_config_write
+    description: Self-protection test
+    risk_level: BLOCKED
+    patterns: ['schlock-config\.yaml']
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # Try to override the self-protection rule
+        engine.apply_overrides(
+            rule_overrides={"schlock_config_write": {"risk_level": "LOW", "enabled": False}},
+            category_overrides={},
+        )
+
+        # Rule should still be present and still BLOCKED
+        rule = next(r for r in engine.rules if r.name == "schlock_config_write")
+        assert rule.risk_level == RiskLevel.BLOCKED
+
+    def test_self_protection_category_cannot_be_disabled(self, tmp_path):
+        """Self-protection category cannot be disabled via category_overrides."""
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "14_self_protection.yaml").write_text(r"""
+rules:
+  - name: schlock_config_write
+    description: Self-protection test
+    risk_level: BLOCKED
+    patterns: ['schlock-config\.yaml']
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"self_protection": {"enabled": False}},
+        )
+
+        # BLOCKED rule should survive category disable
+        assert any(r.name == "schlock_config_write" for r in engine.rules)

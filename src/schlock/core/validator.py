@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
 from schlock.exceptions import ConfigurationError, ParseError
 from schlock.integrations.shellcheck import (
     get_security_findings,
@@ -140,6 +142,57 @@ class ValidationResult:
     matched_rules: list[str] = field(default_factory=list)
 
 
+def _load_rule_overrides() -> tuple[dict, dict]:
+    """Load rule and category overrides from config files.
+
+    Reads config from both paths in precedence order (user first, project second).
+    Project-level overrides win at the property level (not dict-level replace).
+
+    Returns:
+        Tuple of (rule_overrides, category_overrides). Empty dicts if none found.
+        Never raises exceptions.
+    """
+    rule_overrides: dict = {}
+    category_overrides: dict = {}
+
+    # Config paths in priority order (lowest first, highest last)
+    config_paths = [
+        Path.home() / ".config" / "schlock" / "config.yaml",
+        Path.cwd() / ".claude" / "hooks" / "schlock-config.yaml",
+    ]
+
+    for config_path in config_paths:
+        try:
+            if not config_path.exists():
+                continue
+
+            with open(config_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+
+            if not isinstance(data, dict):
+                continue
+
+            # Merge rule_overrides (property-level: per-rule keys merge, per-property overwrites)
+            file_rule_overrides = data.get("rule_overrides", {})
+            if isinstance(file_rule_overrides, dict):
+                for rule_name, props in file_rule_overrides.items():
+                    if isinstance(props, dict):
+                        rule_overrides.setdefault(rule_name, {}).update(props)
+
+            # Merge category_overrides (same property-level merge)
+            file_category_overrides = data.get("category_overrides", {})
+            if isinstance(file_category_overrides, dict):
+                for cat_name, props in file_category_overrides.items():
+                    if isinstance(props, dict):
+                        category_overrides.setdefault(cat_name, {}).update(props)
+
+        except Exception as e:
+            logger.warning(f"Failed to load overrides from {config_path}: {e}")
+            continue
+
+    return rule_overrides, category_overrides
+
+
 def load_rules(config_path: Optional[str] = None) -> RuleEngine:
     """Load rules from the canonical data/rules/ directory.
 
@@ -176,7 +229,14 @@ def load_rules(config_path: Optional[str] = None) -> RuleEngine:
         )
 
     logger.info(f"Loading rules from directory: {rules_dir}")
-    return RuleEngine.from_directory(rules_dir)
+    engine = RuleEngine.from_directory(rules_dir)
+
+    # Apply user/project overrides (only for default path, not test overrides)
+    rule_overrides, category_overrides = _load_rule_overrides()
+    if rule_overrides or category_overrides:
+        engine.apply_overrides(rule_overrides, category_overrides)
+
+    return engine
 
 
 # SECURITY: Dangerous command + flag combinations that must be blocked regardless of quoting
@@ -263,6 +323,128 @@ def _check_dangerous_command_flags(
     return None
 
 
+# SELF-PROTECTION: Paths that identify schlock configuration files.
+# Any command containing these paths is subject to allowlist enforcement.
+_SELF_PROTECTION_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
+
+# SELF-PROTECTION: Read-only commands allowed to reference config files.
+# Allowlist approach: any command NOT in this set is BLOCKED when it references config paths.
+# Only inherently read-only commands are included (cannot modify files by design).
+_SELF_PROTECTION_READ_ALLOWLIST = frozenset(
+    {
+        "cat",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ag",
+        "ack",  # Content viewing/searching
+        "ls",
+        "dir",
+        "stat",
+        "file",  # File info
+        "head",
+        "tail",
+        "less",
+        "more",
+        "bat",
+        "view",  # Pagers/viewers
+        "wc",
+        "md5sum",
+        "sha256sum",
+        "sha1sum",
+        "cksum",  # Measurement
+        "diff",
+        "cmp",
+        "comm",  # Comparison
+        "test",
+        "[",  # Existence checks
+        "basename",
+        "dirname",
+        "realpath",
+        "readlink",  # Path info
+        "jq",  # Structured data viewer (stdout only, cannot write files)
+    }
+)
+
+# Pre-compiled regex for redirect operators targeting config paths
+_SELF_PROTECTION_REDIRECT_PATTERNS = [re.compile(r">>?\s*\S*" + re.escape(path)) for path in _SELF_PROTECTION_PATHS]
+
+# Pre-compiled regex for splitting command strings into segments
+_SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
+
+
+def _check_self_protection(command: str) -> Optional[ValidationResult]:
+    """Allowlist-based check preventing modification of schlock configuration files.
+
+    SECURITY CRITICAL: Uses an allowlist approach — when a config path is detected
+    in a command, only known read-only commands are permitted. All other commands
+    are blocked. This prevents bypass via obscure write commands (ln, dd, rsync, etc.)
+    that a denylist would miss.
+
+    Defense-in-depth: This is layer 2 of 3. Even if YAML rules (layer 1) are corrupted
+    or the hook file_path check (layer 3) is bypassed, this hardcoded check blocks
+    config tampering.
+
+    Known limitation: Variable indirection (e.g., f=config.yaml; rm "$f") can bypass
+    this check because the expanded path doesn't appear in the command string. Mitigated
+    by YAML rule matching and hook-level file_path checks.
+
+    Args:
+        command: Command string to check
+
+    Returns:
+        ValidationResult blocking the command if it targets schlock config, None otherwise
+    """
+    # Fast path: skip if command doesn't reference any config path
+    if not any(path in command for path in _SELF_PROTECTION_PATHS):
+        return None
+
+    # Check 1: Block any redirect operators (> or >>) targeting config files
+    for pattern in _SELF_PROTECTION_REDIRECT_PATTERNS:
+        if pattern.search(command):
+            return _make_self_protection_result(command)
+
+    # Check 2: Allowlist — verify all commands touching config paths are read-only
+    segments = _SEGMENT_SPLIT_RE.split(command)
+    for raw_segment in segments:
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        # Skip pure variable assignments (VAR=value)
+        if re.match(r"^[A-Za-z_]\w*=", segment):
+            continue
+        # Only check segments that reference a config path
+        if not any(path in segment for path in _SELF_PROTECTION_PATHS):
+            continue
+        # Extract command name (first word, strip path prefix)
+        words = segment.split()
+        if not words:
+            continue
+        cmd = words[0].rsplit("/", 1)[-1]
+        if cmd not in _SELF_PROTECTION_READ_ALLOWLIST:
+            return _make_self_protection_result(command)
+
+    return None
+
+
+def _make_self_protection_result(command: str) -> ValidationResult:
+    """Create a BLOCKED ValidationResult for self-protection violations."""
+    logger.warning(f"Self-protection: blocked config modification attempt: {command[:100]}")
+    return ValidationResult(
+        allowed=False,
+        risk_level=RiskLevel.BLOCKED,
+        message="BLOCKED: Modification of schlock safety configuration is not allowed",
+        alternatives=[
+            "Edit schlock configuration manually outside of Claude Code",
+            "Use /schlock:setup to configure schlock interactively",
+        ],
+        exit_code=1,
+        error=None,
+        matched_rules=["self_protection:config_write"],
+    )
+
+
 def _check_special_cases(command: str) -> Optional[ValidationResult]:
     """Check special cases that require dynamic state inspection.
 
@@ -278,6 +460,13 @@ def _check_special_cases(command: str) -> Optional[ValidationResult]:
     Returns:
         ValidationResult if special case triggered, None otherwise
     """
+    # SELF-PROTECTION: Prevent LLM from modifying schlock's own configuration
+    # This is a hardcoded backstop that runs BEFORE YAML rule matching and
+    # cannot be bypassed via rule_overrides or category_overrides.
+    self_protection = _check_self_protection(command)
+    if self_protection is not None:
+        return self_protection
+
     # Git reset --hard protection: check for uncommitted changes
     if "git reset" in command and "--hard" in command:
         try:
@@ -696,8 +885,9 @@ def clear_caches() -> None:
         - RuleEngine cache
         - Parser cache
     """
-    global _global_rule_engine, _global_rule_engine_path, _global_parser  # noqa: PLW0603
+    global _global_rule_engine, _global_rule_engine_path, _global_parser, _global_substitution_validator  # noqa: PLW0603
     _global_cache.clear()
     _global_rule_engine = None
     _global_rule_engine_path = None
     _global_parser = None
+    _global_substitution_validator = None

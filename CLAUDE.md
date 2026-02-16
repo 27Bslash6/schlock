@@ -73,6 +73,13 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 2. User overrides: `~/.config/schlock/config.yaml`
 3. Project overrides: `.claude/hooks/schlock-config.yaml`
 
+**Rule Overrides**: Per-rule and per-category overrides via `rule_overrides` and `category_overrides` YAML keys. BLOCKED rules cannot be downgraded or disabled (security floor).
+
+**Self-Protection**: Three-layer defense prevents LLM agents from modifying schlock config:
+1. YAML rules (`14_self_protection.yaml`, BLOCKED) — can't be overridden
+2. Hardcoded validator check (`_check_self_protection`) — independent of YAML rules
+3. Hook file_path check — blocks Write/Edit tool calls targeting config files
+
 ## Installation
 
 ```bash
