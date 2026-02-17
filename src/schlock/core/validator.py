@@ -156,10 +156,17 @@ def _load_rule_overrides() -> tuple[dict, dict]:
     category_overrides: dict = {}
 
     # Config paths in priority order (lowest first, highest last)
-    config_paths = [
-        Path.home() / ".config" / "schlock" / "config.yaml",
-        Path.cwd() / ".claude" / "hooks" / "schlock-config.yaml",
-    ]
+    # Path.home() can raise RuntimeError (HOME unset, e.g. containers/CI)
+    # Path.cwd() can raise FileNotFoundError (cwd deleted)
+    config_paths: list[Path] = []
+    try:
+        config_paths.append(Path.home() / ".config" / "schlock" / "config.yaml")
+    except Exception as e:
+        logger.warning(f"Cannot resolve home directory for user config: {e}")
+    try:
+        config_paths.append(Path.cwd() / ".claude" / "hooks" / "schlock-config.yaml")
+    except Exception as e:
+        logger.warning(f"Cannot resolve working directory for project config: {e}")
 
     for config_path in config_paths:
         try:
