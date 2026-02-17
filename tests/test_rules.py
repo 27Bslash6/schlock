@@ -630,6 +630,15 @@ rules:
         )
         assert len(override_engine.rules) == original_count
 
+    def test_non_dict_category_override_value_ignored(self, override_engine):
+        """Non-dict category override values are ignored gracefully."""
+        original_count = len(override_engine.rules)
+        override_engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"network": "not_a_dict"},
+        )
+        assert len(override_engine.rules) == original_count
+
     def test_multiple_rule_overrides(self, override_engine):
         """Multiple rules can be overridden simultaneously."""
         override_engine.apply_overrides(

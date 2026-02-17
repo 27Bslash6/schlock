@@ -434,20 +434,20 @@ class TestSelfProtectionHook:
     """Test hook-level self-protection: blocks Write/Edit targeting schlock config."""
 
     @pytest.mark.parametrize(
-        "tool_name,file_path",
+        "tool_name,file_path,tool_input_extra",
         [
-            ("Write", ".claude/hooks/schlock-config.yaml"),
-            ("Write", "/home/user/.config/schlock/config.yaml"),
-            ("Edit", ".claude/hooks/schlock-config.yaml"),
-            ("Edit", "/home/user/.config/schlock/config.yaml"),
-            ("file_write", "project/.claude/hooks/schlock-config.yaml"),
+            ("Write", ".claude/hooks/schlock-config.yaml", {"content": "rule_overrides: {}"}),
+            ("Write", "/home/user/.config/schlock/config.yaml", {"content": "rule_overrides: {}"}),
+            ("Edit", ".claude/hooks/schlock-config.yaml", {"new_string": "rule_overrides: {}", "old_string": ""}),
+            ("Edit", "/home/user/.config/schlock/config.yaml", {"new_string": "rule_overrides: {}", "old_string": ""}),
+            ("file_write", "project/.claude/hooks/schlock-config.yaml", {"content": "rule_overrides: {}"}),
         ],
     )
-    def test_blocks_file_write_to_config(self, tool_name, file_path):
+    def test_blocks_file_write_to_config(self, tool_name, file_path, tool_input_extra):
         """Hook blocks Write/Edit tool calls targeting schlock config files."""
         input_data = {
             "tool_name": tool_name,
-            "tool_input": {"file_path": file_path, "content": "rule_overrides: {}"},
+            "tool_input": {"file_path": file_path, **tool_input_extra},
         }
         response = handle_pre_tool_use(input_data)
         assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -476,10 +476,12 @@ class TestSelfProtectionHook:
         assert "schlock safety configuration" not in reason.lower()
 
     def test_bash_config_write_also_blocked(self):
-        """Bash commands writing to schlock config are blocked via command validation."""
+        """Bash commands writing to schlock config are blocked via self-protection."""
         input_data = {
             "tool_name": "Bash",
             "tool_input": {"command": "echo 'rule_overrides: {}' > .claude/hooks/schlock-config.yaml"},
         }
         response = handle_pre_tool_use(input_data)
         assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "schlock" in reason.lower() or "self_protection" in reason.lower()

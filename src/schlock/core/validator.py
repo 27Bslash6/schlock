@@ -421,14 +421,17 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
         segment = raw_segment.strip()
         if not segment:
             continue
-        # Skip pure variable assignments (VAR=value)
-        if re.match(r"^[A-Za-z_]\w*=", segment):
+        # Strip leading environment variable assignments (e.g., "DUMMY=1 FOO=bar rm ...")
+        # These prefix a command but don't change what it does — the command after them
+        # is what matters. If ONLY assignments remain, it's a pure assignment (skip).
+        stripped = re.sub(r"^([A-Za-z_]\w*=\S*\s+)+", "", segment)
+        if not stripped:
             continue
         # Only check segments that reference a config path
         if not any(path in segment for path in _SELF_PROTECTION_PATHS):
             continue
         # Extract command name (first word, strip path prefix)
-        words = segment.split()
+        words = stripped.split()
         if not words:
             continue
         cmd = words[0].rsplit("/", 1)[-1]

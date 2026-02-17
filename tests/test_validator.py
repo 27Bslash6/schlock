@@ -480,6 +480,20 @@ class TestSelfProtection:
         assert not result.allowed, f"Should block: {command}"
         assert result.risk_level == RiskLevel.BLOCKED
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "DUMMY=1 rm .claude/hooks/schlock-config.yaml",
+            "FOO=bar BAZ=1 cp /tmp/evil.yaml .claude/hooks/schlock-config.yaml",
+            "LANG=C tee ~/.config/schlock/config.yaml",
+        ],
+    )
+    def test_blocks_env_prefixed_write_commands(self, command):
+        """Env-var prefixes don't bypass self-protection allowlist."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
     def test_self_protection_cannot_be_overridden(self, tmp_path):
         """Self-protection rules in YAML are BLOCKED and cannot be overridden."""
         rules_dir = tmp_path / "rules"
