@@ -6,7 +6,7 @@ and the rule matching engine for command validation.
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from re import Pattern
@@ -99,6 +99,7 @@ class SecurityRule:
     risk_level: RiskLevel
     patterns: list[str] = field(default_factory=list)
     alternatives: list[str] = field(default_factory=list)
+    category: str = ""
 
     def __post_init__(self):
         """Validate rule structure after initialization."""
@@ -226,6 +227,158 @@ class RuleEngine:
         engine._load_rules_from_directory(rules_dir)
 
         return engine
+
+    def apply_overrides(
+        self,
+        rule_overrides: dict[str, dict],
+        category_overrides: dict[str, dict],
+    ) -> None:
+        """Apply user/project overrides to loaded rules.
+
+        Two-tier override system:
+        1. Category overrides applied first (broad brush)
+        2. Rule overrides applied second (fine-grained, wins over category)
+
+        Security constraint: BLOCKED rules cannot be downgraded or disabled.
+
+        Args:
+            rule_overrides: Per-rule overrides keyed by rule name.
+                Each value is a dict with optional keys: risk_level (str), enabled (bool).
+            category_overrides: Per-category overrides keyed by category name.
+                Each value is a dict with optional keys: risk_level (str), enabled (bool).
+        """
+        if not rule_overrides and not category_overrides:
+            return
+
+        # Phase 1: Apply category overrides
+        updated_rules: list[SecurityRule] = []
+        disabled_rules: set[str] = set()
+
+        for rule in self.rules:
+            new_rule = rule
+            cat_override = category_overrides.get(rule.category) if rule.category else None
+
+            if cat_override and isinstance(cat_override, dict):
+                new_rule = self._apply_single_override(new_rule, cat_override, source=f"category:{rule.category}")
+
+            # Phase 2: Rule overrides take precedence
+            # Pass original risk level so rule-level can override category upgrades
+            rule_override = rule_overrides.get(rule.name)
+            if rule_override and isinstance(rule_override, dict):
+                new_rule = self._apply_single_override(
+                    new_rule,
+                    rule_override,
+                    source=f"rule:{rule.name}",
+                    original_risk_level=rule.risk_level,
+                )
+
+            # Check if rule was disabled (only originally-BLOCKED rules are protected)
+            # Uses `rule` (original) not `new_rule` (post-override) so that rules
+            # upgraded to BLOCKED by overrides can still be disabled.
+            if not self._is_rule_enabled(rule, cat_override, rule_override):
+                disabled_rules.add(rule.name)
+                continue
+
+            updated_rules.append(new_rule)
+
+        # Warn about unknown rule names
+        known_names = {r.name for r in self.rules}
+        for name in rule_overrides:
+            if name not in known_names:
+                logger.warning(f"Rule override references unknown rule: {name!r}")
+
+        # Warn about unknown categories
+        known_categories = {r.category for r in self.rules if r.category}
+        for name in category_overrides:
+            if name not in known_categories:
+                logger.warning(f"Category override references unknown category: {name!r}")
+
+        # Replace rules and clean up compiled patterns for disabled rules
+        self.rules = updated_rules
+        for rule_name in disabled_rules:
+            self.compiled_patterns.pop(rule_name, None)
+
+    def _apply_single_override(
+        self,
+        rule: SecurityRule,
+        override: dict,
+        source: str,
+        original_risk_level: Optional["RiskLevel"] = None,
+    ) -> SecurityRule:
+        """Apply a single override dict to a rule, respecting BLOCKED floor.
+
+        Args:
+            rule: The rule to potentially modify.
+            override: Override dict with optional risk_level/enabled keys.
+            source: Human-readable source for log messages.
+            original_risk_level: If provided, use this for the BLOCKED floor check
+                instead of rule.risk_level. This allows rule-level overrides to
+                downgrade a rule that was upgraded to BLOCKED by a category override,
+                as long as the original rule was not BLOCKED.
+
+        Returns:
+            The original or replaced SecurityRule.
+        """
+        risk_str = override.get("risk_level")
+        if risk_str is None:
+            return rule
+
+        risk_str = str(risk_str).upper()
+        try:
+            new_level = RiskLevel[risk_str]
+        except KeyError:
+            logger.warning(f"Invalid risk_level {risk_str!r} in {source}, skipping")
+            return rule
+
+        # BLOCKED floor: cannot downgrade originally-BLOCKED rules
+        floor_level = original_risk_level if original_risk_level is not None else rule.risk_level
+        if floor_level == RiskLevel.BLOCKED and new_level < RiskLevel.BLOCKED:
+            logger.warning(f"Cannot downgrade BLOCKED rule {rule.name!r} via {source}")
+            return rule
+
+        if new_level != rule.risk_level:
+            return replace(rule, risk_level=new_level)
+        return rule
+
+    def _is_rule_enabled(
+        self,
+        original_rule: SecurityRule,
+        category_override: Optional[dict],
+        rule_override: Optional[dict],
+    ) -> bool:
+        """Determine if a rule should remain enabled after overrides.
+
+        Rule-level `enabled` takes precedence over category-level.
+        Only originally-BLOCKED rules cannot be disabled (rules upgraded
+        to BLOCKED by overrides can still be disabled).
+
+        Args:
+            original_rule: The rule BEFORE any overrides were applied.
+                Used for BLOCKED floor check to protect original intent.
+            category_override: Category-level override dict (if any).
+            rule_override: Rule-level override dict (if any).
+
+        Returns:
+            True if rule should remain enabled.
+        """
+        # Rule-level enabled takes precedence
+        if rule_override and isinstance(rule_override, dict) and "enabled" in rule_override:
+            if not rule_override["enabled"]:
+                if original_rule.risk_level == RiskLevel.BLOCKED:
+                    logger.warning(f"Cannot disable BLOCKED rule {original_rule.name!r}")
+                    return True
+                return False
+            return True
+
+        # Category-level enabled
+        if category_override and isinstance(category_override, dict) and "enabled" in category_override:
+            if not category_override["enabled"]:
+                if original_rule.risk_level == RiskLevel.BLOCKED:
+                    logger.warning(f"Cannot disable BLOCKED rule {original_rule.name!r} via category override")
+                    return True
+                return False
+
+        return True
 
     def _load_rules(self) -> None:
         """Load and validate rules from YAML file or directory.
@@ -396,6 +549,9 @@ class RuleEngine:
                         file_path=str(yaml_file),
                     )
 
+                # Derive category from filename: "02_file_destruction.yaml" -> "file_destruction"
+                category = re.sub(r"^\d+_", "", yaml_file.stem)
+
                 # Load whitelist patterns (merge from all files)
                 whitelist = data.get("whitelist", [])
                 if whitelist:
@@ -409,6 +565,7 @@ class RuleEngine:
 
                 for idx, rule_data in enumerate(rules_data):
                     try:
+                        rule_data["category"] = category
                         self._load_rule(rule_data, idx)
                     except Exception as e:
                         raise ConfigurationError(

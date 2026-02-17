@@ -495,3 +495,257 @@ rules:
 
         assert match_single.matched == match_dir.matched
         assert match_single.risk_level == match_dir.risk_level
+
+
+class TestRuleOverrides:
+    """Test suite for rule and category overrides."""
+
+    @pytest.fixture
+    def override_engine(self, tmp_path):
+        """Create a RuleEngine with known rules across categories for override testing."""
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+
+        (rules_dir / "01_destruction.yaml").write_text(r"""
+rules:
+  - name: system_destruction
+    description: Complete filesystem destruction
+    risk_level: BLOCKED
+    patterns: ['rm\s+-rf\s+/']
+    alternatives: ["Don't do this"]
+
+  - name: recursive_delete
+    description: Recursive delete of directory
+    risk_level: HIGH
+    patterns: ['rm\s+-r\s+']
+    alternatives: ["Be more specific"]
+""")
+
+        (rules_dir / "02_network.yaml").write_text(r"""
+rules:
+  - name: curl_pipe_bash
+    description: Pipe curl to bash
+    risk_level: BLOCKED
+    patterns: ['curl.*\|\s*bash']
+    alternatives: ["Download and inspect first"]
+
+  - name: open_port
+    description: Listening on a port
+    risk_level: MEDIUM
+    patterns: ['nc\s+-l']
+    alternatives: ["Use a proper server"]
+""")
+
+        return RuleEngine.from_directory(rules_dir)
+
+    # --- Rule-level overrides ---
+
+    def test_upgrade_risk_level(self, override_engine):
+        """Rule override can upgrade risk level."""
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"risk_level": "HIGH"}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "open_port")
+        assert rule.risk_level == RiskLevel.HIGH
+
+    def test_downgrade_non_blocked_rule(self, override_engine):
+        """Rule override can downgrade non-BLOCKED rules."""
+        override_engine.apply_overrides(
+            rule_overrides={"recursive_delete": {"risk_level": "MEDIUM"}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "recursive_delete")
+        assert rule.risk_level == RiskLevel.MEDIUM
+
+    def test_cannot_downgrade_blocked_rule(self, override_engine):
+        """BLOCKED rules cannot be downgraded — security floor."""
+        override_engine.apply_overrides(
+            rule_overrides={"system_destruction": {"risk_level": "HIGH"}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "system_destruction")
+        assert rule.risk_level == RiskLevel.BLOCKED
+
+    def test_disable_rule(self, override_engine):
+        """Non-BLOCKED rules can be disabled."""
+        override_engine.apply_overrides(
+            rule_overrides={"recursive_delete": {"enabled": False}},
+            category_overrides={},
+        )
+        assert not any(r.name == "recursive_delete" for r in override_engine.rules)
+        assert "recursive_delete" not in override_engine.compiled_patterns
+
+    def test_cannot_disable_blocked_rule(self, override_engine):
+        """BLOCKED rules cannot be disabled."""
+        override_engine.apply_overrides(
+            rule_overrides={"system_destruction": {"enabled": False}},
+            category_overrides={},
+        )
+        assert any(r.name == "system_destruction" for r in override_engine.rules)
+
+    def test_unknown_rule_ignored(self, override_engine, caplog):
+        """Unknown rule names are warned and ignored."""
+        original_count = len(override_engine.rules)
+        override_engine.apply_overrides(
+            rule_overrides={"nonexistent_rule": {"risk_level": "HIGH"}},
+            category_overrides={},
+        )
+        assert len(override_engine.rules) == original_count
+        assert "unknown rule" in caplog.text.lower()
+
+    def test_invalid_risk_level_ignored(self, override_engine, caplog):
+        """Invalid risk_level values are warned and skipped."""
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"risk_level": "SUPER_BLOCKED"}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "open_port")
+        assert rule.risk_level == RiskLevel.MEDIUM  # Unchanged
+        assert "Invalid risk_level" in caplog.text
+
+    def test_empty_overrides_noop(self, override_engine):
+        """Empty overrides don't modify anything."""
+        original_rules = list(override_engine.rules)
+        override_engine.apply_overrides(rule_overrides={}, category_overrides={})
+        assert override_engine.rules == original_rules
+
+    def test_preserves_other_fields(self, override_engine):
+        """Override only changes specified fields, preserves everything else."""
+        override_engine.apply_overrides(
+            rule_overrides={"recursive_delete": {"risk_level": "BLOCKED"}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "recursive_delete")
+        assert rule.description == "Recursive delete of directory"
+        assert rule.alternatives == ["Be more specific"]
+        assert rule.category == "destruction"
+
+    def test_non_dict_override_value_ignored(self, override_engine):
+        """Non-dict override values are ignored gracefully."""
+        original_count = len(override_engine.rules)
+        override_engine.apply_overrides(
+            rule_overrides={"recursive_delete": "not_a_dict"},
+            category_overrides={},
+        )
+        assert len(override_engine.rules) == original_count
+
+    def test_non_dict_category_override_value_ignored(self, override_engine):
+        """Non-dict category override values are ignored gracefully."""
+        original_count = len(override_engine.rules)
+        override_engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"network": "not_a_dict"},
+        )
+        assert len(override_engine.rules) == original_count
+
+    def test_multiple_rule_overrides(self, override_engine):
+        """Multiple rules can be overridden simultaneously."""
+        override_engine.apply_overrides(
+            rule_overrides={
+                "open_port": {"risk_level": "HIGH"},
+                "recursive_delete": {"enabled": False},
+            },
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "open_port")
+        assert rule.risk_level == RiskLevel.HIGH
+        assert not any(r.name == "recursive_delete" for r in override_engine.rules)
+
+    # --- Category-level overrides ---
+
+    def test_category_override_all_rules(self, override_engine):
+        """Category override applies to all rules in that category."""
+        override_engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"network": {"enabled": False}},
+        )
+        # open_port (MEDIUM) should be disabled, curl_pipe_bash (BLOCKED) should remain
+        assert not any(r.name == "open_port" for r in override_engine.rules)
+        assert any(r.name == "curl_pipe_bash" for r in override_engine.rules)
+
+    def test_category_risk_level_override(self, override_engine):
+        """Category override can change risk level for all non-BLOCKED rules."""
+        override_engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"network": {"risk_level": "HIGH"}},
+        )
+        open_port = next(r for r in override_engine.rules if r.name == "open_port")
+        assert open_port.risk_level == RiskLevel.HIGH
+        # BLOCKED rule should be unchanged
+        curl = next(r for r in override_engine.rules if r.name == "curl_pipe_bash")
+        assert curl.risk_level == RiskLevel.BLOCKED
+
+    def test_rule_override_wins_over_category(self, override_engine):
+        """Rule-level override takes precedence over category-level."""
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"risk_level": "BLOCKED"}},
+            category_overrides={"network": {"risk_level": "LOW"}},
+        )
+        open_port = next(r for r in override_engine.rules if r.name == "open_port")
+        assert open_port.risk_level == RiskLevel.BLOCKED
+
+    def test_rule_risk_level_wins_over_category_blocked_upgrade(self, override_engine):
+        """Rule-level risk_level overrides a category upgrade to BLOCKED."""
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"risk_level": "HIGH"}},
+            category_overrides={"network": {"risk_level": "BLOCKED"}},
+        )
+        # open_port was originally MEDIUM, category upgraded to BLOCKED,
+        # but rule-level says HIGH — rule wins because original was not BLOCKED
+        open_port = next(r for r in override_engine.rules if r.name == "open_port")
+        assert open_port.risk_level == RiskLevel.HIGH
+
+    def test_rule_enabled_wins_over_category_disabled(self, override_engine):
+        """Rule enabled: true takes precedence over category enabled: false."""
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"enabled": True}},
+            category_overrides={"network": {"enabled": False}},
+        )
+        # open_port should remain because rule-level enabled: true wins
+        assert any(r.name == "open_port" for r in override_engine.rules)
+        # curl_pipe_bash should also remain because it's originally BLOCKED
+        assert any(r.name == "curl_pipe_bash" for r in override_engine.rules)
+
+    def test_unknown_category_ignored(self, override_engine, caplog):
+        """Unknown category names are warned and ignored."""
+        original_count = len(override_engine.rules)
+        override_engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"fantasy_category": {"enabled": False}},
+        )
+        assert len(override_engine.rules) == original_count
+        assert "unknown category" in caplog.text.lower()
+
+    def test_cannot_downgrade_blocked_via_category(self, override_engine):
+        """BLOCKED rules in a category cannot be downgraded."""
+        override_engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"destruction": {"risk_level": "MEDIUM"}},
+        )
+        system_dest = next(r for r in override_engine.rules if r.name == "system_destruction")
+        assert system_dest.risk_level == RiskLevel.BLOCKED
+
+    def test_can_disable_rule_upgraded_to_blocked(self, override_engine):
+        """Rules upgraded to BLOCKED via override can still be disabled (original was not BLOCKED)."""
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"enabled": False}},
+            category_overrides={"network": {"risk_level": "BLOCKED"}},
+        )
+        # open_port was originally MEDIUM, so it can be disabled even after upgrade
+        assert not any(r.name == "open_port" for r in override_engine.rules)
+
+    # --- Category field population ---
+
+    def test_category_populated_during_directory_loading(self, override_engine):
+        """Category field populated from filename during directory loading."""
+        system_dest = next(r for r in override_engine.rules if r.name == "system_destruction")
+        assert system_dest.category == "destruction"
+        open_port = next(r for r in override_engine.rules if r.name == "open_port")
+        assert open_port.category == "network"
+
+    def test_category_empty_for_single_file_loading(self, test_rules_file):
+        """Category defaults to empty string for single-file loading."""
+        engine = RuleEngine(test_rules_file)
+        for rule in engine.rules:
+            assert rule.category == ""

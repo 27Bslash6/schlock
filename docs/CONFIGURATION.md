@@ -63,18 +63,92 @@ Each rule has:
 - `message`: User-facing warning message
 - `alternatives`: Suggested safer alternatives (optional)
 
-### Rule Overrides (Coming in v0.3.0)
+### Rule Overrides
 
-> **Note**: Per-rule customization is planned for v0.3.0. See [ROADMAP.md](ROADMAP.md) for details.
->
-> Planned syntax:
-> ```yaml
-> rule_overrides:
->   git_bulk_staging:
->     risk_level: BLOCKED  # Upgrade from HIGH
->   some_annoying_rule:
->     enabled: false       # Disable entirely
-> ```
+Schlock supports two tiers of rule customization: **category overrides** (broad brush) and **per-rule overrides** (fine-grained). Both are configured in your `schlock-config.yaml`.
+
+#### Syntax
+
+```yaml
+# .claude/hooks/schlock-config.yaml (or ~/.config/schlock/config.yaml)
+
+# Tier 1: Category-level overrides (applies to all rules in the category)
+category_overrides:
+  credential_theft:
+    risk_level: HIGH         # Demote all credential_theft rules from BLOCKED to HIGH
+  network_security:
+    enabled: false           # Disable all network security rules
+
+# Tier 2: Per-rule overrides (takes precedence over category)
+rule_overrides:
+  credential_exposure:
+    risk_level: BLOCKED      # Keep this one at BLOCKED despite category demotion
+  git_bulk_staging:
+    risk_level: BLOCKED      # Promote from HIGH
+  recursive_delete:
+    enabled: false           # Disable this specific rule
+```
+
+#### Override Precedence
+
+Overrides are applied in this order (later wins):
+
+1. **Plugin defaults** (`data/rules/*.yaml`) — base rules
+2. **Category overrides** — applied first, broad brush
+3. **Rule overrides** — applied second, fine-grained, wins over category
+
+**Config file precedence**: Project (`.claude/hooks/`) > User (`~/.config/schlock/`) with property-level merge. If user config sets `enabled: false` and project config sets `risk_level: HIGH` for the same rule, both properties apply.
+
+#### Security Constraints
+
+- **BLOCKED rules cannot be downgraded or disabled** — this is a non-negotiable security floor
+- Invalid overrides log warnings and are skipped (graceful degradation)
+- Unknown rule or category names log warnings and are skipped
+
+#### Available Categories
+
+Categories are derived from rule file names (strip numeric prefix and extension):
+
+| Filename | Category |
+|----------|----------|
+| `00_whitelist.yaml` | `whitelist` |
+| `01_privilege_escalation.yaml` | `privilege_escalation` |
+| `02_file_destruction.yaml` | `file_destruction` |
+| `03_credential_theft.yaml` | `credential_theft` |
+| `04_disk_operations.yaml` | `disk_operations` |
+| `05_code_execution.yaml` | `code_execution` |
+| `06_network_security.yaml` | `network_security` |
+| `07_container_security.yaml` | `container_security` |
+| `08_system_modification.yaml` | `system_modification` |
+| `09_log_tampering.yaml` | `log_tampering` |
+| `10_development_workflows.yaml` | `development_workflows` |
+| `11_dynamic_linker.yaml` | `dynamic_linker` |
+| `12_cloud_security.yaml` | `cloud_security` |
+| `13_data_exfiltration.yaml` | `data_exfiltration` |
+| `14_self_protection.yaml` | `self_protection` |
+
+#### Self-Protection
+
+The `self_protection` category contains BLOCKED rules that prevent LLM agents from modifying schlock's own configuration files. These rules are enforced at three layers:
+
+1. **YAML rules** (BLOCKED) — standard rule matching, cannot be overridden
+2. **Hardcoded allowlist check** — when a config path is detected in a command, only known read-only commands (cat, grep, ls, head, tail, stat, diff, jq, etc.) are permitted; all other commands are blocked
+3. **Hook file_path check** — blocks Write/Edit tool calls targeting config files
+
+The allowlist approach (layer 2) is secure by default: new or unknown commands are blocked without needing to enumerate every possible write tool. This prevents bypass via obscure commands like `ln`, `dd`, `rsync`, or scripting languages.
+
+This means the override system is self-protecting: you cannot use `rule_overrides` or `category_overrides` to disable the rules that protect the configuration files themselves.
+
+To modify schlock configuration, edit the files manually outside of Claude Code, or use `/schlock:setup`.
+
+#### Finding Rule Names
+
+Rule names appear in audit log entries under the `matched_rules` field. Check your audit log to find the exact name of a rule you want to override:
+
+```bash
+TODAY=$(date +%Y-%m-%d)
+jq '.matched_rules' ~/.config/schlock/audit-$TODAY.jsonl
+```
 
 ### Current Workarounds
 

@@ -1,0 +1,65 @@
+# Category: Self-Protection
+# Risk Levels: BLOCKED
+# Description: Prevents LLM agents from modifying schlock's own configuration
+# and safety rules, which would allow bypassing security controls.
+#
+# SECURITY: These rules are BLOCKED level and cannot be downgraded or disabled
+# via rule_overrides or category_overrides (BLOCKED floor enforcement).
+
+rules:
+  # Block writes to schlock config files (redirect operators)
+  - name: schlock_config_redirect
+    description: "Self-protection: Write redirect to schlock configuration file"
+    risk_level: BLOCKED
+    patterns:
+      # Output redirect (> or >>) to schlock config paths
+      - '>>?\s*\S*schlock-config\.yaml'
+      - '>>?\s*\S*\.config/schlock/config\.yaml'
+    alternatives:
+      - "Edit schlock configuration manually outside of Claude Code"
+      - "Use /schlock:setup to configure schlock interactively"
+
+  # Block write commands targeting schlock config files
+  - name: schlock_config_write
+    description: "Self-protection: Write command targeting schlock configuration file"
+    risk_level: BLOCKED
+    patterns:
+      # tee, cp, mv, install targeting schlock config
+      - '\b(tee|cp|mv|install)\b.*schlock-config\.yaml'
+      - '\b(tee|cp|mv|install)\b.*\.config/schlock/config\.yaml'
+      # ln (symlink attacks: replace config with symlink to /dev/null or attacker file)
+      - '\bln\b.*schlock-config\.yaml'
+      - '\bln\b.*\.config/schlock/config\.yaml'
+      # dd (raw write: dd of=config.yaml)
+      - '\bdd\b.*of=\S*schlock-config\.yaml'
+      - '\bdd\b.*of=\S*\.config/schlock/config\.yaml'
+      # sed/awk in-place editing
+      - '\bsed\b[^|]*-i.*schlock-config\.yaml'
+      - '\bsed\b[^|]*-i.*\.config/schlock/config\.yaml'
+      - '\bawk\b[^|]*-i\s+(inplace|in-place).*schlock-config\.yaml'
+      - '\bawk\b[^|]*-i\s+(inplace|in-place).*\.config/schlock/config\.yaml'
+    alternatives:
+      - "Edit schlock configuration manually outside of Claude Code"
+      - "Use /schlock:setup to configure schlock interactively"
+
+  # Block deletion of schlock config files (prevents delete-and-recreate attacks)
+  - name: schlock_config_delete
+    description: "Self-protection: Deletion of schlock configuration file"
+    risk_level: BLOCKED
+    patterns:
+      - '\b(rm|unlink|truncate)\b.*schlock-config\.yaml'
+      - '\b(rm|unlink|truncate)\b.*\.config/schlock/config\.yaml'
+    alternatives:
+      - "Edit schlock configuration manually outside of Claude Code"
+      - "Use /schlock:setup to configure schlock interactively"
+
+  # Block permission changes on schlock config files
+  - name: schlock_config_permissions
+    description: "Self-protection: Permission change on schlock configuration file"
+    risk_level: BLOCKED
+    patterns:
+      - '\b(chmod|chown|chattr)\b.*schlock-config\.yaml'
+      - '\b(chmod|chown|chattr)\b.*\.config/schlock/config\.yaml'
+    alternatives:
+      - "Edit schlock configuration manually outside of Claude Code"
+      - "Use /schlock:setup to configure schlock interactively"
