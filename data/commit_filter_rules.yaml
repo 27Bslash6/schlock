@@ -12,6 +12,16 @@ rules:
     description: "Remove promotional content and advertising from commit messages"
     enabled: true  # Default: enabled (most users want clean commits)
     patterns:
+      # Broad line-level patterns FIRST (prevent partial matches from mangling lines)
+      - pattern: "\\n*🤖.*Generated with.*\\n*"
+        description: "Any line with robot emoji and 'Generated with'"
+        replacement: "\n"
+
+      - pattern: "\\n*Co-Authored-By:.*(?:Claude|@anthropic\\.com).*\\n*"
+        description: "Any Co-Authored-By line mentioning Claude or Anthropic"
+        replacement: "\n"
+
+      # Specific patterns (catch remnants the broad patterns might miss)
       - pattern: "🤖\\s*Generated with \\[Claude Code\\]\\(https://claude\\.com/claude-code\\)"
         description: "Claude Code promotional link with emoji"
         replacement: ""
@@ -35,14 +45,6 @@ rules:
       - pattern: "Co-Authored-By:\\s*Claude(?![\\w])"
         description: "Claude co-author attribution (generic)"
         replacement: ""
-
-      - pattern: "\\n*🤖.*Generated with.*\\n*"
-        description: "Any line with robot emoji and 'Generated with'"
-        replacement: "\n"
-
-      - pattern: "\\n*Co-Authored-By:.*Claude.*\\n*"
-        description: "Any Co-Authored-By line mentioning Claude"
-        replacement: "\n"
 
   # Future categories (disabled by default - templates for users)
   #

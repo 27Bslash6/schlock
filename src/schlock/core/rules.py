@@ -191,8 +191,13 @@ class RuleEngine:
         self.rules: list[SecurityRule] = []
         self.compiled_patterns: dict[str, list[Pattern]] = {}
         self.whitelist_patterns: list[Pattern] = []
+        self._original_risk_levels: dict[str, RiskLevel] = {}
 
         self._load_rules()
+
+        # Capture original risk levels for idempotent override application
+        for rule in self.rules:
+            self._original_risk_levels[rule.name] = rule.risk_level
 
     @classmethod
     def from_directory(cls, rules_dir: Path) -> "RuleEngine":
@@ -222,9 +227,14 @@ class RuleEngine:
         engine.rules = []
         engine.compiled_patterns = {}
         engine.whitelist_patterns = []
+        engine._original_risk_levels: dict[str, RiskLevel] = {}
 
         # Load rules from all YAML files in directory
         engine._load_rules_from_directory(rules_dir)
+
+        # Capture original risk levels for idempotent override application
+        for rule in engine.rules:
+            engine._original_risk_levels[rule.name] = rule.risk_level
 
         return engine
 
@@ -257,6 +267,7 @@ class RuleEngine:
         for rule in self.rules:
             new_rule = rule
             cat_override = category_overrides.get(rule.category) if rule.category else None
+            original_level = self._original_risk_levels.get(rule.name, rule.risk_level)
 
             if cat_override and isinstance(cat_override, dict):
                 new_rule = self._apply_single_override(new_rule, cat_override, source=f"category:{rule.category}")
@@ -269,13 +280,13 @@ class RuleEngine:
                     new_rule,
                     rule_override,
                     source=f"rule:{rule.name}",
-                    original_risk_level=rule.risk_level,
+                    original_risk_level=original_level,
                 )
 
             # Check if rule was disabled (only originally-BLOCKED rules are protected)
-            # Uses `rule` (original) not `new_rule` (post-override) so that rules
-            # upgraded to BLOCKED by overrides can still be disabled.
-            if not self._is_rule_enabled(rule, cat_override, rule_override):
+            # Uses original_level so that rules upgraded to BLOCKED by overrides
+            # can still be disabled.
+            if not self._is_rule_enabled(original_level, cat_override, rule_override, rule.name):
                 disabled_rules.add(rule.name)
                 continue
 
@@ -342,9 +353,10 @@ class RuleEngine:
 
     def _is_rule_enabled(
         self,
-        original_rule: SecurityRule,
+        original_risk_level: "RiskLevel",
         category_override: Optional[dict],
         rule_override: Optional[dict],
+        rule_name: str = "",
     ) -> bool:
         """Determine if a rule should remain enabled after overrides.
 
@@ -353,10 +365,10 @@ class RuleEngine:
         to BLOCKED by overrides can still be disabled).
 
         Args:
-            original_rule: The rule BEFORE any overrides were applied.
-                Used for BLOCKED floor check to protect original intent.
+            original_risk_level: The rule's risk level from initial load.
             category_override: Category-level override dict (if any).
             rule_override: Rule-level override dict (if any).
+            rule_name: Rule name for log messages.
 
         Returns:
             True if rule should remain enabled.
@@ -364,8 +376,8 @@ class RuleEngine:
         # Rule-level enabled takes precedence
         if rule_override and isinstance(rule_override, dict) and "enabled" in rule_override:
             if not rule_override["enabled"]:
-                if original_rule.risk_level == RiskLevel.BLOCKED:
-                    logger.warning(f"Cannot disable BLOCKED rule {original_rule.name!r}")
+                if original_risk_level == RiskLevel.BLOCKED:
+                    logger.warning(f"Cannot disable BLOCKED rule {rule_name!r}")
                     return True
                 return False
             return True
@@ -373,8 +385,8 @@ class RuleEngine:
         # Category-level enabled
         if category_override and isinstance(category_override, dict) and "enabled" in category_override:
             if not category_override["enabled"]:
-                if original_rule.risk_level == RiskLevel.BLOCKED:
-                    logger.warning(f"Cannot disable BLOCKED rule {original_rule.name!r} via category override")
+                if original_risk_level == RiskLevel.BLOCKED:
+                    logger.warning(f"Cannot disable BLOCKED rule {rule_name!r} via category override")
                     return True
                 return False
 

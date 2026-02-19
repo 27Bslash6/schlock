@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import yaml  # noqa: E402 - vendored dependency
 
 from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
+from schlock.core.validator import SELF_PROTECTION_PATHS  # noqa: E402
 from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
 from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
 from schlock.integrations.shellcheck import (  # noqa: E402
@@ -408,9 +409,10 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         file_path = tool_input.get("file_path", "")
         is_write_operation = "content" in tool_input or "new_string" in tool_input
         if file_path and is_write_operation:
-            protected_paths = ("schlock-config.yaml", ".config/schlock/config.yaml")
-            for protected in protected_paths:
-                if protected in file_path:
+            for protected in SELF_PROTECTION_PATHS:
+                # Exact suffix match: file_path ends with the protected path
+                # (avoids false positives like "not-schlock-config.yaml")
+                if file_path == protected or file_path.endswith("/" + protected):
                     logger.warning(f"Self-protection: blocked file operation on {file_path}")
                     execution_time_ms = (time.perf_counter() - start_time) * 1000
                     audit_logger.log_validation(

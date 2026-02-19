@@ -11,6 +11,7 @@ from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import (
     ValidationResult,
     _load_rule_overrides,
+    _matches_protected_path,
     clear_caches,
     load_rules,
     validate_command,
@@ -416,6 +417,10 @@ class TestSelfProtection:
     3. Hook file_path check (tested in test_hook_integration.py)
     """
 
+    def setup_method(self):
+        """Reset cached rule engine to ensure fresh state for each test."""
+        clear_caches()
+
     # --- Layer 2: Hardcoded validator check ---
 
     @pytest.mark.parametrize(
@@ -493,6 +498,59 @@ class TestSelfProtection:
         result = validate_command(command)
         assert not result.allowed, f"Should block: {command}"
         assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Process substitution: >(…) hides python3 inside allowlisted 'cat'.
+            # Layer 2 (_check_self_protection) detects the >(…) pattern and blocks.
+            "cat /tmp/evil.yaml >(python3 -c \"open('.claude/hooks/schlock-config.yaml','w').write('x')\")",
+        ],
+    )
+    def test_process_substitution_with_visible_path_is_blocked(self, command):
+        """Process substitution with config path is caught by self-protection layer 2."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "self_protection" in str(result.matched_rules)
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            # Exact matches
+            ("rm schlock-config.yaml", True),
+            ("cat .config/schlock/config.yaml", True),
+            # Path-separated matches
+            ("rm .claude/hooks/schlock-config.yaml", True),
+            ("cat /home/user/.config/schlock/config.yaml", True),
+            # Inside quotes (python cmd, process substitution)
+            ("python3 -c \"open('.claude/hooks/schlock-config.yaml','w')\"", True),
+            # False positives: substring inside longer filename
+            ("rm /tmp/not-schlock-config.yaml-backup", False),
+            ("cat my-schlock-config.yaml.bak", False),
+            # No match at all
+            ("echo hello", False),
+            # Boundary: path after redirect
+            ("echo x > .claude/hooks/schlock-config.yaml", True),
+        ],
+    )
+    def test_matches_protected_path(self, text, expected):
+        """Boundary-aware matching avoids false positives while catching real paths."""
+        assert _matches_protected_path(text) == expected, f"Expected {expected} for: {text}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Quoted env-var with spaces before real command
+            'LANG="en US" rm .claude/hooks/schlock-config.yaml',
+            # Pure assignment referencing config path (still caught by hardcoded check)
+            "FOO=.claude/hooks/schlock-config.yaml",
+        ],
+    )
+    def test_env_var_stripping_edge_cases(self, command):
+        """Env-var stripping handles quoted values correctly."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
 
     def test_self_protection_cannot_be_overridden(self, tmp_path):
         """Self-protection rules in YAML are BLOCKED and cannot be overridden."""

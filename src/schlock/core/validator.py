@@ -332,7 +332,34 @@ def _check_dangerous_command_flags(
 
 # SELF-PROTECTION: Paths that identify schlock configuration files.
 # Any command containing these paths is subject to allowlist enforcement.
-_SELF_PROTECTION_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
+# Also imported by hooks/pre_tool_use.py for hook-level self-protection.
+SELF_PROTECTION_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
+
+
+def _matches_protected_path(text: str) -> bool:
+    """Check if text contains a reference to a protected config path.
+
+    Uses boundary-aware matching to avoid false positives from paths like
+    'not-schlock-config.yaml-backup' while still catching paths inside quotes or arguments.
+    """
+    for path in SELF_PROTECTION_PATHS:
+        if path not in text:
+            continue
+        idx = 0
+        while True:
+            idx = text.find(path, idx)
+            if idx == -1:
+                break
+            # Character before must be path separator, whitespace, quote, or start
+            before_ok = idx == 0 or text[idx - 1] in " \t\n\"'(,;|&>=/"
+            # Character after must be whitespace, quote, punctuation, or end
+            end = idx + len(path)
+            after_ok = end >= len(text) or text[end] in " \t\n\"'(),;|&>"
+            if before_ok and after_ok:
+                return True
+            idx += 1
+    return False
+
 
 # SELF-PROTECTION: Read-only commands allowed to reference config files.
 # Allowlist approach: any command NOT in this set is BLOCKED when it references config paths.
@@ -375,7 +402,7 @@ _SELF_PROTECTION_READ_ALLOWLIST = frozenset(
 )
 
 # Pre-compiled regex for redirect operators targeting config paths
-_SELF_PROTECTION_REDIRECT_PATTERNS = [re.compile(r">>?\s*\S*" + re.escape(path)) for path in _SELF_PROTECTION_PATHS]
+_SELF_PROTECTION_REDIRECT_PATTERNS = [re.compile(r">>?\s*\S*" + re.escape(path)) for path in SELF_PROTECTION_PATHS]
 
 # Pre-compiled regex for splitting command strings into segments
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
@@ -404,7 +431,7 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
         ValidationResult blocking the command if it targets schlock config, None otherwise
     """
     # Fast path: skip if command doesn't reference any config path
-    if not any(path in command for path in _SELF_PROTECTION_PATHS):
+    if not _matches_protected_path(command):
         return None
 
     # Check 1: Block any redirect operators (> or >>) targeting config files
@@ -431,11 +458,11 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
         # Strip leading environment variable assignments (e.g., "DUMMY=1 FOO=bar rm ...")
         # These prefix a command but don't change what it does — the command after them
         # is what matters. If ONLY assignments remain, it's a pure assignment (skip).
-        stripped = re.sub(r"^([A-Za-z_]\w*=\S*\s+)+", "", segment)
+        stripped = re.sub(r'^([A-Za-z_]\w*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+)+', "", segment)
         if not stripped:
             continue
         # Only check segments that reference a config path
-        if not any(path in segment for path in _SELF_PROTECTION_PATHS):
+        if not _matches_protected_path(segment):
             continue
         # Extract command name (first word, strip path prefix)
         words = stripped.split()
@@ -443,6 +470,10 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
             continue
         cmd = words[0].rsplit("/", 1)[-1]
         if cmd not in _SELF_PROTECTION_READ_ALLOWLIST:
+            return _make_self_protection_result(command)
+        # Even if cmd is allowlisted, block if segment contains process substitution
+        # >(cmd) or <(cmd) — these can hide arbitrary commands inside an allowed outer command
+        if re.search(r"[<>]\s*\(", segment):
             return _make_self_protection_result(command)
 
     return None

@@ -454,15 +454,15 @@ class TestSelfProtectionHook:
         assert "schlock" in response["hookSpecificOutput"]["permissionDecisionReason"].lower()
 
     @pytest.mark.parametrize(
-        "tool_name,file_path,tool_input_extra",
+        "tool_name,file_path,tool_input_extra,expected_self_protection_deny",
         [
-            ("Write", "src/main.py", {"content": "print('hello')"}),
-            ("Write", ".claude/hooks/other-config.yaml", {"content": "key: value"}),
-            ("Edit", "README.md", {"new_string": "updated", "old_string": "original"}),
-            ("Read", ".claude/hooks/schlock-config.yaml", {}),  # Read is fine
+            ("Write", "src/main.py", {"content": "print('hello')"}, False),
+            ("Write", ".claude/hooks/other-config.yaml", {"content": "key: value"}, False),
+            ("Edit", "README.md", {"new_string": "updated", "old_string": "original"}, False),
+            ("Read", ".claude/hooks/schlock-config.yaml", {}, False),  # Read is fine
         ],
     )
-    def test_allows_non_config_file_operations(self, tool_name, file_path, tool_input_extra):
+    def test_allows_non_config_file_operations(self, tool_name, file_path, tool_input_extra, expected_self_protection_deny):
         """Hook allows file operations that don't target schlock config."""
         tool_input = {"file_path": file_path, **tool_input_extra}
         input_data = {
@@ -470,10 +470,11 @@ class TestSelfProtectionHook:
             "tool_input": tool_input,
         }
         response = handle_pre_tool_use(input_data)
-        # These should NOT be denied by self-protection
-        # (they may be denied for other reasons like missing command, but not self-protection)
+        decision = response["hookSpecificOutput"]["permissionDecision"]
         reason = response["hookSpecificOutput"].get("permissionDecisionReason", "")
-        assert "schlock safety configuration" not in reason.lower()
+        # Verify self-protection is NOT the reason for any denial
+        is_self_protection_deny = decision == "deny" and "schlock safety configuration" in reason.lower()
+        assert is_self_protection_deny == expected_self_protection_deny
 
     def test_bash_config_write_also_blocked(self):
         """Bash commands writing to schlock config are blocked via self-protection."""
@@ -485,3 +486,12 @@ class TestSelfProtectionHook:
         assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
         reason = response["hookSpecificOutput"]["permissionDecisionReason"]
         assert "schlock" in reason.lower() or "self_protection" in reason.lower()
+
+    def test_process_substitution_with_visible_path_is_blocked(self):
+        """Process substitution with literal config path is caught by validator."""
+        input_data = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat /tmp/evil.yaml >(python3 -c \"open('.claude/hooks/schlock-config.yaml','w')\")"},
+        }
+        response = handle_pre_tool_use(input_data)
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
