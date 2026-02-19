@@ -471,6 +471,10 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
         cmd = words[0].rsplit("/", 1)[-1]
         if cmd not in _SELF_PROTECTION_READ_ALLOWLIST:
             return _make_self_protection_result(command)
+        # Even if cmd is allowlisted, block if segment contains process substitution
+        # >(cmd) or <(cmd) — these can hide arbitrary commands inside an allowed outer command
+        if re.search(r"[<>]\s*\(", segment):
+            return _make_self_protection_result(command)
 
     return None
 

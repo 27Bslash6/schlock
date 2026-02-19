@@ -502,17 +502,17 @@ class TestSelfProtection:
     @pytest.mark.parametrize(
         "command",
         [
-            # Process substitution: config path is visible in command string,
-            # so _matches_protected_path detects it and the non-allowlisted
-            # python3 gets blocked. This documents the behavior.
+            # Process substitution: >(…) hides python3 inside allowlisted 'cat'.
+            # Layer 2 (_check_self_protection) detects the >(…) pattern and blocks.
             "cat /tmp/evil.yaml >(python3 -c \"open('.claude/hooks/schlock-config.yaml','w').write('x')\")",
         ],
     )
     def test_process_substitution_with_visible_path_is_blocked(self, command):
-        """Process substitution with literal config path is caught by self-protection."""
+        """Process substitution with config path is caught by self-protection layer 2."""
         result = validate_command(command)
         assert not result.allowed, f"Should block: {command}"
         assert result.risk_level == RiskLevel.BLOCKED
+        assert "self_protection" in str(result.matched_rules)
 
     @pytest.mark.parametrize(
         "text,expected",

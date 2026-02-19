@@ -410,7 +410,9 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         is_write_operation = "content" in tool_input or "new_string" in tool_input
         if file_path and is_write_operation:
             for protected in SELF_PROTECTION_PATHS:
-                if protected in file_path:
+                # Exact suffix match: file_path ends with the protected path
+                # (avoids false positives like "not-schlock-config.yaml")
+                if file_path == protected or file_path.endswith("/" + protected):
                     logger.warning(f"Self-protection: blocked file operation on {file_path}")
                     execution_time_ms = (time.perf_counter() - start_time) * 1000
                     audit_logger.log_validation(
