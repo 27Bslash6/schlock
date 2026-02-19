@@ -416,6 +416,10 @@ class TestSelfProtection:
     3. Hook file_path check (tested in test_hook_integration.py)
     """
 
+    def setup_method(self):
+        """Reset cached rule engine to ensure fresh state for each test."""
+        clear_caches()
+
     # --- Layer 2: Hardcoded validator check ---
 
     @pytest.mark.parametrize(
@@ -490,6 +494,21 @@ class TestSelfProtection:
     )
     def test_blocks_env_prefixed_write_commands(self, command):
         """Env-var prefixes don't bypass self-protection allowlist."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Process substitution: config path is visible in command string,
+            # so _matches_protected_path detects it and the non-allowlisted
+            # python3 gets blocked. This documents the behavior.
+            "cat /tmp/evil.yaml >(python3 -c \"open('.claude/hooks/schlock-config.yaml','w').write('x')\")",
+        ],
+    )
+    def test_process_substitution_with_visible_path_is_blocked(self, command):
+        """Process substitution with literal config path is caught by self-protection."""
         result = validate_command(command)
         assert not result.allowed, f"Should block: {command}"
         assert result.risk_level == RiskLevel.BLOCKED

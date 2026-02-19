@@ -33,11 +33,11 @@ rules:
       # dd (raw write: dd of=config.yaml)
       - '\bdd\b.*of=\S*schlock-config\.yaml'
       - '\bdd\b.*of=\S*\.config/schlock/config\.yaml'
-      # sed/awk in-place editing
-      - '\bsed\b[^|]*-i.*schlock-config\.yaml'
-      - '\bsed\b[^|]*-i.*\.config/schlock/config\.yaml'
-      - '\bawk\b[^|]*-i\s+(inplace|in-place).*schlock-config\.yaml'
-      - '\bawk\b[^|]*-i\s+(inplace|in-place).*\.config/schlock/config\.yaml'
+      # sed/awk in-place editing (short and GNU long-form flags)
+      - '\bsed\b[^|]*(-i|--in-?place).*schlock-config\.yaml'
+      - '\bsed\b[^|]*(-i|--in-?place).*\.config/schlock/config\.yaml'
+      - '\bawk\b[^|]*(-i\s+(inplace|in-place)|--in-?place).*schlock-config\.yaml'
+      - '\bawk\b[^|]*(-i\s+(inplace|in-place)|--in-?place).*\.config/schlock/config\.yaml'
     alternatives:
       - "Edit schlock configuration manually outside of Claude Code"
       - "Use /schlock:setup to configure schlock interactively"
