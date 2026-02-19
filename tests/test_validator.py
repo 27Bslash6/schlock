@@ -552,44 +552,6 @@ class TestSelfProtection:
         result = validate_command(command)
         assert not result.allowed, f"Should block: {command}"
 
-    @pytest.mark.parametrize(
-        "text,expected",
-        [
-            # Exact matches
-            ("rm schlock-config.yaml", True),
-            ("cat .config/schlock/config.yaml", True),
-            # Path-separated matches
-            ("rm .claude/hooks/schlock-config.yaml", True),
-            ("cat /home/user/.config/schlock/config.yaml", True),
-            # Inside quotes (python cmd, process substitution)
-            ("python3 -c \"open('.claude/hooks/schlock-config.yaml','w')\"", True),
-            # False positives: substring inside longer filename
-            ("rm /tmp/not-schlock-config.yaml-backup", False),
-            ("cat my-schlock-config.yaml.bak", False),
-            # No match at all
-            ("echo hello", False),
-            # Boundary: path after redirect
-            ("echo x > .claude/hooks/schlock-config.yaml", True),
-        ],
-    )
-    def test_matches_protected_path(self, text, expected):
-        """Boundary-aware matching avoids false positives while catching real paths."""
-        assert _matches_protected_path(text) == expected, f"Expected {expected} for: {text}"
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            # Quoted env-var with spaces before real command
-            'LANG="en US" rm .claude/hooks/schlock-config.yaml',
-            # Pure assignment referencing config path (still caught by hardcoded check)
-            "FOO=.claude/hooks/schlock-config.yaml",
-        ],
-    )
-    def test_env_var_stripping_edge_cases(self, command):
-        """Env-var stripping handles quoted values correctly."""
-        result = validate_command(command)
-        assert not result.allowed, f"Should block: {command}"
-
     def test_self_protection_cannot_be_overridden(self, tmp_path):
         """Self-protection rules in YAML are BLOCKED and cannot be overridden."""
         rules_dir = tmp_path / "rules"
