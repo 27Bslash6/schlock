@@ -5,6 +5,13 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.4.0...schlock-v0.5.0) (2026-02-19)
+
+
+### Features
+
+* per-rule overrides, self-protection, and commit filter fix ([#51](https://github.com/27Bslash6/schlock/issues/51)) ([22b71d4](https://github.com/27Bslash6/schlock/commit/22b71d44d2e501fc966a142cb54c6bb711c6b4ad))
+
 ## [0.4.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.3.1...schlock-v0.4.0) (2026-02-17)
 
 
