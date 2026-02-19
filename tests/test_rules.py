@@ -744,6 +744,26 @@ rules:
         open_port = next(r for r in override_engine.rules if r.name == "open_port")
         assert open_port.category == "network"
 
+    def test_apply_overrides_is_idempotent(self, override_engine):
+        """Repeated apply_overrides uses original risk levels, not mutated ones."""
+        # Phase 1: Upgrade open_port to BLOCKED via category
+        override_engine.apply_overrides(
+            rule_overrides={},
+            category_overrides={"network": {"risk_level": "BLOCKED"}},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "open_port")
+        assert rule.risk_level == RiskLevel.BLOCKED
+
+        # Phase 2: Downgrade open_port via rule override
+        # Without idempotency fix, this would fail because the engine thinks
+        # open_port was always BLOCKED
+        override_engine.apply_overrides(
+            rule_overrides={"open_port": {"risk_level": "MEDIUM"}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "open_port")
+        assert rule.risk_level == RiskLevel.MEDIUM
+
     def test_category_empty_for_single_file_loading(self, test_rules_file):
         """Category defaults to empty string for single-file loading."""
         engine = RuleEngine(test_rules_file)
