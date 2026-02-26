@@ -1,0 +1,62 @@
+# schlock
+
+> schlock is a Claude Code plugin that intercepts dangerous bash commands before they execute. It uses bashlex AST parsing (not regex) to validate commands against 140+ security rules, with configurable risk tolerance presets (permissive, balanced, paranoid) and JSONL audit logging. Distributed as a Claude Code plugin with vendored dependencies — no PyPI, no Python environment required.
+
+Key facts:
+
+- **Safety validation** is always on. Commands are parsed into ASTs via bashlex and matched against security rules across 14 threat categories
+- **Risk levels**: BLOCKED (always denied), HIGH (ask in balanced mode), MEDIUM, LOW, SAFE
+- **Risk presets**: `permissive` (allow HIGH), `balanced` (ask HIGH, default), `paranoid` (deny HIGH, ask MEDIUM)
+- **Per-rule and per-category overrides** via `rule_overrides` and `category_overrides` in config YAML. BLOCKED rules cannot be downgraded (security floor)
+- **Self-protection**: Three-layer defense prevents LLM agents from modifying schlock config files
+- **Audit logging** is always on, writing to `~/.config/schlock/audit-YYYY-MM-DD.jsonl`
+- **Advertising blocker** (optional): Blocks "Generated with Claude Code" spam from commits
+- **ShellCheck integration** (optional): Catches command injection, format string vulnerabilities, and unquoted variable expansion
+- **Config hierarchy**: Plugin defaults → User overrides (`~/.config/schlock/config.yaml`) → Project overrides (`.claude/hooks/schlock-config.yaml`)
+- **Performance**: <1ms for simple commands, <15ms for complex pipelines, ~100 validations/sec
+
+## Docs
+
+- [README](https://github.com/27Bslash6/schlock/blob/main/README.md): Project overview, problem statement, quick start, how it works, risk levels, performance, and configuration basics
+- [Installation Guide](https://github.com/27Bslash6/schlock/blob/main/docs/INSTALLING.md): Individual and team installation, plugin marketplace setup, verification checklist, troubleshooting, and uninstallation
+- [Configuration Guide](https://github.com/27Bslash6/schlock/blob/main/docs/CONFIGURATION.md): 3-tier config system, safety rule customization, rule and category overrides, advertising blocker, audit logging format and querying, team-wide configuration, and advanced examples
+- [Security Rules Organization](https://github.com/27Bslash6/schlock/blob/main/docs/RULES_ORGANIZATION.md): Multi-file rule structure, 14 threat categories, rule file format, pattern guidelines, adding new rules, and backward compatibility
+- [Contributing Guide](https://github.com/27Bslash6/schlock/blob/main/CONTRIBUTING.md): Development setup, project structure, coding standards, testing philosophy, module boundaries, performance guidelines, and release process
+- [QA Tooling Guide](https://github.com/27Bslash6/schlock/blob/main/docs/QA_TOOLING.md): Ruff, pytest, basedpyright, pre-commit hooks, Makefile commands, CI/CD targets, and workflow examples
+
+## API
+
+- [Plugin Manifest](https://github.com/27Bslash6/schlock/blob/main/.claude-plugin/plugin.json): Claude Code plugin metadata — name, version, description, author
+- [Hook Registration](https://github.com/27Bslash6/schlock/blob/main/hooks/hooks.json): Claude Code hook bindings — maps PreToolUse to safety validation and SessionStart to config check
+- [Pre-tool Hook](https://github.com/27Bslash6/schlock/blob/main/hooks/pre_tool_use.py): Safety validation entry point — intercepts Bash tool calls, runs validation pipeline, returns allow/block/warn decisions
+- [Validator](https://github.com/27Bslash6/schlock/blob/main/src/schlock/core/validator.py): Main validation pipeline — command parsing, rule matching, risk assessment, caching
+- [Parser](https://github.com/27Bslash6/schlock/blob/main/src/schlock/core/parser.py): Bashlex AST parsing, command extraction, string literal handling, substitution detection
+- [Rules Engine](https://github.com/27Bslash6/schlock/blob/main/src/schlock/core/rules.py): Security rule loading, pattern compilation, multi-file rule merging, override application
+- [Substitution Validator](https://github.com/27Bslash6/schlock/blob/main/src/schlock/core/substitution.py): Hybrid AST + whitelist + recursive validation for command/process substitution safety
+- [Cache](https://github.com/27Bslash6/schlock/blob/main/src/schlock/core/cache.py): Thread-safe LRU cache for validation results
+- [Audit Logger](https://github.com/27Bslash6/schlock/blob/main/src/schlock/integrations/audit.py): JSONL audit trail with daily rotation, thread-safe append-only writes
+- [Commit Filter](https://github.com/27Bslash6/schlock/blob/main/src/schlock/integrations/commit_filter.py): Advertising blocker — intercepts git commit commands and blocks promotional content
+- [ShellCheck Integration](https://github.com/27Bslash6/schlock/blob/main/src/schlock/integrations/shellcheck.py): Optional ShellCheck wrapper for enhanced vulnerability detection
+
+## Rules
+
+- [Whitelist](https://github.com/27Bslash6/schlock/blob/main/data/rules/00_whitelist.yaml): Explicitly safe commands (git status, ls, etc.)
+- [Privilege Escalation](https://github.com/27Bslash6/schlock/blob/main/data/rules/01_privilege_escalation.yaml): sudo, su, pkexec, doas, chroot (BLOCKED)
+- [File Destruction](https://github.com/27Bslash6/schlock/blob/main/data/rules/02_file_destruction.yaml): rm -rf, fork bombs, find -delete, truncation (BLOCKED/HIGH)
+- [Credential Theft](https://github.com/27Bslash6/schlock/blob/main/data/rules/03_credential_theft.yaml): .env, .ssh, .aws credential exposure (BLOCKED)
+- [Disk Operations](https://github.com/27Bslash6/schlock/blob/main/data/rules/04_disk_operations.yaml): dd, mkfs, fdisk, wipefs (BLOCKED)
+- [Code Execution](https://github.com/27Bslash6/schlock/blob/main/data/rules/05_code_execution.yaml): curl|bash, eval, python -c (BLOCKED/HIGH)
+- [Network Security](https://github.com/27Bslash6/schlock/blob/main/data/rules/06_network_security.yaml): nc -e, http servers, firewall mods (BLOCKED/HIGH)
+- [Container Security](https://github.com/27Bslash6/schlock/blob/main/data/rules/07_container_security.yaml): docker --privileged, volume mounts (HIGH)
+- [System Modification](https://github.com/27Bslash6/schlock/blob/main/data/rules/08_system_modification.yaml): /etc writes, chmod 777, recursive permissions (BLOCKED/HIGH)
+- [Log Tampering](https://github.com/27Bslash6/schlock/blob/main/data/rules/09_log_tampering.yaml): history -c, /var/log clearing (HIGH)
+- [Development Workflows](https://github.com/27Bslash6/schlock/blob/main/data/rules/10_development_workflows.yaml): git push, npm install, docker build (HIGH/MEDIUM/LOW/SAFE)
+- [Dynamic Linker](https://github.com/27Bslash6/schlock/blob/main/data/rules/11_dynamic_linker.yaml): LD_PRELOAD, LD_LIBRARY_PATH manipulation (BLOCKED/HIGH)
+- [Cloud Security](https://github.com/27Bslash6/schlock/blob/main/data/rules/12_cloud_security.yaml): AWS/GCP/Azure credential theft, IAM manipulation, secrets manager access (BLOCKED/HIGH/MEDIUM)
+- [Data Exfiltration](https://github.com/27Bslash6/schlock/blob/main/data/rules/13_data_exfiltration.yaml): Browser credential theft, process memory dumps, debugger attachment (BLOCKED/HIGH)
+- [Self Protection](https://github.com/27Bslash6/schlock/blob/main/data/rules/14_self_protection.yaml): Rules preventing LLM agents from modifying schlock config (BLOCKED, non-overridable)
+
+## Optional
+
+- [Changelog](https://github.com/27Bslash6/schlock/blob/main/docs/CHANGELOG.md): Release history from v0.2.1 through v0.5.0
+- [Roadmap](https://github.com/27Bslash6/schlock/blob/main/docs/ROADMAP.md): Product roadmap, planned features, deferred items, and decision framework
