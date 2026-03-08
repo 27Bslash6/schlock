@@ -5,6 +5,18 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.5.0...schlock-v0.6.0) (2026-03-08)
+
+
+### Features
+
+* allow explicit opt-in to override BLOCKED rules via allow_blocked_override ([#56](https://github.com/27Bslash6/schlock/issues/56)) ([fb6fdce](https://github.com/27Bslash6/schlock/commit/fb6fdce17c710757d4efc4ce7b4f46126a0af484)), closes [#53](https://github.com/27Bslash6/schlock/issues/53)
+
+
+### Bug Fixes
+
+* allow gh auth token | docker login --password-stdin ([#55](https://github.com/27Bslash6/schlock/issues/55)) ([d222913](https://github.com/27Bslash6/schlock/commit/d222913b598a601401df6e8f845edd939f3c641c))
+
 ## [0.5.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.4.0...schlock-v0.5.0) (2026-02-19)
 
 
