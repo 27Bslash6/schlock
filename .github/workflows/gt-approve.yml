@@ -1,0 +1,29 @@
+name: GT Refinery Approve
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to approve'
+        required: true
+        type: number
+      reason:
+        description: 'Approval reason from refinery'
+        required: true
+        type: string
+
+permissions:
+  pull-requests: write
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Approve PR
+        uses: hmarr/auto-approve-action@v4
+        with:
+          pull-request-number: ${{ inputs.pr_number }}
+          review-message: |
+            ✅ GT Refinery approved.
+            
+            ${{ inputs.reason }}
