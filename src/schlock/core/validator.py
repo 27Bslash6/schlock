@@ -791,6 +791,32 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
 
             # If we have multiple segments, validate each one
             if len(segments) > 1:
+                # Full-command whitelist check before segment validation.
+                # Per-segment validation cannot detect safe multi-command patterns
+                # (e.g., "gh auth token | docker login ... --password-stdin") because
+                # each segment is evaluated in isolation. Whitelisting the full command
+                # here allows specific safe pipe patterns without whitelisting the
+                # constituent commands standalone.
+                if engine.is_whitelisted(command):
+                    match = RuleMatch(
+                        matched=False,
+                        rule=None,
+                        risk_level=RiskLevel.SAFE,
+                        message="Command is whitelisted",
+                        alternatives=[],
+                    )
+                    result = ValidationResult(
+                        allowed=True,
+                        risk_level=RiskLevel.SAFE,
+                        message="Command is whitelisted",
+                        alternatives=[],
+                        exit_code=0,
+                        error=None,
+                        matched_rules=[],
+                    )
+                    _global_cache.set(command, result)
+                    return result
+
                 highest_risk = RiskLevel.SAFE
                 highest_match = None
 
