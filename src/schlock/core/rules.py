@@ -281,6 +281,7 @@ class RuleEngine:
                     rule_override,
                     source=f"rule:{rule.name}",
                     original_risk_level=original_level,
+                    allow_escape_hatch=True,
                 )
 
             # Check if rule was disabled (only originally-BLOCKED rules are protected)
@@ -309,23 +310,28 @@ class RuleEngine:
         for rule_name in disabled_rules:
             self.compiled_patterns.pop(rule_name, None)
 
+    _IMMUTABLE_CATEGORIES: frozenset[str] = frozenset({"self_protection"})
+
     def _apply_single_override(
         self,
         rule: SecurityRule,
         override: dict,
         source: str,
         original_risk_level: Optional["RiskLevel"] = None,
+        allow_escape_hatch: bool = False,
     ) -> SecurityRule:
         """Apply a single override dict to a rule, respecting BLOCKED floor.
 
         Args:
             rule: The rule to potentially modify.
-            override: Override dict with optional risk_level/enabled keys.
+            override: Override dict with optional risk_level/enabled/allow_blocked_override keys.
             source: Human-readable source for log messages.
             original_risk_level: If provided, use this for the BLOCKED floor check
                 instead of rule.risk_level. This allows rule-level overrides to
                 downgrade a rule that was upgraded to BLOCKED by a category override,
                 as long as the original rule was not BLOCKED.
+            allow_escape_hatch: If True, allow_blocked_override in the override dict
+                is honoured. Only rule-level overrides should pass True here.
 
         Returns:
             The original or replaced SecurityRule.
@@ -344,8 +350,23 @@ class RuleEngine:
         # BLOCKED floor: cannot downgrade originally-BLOCKED rules
         floor_level = original_risk_level if original_risk_level is not None else rule.risk_level
         if floor_level == RiskLevel.BLOCKED and new_level < RiskLevel.BLOCKED:
-            logger.warning(f"Cannot downgrade BLOCKED rule {rule.name!r} via {source}")
-            return rule
+            # Self-protection rules are always immutable — no escape hatch
+            if rule.category in self._IMMUTABLE_CATEGORIES:
+                logger.warning(
+                    f"Cannot downgrade self-protection rule {rule.name!r} via {source} — "
+                    "self-protection rules are always immutable"
+                )
+                return rule
+
+            # allow_blocked_override: true is the explicit opt-in escape hatch (rule-level only)
+            if allow_escape_hatch and override.get("allow_blocked_override") is True:
+                logger.warning(
+                    f"SECURITY OVERRIDE: BLOCKED rule {rule.name!r} downgraded to "
+                    f"{new_level.name} via {source}. Ensure this is intentional and audited."
+                )
+            else:
+                logger.warning(f"Cannot downgrade BLOCKED rule {rule.name!r} via {source}")
+                return rule
 
         if new_level != rule.risk_level:
             return replace(rule, risk_level=new_level)

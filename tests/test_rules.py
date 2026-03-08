@@ -769,3 +769,81 @@ rules:
         engine = RuleEngine(test_rules_file)
         for rule in engine.rules:
             assert rule.category == ""
+
+
+class TestAllowBlockedOverride:
+    """Test suite for allow_blocked_override escape hatch."""
+
+    @pytest.fixture
+    def engine_with_self_protection(self, tmp_path):
+        """Create a RuleEngine with a BLOCKED rule and a self_protection rule."""
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+
+        (rules_dir / "01_cloud_security.yaml").write_text(r"""
+rules:
+  - name: azure_credential_theft
+    description: Azure credential and token access
+    risk_level: BLOCKED
+    patterns: ['az\s+account\s+get-access-token']
+    alternatives: ["Use managed identity"]
+""")
+
+        (rules_dir / "14_self_protection.yaml").write_text(r"""
+rules:
+  - name: schlock_config_write
+    description: "Self-protection: Write command targeting schlock configuration file"
+    risk_level: BLOCKED
+    patterns: ['\btee\b.*schlock-config\.yaml']
+    alternatives: ["Edit manually"]
+""")
+
+        return RuleEngine.from_directory(rules_dir)
+
+    def test_allow_blocked_override_downgrades_blocked_rule(self, engine_with_self_protection, caplog):
+        """allow_blocked_override: true allows downgrading a BLOCKED rule."""
+        engine_with_self_protection.apply_overrides(
+            rule_overrides={"azure_credential_theft": {"risk_level": "HIGH", "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        rule = next(r for r in engine_with_self_protection.rules if r.name == "azure_credential_theft")
+        assert rule.risk_level == RiskLevel.HIGH
+        assert "SECURITY OVERRIDE" in caplog.text
+
+    def test_without_allow_blocked_override_flag_still_blocked(self, engine_with_self_protection, caplog):
+        """Without allow_blocked_override, BLOCKED rules remain blocked."""
+        engine_with_self_protection.apply_overrides(
+            rule_overrides={"azure_credential_theft": {"risk_level": "HIGH"}},
+            category_overrides={},
+        )
+        rule = next(r for r in engine_with_self_protection.rules if r.name == "azure_credential_theft")
+        assert rule.risk_level == RiskLevel.BLOCKED
+        assert "Cannot downgrade BLOCKED rule" in caplog.text
+
+    def test_allow_blocked_override_false_still_blocked(self, engine_with_self_protection):
+        """allow_blocked_override: false does not unlock the escape hatch."""
+        engine_with_self_protection.apply_overrides(
+            rule_overrides={"azure_credential_theft": {"risk_level": "HIGH", "allow_blocked_override": False}},
+            category_overrides={},
+        )
+        rule = next(r for r in engine_with_self_protection.rules if r.name == "azure_credential_theft")
+        assert rule.risk_level == RiskLevel.BLOCKED
+
+    def test_self_protection_rule_immutable_even_with_flag(self, engine_with_self_protection, caplog):
+        """Self-protection rules cannot be downgraded even with allow_blocked_override."""
+        engine_with_self_protection.apply_overrides(
+            rule_overrides={"schlock_config_write": {"risk_level": "HIGH", "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        rule = next(r for r in engine_with_self_protection.rules if r.name == "schlock_config_write")
+        assert rule.risk_level == RiskLevel.BLOCKED
+        assert "immutable" in caplog.text
+
+    def test_allow_blocked_override_does_not_affect_category_override(self, engine_with_self_protection):
+        """allow_blocked_override in category override has no effect (rule-level only)."""
+        engine_with_self_protection.apply_overrides(
+            rule_overrides={},
+            category_overrides={"cloud_security": {"risk_level": "HIGH", "allow_blocked_override": True}},
+        )
+        rule = next(r for r in engine_with_self_protection.rules if r.name == "azure_credential_theft")
+        assert rule.risk_level == RiskLevel.BLOCKED
