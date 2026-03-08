@@ -4,6 +4,7 @@ Generates and writes validated YAML configuration files with atomic operations,
 timestamped backups, and metadata tracking.
 """
 
+import json
 import logging
 import sys
 from contextlib import suppress
@@ -389,3 +390,130 @@ def validate_config_yaml(config_dict: dict[str, Any]) -> list[str]:  # noqa: PLR
             errors.append("commit_filter.rules.advertising required")
 
     return errors
+
+
+# Default path to Claude Code user settings
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+
+# Hook entry to register for Bash command interception
+_PRE_TOOL_USE_MATCHER = "Bash"
+
+
+@dataclass(frozen=True)
+class HookWriteResult:
+    """Result of hook registration in settings.json.
+
+    Attributes:
+        success: Whether registration completed successfully
+        settings_path: Path to settings.json that was written
+        already_registered: True if hook was already present (no-op write)
+        error: Error message if registration failed (None on success)
+    """
+
+    success: bool
+    settings_path: Path
+    already_registered: bool
+    error: Optional[str]
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON file atomically using temp file + rename.
+
+    Args:
+        path: Destination path
+        data: Dict to serialize as JSON
+
+    Raises:
+        OSError: If write or rename fails
+    """
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        safe_chmod(temp_path, CONFIG_FILE_PERMS)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def register_hook(
+    plugin_root: Path,
+    settings_path: Optional[Path] = None,
+) -> HookWriteResult:
+    """Register PreToolUse hook in ~/.claude/settings.json.
+
+    Adds the schlock Bash interception hook to Claude Code's user settings.
+    Idempotent — safe to call multiple times.
+
+    Args:
+        plugin_root: Path to schlock plugin root (used to build hook command)
+        settings_path: Path to settings.json (default: ~/.claude/settings.json)
+
+    Returns:
+        HookWriteResult with success status and whether hook was already present
+
+    Example:
+        >>> result = register_hook(Path("/path/to/schlock"))
+        >>> if result.success:
+        ...     print("Hook registered")
+    """
+    if settings_path is None:
+        settings_path = CLAUDE_SETTINGS_PATH
+
+    hook_command = f"python3 {plugin_root}/hooks/pre_tool_use.py"
+
+    try:
+        # Read existing settings (or start fresh)
+        if settings_path.exists():
+            try:
+                data: dict[str, Any] = json.loads(settings_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        else:
+            data = {}
+
+        # Navigate to PreToolUse list, creating structure as needed
+        hooks_section: dict[str, Any] = data.setdefault("hooks", {})
+        pre_tool_use: list[dict[str, Any]] = hooks_section.setdefault("PreToolUse", [])
+
+        # Check if our hook command is already registered (idempotent)
+        for entry in pre_tool_use:
+            for hook in entry.get("hooks", []):
+                if hook.get("command") == hook_command:
+                    return HookWriteResult(
+                        success=True,
+                        settings_path=settings_path,
+                        already_registered=True,
+                        error=None,
+                    )
+
+        # Append the new hook entry
+        pre_tool_use.append(
+            {
+                "matcher": _PRE_TOOL_USE_MATCHER,
+                "hooks": [{"type": "command", "command": hook_command}],
+            }
+        )
+
+        # Ensure parent directory exists and write atomically
+        safe_mkdir(settings_path.parent, CONFIG_DIR_PERMS)
+        _write_json_atomic(settings_path, data)
+
+        return HookWriteResult(
+            success=True,
+            settings_path=settings_path,
+            already_registered=False,
+            error=None,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to register hook: {e}")
+        return HookWriteResult(
+            success=False,
+            settings_path=settings_path,
+            already_registered=False,
+            error=str(e),
+        )

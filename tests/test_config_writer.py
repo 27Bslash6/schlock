@@ -1,5 +1,6 @@
 """Tests for configuration writer module."""
 
+import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -9,10 +10,12 @@ import pytest
 import yaml
 
 from schlock.setup.config_writer import (
+    HookWriteResult,
     WizardChoices,
     WriteResult,
     create_backup,
     generate_config_yaml,
+    register_hook,
     validate_config_yaml,
     write_config,
 )
@@ -306,3 +309,125 @@ class TestWriteConfig:
             # Same structure except timestamp
             assert config1["commit_filter"] == config2["commit_filter"]
             assert config1["_metadata"]["wizard_version"] == config2["_metadata"]["wizard_version"]
+
+
+class TestRegisterHook:
+    """Test suite for register_hook function."""
+
+    def test_register_hook_creates_settings_file(self, tmp_path):
+        """register_hook creates settings.json when it does not exist."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        result = register_hook(plugin_root, settings_path=settings_path)
+
+        assert result.success is True
+        assert result.already_registered is False
+        assert result.error is None
+        assert settings_path.exists()
+
+    def test_register_hook_writes_pre_tool_use(self, tmp_path):
+        """register_hook adds PreToolUse hook for Bash."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        register_hook(plugin_root, settings_path=settings_path)
+
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert "hooks" in data
+        assert "PreToolUse" in data["hooks"]
+        entries = data["hooks"]["PreToolUse"]
+        assert len(entries) == 1
+        assert entries[0]["matcher"] == "Bash"
+        assert entries[0]["hooks"][0]["type"] == "command"
+        assert str(plugin_root) in entries[0]["hooks"][0]["command"]
+        assert "pre_tool_use.py" in entries[0]["hooks"][0]["command"]
+
+    def test_register_hook_idempotent(self, tmp_path):
+        """Calling register_hook twice does not add duplicate entries."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        result1 = register_hook(plugin_root, settings_path=settings_path)
+        result2 = register_hook(plugin_root, settings_path=settings_path)
+
+        assert result1.success is True
+        assert result1.already_registered is False
+        assert result2.success is True
+        assert result2.already_registered is True
+
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert len(data["hooks"]["PreToolUse"]) == 1
+
+    def test_register_hook_preserves_existing_settings(self, tmp_path):
+        """register_hook does not overwrite existing settings.json content."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        existing = {"enabledPlugins": {"schlock@27b": True}, "theme": "dark"}
+        settings_path.write_text(json.dumps(existing), encoding="utf-8")
+
+        register_hook(plugin_root, settings_path=settings_path)
+
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert data["enabledPlugins"] == {"schlock@27b": True}
+        assert data["theme"] == "dark"
+        assert "hooks" in data
+
+    def test_register_hook_preserves_existing_hooks(self, tmp_path):
+        """register_hook appends to existing PreToolUse hooks."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        existing = {
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 /other/hook.py"}]}]}
+        }
+        settings_path.write_text(json.dumps(existing), encoding="utf-8")
+
+        register_hook(plugin_root, settings_path=settings_path)
+
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert len(data["hooks"]["PreToolUse"]) == 2
+
+    def test_register_hook_returns_hook_write_result(self, tmp_path):
+        """register_hook returns a HookWriteResult instance."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        result = register_hook(plugin_root, settings_path=settings_path)
+
+        assert isinstance(result, HookWriteResult)
+        assert result.settings_path == settings_path
+
+    def test_register_hook_handles_corrupt_json(self, tmp_path):
+        """register_hook recovers from corrupt settings.json by starting fresh."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        settings_path.write_text("not valid json", encoding="utf-8")
+
+        result = register_hook(plugin_root, settings_path=settings_path)
+
+        assert result.success is True
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert "hooks" in data
+
+    def test_register_hook_creates_parent_directory(self, tmp_path):
+        """register_hook creates parent directories if needed."""
+        settings_path = tmp_path / "nested" / "dir" / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        result = register_hook(plugin_root, settings_path=settings_path)
+
+        assert result.success is True
+        assert settings_path.exists()
+
+    def test_register_hook_result_immutable(self, tmp_path):
+        """HookWriteResult should be immutable (frozen dataclass)."""
+        settings_path = tmp_path / "settings.json"
+        plugin_root = tmp_path / "schlock"
+
+        result = register_hook(plugin_root, settings_path=settings_path)
+
+        with pytest.raises(AttributeError):
+            result.success = False  # type: ignore[misc]

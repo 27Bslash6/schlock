@@ -315,7 +315,7 @@ sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
 sys.path.insert(0, str(_root / "src"))
 
 # Actual logic
-from schlock.setup.config_writer import WizardChoices, write_config
+from schlock.setup.config_writer import WizardChoices, write_config, register_hook
 from schlock.integrations.shellcheck import get_install_instructions
 
 # Reconstruct choices (Claude substitutes actual values from earlier steps)
@@ -331,6 +331,18 @@ if result.success:
     print(f"Configuration saved to {result.config_path}")
     if result.backup_path:
         print(f"(Previous config backed up to {result.backup_path})")
+
+    # Register PreToolUse hook in ~/.claude/settings.json
+    hook_result = register_hook(_root)
+    if hook_result.success:
+        if hook_result.already_registered:
+            print("Hook already registered in ~/.claude/settings.json")
+        else:
+            print(f"Registered PreToolUse hook in {hook_result.settings_path}")
+    else:
+        print(f"Warning: Could not register hook automatically: {hook_result.error}")
+        print("Manual fix: Add PreToolUse hook to ~/.claude/settings.json")
+
     print("\nNext steps:")
     print("- Config is active immediately (no restart needed)")
     print("- Share .claude/hooks/ in git for team standardization")
