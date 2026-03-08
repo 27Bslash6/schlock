@@ -798,13 +798,6 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # here allows specific safe pipe patterns without whitelisting the
                 # constituent commands standalone.
                 if engine.is_whitelisted(command):
-                    match = RuleMatch(
-                        matched=False,
-                        rule=None,
-                        risk_level=RiskLevel.SAFE,
-                        message="Command is whitelisted",
-                        alternatives=[],
-                    )
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
