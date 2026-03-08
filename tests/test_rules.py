@@ -769,3 +769,80 @@ rules:
         engine = RuleEngine(test_rules_file)
         for rule in engine.rules:
             assert rule.category == ""
+
+    # --- allow_blocked_override ---
+
+    @pytest.fixture
+    def self_protection_engine(self, tmp_path):
+        """Engine with a self_protection category rule for immutability tests."""
+        rules_dir = tmp_path / "rules_sp"
+        rules_dir.mkdir()
+        (rules_dir / "14_self_protection.yaml").write_text(r"""
+rules:
+  - name: schlock_config_write
+    description: "Self-protection: write to schlock config"
+    risk_level: BLOCKED
+    patterns: ['schlock-config\.yaml']
+    alternatives: ["Edit manually"]
+""")
+        return RuleEngine.from_directory(rules_dir)
+
+    def test_downgrade_blocked_rule_with_flag(self, override_engine):
+        """allow_blocked_override: true permits downgrading a BLOCKED rule."""
+        override_engine.apply_overrides(
+            rule_overrides={"system_destruction": {"risk_level": "HIGH", "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "system_destruction")
+        assert rule.risk_level == RiskLevel.HIGH
+
+    def test_disable_blocked_rule_with_flag(self, override_engine):
+        """allow_blocked_override: true permits disabling a BLOCKED rule."""
+        override_engine.apply_overrides(
+            rule_overrides={"system_destruction": {"enabled": False, "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        assert not any(r.name == "system_destruction" for r in override_engine.rules)
+
+    def test_allow_blocked_override_logs_security_warning(self, override_engine, caplog):
+        """Downgrading a BLOCKED rule with the flag logs a prominent SECURITY warning."""
+        override_engine.apply_overrides(
+            rule_overrides={"system_destruction": {"risk_level": "HIGH", "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        assert "SECURITY" in caplog.text
+        assert "system_destruction" in caplog.text
+
+    def test_allow_blocked_override_false_still_blocked(self, override_engine):
+        """allow_blocked_override: false does not permit downgrading BLOCKED rules."""
+        override_engine.apply_overrides(
+            rule_overrides={"system_destruction": {"risk_level": "HIGH", "allow_blocked_override": False}},
+            category_overrides={},
+        )
+        rule = next(r for r in override_engine.rules if r.name == "system_destruction")
+        assert rule.risk_level == RiskLevel.BLOCKED
+
+    def test_self_protection_immutable_with_flag(self, self_protection_engine):
+        """self_protection rules cannot be downgraded even with allow_blocked_override: true."""
+        self_protection_engine.apply_overrides(
+            rule_overrides={"schlock_config_write": {"risk_level": "HIGH", "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        rule = next(r for r in self_protection_engine.rules if r.name == "schlock_config_write")
+        assert rule.risk_level == RiskLevel.BLOCKED
+
+    def test_self_protection_cannot_be_disabled_with_flag(self, self_protection_engine):
+        """self_protection rules cannot be disabled even with allow_blocked_override: true."""
+        self_protection_engine.apply_overrides(
+            rule_overrides={"schlock_config_write": {"enabled": False, "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        assert any(r.name == "schlock_config_write" for r in self_protection_engine.rules)
+
+    def test_self_protection_flag_logs_warning(self, self_protection_engine, caplog):
+        """Attempting allow_blocked_override on self_protection logs a warning."""
+        self_protection_engine.apply_overrides(
+            rule_overrides={"schlock_config_write": {"risk_level": "HIGH", "allow_blocked_override": True}},
+            category_overrides={},
+        )
+        assert "self_protection" in caplog.text
