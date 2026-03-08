@@ -1247,6 +1247,16 @@ class TestGitCredentialTheft:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.HIGH, f"Known hosts manipulation not HIGH: {cmd}"
 
+    def test_gh_auth_token_docker_login_allowed(self, safety_rules_path):
+        """gh auth token piped to docker login --password-stdin should be allowed (safe pattern)."""
+        safe_patterns = [
+            "gh auth token | docker login ghcr.io -u myuser --password-stdin",
+            "gh auth token | docker login ghcr.io -u 27bslash6 --password-stdin",
+        ]
+        for cmd in safe_patterns:
+            result = validate_command(cmd, config_path=safety_rules_path)
+            assert result.allowed, f"Safe gh auth token docker login pattern blocked: {cmd}"
+
 
 class TestEnvironmentCredentialExtraction:
     """Test environment variable credential extraction (GAP-003)."""

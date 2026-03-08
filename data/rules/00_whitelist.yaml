@@ -17,5 +17,10 @@ whitelist:
   - ^chmod\s+[0-7]{3}\s+/tmp/
   - ^chmod\s+-R\s+[0-7]{3}\s+/tmp/
 
+  # Safe container registry authentication via gh CLI
+  # Token is piped directly to docker's credential store, never exposed to stdout/logs.
+  # GitHub's official docs recommend this pattern for ghcr.io authentication.
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+-u\s+\S+\s+--password-stdin
+
 # Note: This file has no rules section, only whitelist patterns
 rules: []
