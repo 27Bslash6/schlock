@@ -158,15 +158,13 @@ class TestNetworkBackdoors:
     def test_network_backdoors_blocked(self, safety_rules_path, command, description):
         """Network backdoor commands MUST be blocked."""
         result = validate_command(command, config_path=safety_rules_path)
-        # These might not all be blocked by current rules, but they SHOULD be
-        if "nc " in command or "socat" in command:
-            # Mark as expected to potentially fail until rules updated
-            if result.allowed:
-                pytest.skip(f"Rule not yet implemented for: {description}")
-        elif "ssh-keygen -R" in command:
-            # ssh-keygen -R * is HIGH risk (not BLOCKED) as it's dangerous but not catastrophic
-            if result.risk_level == RiskLevel.SAFE:
-                pytest.skip(f"Rule not yet implemented for: {description}")
+        # Direct network tool backdoors (nc/ncat/netcat/socat) must be fully BLOCKED
+        first_token = command.split()[0] if command.split() else ""
+        if first_token in ("nc", "ncat", "netcat", "socat"):
+            assert not result.allowed, f"Expected {description} to be blocked, got allowed=True, risk={result.risk_level}"
+            assert result.risk_level == RiskLevel.BLOCKED, f"Expected BLOCKED for {description}, got {result.risk_level}"
+        else:
+            # Script-based backdoors and SSH key manipulation: must be HIGH risk or worse
             assert result.risk_level in (RiskLevel.HIGH, RiskLevel.BLOCKED), (
                 f"Expected HIGH/BLOCKED for {description}, got {result.risk_level}"
             )
