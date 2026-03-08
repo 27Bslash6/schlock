@@ -55,3 +55,8 @@ Thumbs.db
 
 # Development files (excluded from public releases)
 .claude/
+
+# Gas Town (added by gt)
+.runtime/
+.logs/
+.beads/
