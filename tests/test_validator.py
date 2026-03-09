@@ -5,6 +5,7 @@ Also includes FIX 5: matched_rules field population test.
 
 import pytest
 
+import schlock
 import schlock.core.validator as val_module
 from schlock.core import parser
 from schlock.core.rules import RiskLevel, RuleEngine
@@ -147,6 +148,16 @@ class TestLoadRules:
 
         # Restore
         monkeypatch.setattr(val_module, "__file__", original_file)
+
+
+class TestPublicAPI:
+    """Test suite for schlock public API surface."""
+
+    def test_self_protection_paths_importable_from_public_api(self):
+        """SELF_PROTECTION_PATHS is importable from top-level schlock package."""
+        assert isinstance(schlock.SELF_PROTECTION_PATHS, tuple)
+        assert "schlock-config.yaml" in schlock.SELF_PROTECTION_PATHS
+        assert ".config/schlock/config.yaml" in schlock.SELF_PROTECTION_PATHS
 
 
 class TestValidationResult:
@@ -468,6 +479,26 @@ class TestSelfProtection:
     @pytest.mark.parametrize(
         "command",
         [
+            # awk -i inplace (standard gawk in-place editing)
+            "awk -i inplace '{print}' .claude/hooks/schlock-config.yaml",
+            # gawk --include=inplace (GNU long-form)
+            "gawk --include=inplace '{print}' .claude/hooks/schlock-config.yaml",
+            # gawk --include inplace (space-separated)
+            "gawk --include inplace .claude/hooks/schlock-config.yaml",
+            # Same patterns targeting user config
+            "awk -i in-place '{print}' ~/.config/schlock/config.yaml",
+            "gawk --include=in-place '{print}' ~/.config/schlock/config.yaml",
+        ],
+    )
+    def test_blocks_awk_inplace_config_writes(self, command):
+        """awk/gawk in-place editing variants are blocked by self-protection."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             # Bypass vectors that the old denylist approach would miss
             "ln -sf /dev/null .claude/hooks/schlock-config.yaml",
             "dd of=.claude/hooks/schlock-config.yaml",
@@ -545,6 +576,8 @@ class TestSelfProtection:
             'LANG="en US" rm .claude/hooks/schlock-config.yaml',
             # Pure assignment referencing config path (still caught by hardcoded check)
             "FOO=.claude/hooks/schlock-config.yaml",
+            # Escaped quote inside env-var value — fail-safe: incomplete strip → BLOCKED
+            'VAR="val\\"ue" rm .claude/hooks/schlock-config.yaml',
         ],
     )
     def test_env_var_stripping_edge_cases(self, command):
