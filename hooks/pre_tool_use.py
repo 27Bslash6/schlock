@@ -32,8 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import yaml  # noqa: E402 - vendored dependency
 
-from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
-from schlock.core.validator import SELF_PROTECTION_PATHS  # noqa: E402
+from schlock import SELF_PROTECTION_PATHS, RiskLevel, ValidationResult, validate_command  # noqa: E402
 from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
 from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
 from schlock.integrations.shellcheck import (  # noqa: E402

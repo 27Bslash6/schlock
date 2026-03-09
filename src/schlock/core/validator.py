@@ -458,6 +458,10 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
         # Strip leading environment variable assignments (e.g., "DUMMY=1 FOO=bar rm ...")
         # These prefix a command but don't change what it does — the command after them
         # is what matters. If ONLY assignments remain, it's a pure assignment (skip).
+        # NOTE: Quoted values with backslash-escaped quotes (e.g., VAR="val\"ue") are NOT
+        # handled — the regex terminates at the escaped quote, leaving residual text.
+        # This is FAIL-SAFE: incomplete stripping means the "command" includes assignment
+        # fragments, which won't match the read-only allowlist → BLOCKED (not bypassed).
         stripped = re.sub(r'^([A-Za-z_]\w*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+)+', "", segment)
         if not stripped:
             continue
