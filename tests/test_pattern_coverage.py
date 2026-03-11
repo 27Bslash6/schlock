@@ -1225,6 +1225,25 @@ class TestGitCredentialTheft:
             assert not result.allowed, f"Git credential access not blocked: {cmd}"
             assert result.risk_level == RiskLevel.BLOCKED
 
+    def test_gh_auth_token_docker_login_bypass_blocked(self, safety_rules_path):
+        """gh auth token piped to docker login (credential bypass) should be BLOCKED."""
+        dangerous_variants = [
+            "gh auth token | docker login --password-stdin",
+            "gh auth token | docker login ghcr.io --password-stdin",
+            "gh auth token && docker login --password-stdin",
+            "gh auth token || rm -rf /",
+        ]
+        for cmd in dangerous_variants:
+            result = validate_command(cmd, config_path=safety_rules_path)
+            assert not result.allowed, f"Docker login bypass not blocked: {cmd}"
+            assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_standalone_gh_auth_token_blocked(self, safety_rules_path):
+        """Standalone gh auth token should be BLOCKED with correct risk level."""
+        result = validate_command("gh auth token", config_path=safety_rules_path)
+        assert not result.allowed, "gh auth token should be blocked"
+        assert result.risk_level == RiskLevel.BLOCKED
+
     def test_github_cli_token_theft_blocked(self, safety_rules_path):
         """GitHub CLI token theft should be BLOCKED."""
         dangerous = [
