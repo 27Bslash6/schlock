@@ -35,7 +35,7 @@ jobs:
       run: uv run pytest --cov=src/schlock --cov-report=xml --cov-report=term --junitxml=junit.xml -o junit_family=legacy
 
     - name: Upload coverage
-      uses: codecov/codecov-action@4481f553995cc5011b158ce191746ac1a1d0f815 # v5.5.3
+      uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
       with:
         files: ./coverage.xml
         use_oidc: true
@@ -43,7 +43,7 @@ jobs:
 
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@4481f553995cc5011b158ce191746ac1a1d0f815 # v5.5.3
+      uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
       with:
         files: ./junit.xml
         report_type: test_results
