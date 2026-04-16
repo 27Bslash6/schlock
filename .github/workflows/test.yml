@@ -65,7 +65,7 @@ jobs:
       uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
     - name: pip-audit
-      run: uv export --no-hashes | uvx pip-audit -r /dev/stdin
+      run: uv export --no-hashes | uvx pip-audit -r /dev/stdin --ignore-vuln CVE-2026-4539  # pygments 2.19.2, no fix available (transitive dev dep via pytest)
 
     - name: osv-scanner
       run: |
