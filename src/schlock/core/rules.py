@@ -633,7 +633,7 @@ class RuleEngine:
         Returns:
             True if command matches any whitelist pattern
         """
-        return any(pattern.search(command) for pattern in self.whitelist_patterns)
+        return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
     def match_command(
         self,
