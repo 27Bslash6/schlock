@@ -142,33 +142,67 @@ class ValidationResult:
     matched_rules: list[str] = field(default_factory=list)
 
 
-def _load_rule_overrides() -> tuple[dict, dict]:
-    """Load rule and category overrides from config files.
+def _extract_whitelist_patterns(data: dict, config_path: Path, is_user_level: bool) -> list[str]:
+    """Extract whitelist patterns from a parsed config file.
+
+    SECURITY: Only user-level config may define whitelist patterns.
+    Project-level config is rejected with a warning.
+    """
+    if not is_user_level:
+        if data.get("whitelist"):
+            logger.warning(
+                f"Ignoring whitelist patterns in project config {config_path} "
+                "(whitelist is only supported in user-level config ~/.config/schlock/config.yaml)"
+            )
+        return []
+
+    file_whitelist = data.get("whitelist", [])
+    if not isinstance(file_whitelist, list):
+        if file_whitelist:
+            logger.warning(f"Ignoring non-list whitelist value in {config_path}")
+        return []
+
+    patterns: list[str] = []
+    for pattern in file_whitelist:
+        if isinstance(pattern, str):
+            patterns.append(pattern)
+        else:
+            logger.warning(f"Skipping non-string whitelist pattern in {config_path}: {pattern!r}")
+    return patterns
+
+
+def _load_rule_overrides() -> tuple[dict, dict, list[str]]:
+    """Load rule/category overrides and whitelist patterns from config files.
 
     Reads config from both paths in precedence order (user first, project second).
     Project-level overrides win at the property level (not dict-level replace).
 
+    SECURITY: Whitelist patterns are loaded from user-level config ONLY.
+    Project-level config cannot define whitelist patterns because whitelist
+    bypasses ALL rules including BLOCKED — a malicious repo could exploit this.
+
     Returns:
-        Tuple of (rule_overrides, category_overrides). Empty dicts if none found.
-        Never raises exceptions.
+        Tuple of (rule_overrides, category_overrides, whitelist_patterns).
+        Empty dicts/list if none found. Never raises exceptions.
     """
     rule_overrides: dict = {}
     category_overrides: dict = {}
+    whitelist_patterns: list[str] = []
 
-    # Config paths in priority order (lowest first, highest last)
+    # Config paths: (path, is_user_level) in priority order (lowest first)
     # Path.home() can raise RuntimeError (HOME unset, e.g. containers/CI)
     # Path.cwd() can raise FileNotFoundError (cwd deleted)
-    config_paths: list[Path] = []
+    config_paths: list[tuple[Path, bool]] = []
     try:
-        config_paths.append(Path.home() / ".config" / "schlock" / "config.yaml")
+        config_paths.append((Path.home() / ".config" / "schlock" / "config.yaml", True))
     except Exception as e:
         logger.warning(f"Cannot resolve home directory for user config: {e}")
     try:
-        config_paths.append(Path.cwd() / ".claude" / "hooks" / "schlock-config.yaml")
+        config_paths.append((Path.cwd() / ".claude" / "hooks" / "schlock-config.yaml", False))
     except Exception as e:
         logger.warning(f"Cannot resolve working directory for project config: {e}")
 
-    for config_path in config_paths:
+    for config_path, is_user_level in config_paths:
         try:
             if not config_path.exists():
                 continue
@@ -193,11 +227,14 @@ def _load_rule_overrides() -> tuple[dict, dict]:
                     if isinstance(props, dict):
                         category_overrides.setdefault(cat_name, {}).update(props)
 
+            # Whitelist patterns (user-level only, see _extract_whitelist_patterns)
+            whitelist_patterns.extend(_extract_whitelist_patterns(data, config_path, is_user_level))
+
         except Exception as e:
             logger.warning(f"Failed to load overrides from {config_path}: {e}")
             continue
 
-    return rule_overrides, category_overrides
+    return rule_overrides, category_overrides, whitelist_patterns
 
 
 def load_rules(config_path: Optional[str] = None) -> RuleEngine:
@@ -239,9 +276,18 @@ def load_rules(config_path: Optional[str] = None) -> RuleEngine:
     engine = RuleEngine.from_directory(rules_dir)
 
     # Apply user/project overrides (only for default path, not test overrides)
-    rule_overrides, category_overrides = _load_rule_overrides()
+    rule_overrides, category_overrides, whitelist_patterns = _load_rule_overrides()
     if rule_overrides or category_overrides:
         engine.apply_overrides(rule_overrides, category_overrides)
+
+    # Apply user whitelist patterns (user-level config only, see _load_rule_overrides)
+    if whitelist_patterns:
+        try:
+            engine._compile_whitelist(whitelist_patterns)
+        except ConfigurationError as e:
+            # User config has invalid regex — log and continue without user patterns.
+            # Built-in whitelist patterns from 00_whitelist.yaml are unaffected.
+            logger.warning(f"Invalid whitelist pattern in user config, skipping: {e}")
 
     return engine
 

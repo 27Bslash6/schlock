@@ -336,7 +336,7 @@ rule_overrides:
     enabled: false
 """)
         monkeypatch.chdir(tmp_path)
-        rule_overrides, category_overrides = _load_rule_overrides()
+        rule_overrides, category_overrides, _ = _load_rule_overrides()
         assert "recursive_delete" in rule_overrides
         assert rule_overrides["recursive_delete"]["enabled"] is False
         assert category_overrides == {}
@@ -351,7 +351,7 @@ category_overrides:
     risk_level: HIGH
 """)
         monkeypatch.chdir(tmp_path)
-        rule_overrides, category_overrides = _load_rule_overrides()
+        rule_overrides, category_overrides, _ = _load_rule_overrides()
         assert rule_overrides == {}
         assert "network_security" in category_overrides
         assert category_overrides["network_security"]["risk_level"] == "HIGH"
@@ -380,7 +380,7 @@ rule_overrides:
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "user_home")
         monkeypatch.chdir(tmp_path / "project")
 
-        rule_overrides, _ = _load_rule_overrides()
+        rule_overrides, _, _ = _load_rule_overrides()
         # enabled: false from user + risk_level: HIGH from project (overwrites user's LOW)
         assert rule_overrides["some_rule"]["enabled"] is False
         assert rule_overrides["some_rule"]["risk_level"] == "HIGH"
@@ -390,7 +390,7 @@ rule_overrides:
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "nonexistent_home")
         monkeypatch.chdir(tmp_path)
 
-        rule_overrides, category_overrides = _load_rule_overrides()
+        rule_overrides, category_overrides, _ = _load_rule_overrides()
         assert rule_overrides == {}
         assert category_overrides == {}
 
@@ -402,10 +402,94 @@ rule_overrides:
 
         monkeypatch.chdir(tmp_path)
 
-        rule_overrides, category_overrides = _load_rule_overrides()
+        rule_overrides, category_overrides, _ = _load_rule_overrides()
         assert rule_overrides == {}
         assert category_overrides == {}
         assert "Failed to load overrides" in caplog.text
+
+    def test_load_whitelist_from_user_config(self, tmp_path, monkeypatch):
+        """Whitelist patterns loaded from user-level config."""
+        user_config = tmp_path / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        (user_config / "config.yaml").write_text("""
+whitelist:
+  - ^gcloud\\s+config\\s+get-value\\s+project
+  - ^my-safe-script\\.sh
+""")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        _, _, whitelist_patterns = _load_rule_overrides()
+        assert len(whitelist_patterns) == 2
+        assert whitelist_patterns[0] == r"^gcloud\s+config\s+get-value\s+project"
+        assert whitelist_patterns[1] == r"^my-safe-script\.sh"
+
+    def test_whitelist_patterns_bypass_blocked_rules(self, tmp_path, monkeypatch):
+        """User whitelist pattern allows a command that would otherwise be BLOCKED."""
+        clear_caches()
+        user_config = tmp_path / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        # Whitelist a specific gcloud command caught by gcp_credential_theft (BLOCKED)
+        (user_config / "config.yaml").write_text("""
+whitelist:
+  - ^gcloud\\s+config\\s+get-value\\s+project$
+""")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        result = validate_command("gcloud config get-value project")
+        assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
+
+    def test_whitelist_invalid_regex_skipped(self, tmp_path, monkeypatch, caplog):
+        """Invalid regex in whitelist logs warning, doesn't crash validation."""
+        clear_caches()
+        user_config = tmp_path / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        (user_config / "config.yaml").write_text("""
+whitelist:
+  - "[invalid(regex"
+""")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        # Should not crash — invalid pattern is skipped with warning
+        result = validate_command("echo hello")
+        assert result.allowed
+        assert "Invalid whitelist pattern" in caplog.text
+
+    def test_whitelist_ignored_from_project_config(self, tmp_path, monkeypatch, caplog):
+        """Project-level config whitelist patterns are NOT loaded (security)."""
+        project_config = tmp_path / ".claude" / "hooks"
+        project_config.mkdir(parents=True)
+        (project_config / "schlock-config.yaml").write_text("""
+whitelist:
+  - ^rm\\s+-rf\\s+/
+""")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "nonexistent")
+        monkeypatch.chdir(tmp_path)
+
+        _, _, whitelist_patterns = _load_rule_overrides()
+        assert whitelist_patterns == []
+        assert "only supported in user-level config" in caplog.text
+
+    def test_self_protection_not_bypassable_via_whitelist(self, tmp_path, monkeypatch):
+        """Self-protection blocks config modification even with broad whitelist."""
+        clear_caches()
+        user_config = tmp_path / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        # Broad whitelist that matches everything
+        (user_config / "config.yaml").write_text("""
+whitelist:
+  - .*
+""")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        # Self-protection runs BEFORE whitelist matching — still blocked
+        result = validate_command("rm .claude/hooks/schlock-config.yaml")
+        assert not result.allowed
+        assert result.risk_level == RiskLevel.BLOCKED
 
 
 class TestSelfProtection:
