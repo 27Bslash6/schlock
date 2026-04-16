@@ -485,7 +485,9 @@ class RuleEngine:
         """
         for pattern_str in patterns:
             try:
-                compiled = re.compile(pattern_str, re.MULTILINE)
+                # No re.MULTILINE: whitelist uses match() which anchors at start.
+                # MULTILINE would change $ to match at line boundaries, not string end.
+                compiled = re.compile(pattern_str)
                 self.whitelist_patterns.append(compiled)
             except re.error as e:
                 raise ConfigurationError(

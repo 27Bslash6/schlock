@@ -75,6 +75,8 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 
 **Rule Overrides**: Per-rule and per-category overrides via `rule_overrides` and `category_overrides` YAML keys. BLOCKED rules cannot be downgraded or disabled (security floor).
 
+**Command Whitelist**: User-level config (`~/.config/schlock/config.yaml`) supports `whitelist:` — a list of regex patterns that bypass ALL rules including BLOCKED. Project-level config cannot define whitelist patterns (privilege escalation risk). See `docs/CONFIGURATION.md`.
+
 **Self-Protection**: Three-layer defense prevents LLM agents from modifying schlock config:
 1. YAML rules (`14_self_protection.yaml`, BLOCKED) — can't be overridden
 2. Hardcoded validator check (`_check_self_protection`) — independent of YAML rules

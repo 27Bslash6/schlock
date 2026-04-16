@@ -102,8 +102,55 @@ Overrides are applied in this order (later wins):
 #### Security Constraints
 
 - **BLOCKED rules cannot be downgraded or disabled** — this is a non-negotiable security floor
+- **Whitelist patterns are user-level config only** — project-level config cannot define whitelist patterns (see below)
 - Invalid overrides log warnings and are skipped (graceful degradation)
 - Unknown rule or category names log warnings and are skipped
+
+### Command Whitelist
+
+For commands that are caught by rules you can't override (e.g., BLOCKED-level rules), you can define whitelist patterns in your **user-level** config. Whitelisted commands bypass all rules including BLOCKED.
+
+```yaml
+# ~/.config/schlock/config.yaml (user-level ONLY)
+whitelist:
+  - ^gcloud\s+config\s+get-value\s+project$
+  - '^"?/home/\w+/\.claude/plugins/.*\.sh'
+```
+
+#### How It Works
+
+- Patterns are regex, matched against the start of the command string (like `re.match()`)
+- A match bypasses ALL rule checks — the command is allowed unconditionally
+- User whitelist patterns merge with built-in whitelist patterns from the plugin
+- Invalid regex patterns are skipped with a warning (won't crash the validator)
+
+#### Writing Good Patterns
+
+Whitelist patterns use prefix matching (anchored at the start, not the end). Write patterns specific enough to avoid unintended matches:
+
+```yaml
+# GOOD: Specific command with anchored end
+whitelist:
+  - ^gcloud\s+config\s+get-value\s+project$
+
+# GOOD: Specific script path
+whitelist:
+  - '^/home/myuser/\.claude/plugins/setup\.sh\b'
+
+# BAD: Too broad — matches ALL gcloud commands including dangerous ones
+whitelist:
+  - ^gcloud
+```
+
+Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
+
+#### Security: User-Level Only
+
+Whitelist patterns are **only** loaded from `~/.config/schlock/config.yaml`. Project-level config (`.claude/hooks/schlock-config.yaml`) cannot define whitelist patterns.
+
+**Why?** Whitelist bypasses ALL rules including BLOCKED. If project-level config could define whitelist patterns, a malicious repository could include a `schlock-config.yaml` that whitelists dangerous commands. Since project config is auto-loaded when you `cd` into a repo, this would be a privilege escalation attack.
+
+Rule and category overrides are safe at the project level because `apply_overrides()` enforces a BLOCKED floor — you can't downgrade BLOCKED rules. Whitelist has no such floor by design (bypassing BLOCKED is its purpose), so it's restricted to user-level config.
 
 #### Available Categories
 
