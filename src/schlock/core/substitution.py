@@ -346,6 +346,55 @@ def _find_kubectl_subcommand(args: list[str]) -> str | None:
     return None
 
 
+def _find_sub_subcommand(args: list[str], parent_subcommand: str) -> str | None:
+    """Find the first positional token after a kubectl sub-subcommand.
+
+    Skips flags (tokens starting with '-') and their values to find the
+    actual sub-subcommand (e.g., "set-context" in "kubectl config set-context").
+
+    Args:
+        args: Word tokens from bashlex AST (includes "kubectl" as first element)
+        parent_subcommand: The parent subcommand to search after (e.g., "config")
+
+    Returns:
+        The sub-subcommand string, or None if not found
+    """
+    # Find the position of the parent subcommand
+    found_parent = False
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if not found_parent:
+            if arg == parent_subcommand:
+                found_parent = True
+            continue
+        # Now we're past the parent subcommand — find first positional
+        # --flag=value → skip entirely
+        if arg.startswith("--") and "=" in arg:
+            continue
+        # Known value-taking global flag → skip next arg too
+        if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
+            skip_next = True
+            continue
+        # Other flags (boolean) → skip
+        if arg.startswith("-"):
+            continue
+        # First positional = sub-subcommand
+        return arg
+    return None
+
+
+def _is_truthy_flag_value(value: str) -> bool:
+    """Check if a flag value like --raw=<value> is truthy.
+
+    Returns True for: true, 1, yes, y (case-insensitive)
+    Returns False for: false, 0, no, n (case-insensitive) and anything else
+    """
+    return value.lower() in ("true", "1", "yes", "y")
+
+
 @dataclass
 class SubstitutionNode:
     """Represents a command or process substitution in the AST."""
@@ -707,7 +756,7 @@ class SubstitutionValidator:
 
         return check_node(cmd_node)
 
-    def _has_dangerous_inner_structure(  # noqa: PLR0911, PLR0912
+    def _has_dangerous_inner_structure(  # noqa: PLR0911, PLR0912, PLR0915
         self, node: Any, base_command: str | None = None
     ) -> tuple[bool, str]:
         """Check if inner command has dangerous structures or arguments.
@@ -836,32 +885,40 @@ class SubstitutionValidator:
 
                 # Multi-level subcommand checks:
                 # kubectl config view → safe, kubectl config set-context → dangerous
+                # Only match the first positional token after the subcommand,
+                # not flag values that happen to share names with dangerous ops.
                 if subcommand == "config":
-                    for arg in args:
-                        if arg in _DANGEROUS_KUBECTL_CONFIG_OPS:
-                            return True, f"kubectl config {arg} modifies kubeconfig"
+                    sub_sub = _find_sub_subcommand(args, "config")
+                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_CONFIG_OPS:
+                        return True, f"kubectl config {sub_sub} modifies kubeconfig"
                     # config view --raw exposes certificates, keys, and tokens
-                    # Handles --raw, --raw=true, --flatten, --flatten=true forms
-                    if "view" in args and any(
-                        arg == "--raw" or arg.startswith("--raw=") or arg == "--flatten" or arg.startswith("--flatten=")
-                        for arg in args
-                    ):
-                        return True, "kubectl config view --raw/--flatten exposes credentials"
+                    # Bare --raw/--flatten flags are dangerous; --raw=<val>/--flatten=<val>
+                    # are only dangerous when the value is truthy (true, 1, yes, y).
+                    if sub_sub == "view":
+                        for arg in args:
+                            if arg in ("--raw", "--flatten"):
+                                return True, "kubectl config view --raw/--flatten exposes credentials"
+                            if arg.startswith("--raw="):
+                                if _is_truthy_flag_value(arg.split("=", 1)[1]):
+                                    return True, "kubectl config view --raw/--flatten exposes credentials"
+                            if arg.startswith("--flatten="):
+                                if _is_truthy_flag_value(arg.split("=", 1)[1]):
+                                    return True, "kubectl config view --raw/--flatten exposes credentials"
 
                 if subcommand == "auth":
-                    for arg in args:
-                        if arg in _DANGEROUS_KUBECTL_AUTH_OPS:
-                            return True, f"kubectl auth {arg} modifies RBAC"
+                    sub_sub = _find_sub_subcommand(args, "auth")
+                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_AUTH_OPS:
+                        return True, f"kubectl auth {sub_sub} modifies RBAC"
 
                 if subcommand == "rollout":
-                    for arg in args:
-                        if arg in _DANGEROUS_KUBECTL_ROLLOUT_OPS:
-                            return True, f"kubectl rollout {arg} modifies deployment state"
+                    sub_sub = _find_sub_subcommand(args, "rollout")
+                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_ROLLOUT_OPS:
+                        return True, f"kubectl rollout {sub_sub} modifies deployment state"
 
                 if subcommand == "cluster-info":
-                    for arg in args:
-                        if arg in _DANGEROUS_KUBECTL_CLUSTER_INFO_OPS:
-                            return True, f"kubectl cluster-info {arg} exfiltrates cluster data"
+                    sub_sub = _find_sub_subcommand(args, "cluster-info")
+                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_CLUSTER_INFO_OPS:
+                        return True, f"kubectl cluster-info {sub_sub} exfiltrates cluster data"
 
         return False, ""
 
