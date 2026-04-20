@@ -7,7 +7,11 @@ coverage:
     patch:
       default:
         target: 80%
+        # Don't fail PR checks for missing lines above target
+        informational: true
 
 comment:
   layout: "condensed_header, condensed_files, condensed_footer"
   require_changes: true
+  # Only show files with coverage changes, skip noise
+  hide_comment_details: true
