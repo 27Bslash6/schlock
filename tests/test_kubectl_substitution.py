@@ -600,3 +600,85 @@ class TestRolloutSubcommands:
         """State-modifying rollout operations must be blocked."""
         result = validate_command(command)
         assert not result.allowed, f"SECURITY: {description} was NOT blocked!"
+
+
+# ============================================================
+# Positional-only sub-subcommand matching (false positive prevention)
+# ============================================================
+
+
+class TestSubSubcommandPositionalParsing:
+    """Regression: flag VALUES must not be misclassified as sub-subcommands.
+
+    e.g. kubectl config --kubeconfig set-context view
+    Here "set-context" is the --kubeconfig value, NOT the config sub-subcommand.
+    """
+
+    def test_config_flag_value_not_misclassified(self):
+        """--namespace value matching a dangerous op must not trigger block."""
+        result = validate_command('echo "$(kubectl config -n set view)"')
+        assert result.allowed, "Flag value 'set' should not be treated as sub-subcommand"
+
+    def test_config_kubeconfig_value_not_misclassified(self):
+        """--kubeconfig path that matches a dangerous op must not trigger block."""
+        result = validate_command('echo "$(kubectl config --kubeconfig set-context get-contexts)"')
+        assert result.allowed, "Flag value 'set-context' should not be treated as sub-subcommand"
+
+    def test_config_dangerous_still_caught_after_flags(self):
+        """Real sub-subcommand after flags must still be caught."""
+        result = validate_command('echo "$(kubectl config -n default set-context prod)"')
+        assert not result.allowed, "Real set-context sub-subcommand must be blocked"
+
+    def test_rollout_flag_value_not_misclassified(self):
+        """Flag value matching a dangerous op in rollout context."""
+        result = validate_command('echo "$(kubectl rollout -n restart status deployment/app)"')
+        assert result.allowed, "Flag value 'restart' should not be treated as sub-subcommand"
+
+    def test_rollout_dangerous_still_caught_after_flags(self):
+        """Real sub-subcommand after flags must still be caught."""
+        result = validate_command('echo "$(kubectl rollout -n default restart deployment/app)"')
+        assert not result.allowed, "Real restart sub-subcommand must be blocked"
+
+
+class TestConfigViewRawFalsePositives:
+    """Regression: --raw=false and --flatten=false must NOT be blocked."""
+
+    def test_config_view_raw_equals_false(self):
+        """--raw=false explicitly disables raw output — safe."""
+        result = validate_command('echo "$(kubectl config view --raw=false)"')
+        assert result.allowed, "--raw=false should not be blocked"
+
+    def test_config_view_flatten_equals_false(self):
+        """--flatten=false explicitly disables flattening — safe."""
+        result = validate_command('echo "$(kubectl config view --flatten=false)"')
+        assert result.allowed, "--flatten=false should not be blocked"
+
+    def test_config_view_raw_equals_zero(self):
+        """--raw=0 is falsy — safe."""
+        result = validate_command('echo "$(kubectl config view --raw=0)"')
+        assert result.allowed, "--raw=0 should not be blocked"
+
+    def test_config_view_flatten_equals_no(self):
+        """--flatten=no is falsy — safe."""
+        result = validate_command('echo "$(kubectl config view --flatten=no)"')
+        assert result.allowed, "--flatten=no should not be blocked"
+
+    def test_config_view_raw_equals_yes(self):
+        """--raw=yes is truthy — dangerous."""
+        result = validate_command('echo "$(kubectl config view --raw=yes)"')
+        assert not result.allowed, "--raw=yes must be blocked"
+
+    def test_config_view_flatten_equals_one(self):
+        """--flatten=1 is truthy — dangerous."""
+        result = validate_command('echo "$(kubectl config view --flatten=1)"')
+        assert not result.allowed, "--flatten=1 must be blocked"
+
+    def test_config_view_raw_equals_y(self):
+        """--raw=y is truthy — dangerous."""
+        result = validate_command('echo "$(kubectl config view --raw=y)"')
+        assert not result.allowed, "--raw=y must be blocked"
+
+    def test_config_view_raw_equals_true_uppercase(self):
+        """--raw=TRUE is truthy (case-insensitive) — dangerous."""
+        result = validate_command('echo "$(kubectl config view --raw=TRUE)"')
+        assert not result.allowed, "--raw=TRUE must be blocked"
