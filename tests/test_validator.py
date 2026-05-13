@@ -442,13 +442,16 @@ whitelist:
         assert result.risk_level == RiskLevel.SAFE
 
     def test_whitelist_invalid_regex_skipped(self, tmp_path, monkeypatch, caplog):
-        """Invalid regex in whitelist logs warning, doesn't crash validation."""
+        """Invalid regex in whitelist logs warning; valid patterns before and after still work."""
         clear_caches()
         user_config = tmp_path / ".config" / "schlock"
         user_config.mkdir(parents=True)
+        # Pattern sequence: valid, invalid, valid — all three must be independently handled
         (user_config / "config.yaml").write_text("""
 whitelist:
+  - ^gcloud\\s+config\\s+get-value\\s+project$
   - "[invalid(regex"
+  - ^my-safe-tool\\s+run$
 """)
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
         monkeypatch.chdir(tmp_path)
@@ -457,6 +460,16 @@ whitelist:
         result = validate_command("echo hello")
         assert result.allowed
         assert "Invalid whitelist pattern" in caplog.text
+
+        # Valid pattern BEFORE the invalid one still works
+        result = validate_command("gcloud config get-value project")
+        assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
+
+        # Valid pattern AFTER the invalid one still works
+        result = validate_command("my-safe-tool run")
+        assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
 
     def test_whitelist_ignored_from_project_config(self, tmp_path, monkeypatch, caplog):
         """Project-level config whitelist patterns are NOT loaded (security)."""

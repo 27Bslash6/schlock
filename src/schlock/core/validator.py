@@ -281,12 +281,11 @@ def load_rules(config_path: Optional[str] = None) -> RuleEngine:
         engine.apply_overrides(rule_overrides, category_overrides)
 
     # Apply user whitelist patterns (user-level config only, see _load_rule_overrides)
-    if whitelist_patterns:
+    # Compile each pattern independently so one bad regex doesn't drop the rest.
+    for pattern in whitelist_patterns:
         try:
-            engine._compile_whitelist(whitelist_patterns)
+            engine._compile_whitelist([pattern])
         except ConfigurationError as e:
-            # User config has invalid regex — log and continue without user patterns.
-            # Built-in whitelist patterns from 00_whitelist.yaml are unaffected.
             logger.warning(f"Invalid whitelist pattern in user config, skipping: {e}")
 
     return engine
