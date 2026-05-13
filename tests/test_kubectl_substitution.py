@@ -198,7 +198,7 @@ class TestDangerousKubectlSubstitutionBlocked:
         """Dangerous kubectl subcommands must be blocked in substitution context."""
         result = validate_command(command)
         assert not result.allowed, f"SECURITY: kubectl {description} was NOT blocked in substitution!"
-        assert result.risk_level in (RiskLevel.HIGH, RiskLevel.BLOCKED)
+        assert result.risk_level == RiskLevel.BLOCKED, f"kubectl {description} should be BLOCKED, got {result.risk_level}"
 
 
 class TestKubectlSecretAccessBlockedInSubstitution:
@@ -215,6 +215,11 @@ class TestKubectlSecretAccessBlockedInSubstitution:
             ('echo "$(kubectl get secret db-creds -o yaml)"', "get secret as YAML"),
             ('echo "$(kubectl describe secret db-creds)"', "describe secret"),
             ("echo \"$(kubectl get secret api-key -o jsonpath='{.data.token}')\"", "extract secret data"),
+            # Multi-resource forms
+            ('echo "$(kubectl get configmaps,secrets -o yaml)"', "comma-separated with secrets"),
+            ('echo "$(kubectl get secret/my-password)"', "resource/name form"),
+            # API group dotted suffix
+            ('echo "$(kubectl get secrets.v1)"', "dotted API group suffix"),
         ],
     )
     def test_kubectl_secrets_blocked_in_substitution(self, command, description):
@@ -382,6 +387,24 @@ class TestKubectlEdgeCases:
         # With balanced preset, HIGH risk = allowed with "ask" prompt
         # The key thing: the risk level must be HIGH or BLOCKED, not SAFE
         assert result.risk_level in (RiskLevel.HIGH, RiskLevel.BLOCKED)
+
+    def test_malformed_unclosed_command_substitution(self):
+        """Unclosed $() is a parse error — must fail closed (BLOCKED)."""
+        result = validate_command('echo "$(kubectl get pods"')
+        assert not result.allowed
+        assert result.error is not None
+
+    def test_malformed_truncated_command_substitution(self):
+        """Truncated $() is a parse error — must fail closed (BLOCKED)."""
+        result = validate_command('echo "$(kubectl"')
+        assert not result.allowed
+        assert result.error is not None
+
+    def test_process_substitution_in_double_quotes_is_literal(self):
+        """<() inside double quotes is a literal string, not process substitution."""
+        # Bash treats <(...) literally inside double quotes — not a security concern
+        result = validate_command('echo "<(kubectl get pods)"')
+        assert result.allowed
 
 
 # ============================================================
@@ -682,3 +705,13 @@ class TestConfigViewRawFalsePositives:
         """--raw=TRUE is truthy (case-insensitive) — dangerous."""
         result = validate_command('echo "$(kubectl config view --raw=TRUE)"')
         assert not result.allowed, "--raw=TRUE must be blocked"
+
+    def test_config_view_raw_equals_t_single_letter(self):
+        """--raw=t is truthy in pflag (kubectl's flag library) — dangerous."""
+        result = validate_command('echo "$(kubectl config view --raw=t)"')
+        assert not result.allowed, "--raw=t must be blocked (pflag accepts single-letter truthy)"
+
+    def test_config_view_flatten_equals_t_single_letter(self):
+        """--flatten=t is truthy in pflag — dangerous."""
+        result = validate_command('echo "$(kubectl config view --flatten=t)"')
+        assert not result.allowed, "--flatten=t must be blocked (pflag accepts single-letter truthy)"

@@ -359,29 +359,29 @@ def _find_sub_subcommand(args: list[str], parent_subcommand: str) -> str | None:
     Returns:
         The sub-subcommand string, or None if not found
     """
-    # Find the position of the parent subcommand
+    # Find the position of the parent subcommand, then the first positional after it.
+    # Flag-value skipping runs in BOTH phases to prevent a global flag's value
+    # (e.g., --context config) from being mistaken for the parent subcommand.
     found_parent = False
     skip_next = False
     for arg in args:
         if skip_next:
             skip_next = False
             continue
+        # Skip --flag=value regardless of phase (prevents confusion like --context config)
+        if arg.startswith("--") and "=" in arg:
+            continue
+        if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        # Positional token
         if not found_parent:
             if arg == parent_subcommand:
                 found_parent = True
             continue
-        # Now we're past the parent subcommand — find first positional
-        # --flag=value → skip entirely
-        if arg.startswith("--") and "=" in arg:
-            continue
-        # Known value-taking global flag → skip next arg too
-        if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
-            skip_next = True
-            continue
-        # Other flags (boolean) → skip
-        if arg.startswith("-"):
-            continue
-        # First positional = sub-subcommand
+        # First positional after parent = sub-subcommand
         return arg
     return None
 
@@ -392,7 +392,7 @@ def _is_truthy_flag_value(value: str) -> bool:
     Returns True for: true, 1, yes, y (case-insensitive)
     Returns False for: false, 0, no, n (case-insensitive) and anything else
     """
-    return value.lower() in ("true", "1", "yes", "y")
+    return value.lower() in ("true", "1", "yes", "y", "t")
 
 
 @dataclass
@@ -874,14 +874,17 @@ class SubstitutionValidator:
 
                 # Block secret/secrets resource access on get/describe
                 # Catches: kubectl get secrets -o json, kubectl get -o yaml secret,
-                # kubectl get configmaps,secrets -o yaml (comma-separated)
+                # kubectl get configmaps,secrets -o yaml (comma-separated),
+                # kubectl get secrets.v1 (API group dotted suffix),
+                # kubectl get secret/my-password (resource/name)
                 if subcommand in ("get", "describe"):
                     for arg in args:
                         arg_lower = arg.lower()
-                        if arg_lower in ("secret", "secrets"):
+                        # Normalize: split on commas and slashes for multi-resource forms,
+                        # then strip dotted API group suffixes (secrets.v1 → secrets)
+                        tokens = [t for part in arg_lower.replace(",", "/").split("/") if (t := part.split(".")[0])]
+                        if any(t in ("secret", "secrets") for t in tokens):
                             return True, f"kubectl {subcommand} secret access blocked in substitution"
-                        if "secret" in arg_lower and ("," in arg_lower or "/" in arg_lower):
-                            return True, f"kubectl {subcommand} with multi-resource secret access blocked"
 
                 # Multi-level subcommand checks:
                 # kubectl config view → safe, kubectl config set-context → dangerous
@@ -938,6 +941,16 @@ class SubstitutionValidator:
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
                 message=f"Dangerous structure in substitution: {structure_reason}",
+            )
+
+        # AST-level bypass detection (brace expansion, variable-as-command, etc.)
+        # Defense-in-depth: even whitelisted commands should reject obfuscated invocations.
+        is_suspicious, reason = self.has_suspicious_ast_patterns(sub_node.ast_node)
+        if is_suspicious:
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"Suspicious pattern in substitution: {reason}",
             )
 
         for nested in sub_node.nested_substitutions:
