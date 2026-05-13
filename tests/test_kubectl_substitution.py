@@ -291,6 +291,7 @@ class TestKubectlConfigSubcommands:
         """State-modifying config operations must be blocked."""
         result = validate_command(command)
         assert not result.allowed, f"SECURITY: {description} was NOT blocked!"
+        assert result.risk_level == RiskLevel.BLOCKED, f"{description} should be BLOCKED, got {result.risk_level}"
 
 
 class TestKubectlAuthSubcommands:
@@ -308,6 +309,7 @@ class TestKubectlAuthSubcommands:
         """auth reconcile modifies RBAC — must be blocked."""
         result = validate_command('echo "$(kubectl auth reconcile -f rbac.yaml)"')
         assert not result.allowed
+        assert result.risk_level == RiskLevel.BLOCKED
 
 
 # ============================================================
@@ -623,6 +625,7 @@ class TestRolloutSubcommands:
         """State-modifying rollout operations must be blocked."""
         result = validate_command(command)
         assert not result.allowed, f"SECURITY: {description} was NOT blocked!"
+        assert result.risk_level == RiskLevel.BLOCKED, f"{description} should be BLOCKED, got {result.risk_level}"
 
 
 # ============================================================
@@ -651,6 +654,7 @@ class TestSubSubcommandPositionalParsing:
         """Real sub-subcommand after flags must still be caught."""
         result = validate_command('echo "$(kubectl config -n default set-context prod)"')
         assert not result.allowed, "Real set-context sub-subcommand must be blocked"
+        assert result.risk_level == RiskLevel.BLOCKED
 
     def test_rollout_flag_value_not_misclassified(self):
         """Flag value matching a dangerous op in rollout context."""
@@ -661,6 +665,7 @@ class TestSubSubcommandPositionalParsing:
         """Real sub-subcommand after flags must still be caught."""
         result = validate_command('echo "$(kubectl rollout -n default restart deployment/app)"')
         assert not result.allowed, "Real restart sub-subcommand must be blocked"
+        assert result.risk_level == RiskLevel.BLOCKED
 
 
 class TestConfigViewRawFalsePositives:

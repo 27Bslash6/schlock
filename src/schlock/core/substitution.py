@@ -873,12 +873,21 @@ class SubstitutionValidator:
                         return True, "kubectl get --raw accesses raw API paths"
 
                 # Block secret/secrets resource access on get/describe
-                # Catches: kubectl get secrets -o json, kubectl get -o yaml secret,
-                # kubectl get configmaps,secrets -o yaml (comma-separated),
-                # kubectl get secrets.v1 (API group dotted suffix),
-                # kubectl get secret/my-password (resource/name)
+                # Only check positional args — skip flags and their values to avoid
+                # false positives on paths like --kubeconfig /etc/secrets/kubeconfig
                 if subcommand in ("get", "describe"):
+                    skip_next = False
                     for arg in args:
+                        if skip_next:
+                            skip_next = False
+                            continue
+                        if arg.startswith("--") and "=" in arg:
+                            continue
+                        if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
+                            skip_next = True
+                            continue
+                        if arg.startswith("-"):
+                            continue
                         arg_lower = arg.lower()
                         # Normalize: split on commas and slashes for multi-resource forms,
                         # then strip dotted API group suffixes (secrets.v1 → secrets)
