@@ -155,6 +155,7 @@ _KUBECTL_GLOBAL_VALUE_FLAGS: frozenset[str] = frozenset(
         "-s",
         "--server",
         "--kubeconfig",
+        "--kuberc",  # v1.33+: user preferences file path
         "--context",
         "--cluster",
         "--user",
@@ -162,6 +163,7 @@ _KUBECTL_GLOBAL_VALUE_FLAGS: frozenset[str] = frozenset(
         "--as",
         "--as-group",
         "--as-uid",
+        "--as-user-extra",  # impersonation key=value pairs
         "--certificate-authority",
         "--client-certificate",
         "--client-key",
@@ -322,6 +324,7 @@ def _iter_kubectl_positionals(args: list[str]) -> Iterator[str]:
     Skips flags and their values:
     - ``--flag=value`` → skipped entirely
     - Known global value-taking flags → skip flag and next arg
+    - Attached short forms (``-nproduction``, ``-n=prod``) → skipped entirely
     - Known boolean short flags (-A, -h, -R, -w) → skip flag only
     - Unrecognized short flags (-o, -f, -l, etc.) → assumed to consume
       the next arg (conservative; prevents subcommand masking attacks)
@@ -344,8 +347,16 @@ def _iter_kubectl_positionals(args: list[str]) -> Iterator[str]:
             continue
         if arg.startswith("--"):
             continue
-        if arg.startswith("-"):
-            skip_next = True
+        # Short flag handling: check for attached-value forms (-nfoo, -n=foo)
+        # before the catch-all. A known value-taking short flag with extra chars
+        # has its value attached — no need to consume the next arg.
+        if arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
+            flag_letter = arg[:2]  # e.g., "-n" from "-nproduction"
+            if flag_letter in _KUBECTL_GLOBAL_VALUE_FLAGS and len(arg) > 2:
+                continue  # attached value: -nfoo or -n=foo
+            if flag_letter in _KUBECTL_BOOLEAN_SHORT_FLAGS:
+                continue  # boolean: -Afoo is unusual but harmless
+            skip_next = True  # unrecognized: assume value-consuming
             continue
         yield arg
 
