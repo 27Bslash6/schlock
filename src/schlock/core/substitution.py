@@ -25,6 +25,8 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from .rules import RiskLevel
 
 # Maximum recursion depth for nested substitution validation
@@ -166,14 +168,30 @@ _KUBECTL_GLOBAL_VALUE_FLAGS: frozenset[str] = frozenset(
         "--cache-dir",
         "--request-timeout",
         "-v",
-        # Additional value-consuming global flags
         "--tls-server-name",
         "--username",
         "--password",
         "--profile",
         "--profile-output",
         "--log-flush-frequency",
+        "--log-backtrace-at",
+        "--log-dir",
+        "--log-file",
+        "--log-file-max-size",
+        "--stderrthreshold",
         "--vmodule",
+    }
+)
+
+# Known kubectl boolean flags that do NOT consume the next argument.
+# Used by _find_kubectl_subcommand: unrecognized short flags are assumed
+# to consume a value (conservative/safe), so only known booleans are skipped.
+_KUBECTL_BOOLEAN_SHORT_FLAGS: frozenset[str] = frozenset(
+    {
+        "-h",
+        "-A",  # --all-namespaces
+        "-R",  # --recursive
+        "-w",  # --watch (boolean in most subcommands)
     }
 )
 
@@ -222,13 +240,6 @@ _DANGEROUS_KUBECTL_CONFIG_OPS: frozenset[str] = frozenset(
     }
 )
 
-# kubectl auth sub-subcommands that modify RBAC state
-_DANGEROUS_KUBECTL_AUTH_OPS: frozenset[str] = frozenset(
-    {
-        "reconcile",
-    }
-)
-
 # kubectl rollout sub-subcommands that modify deployment state
 _DANGEROUS_KUBECTL_ROLLOUT_OPS: frozenset[str] = frozenset(
     {
@@ -236,13 +247,6 @@ _DANGEROUS_KUBECTL_ROLLOUT_OPS: frozenset[str] = frozenset(
         "undo",
         "pause",
         "resume",
-    }
-)
-
-# kubectl cluster-info sub-subcommands that exfiltrate data
-_DANGEROUS_KUBECTL_CLUSTER_INFO_OPS: frozenset[str] = frozenset(
-    {
-        "dump",
     }
 )
 
@@ -312,17 +316,17 @@ class SubstitutionType(Enum):
     PROCESS_OUTPUT = "process_output"  # >(cmd)
 
 
-def _find_kubectl_subcommand(args: list[str]) -> str | None:
-    """Find the kubectl subcommand from a bashlex argument list.
+def _iter_kubectl_positionals(args: list[str]) -> Iterator[str]:
+    """Yield only positional tokens from a kubectl argument list.
 
-    Skips over the command name and global flags (and their values) to find
-    the first positional argument, which is the kubectl subcommand.
-
-    Args:
-        args: Word tokens from bashlex AST (includes "kubectl" as first element)
-
-    Returns:
-        The subcommand string, or None if not found
+    Skips flags and their values:
+    - ``--flag=value`` → skipped entirely
+    - Known global value-taking flags → skip flag and next arg
+    - Known boolean short flags (-A, -h, -R, -w) → skip flag only
+    - Unrecognized short flags (-o, -f, -l, etc.) → assumed to consume
+      the next arg (conservative; prevents subcommand masking attacks)
+    - Unrecognized long flags → assumed boolean (--flag=value already handled)
+    - ``kubectl`` literal → skipped
     """
     skip_next = False
     for arg in args:
@@ -331,58 +335,43 @@ def _find_kubectl_subcommand(args: list[str]) -> str | None:
         if skip_next:
             skip_next = False
             continue
-        # --flag=value form — skip entirely
         if arg.startswith("--") and "=" in arg:
             continue
-        # Known value-taking global flag — skip next arg too
         if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
             skip_next = True
             continue
-        # Other flags (boolean) — skip
-        if arg.startswith("-"):
+        if arg in _KUBECTL_BOOLEAN_SHORT_FLAGS:
             continue
-        # First positional arg = subcommand
-        return arg
-    return None
+        if arg.startswith("--"):
+            continue
+        if arg.startswith("-"):
+            skip_next = True
+            continue
+        yield arg
+
+
+def _find_kubectl_subcommand(args: list[str]) -> str | None:
+    """Find the kubectl subcommand (first positional token) from args.
+
+    Uses _iter_kubectl_positionals which conservatively treats unrecognized
+    short flags as value-consuming to prevent subcommand masking attacks.
+    """
+    return next(_iter_kubectl_positionals(args), None)
 
 
 def _find_sub_subcommand(args: list[str], parent_subcommand: str) -> str | None:
-    """Find the first positional token after a kubectl sub-subcommand.
+    """Find the sub-subcommand token that follows a given parent subcommand.
 
-    Skips flags (tokens starting with '-') and their values to find the
-    actual sub-subcommand (e.g., "set-context" in "kubectl config set-context").
-
-    Args:
-        args: Word tokens from bashlex AST (includes "kubectl" as first element)
-        parent_subcommand: The parent subcommand to search after (e.g., "config")
-
-    Returns:
-        The sub-subcommand string, or None if not found
+    E.g., "set-context" in "kubectl config set-context".
+    Uses _iter_kubectl_positionals for consistent flag-skipping.
     """
-    # Find the position of the parent subcommand, then the first positional after it.
-    # Flag-value skipping runs in BOTH phases to prevent a global flag's value
-    # (e.g., --context config) from being mistaken for the parent subcommand.
     found_parent = False
-    skip_next = False
-    for arg in args:
-        if skip_next:
-            skip_next = False
-            continue
-        # Skip --flag=value regardless of phase (prevents confusion like --context config)
-        if arg.startswith("--") and "=" in arg:
-            continue
-        if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
-            skip_next = True
-            continue
-        if arg.startswith("-"):
-            continue
-        # Positional token
+    for positional in _iter_kubectl_positionals(args):
         if not found_parent:
-            if arg == parent_subcommand:
+            if positional == parent_subcommand:
                 found_parent = True
             continue
-        # First positional after parent = sub-subcommand
-        return arg
+        return positional
     return None
 
 
@@ -873,25 +862,13 @@ class SubstitutionValidator:
                         return True, "kubectl get --raw accesses raw API paths"
 
                 # Block secret/secrets resource access on get/describe
-                # Only check positional args — skip flags and their values to avoid
+                # Only check positional args (via shared helper) to avoid
                 # false positives on paths like --kubeconfig /etc/secrets/kubeconfig
                 if subcommand in ("get", "describe"):
-                    skip_next = False
-                    for arg in args:
-                        if skip_next:
-                            skip_next = False
-                            continue
-                        if arg.startswith("--") and "=" in arg:
-                            continue
-                        if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
-                            skip_next = True
-                            continue
-                        if arg.startswith("-"):
-                            continue
-                        arg_lower = arg.lower()
+                    for positional in _iter_kubectl_positionals(args):
                         # Normalize: split on commas and slashes for multi-resource forms,
                         # then strip dotted API group suffixes (secrets.v1 → secrets)
-                        tokens = [t for part in arg_lower.replace(",", "/").split("/") if (t := part.split(".")[0])]
+                        tokens = [t for part in positional.lower().replace(",", "/").split("/") if (t := part.split(".")[0])]
                         if any(t in ("secret", "secrets") for t in tokens):
                             return True, f"kubectl {subcommand} secret access blocked in substitution"
 
@@ -903,23 +880,20 @@ class SubstitutionValidator:
                     sub_sub = _find_sub_subcommand(args, "config")
                     if sub_sub and sub_sub in _DANGEROUS_KUBECTL_CONFIG_OPS:
                         return True, f"kubectl config {sub_sub} modifies kubeconfig"
-                    # config view --raw exposes certificates, keys, and tokens
-                    # Bare --raw/--flatten flags are dangerous; --raw=<val>/--flatten=<val>
-                    # are only dangerous when the value is truthy (true, 1, yes, y).
+                    # config view --raw/--flatten exposes certificates, keys, and tokens.
+                    # Bare flags are dangerous; --flag=<val> only when truthy.
                     if sub_sub == "view":
-                        for arg in args:
-                            if arg in ("--raw", "--flatten"):
+                        for flag in ("--raw", "--flatten"):
+                            if any(arg == flag for arg in args):
                                 return True, "kubectl config view --raw/--flatten exposes credentials"
-                            if arg.startswith("--raw="):
-                                if _is_truthy_flag_value(arg.split("=", 1)[1]):
-                                    return True, "kubectl config view --raw/--flatten exposes credentials"
-                            if arg.startswith("--flatten="):
-                                if _is_truthy_flag_value(arg.split("=", 1)[1]):
+                            prefix = flag + "="
+                            for arg in args:
+                                if arg.startswith(prefix) and _is_truthy_flag_value(arg.split("=", 1)[1]):
                                     return True, "kubectl config view --raw/--flatten exposes credentials"
 
                 if subcommand == "auth":
                     sub_sub = _find_sub_subcommand(args, "auth")
-                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_AUTH_OPS:
+                    if sub_sub == "reconcile":
                         return True, f"kubectl auth {sub_sub} modifies RBAC"
 
                 if subcommand == "rollout":
@@ -929,7 +903,7 @@ class SubstitutionValidator:
 
                 if subcommand == "cluster-info":
                     sub_sub = _find_sub_subcommand(args, "cluster-info")
-                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_CLUSTER_INFO_OPS:
+                    if sub_sub == "dump":
                         return True, f"kubectl cluster-info {sub_sub} exfiltrates cluster data"
 
         return False, ""

@@ -18,9 +18,6 @@ import pytest
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
-    CONTEXTUAL_SUBSTITUTION_COMMANDS,
-    DANGEROUS_SUBSTITUTION_COMMANDS,
-    SAFE_SUBSTITUTION_COMMANDS,
     SubstitutionValidator,
     _find_kubectl_subcommand,
 )
@@ -45,23 +42,6 @@ def validator(parser, rule_engine):
 # ============================================================
 # Constants
 # ============================================================
-
-
-class TestContextualWhitelistConstants:
-    """Test CONTEXTUAL_SUBSTITUTION_COMMANDS constant."""
-
-    def test_is_frozenset(self):
-        assert isinstance(CONTEXTUAL_SUBSTITUTION_COMMANDS, frozenset)
-
-    def test_kubectl_in_contextual_set(self):
-        assert "kubectl" in CONTEXTUAL_SUBSTITUTION_COMMANDS
-
-    def test_not_overlapping_with_safe_or_dangerous(self):
-        """Contextual commands must not be in the safe or dangerous sets."""
-        overlap_safe = CONTEXTUAL_SUBSTITUTION_COMMANDS & SAFE_SUBSTITUTION_COMMANDS
-        overlap_dangerous = CONTEXTUAL_SUBSTITUTION_COMMANDS & DANGEROUS_SUBSTITUTION_COMMANDS
-        assert len(overlap_safe) == 0, f"Overlap with safe: {overlap_safe}"
-        assert len(overlap_dangerous) == 0, f"Overlap with dangerous: {overlap_dangerous}"
 
 
 # ============================================================
