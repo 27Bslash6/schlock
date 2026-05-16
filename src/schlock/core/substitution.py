@@ -347,16 +347,18 @@ def _iter_kubectl_positionals(args: list[str]) -> Iterator[str]:
             continue
         if arg.startswith("--"):
             continue
-        # Short flag handling: check for attached-value forms (-nfoo, -n=foo)
-        # before the catch-all. A known value-taking short flag with extra chars
-        # has its value attached — no need to consume the next arg.
+        # Short flag handling (-X...):
+        # - Attached value (-ojson, -n=prod, -nfoo): value is embedded, skip
+        #   without consuming next token (regardless of whether flag is known)
+        # - Bare known boolean (-A, -h): skip without consuming
+        # - Bare unrecognized (-o, -f): assume value-consuming, set skip_next
         if arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
-            flag_letter = arg[:2]  # e.g., "-n" from "-nproduction"
-            if flag_letter in _KUBECTL_GLOBAL_VALUE_FLAGS and len(arg) > 2:
-                continue  # attached value: -nfoo or -n=foo
+            if len(arg) > 2 or "=" in arg:
+                continue  # attached value form: -ojson, -n=prod, -nfoo
+            flag_letter = arg[:2]
             if flag_letter in _KUBECTL_BOOLEAN_SHORT_FLAGS:
-                continue  # boolean: -Afoo is unusual but harmless
-            skip_next = True  # unrecognized: assume value-consuming
+                continue
+            skip_next = True  # bare unrecognized: assume value-consuming
             continue
         yield arg
 

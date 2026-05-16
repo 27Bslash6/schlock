@@ -40,11 +40,6 @@ def validator(parser, rule_engine):
 
 
 # ============================================================
-# Constants
-# ============================================================
-
-
-# ============================================================
 # Safe kubectl in substitutions — should be ALLOWED
 # ============================================================
 
@@ -251,6 +246,7 @@ class TestKubectlConfigSubcommands:
         """Read-only config operations should be allowed."""
         result = validate_command(command)
         assert result.allowed, f"False positive: {command} blocked: {result.message}"
+        assert result.risk_level == RiskLevel.SAFE
 
     @pytest.mark.parametrize(
         "command,description",
@@ -280,10 +276,12 @@ class TestKubectlAuthSubcommands:
     def test_auth_can_i_allowed(self):
         result = validate_command('echo "$(kubectl auth can-i get pods)"')
         assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
 
     def test_auth_whoami_allowed(self):
         result = validate_command('echo "$(kubectl auth whoami)"')
         assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
 
     def test_auth_reconcile_blocked(self):
         """auth reconcile modifies RBAC — must be blocked."""
@@ -331,11 +329,13 @@ class TestKubectlProcessSubstitution:
         """Safe kubectl in process substitution should work."""
         result = validate_command("diff <(kubectl get pods -n staging) <(kubectl get pods -n prod)")
         assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
 
     def test_dangerous_kubectl_in_process_substitution(self):
         """Dangerous kubectl in process substitution must be blocked."""
         result = validate_command("bash <(kubectl exec pod -- cat /etc/shadow)")
         assert not result.allowed
+        assert result.risk_level == RiskLevel.BLOCKED
 
 
 # ============================================================
@@ -591,6 +591,7 @@ class TestRolloutSubcommands:
         """Read-only rollout operations should be allowed."""
         result = validate_command(command)
         assert result.allowed, f"False positive: {command} blocked: {result.message}"
+        assert result.risk_level == RiskLevel.SAFE
 
     @pytest.mark.parametrize(
         "command,description",
