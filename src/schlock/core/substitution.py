@@ -25,6 +25,8 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from .rules import RiskLevel
 
 # Maximum recursion depth for nested substitution validation
@@ -129,6 +131,127 @@ SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
+# Commands that are conditionally safe inside substitution
+# These require subcommand-level analysis AND still go through YAML rules.
+# Unlike SAFE_SUBSTITUTION_COMMANDS (which bypass rules), contextual commands
+# preserve defense-in-depth: the YAML rule engine catches dangerous patterns
+# (e.g., kubectl_secrets_theft) that the subcommand allowlist alone would miss.
+CONTEXTUAL_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
+    {
+        # kubectl: read-only subcommands safe, state-modifying subcommands dangerous
+        # NOTE: contextual checks in _has_dangerous_inner_structure()
+        "kubectl",
+    }
+)
+
+# kubectl global flags that consume the next argument as a value.
+# Used to skip over flag values when finding the subcommand.
+# Source: kubectl options (1.32). Regenerate with:
+#   kubectl options | grep -E '^\s+--?\w' | grep -v '=false' | awk '{print $1}'
+_KUBECTL_GLOBAL_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "-n",
+        "--namespace",
+        "-s",
+        "--server",
+        "--kubeconfig",
+        "--kuberc",  # v1.33+: user preferences file path
+        "--context",
+        "--cluster",
+        "--user",
+        "--token",
+        "--as",
+        "--as-group",
+        "--as-uid",
+        "--as-user-extra",  # impersonation key=value pairs
+        "--certificate-authority",
+        "--client-certificate",
+        "--client-key",
+        "--cache-dir",
+        "--request-timeout",
+        "-v",
+        "--tls-server-name",
+        "--username",
+        "--password",
+        "--profile",
+        "--profile-output",
+        "--log-flush-frequency",
+        "--log-backtrace-at",
+        "--log-dir",
+        "--log-file",
+        "--log-file-max-size",
+        "--stderrthreshold",
+        "--vmodule",
+    }
+)
+
+# Known kubectl boolean flags that do NOT consume the next argument.
+# Used by _find_kubectl_subcommand: unrecognized short flags are assumed
+# to consume a value (conservative/safe), so only known booleans are skipped.
+_KUBECTL_BOOLEAN_SHORT_FLAGS: frozenset[str] = frozenset(
+    {
+        "-h",
+        "-A",  # --all-namespaces
+        "-R",  # --recursive
+        "-w",  # --watch (boolean in most subcommands)
+    }
+)
+
+# kubectl subcommands that are safe (read-only) inside substitutions.
+# Everything NOT in this set is considered dangerous (default-deny).
+_SAFE_KUBECTL_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        # Read-only cluster queries
+        "get",
+        "describe",
+        "logs",
+        "top",
+        "explain",
+        "version",
+        "api-resources",
+        "api-versions",
+        "cluster-info",
+        "events",
+        # Config inspection (sub-subcommands checked separately)
+        "config",
+        # Auth inspection (sub-subcommands checked separately)
+        "auth",
+        # Dry-run / comparison (no mutation)
+        "diff",
+        "wait",
+        # Template generation (output only, no apply)
+        "kustomize",
+        # Rollout inspection (sub-subcommands checked separately)
+        "rollout",
+    }
+)
+
+# kubectl config sub-subcommands that modify kubeconfig state
+_DANGEROUS_KUBECTL_CONFIG_OPS: frozenset[str] = frozenset(
+    {
+        "set",
+        "set-context",
+        "set-cluster",
+        "set-credentials",
+        "delete-context",
+        "delete-cluster",
+        "delete-user",
+        "use-context",
+        "rename-context",
+        "unset",
+    }
+)
+
+# kubectl rollout sub-subcommands that modify deployment state
+_DANGEROUS_KUBECTL_ROLLOUT_OPS: frozenset[str] = frozenset(
+    {
+        "restart",
+        "undo",
+        "pause",
+        "resume",
+    }
+)
+
 # Commands that are ALWAYS dangerous inside substitution
 # Even if they would be allowed outside substitution context
 DANGEROUS_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
@@ -193,6 +316,85 @@ class SubstitutionType(Enum):
     COMMAND = "command"  # $(cmd) or `cmd`
     PROCESS_INPUT = "process_input"  # <(cmd)
     PROCESS_OUTPUT = "process_output"  # >(cmd)
+
+
+def _iter_kubectl_positionals(args: list[str]) -> Iterator[str]:
+    """Yield only positional tokens from a kubectl argument list.
+
+    Skips flags and their values:
+    - ``--flag=value`` → skipped entirely
+    - Known global value-taking flags → skip flag and next arg
+    - Attached short forms (``-nproduction``, ``-n=prod``) → skipped entirely
+    - Known boolean short flags (-A, -h, -R, -w) → skip flag only
+    - Unrecognized short flags (-o, -f, -l, etc.) → assumed to consume
+      the next arg (conservative; prevents subcommand masking attacks)
+    - Unrecognized long flags → assumed boolean (--flag=value already handled)
+    - ``kubectl`` literal → skipped
+    """
+    skip_next = False
+    for arg in args:
+        if arg == "kubectl":
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith("--") and "=" in arg:
+            continue
+        if arg in _KUBECTL_GLOBAL_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if arg in _KUBECTL_BOOLEAN_SHORT_FLAGS:
+            continue
+        if arg.startswith("--"):
+            continue
+        # Short flag handling (-X...):
+        # - Attached value (-ojson, -n=prod, -nfoo): value is embedded, skip
+        #   without consuming next token (regardless of whether flag is known)
+        # - Bare known boolean (-A, -h): skip without consuming
+        # - Bare unrecognized (-o, -f): assume value-consuming, set skip_next
+        if arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
+            if len(arg) > 2 or "=" in arg:
+                continue  # attached value form: -ojson, -n=prod, -nfoo
+            flag_letter = arg[:2]
+            if flag_letter in _KUBECTL_BOOLEAN_SHORT_FLAGS:
+                continue
+            skip_next = True  # bare unrecognized: assume value-consuming
+            continue
+        yield arg
+
+
+def _find_kubectl_subcommand(args: list[str]) -> str | None:
+    """Find the kubectl subcommand (first positional token) from args.
+
+    Uses _iter_kubectl_positionals which conservatively treats unrecognized
+    short flags as value-consuming to prevent subcommand masking attacks.
+    """
+    return next(_iter_kubectl_positionals(args), None)
+
+
+def _find_sub_subcommand(args: list[str], parent_subcommand: str) -> str | None:
+    """Find the sub-subcommand token that follows a given parent subcommand.
+
+    E.g., "set-context" in "kubectl config set-context".
+    Uses _iter_kubectl_positionals for consistent flag-skipping.
+    """
+    found_parent = False
+    for positional in _iter_kubectl_positionals(args):
+        if not found_parent:
+            if positional == parent_subcommand:
+                found_parent = True
+            continue
+        return positional
+    return None
+
+
+def _is_truthy_flag_value(value: str) -> bool:
+    """Check if a flag value like --raw=<value> is truthy.
+
+    Returns True for: true, 1, yes, y (case-insensitive)
+    Returns False for: false, 0, no, n (case-insensitive) and anything else
+    """
+    return value.lower() in ("true", "1", "yes", "y", "t")
 
 
 @dataclass
@@ -556,7 +758,7 @@ class SubstitutionValidator:
 
         return check_node(cmd_node)
 
-    def _has_dangerous_inner_structure(  # noqa: PLR0911, PLR0912
+    def _has_dangerous_inner_structure(  # noqa: PLR0911, PLR0912, PLR0915
         self, node: Any, base_command: str | None = None
     ) -> tuple[bool, str]:
         """Check if inner command has dangerous structures or arguments.
@@ -649,7 +851,115 @@ class SubstitutionValidator:
                     if arg in dangerous_find_flags:
                         return True, f"find {arg} executes commands or modifies files"
 
+            # Check for kubectl with dangerous subcommands
+            # kubectl safety depends on the subcommand: get/describe/logs are read-only,
+            # exec/apply/delete/run modify state or execute code.
+            # Uses an allowlist of safe subcommands (default-deny for unknown).
+            if base_command == "kubectl" and args:
+                subcommand = _find_kubectl_subcommand(args)
+
+                if not subcommand:
+                    return True, "kubectl without identifiable subcommand in substitution"
+
+                if subcommand not in _SAFE_KUBECTL_SUBCOMMANDS:
+                    return True, f"kubectl {subcommand} modifies cluster state or executes code"
+
+                # --- Argument-level checks for safe subcommands ---
+                # These catch dangerous patterns within otherwise-safe subcommands.
+                # Position-independent (scans all args), unlike YAML regex.
+
+                # Block --raw on get (accesses arbitrary API paths, bypasses resource-type checks)
+                # Handles both --raw and --raw=<path> forms
+                if subcommand == "get":
+                    if any(arg == "--raw" or arg.startswith("--raw=") for arg in args):
+                        return True, "kubectl get --raw accesses raw API paths"
+
+                # Block secret/secrets resource access on get/describe
+                # Only check positional args (via shared helper) to avoid
+                # false positives on paths like --kubeconfig /etc/secrets/kubeconfig
+                if subcommand in ("get", "describe"):
+                    for positional in _iter_kubectl_positionals(args):
+                        # Normalize: split on commas and slashes for multi-resource forms,
+                        # then strip dotted API group suffixes (secrets.v1 → secrets)
+                        tokens = [t for part in positional.lower().replace(",", "/").split("/") if (t := part.split(".")[0])]
+                        if any(t in ("secret", "secrets") for t in tokens):
+                            return True, f"kubectl {subcommand} secret access blocked in substitution"
+
+                # Multi-level subcommand checks:
+                # kubectl config view → safe, kubectl config set-context → dangerous
+                # Only match the first positional token after the subcommand,
+                # not flag values that happen to share names with dangerous ops.
+                if subcommand == "config":
+                    sub_sub = _find_sub_subcommand(args, "config")
+                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_CONFIG_OPS:
+                        return True, f"kubectl config {sub_sub} modifies kubeconfig"
+                    # config view --raw/--flatten exposes certificates, keys, and tokens.
+                    # Bare flags are dangerous; --flag=<val> only when truthy.
+                    if sub_sub == "view":
+                        for flag in ("--raw", "--flatten"):
+                            if any(arg == flag for arg in args):
+                                return True, "kubectl config view --raw/--flatten exposes credentials"
+                            prefix = flag + "="
+                            for arg in args:
+                                if arg.startswith(prefix) and _is_truthy_flag_value(arg.split("=", 1)[1]):
+                                    return True, "kubectl config view --raw/--flatten exposes credentials"
+
+                if subcommand == "auth":
+                    sub_sub = _find_sub_subcommand(args, "auth")
+                    if sub_sub == "reconcile":
+                        return True, f"kubectl auth {sub_sub} modifies RBAC"
+
+                if subcommand == "rollout":
+                    sub_sub = _find_sub_subcommand(args, "rollout")
+                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_ROLLOUT_OPS:
+                        return True, f"kubectl rollout {sub_sub} modifies deployment state"
+
+                if subcommand == "cluster-info":
+                    sub_sub = _find_sub_subcommand(args, "cluster-info")
+                    if sub_sub == "dump":
+                        return True, f"kubectl cluster-info {sub_sub} exfiltrates cluster data"
+
         return False, ""
+
+    def _check_structural_and_nested(self, sub_node: SubstitutionNode, depth: int) -> SubstitutionValidationResult | None:
+        """Check structural safety and nested substitutions.
+
+        Shared logic between Layer 1 (whitelist) and Layer 1b (contextual whitelist).
+
+        Returns:
+            A BLOCKED result if checks fail, or None if everything passes.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        has_dangerous, structure_reason = self._has_dangerous_inner_structure(sub_node.ast_node, sub_node.base_command)
+        if has_dangerous:
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"Dangerous structure in substitution: {structure_reason}",
+            )
+
+        # AST-level bypass detection (brace expansion, variable-as-command, etc.)
+        # Defense-in-depth: even whitelisted commands should reject obfuscated invocations.
+        is_suspicious, reason = self.has_suspicious_ast_patterns(sub_node.ast_node)
+        if is_suspicious:
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"Suspicious pattern in substitution: {reason}",
+            )
+
+        for nested in sub_node.nested_substitutions:
+            nested_result = self.validate_substitution(nested, depth + 1)
+            if not nested_result.allowed:
+                return SubstitutionValidationResult(
+                    allowed=False,
+                    risk_level=nested_result.risk_level,
+                    message=f"Nested substitution blocked: {nested_result.message}",
+                    inner_results=[nested_result],
+                )
+
+        return None
 
     def validate_substitution(  # noqa: PLR0911, PLR0912
         self, sub_node: SubstitutionNode, depth: int = 0
@@ -677,31 +987,9 @@ class SubstitutionValidator:
 
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):
-            # SECURITY: Check for dangerous structures that bypass whitelist safety
-            # Pipelines like $(date | bash) or chains like $(date; rm -rf /)
-            # weaponize even safe base commands
-            has_dangerous, structure_reason = self._has_dangerous_inner_structure(sub_node.ast_node, sub_node.base_command)
-
-            if has_dangerous:
-                # Whitelisted command has dangerous structure (pipeline/chain)
-                # Block it - the user can run these commands directly instead
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=RiskLevel.BLOCKED,
-                    message=f"Dangerous structure in substitution: {structure_reason}",
-                )
-
-            # Safe structure - validate nested substitutions and return SAFE
-            if sub_node.nested_substitutions:
-                for nested in sub_node.nested_substitutions:
-                    nested_result = self.validate_substitution(nested, depth + 1)
-                    if not nested_result.allowed:
-                        return SubstitutionValidationResult(
-                            allowed=False,
-                            risk_level=nested_result.risk_level,
-                            message=f"Nested substitution blocked: {nested_result.message}",
-                            inner_results=[nested_result],
-                        )
+            blocked = self._check_structural_and_nested(sub_node, depth)
+            if blocked:
+                return blocked
             return SubstitutionValidationResult(
                 allowed=True,
                 risk_level=RiskLevel.SAFE,
@@ -709,7 +997,36 @@ class SubstitutionValidator:
                 whitelisted=True,
             )
 
-        # Layer 1b: Blacklist check
+        # Layer 1b: Contextual whitelist — commands with subcommand-dependent safety.
+        # Unlike the full whitelist, these STILL go through YAML rules (defense in depth).
+        # e.g., kubectl: "get pods" is safe, but "get secrets -o json" is caught by YAML rules.
+        if sub_node.base_command in CONTEXTUAL_SUBSTITUTION_COMMANDS:
+            blocked = self._check_structural_and_nested(sub_node, depth)
+            if blocked:
+                return blocked
+
+            # YAML rule check — defense in depth for contextual commands.
+            # This catches patterns like kubectl_secrets_theft, kubectl_rbac_manipulation
+            # that the structural checks alone would miss.
+            if sub_node.inner_command:
+                rule_match = self.rule_engine.match_command(sub_node.inner_command)
+                if rule_match and rule_match.matched:
+                    amplified_risk = self._amplify_risk(rule_match.risk_level)
+                    if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+                        return SubstitutionValidationResult(
+                            allowed=False,
+                            risk_level=RiskLevel.BLOCKED,
+                            message=f"Inner command blocked: {rule_match.message}",
+                        )
+
+            # Passed structural checks AND YAML rules — safe in substitution
+            return SubstitutionValidationResult(
+                allowed=True,
+                risk_level=RiskLevel.SAFE,
+                message=f"Contextual whitelist: {sub_node.base_command}",
+            )
+
+        # Layer 1c: Blacklist check
         if self.is_blacklisted(sub_node.base_command):
             return SubstitutionValidationResult(
                 allowed=False,
