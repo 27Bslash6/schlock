@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -596,3 +597,18 @@ class TestUnscannableMessageHookHandling:
         joined = " ".join(violations).lower()
         assert "advertising" not in joined  # not mislabeled
         assert "unscannable" in joined  # distinct, descriptive type
+
+    @patch("pre_tool_use.get_audit_logger")
+    @patch("pre_tool_use.validate_command", return_value=SimpleNamespace(error="boom"))
+    @patch("pre_tool_use.get_filter")
+    def test_warn_marker_recorded_on_validation_error_deny(self, mock_get_filter, _mock_validate, mock_get_audit):
+        """A warn-classified unscannable command that then hits a validation-error deny must
+        still record the unscannable detection in the audit entry (audit captures all decisions),
+        not just on the happy allow/ask path."""
+        mock_get_filter.return_value = self._filter("warn")
+        mock_audit = mock_get_audit.return_value
+        handle_pre_tool_use(self._input("git commit -F /tmp/msg.txt"))
+        block_calls = [c for c in mock_audit.log_validation.call_args_list if c.kwargs.get("decision") == "block"]
+        assert block_calls, "expected a block audit entry on validation error"
+        joined = " ".join(block_calls[-1].kwargs["violations"]).lower()
+        assert "unscannable" in joined  # warn detection survives the error-deny path

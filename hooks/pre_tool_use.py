@@ -395,6 +395,10 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
     start_time = time.perf_counter()
     audit_logger = get_audit_logger()
     context = get_context()
+    # Issue #76: an unscannable-message (file/stdin) detection must reach whichever audit entry
+    # ultimately fires. Initialized before the try so the except handlers can read them safely.
+    unscannable_warning = None
+    unscannable_audit_violation = None
 
     try:
         # 1. Extract command from stdin JSON
@@ -459,11 +463,6 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         logger.info(f"Validating command: {command[:100]}...")  # Log first 100 chars
 
         # 2. FILTER FIRST (before safety validation)
-        # Carries a non-blocking note attached to the final decision when an unscannable
-        # commit message (issue #76) is allowed under unscannable_message_action=warn, plus a
-        # dedicated audit violation so the warn is recorded on the final allow/ask audit entry.
-        unscannable_warning = None
-        unscannable_audit_violation = None
         filter_instance = get_filter()
         if filter_instance:
             filter_result = filter_instance.filter_commit_message(command)
@@ -550,10 +549,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         if result.error:
             logger.error(f"Validation error: {result.error}")
             execution_time_ms = (time.perf_counter() - start_time) * 1000
+            error_violations = [f"Validation error: {result.error}"]
+            if unscannable_audit_violation:
+                error_violations.append(unscannable_audit_violation)
             audit_logger.log_validation(
                 command=command[:500],
                 risk_level="BLOCKED",
-                violations=[f"Validation error: {result.error}"],
+                violations=error_violations,
                 decision="block",
                 execution_time_ms=execution_time_ms,
                 context=context,
@@ -658,10 +660,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         # Validator initialization failed
         logger.error(f"RuntimeError in hook: {e}")
         execution_time_ms = (time.perf_counter() - start_time) * 1000
+        rt_violations = [f"RuntimeError: {str(e)}"]
+        if unscannable_audit_violation:
+            rt_violations.append(unscannable_audit_violation)
         audit_logger.log_validation(
             command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
             risk_level="BLOCKED",
-            violations=[f"RuntimeError: {str(e)}"],
+            violations=rt_violations,
             decision="block",
             execution_time_ms=execution_time_ms,
             context=context,
@@ -678,10 +683,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         # Catch-all for unexpected errors
         logger.error(f"Unexpected error in hook: {e}", exc_info=True)
         execution_time_ms = (time.perf_counter() - start_time) * 1000
+        unexpected_violations = [f"Unexpected error: {str(e)}"]
+        if unscannable_audit_violation:
+            unexpected_violations.append(unscannable_audit_violation)
         audit_logger.log_validation(
             command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
             risk_level="BLOCKED",
-            violations=[f"Unexpected error: {str(e)}"],
+            violations=unexpected_violations,
             decision="block",
             execution_time_ms=execution_time_ms,
             context=context,
