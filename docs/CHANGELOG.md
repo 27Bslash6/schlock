@@ -5,6 +5,20 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.6.0...schlock-v0.7.0) (2026-06-01)
+
+
+### Features
+
+* add kubectl contextual safety for command substitutions ([#64](https://github.com/27Bslash6/schlock/issues/64)) ([0b78eae](https://github.com/27Bslash6/schlock/commit/0b78eaeb5ce6aa2795c6a5689fd568a5e70fdd37))
+* **commit-filter:** warn/block on commit messages not in argv ([#76](https://github.com/27Bslash6/schlock/issues/76)) ([#78](https://github.com/27Bslash6/schlock/issues/78)) ([37602ff](https://github.com/27Bslash6/schlock/commit/37602ff39b594a250fe1821250dda3f686e403c7))
+* support custom whitelist patterns in user config yaml ([#73](https://github.com/27Bslash6/schlock/issues/73)) ([854ef12](https://github.com/27Bslash6/schlock/commit/854ef12b9182f8fe5f4f55eb3ddb3e7e59d62aee)), closes [#66](https://github.com/27Bslash6/schlock/issues/66)
+
+
+### Bug Fixes
+
+* whitelist security bypass vulnerabilities ([#59](https://github.com/27Bslash6/schlock/issues/59)) ([867626f](https://github.com/27Bslash6/schlock/commit/867626fd12d048d9f02ca92e7830b73e82026870))
+
 ## [0.6.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.5.0...schlock-v0.6.0) (2026-03-08)
 
 
