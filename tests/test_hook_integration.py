@@ -30,6 +30,7 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
+from schlock.integrations.commit_filter import CommitMessageFilter
 
 
 class TestStatusMapping:
@@ -495,3 +496,76 @@ class TestSelfProtectionHook:
         }
         response = handle_pre_tool_use(input_data)
         assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+class TestUnscannableMessageHookHandling:
+    """Hook-level warn/block/off handling for issue #76 unscannable commit messages.
+
+    A commit whose message is delivered outside argv (-F/--file, or -F - stdin) cannot be
+    scanned pre-execution. Per ``unscannable_message_action``: block -> deny before it runs;
+    warn -> allow but attach a model-visible note; off -> today's silent pass. Legitimate
+    message reuse (--amend --no-edit) and inline -m (even with an incidental $()) are never flagged.
+    """
+
+    @staticmethod
+    def _input(cmd):
+        return {"tool_name": "Bash", "tool_input": {"command": cmd}}
+
+    @staticmethod
+    def _filter(action):
+        return CommitMessageFilter({"enabled": True, "rules": {}, "unscannable_message_action": action})
+
+    @patch("pre_tool_use.get_filter")
+    def test_unscannable_block_denies(self, mock_get_filter):
+        """action=block -> a file-delivered message is denied before execution."""
+        mock_get_filter.return_value = self._filter("block")
+        response = handle_pre_tool_use(self._input("git commit -F /tmp/msg.txt"))
+        hso = response["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "deny"
+        assert hso["permissionDecisionReason"]  # explains the reason
+
+    @patch("pre_tool_use.get_filter")
+    def test_unscannable_warn_allows_with_context(self, mock_get_filter):
+        """action=warn -> allowed (not blocked) with a model-visible additionalContext note."""
+        mock_get_filter.return_value = self._filter("warn")
+        response = handle_pre_tool_use(self._input("git commit -F /tmp/msg.txt"))
+        hso = response["hookSpecificOutput"]
+        assert hso["permissionDecision"] != "deny"
+        assert "additionalContext" in hso
+        assert "scan" in hso["additionalContext"].lower()
+
+    @patch("pre_tool_use.get_filter")
+    def test_unscannable_off_allows_silently(self, mock_get_filter):
+        """action=off -> allowed with no note (preserves today's silent behavior)."""
+        mock_get_filter.return_value = self._filter("off")
+        response = handle_pre_tool_use(self._input("git commit -F /tmp/msg.txt"))
+        hso = response["hookSpecificOutput"]
+        assert hso["permissionDecision"] != "deny"
+        assert "additionalContext" not in hso
+
+    @patch("pre_tool_use.get_filter")
+    def test_stdin_warn_allows_with_context(self, mock_get_filter):
+        """git commit -F - (stdin) under warn -> allowed with a note."""
+        mock_get_filter.return_value = self._filter("warn")
+        response = handle_pre_tool_use(self._input("git commit -F -"))
+        hso = response["hookSpecificOutput"]
+        assert hso["permissionDecision"] != "deny"
+        assert "additionalContext" in hso
+
+    @patch("pre_tool_use.get_filter")
+    def test_inline_substitution_not_flagged(self, mock_get_filter):
+        """-m "$(cat externalfile)" is scannable (literal in argv) -> no unscannable note."""
+        mock_get_filter.return_value = self._filter("block")
+        response = handle_pre_tool_use(self._input('git commit -m "$(cat /tmp/msg.txt)"'))
+        hso = response["hookSpecificOutput"]
+        assert hso["permissionDecision"] != "deny"
+        assert "additionalContext" not in hso
+
+    @patch("pre_tool_use.get_filter")
+    def test_amend_reuse_not_flagged_even_when_block(self, mock_get_filter):
+        """Legit reuse (--amend --no-edit) is never warned/blocked, even at the strictest action."""
+        mock_get_filter.return_value = self._filter("block")
+        response = handle_pre_tool_use(self._input("git commit --amend --no-edit"))
+        hso = response["hookSpecificOutput"]
+        assert hso["permissionDecision"] != "deny"
+        assert "additionalContext" not in hso

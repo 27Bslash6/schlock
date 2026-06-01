@@ -4,6 +4,19 @@
 # Version
 version: "1.0.0"
 
+# Policy for commit messages whose content is NOT in the command string (issue #76):
+# delivery via -F/--file (a file or stdin) or an unevaluated $(...)/backtick substitution.
+# Such content cannot be scanned before the command runs, so schlock cannot strip a Claude
+# trailer from it. This setting decides what happens when such a commit is detected:
+#   off   - silent pass-through (legacy behavior; the gap is invisible)
+#   warn  - allow the commit but tell the model the message was not scanned (DEFAULT)
+#   block - deny the commit; the message must be inlined with -m to be scannable
+# This value is read from THIS bundled rules file. User/project override of commit_filter
+# settings is not yet wired (load_filter_config loads plugin defaults only), so edit it here.
+# NOTE: legitimate message reuse (git commit --amend --no-edit, -C/-c, --squash/--fixup,
+# --template, bare `git commit`) is NEVER flagged - there is no new content to smuggle.
+unscannable_message_action: warn
+
 # Rule Categories
 # Each category can be independently enabled/disabled
 rules:

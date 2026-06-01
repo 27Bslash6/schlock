@@ -459,6 +459,9 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         logger.info(f"Validating command: {command[:100]}...")  # Log first 100 chars
 
         # 2. FILTER FIRST (before safety validation)
+        # Carries a non-blocking note attached to the final decision when an unscannable
+        # commit message (issue #76) is allowed under unscannable_message_action=warn.
+        unscannable_warning = None
         filter_instance = get_filter()
         if filter_instance:
             filter_result = filter_instance.filter_commit_message(command)
@@ -506,6 +509,31 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                         "permissionDecisionReason": denial_message,
                     }
                 }
+
+            # Issue #76: message is content-bearing but NOT in argv (file/stdin/unevaluated
+            # substitution), so it could not be scanned. Honor unscannable_message_action:
+            # block denies up front; warn rides a model-visible note on the final decision.
+            if filter_result.unscannable_decision == "block":
+                logger.warning("[commit-filter] BLOCKED unscannable commit message (content not in argv)")
+                execution_time_ms = (time.perf_counter() - start_time) * 1000
+                audit_logger.log_validation(
+                    command=command[:500],
+                    risk_level="BLOCKED",
+                    violations=["Advertising: unscannable commit message"],
+                    decision="block",
+                    execution_time_ms=execution_time_ms,
+                    context=context,
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": f"BLOCKED: {filter_result.unscannable_reason}",
+                    }
+                }
+            if filter_result.unscannable_decision == "warn":
+                logger.warning("[commit-filter] WARN unscannable commit message (content not in argv)")
+                unscannable_warning = filter_result.unscannable_reason
 
         # 3. Ensure validator is initialized
         get_validator()
@@ -568,7 +596,10 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                 execution_time_ms=execution_time_ms,
                 context=context,
             )
-            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+            allow_output = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+            if unscannable_warning:
+                allow_output["additionalContext"] = unscannable_warning
+            return {"hookSpecificOutput": allow_output}
 
         if decision == "ask":
             # Prompt user for approval (HIGH risk or ShellCheck findings)
@@ -585,13 +616,14 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                 execution_time_ms=execution_time_ms,
                 context=context,
             )
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": message,
-                }
+            ask_output = {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "ask",
+                "permissionDecisionReason": message,
             }
+            if unscannable_warning:
+                ask_output["additionalContext"] = unscannable_warning
+            return {"hookSpecificOutput": ask_output}
 
         # Blocked case (decision == "deny")
         message = format_message(result, decision="deny")
