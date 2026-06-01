@@ -55,6 +55,13 @@ class FilterResult:
         patterns_removed: List of patterns that matched (with category info)
         categories_matched: List of category names that had matches
         error: Error message if filtering failed (None on success)
+        message_delivery: How the message reaches git ("scannable" | "unscannable" | "none").
+            See CommitMessageFilter.classify_message_delivery.
+        unscannable_decision: Decision for an unscannable content-bearing commit (issue #76):
+            None (not applicable, or policy is "off"), "warn", or "block". Distinct from the
+            filter's configured policy CommitMessageFilter.unscannable_action ("off" maps here
+            to None); this field is the per-command outcome the hook acts on.
+        unscannable_reason: Human-readable explanation when unscannable_decision is set.
     """
 
     cleaned_command: str
@@ -64,6 +71,9 @@ class FilterResult:
     patterns_removed: list[dict[str, str]] = field(default_factory=list)
     categories_matched: list[str] = field(default_factory=list)
     error: Optional[str] = None
+    message_delivery: str = "none"
+    unscannable_decision: Optional[str] = None
+    unscannable_reason: str = ""
 
 
 class CommitMessageFilter:
@@ -106,6 +116,12 @@ class CommitMessageFilter:
         """
         self.config = config
         self.enabled = config.get("enabled", True)  # Default: enabled
+
+        # Policy for commit messages whose content is NOT in argv (issue #76): file/stdin
+        # delivery or unevaluated substitution. "warn" is the safe default — non-destructive
+        # but not silent. Invalid values fall back to "warn" rather than raising.
+        action = str(config.get("unscannable_message_action", "warn")).strip().lower()
+        self.unscannable_action = action if action in ("off", "warn", "block") else "warn"
 
         # Compile patterns from enabled categories
         self._compiled_patterns: list[tuple[re.Pattern, str, str, str]] = []
@@ -229,6 +245,126 @@ class CommitMessageFilter:
 
         # Both methods failed → fail-open (return None)
         return None
+
+    def classify_message_delivery(self, command: str) -> str:
+        """Classify how a git commit command delivers its message.
+
+        Returns one of:
+            "scannable"   - a message was extracted from argv (any ``-m "..."`` form). Its
+                            literal bytes are in the command, so it is scanned as-is - an
+                            incidental ``$(...)`` does not stop the literal parts (including a
+                            trailer) from being matched and stripped.
+            "unscannable" - the message is delivered from OUTSIDE argv: ``-F`` / ``--file``
+                            (a file, or ``-`` for stdin). There is nothing in the command to
+                            scan, so the filter can only warn or block - it cannot strip.
+            "none"        - no NEW author-supplied message content (bare ``git commit``,
+                            ``--amend --no-edit``, ``-C`` / ``-c`` / ``--squash`` /
+                            ``--fixup`` / ``--template`` message reuse or editor deferral).
+
+        WHY THIS EXISTS: ``extract_commit_message`` returns ``None`` for BOTH legitimate
+        message reuse (``--amend --no-edit``, ``-C HEAD``) and the issue #76 file bypass
+        (``-F file``). Acting on the bare ``None`` signal would block every amend/reuse, so
+        this method separates "content we structurally cannot see" from "no new content".
+
+        NOTE: ``-m "$(cat externalfile)"`` (the WHOLE message is a substitution) is treated as
+        ``scannable`` - its literal ``$(...)`` text is scanned and matches nothing, so it slips
+        pre-execution. Catching that reliably needs the ACTUAL committed message (a post-commit
+        check), not argv inspection - argv genuinely does not contain the bytes. Pure and
+        side-effect free. Public entry point used by tests; ``filter_commit_message`` shares the
+        core decision via ``_classify_from_extraction``.
+        """
+        if not self.is_git_commit_command(command):
+            return "none"
+        return self._classify_from_extraction(command, self.extract_commit_message(command))
+
+    def _classify_from_extraction(self, command: str, extracted: Optional[str]) -> str:
+        """Classify delivery given an already-extracted message (shared with filtering).
+
+        Split out so ``filter_commit_message`` can extract once and classify rather than
+        extracting twice. ``extracted`` is ``extract_commit_message``'s result for a command
+        already known to be a git commit.
+
+        A file/stdin flag in ANY git commit segment means part of the command is content not
+        in argv -> ``unscannable`` (checked FIRST: a compound `git commit -m x && git commit -F
+        y` must not be masked as scannable by the earlier inline message). Otherwise an extracted
+        message is literally in argv -> ``scannable`` (scan it, incidental substitutions and all);
+        anything else is reuse/editor deferral -> ``none``.
+        """
+        if self._command_has_file_content_flag(command):
+            return "unscannable"
+        if extracted is not None:
+            return "scannable"
+        return "none"
+
+    def _command_has_file_content_flag(self, command: str) -> bool:
+        """True if any git commit segment delivers its message from a file or stdin (-F/--file)."""
+        for words in self._git_commit_word_lists(command):
+            for word in words[2:]:  # skip "git commit"; flags follow the subcommand
+                if word == "--":
+                    break  # everything after the option terminator is a pathspec, not a flag
+                if word == "--file" or word.startswith("--file="):
+                    return True
+                # Single-dash short-flag cluster: -F, attached -Fpath, or clustered -aF / -aFpath.
+                if word.startswith("-") and not word.startswith("--") and self._short_cluster_has_file_flag(word):
+                    return True
+        return False
+
+    @staticmethod
+    def _short_cluster_has_file_flag(token: str) -> bool:
+        """True if a single-dash short-flag cluster uses -F (commit message from a file/stdin).
+
+        Walks the cluster letters: -m/-C/-c also take arguments, so reaching one of THOSE first
+        means the remainder is that flag's value (e.g. -mFix is message "Fix", not a file flag).
+        Reaching 'F' first means file delivery (handles -F, -Fpath, -aF, -aFpath).
+        """
+        for ch in token[1:]:
+            if ch == "F":
+                return True
+            if ch in "mCc":  # argument-taking flag; the rest of the token is its value, not flags
+                return False
+        return False
+
+    # Explanation surfaced when an unscannable commit is warned/blocked. Unscannable always
+    # means file/stdin delivery (-F/--file), so a single static message suffices.
+    _UNSCANNABLE_REASON = (
+        "Commit message supplied via a file or stdin (-F/--file); its content is not in the "
+        "command and was not scanned for advertising. Inline the message with -m to enable "
+        "scanning, or remove any unwanted trailer manually."
+    )
+
+    def _git_commit_word_lists(self, command: str) -> list[list[str]]:
+        """Return the argv word lists of every ``git commit`` invocation in the command.
+
+        Uses bashlex to isolate the git commit segment(s) of a compound command. On parse
+        failure (or an oversized command) falls back to splitting the whole command -
+        over-detecting a file flag and warning is safer than silently missing it for this
+        fail-open filter, and never parsing an oversized string avoids a DoS on the hook.
+        """
+        if len(command) > MAX_COMMAND_SIZE:  # DoS guard: never run bashlex on an oversized command
+            return [command.split()]
+        try:
+            parts = bashlex.parse(command)
+        except Exception:  # noqa: BLE001 - bashlex raises various types; fail-open to split
+            return [command.split()]
+
+        results: list[list[str]] = []
+
+        def visit(node: Any) -> None:
+            if getattr(node, "kind", None) == "command":
+                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                if len(words) >= 2 and words[0] == "git" and words[1] == "commit":
+                    results.append(words)
+            for attr in ("parts", "list", "command"):
+                child = getattr(node, attr, None)
+                if child is None:
+                    continue
+                for item in child if isinstance(child, list) else [child]:
+                    visit(item)
+
+        for part in parts:
+            visit(part)
+
+        return results if results else [command.split()]
 
     def _extract_via_bashlex(self, command: str) -> Optional[str]:
         """Extract commit message using bashlex AST parsing.
@@ -487,20 +623,48 @@ class CommitMessageFilter:
                     categories_matched=[],
                 )
 
-            # Extract message
+            # Extract once and classify how the message is delivered to git.
             message = self.extract_commit_message(command)
-            if message is None:
-                # Could not extract message -> fail-open (allow original)
-                logger.warning("Could not extract commit message from command")
+            delivery = self._classify_from_extraction(command, message)
+
+            # Content-bearing but NOT in argv (file / stdin) -> #76. We cannot scan it
+            # pre-execution; surface a warn/block decision per config.
+            if delivery == "unscannable":
+                if self.unscannable_action == "off":
+                    # Opt-out: preserve historical silent pass-through. This is a deliberate
+                    # skip, NOT a failure, so `error` stays None (the state is recorded by
+                    # message_delivery="unscannable" + unscannable_decision=None).
+                    return FilterResult(
+                        cleaned_command=command,
+                        original_message="",
+                        cleaned_message="",
+                        was_modified=False,
+                        message_delivery="unscannable",
+                        unscannable_decision=None,
+                    )
+                logger.warning("[commit-filter] Unscannable commit message (file/stdin); action=%s", self.unscannable_action)
                 return FilterResult(
                     cleaned_command=command,
                     original_message="",
                     cleaned_message="",
                     was_modified=False,
-                    patterns_removed=[],
-                    categories_matched=[],
-                    error="Could not extract commit message",
+                    message_delivery="unscannable",
+                    unscannable_decision=self.unscannable_action,
+                    unscannable_reason=self._UNSCANNABLE_REASON,
                 )
+
+            # No NEW author-supplied content (bare commit, --amend --no-edit, -C/-c/--squash/
+            # --fixup/--template). Legitimate reuse/deferral -> pass through, never flag.
+            if delivery == "none":
+                return FilterResult(
+                    cleaned_command=command,
+                    original_message="",
+                    cleaned_message="",
+                    was_modified=False,
+                    message_delivery="none",
+                )
+
+            # delivery == "scannable": by the classifier contract `message` is non-None here.
 
             # Clean message
             cleaned, patterns_removed, categories = self.clean_message(message)
@@ -517,6 +681,7 @@ class CommitMessageFilter:
                     was_modified=False,
                     patterns_removed=[],
                     categories_matched=[],
+                    message_delivery="scannable",
                 )
 
             # Check if cleaned message is empty
@@ -529,6 +694,7 @@ class CommitMessageFilter:
                     was_modified=False,  # Don't use cleaned (it's empty)
                     patterns_removed=patterns_removed,
                     categories_matched=categories,
+                    message_delivery="scannable",
                     error="Commit message is empty after filtering",
                 )
 
@@ -542,6 +708,7 @@ class CommitMessageFilter:
                 was_modified=True,
                 patterns_removed=patterns_removed,
                 categories_matched=categories,
+                message_delivery="scannable",
             )
 
         except Exception as e:

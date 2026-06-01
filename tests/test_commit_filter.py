@@ -405,16 +405,23 @@ class TestFilterOrchestration:
         assert not result.was_modified
         assert result.cleaned_command == cmd
 
-    def test_fails_open_on_extraction_failure(self):
-        """Returns original command when extraction fails."""
+    def test_amend_message_reuse_passes_through_cleanly(self):
+        """git commit --amend reuses the existing message (no NEW content) -> clean pass.
+
+        Previously this was treated as an extraction *failure* (error set). It is not a
+        failure: there is simply no new author-supplied content to scan, so it must pass
+        through cleanly without flagging, exactly like every routine amend/reuse.
+        """
         filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
 
-        cmd = "git commit --amend"  # No -m flag
+        cmd = "git commit --amend"  # No -m flag: reuses existing message via editor
         result = filter_instance.filter_commit_message(cmd)
 
         assert not result.was_modified
-        assert result.cleaned_command == cmd
-        assert result.error is not None
+        assert result.cleaned_command == cmd  # commit not broken
+        assert result.message_delivery == "none"
+        assert result.unscannable_decision is None
+        assert result.error is None  # legitimate reuse, not a failure
 
     def test_fails_open_on_empty_message_after_filtering(self):
         """Returns original when cleaned message is empty."""
@@ -537,17 +544,23 @@ class TestErrorHandling:
         filter_instance = CommitMessageFilter(config)
         assert len(filter_instance._compiled_patterns) == 0  # Pattern skipped
 
-    def test_handles_extraction_failure_gracefully(self):
-        """Handles extraction failure without breaking."""
-        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}})
+    def test_off_action_passes_through_without_error(self):
+        """With unscannable_message_action=off, an unscannable (file-delivered) message
+        passes through cleanly. ``error`` is reserved for genuine filter FAILURES, so a
+        deliberate config-driven pass-through must NOT set it (else downstream callers and
+        audit data can't tell a chosen skip from a real failure). The skip is recorded by
+        message_delivery="unscannable" + unscannable_decision=None instead.
+        """
+        filter_instance = CommitMessageFilter({"enabled": True, "rules": {}, "unscannable_message_action": "off"})
 
-        # Command with no extractable message
-        cmd = "git commit --amend"
+        cmd = "git commit -F /tmp/msg.txt"  # content on disk, not scannable
         result = filter_instance.filter_commit_message(cmd)
 
         assert not result.was_modified
-        assert result.cleaned_command == cmd  # Original
-        assert result.error is not None  # Error logged
+        assert result.cleaned_command == cmd  # Original, commit not broken
+        assert result.error is None  # deliberate skip is NOT a failure
+        assert result.message_delivery == "unscannable"
+        assert result.unscannable_decision is None  # off -> no warn/block surfaced
 
     def test_catches_unexpected_exceptions(self):
         """Catches unexpected exceptions and fails open."""
@@ -707,3 +720,278 @@ class TestPerformance:
 
         # Same object reference means no recompilation
         assert patterns_before is patterns_after
+
+
+class TestMessageDeliveryClassification:
+    """classify_message_delivery distinguishes three commit-message delivery classes.
+
+    This is the content-aware detector that makes ``warn`` a safe default. The bare
+    ``None`` extraction signal is overloaded: ``git commit --amend --no-edit``,
+    ``git commit -C HEAD`` (legit message reuse) and ``git commit -F file`` (the #76
+    advertising bypass) ALL extract to ``None``. Policy keyed on extraction alone would
+    block every amend/reuse. The classifier separates them:
+
+    - ``scannable``   a message extracted from argv (any ``-m "..."`` form). Its literal bytes
+                      are present, so it is scanned as-is even if it embeds an incidental
+                      ``$(...)`` - the literal parts (including a trailer) are still matched.
+    - ``unscannable`` the message is delivered from OUTSIDE argv: ``-F``/``--file`` (a file, or
+                      ``-`` for stdin). Nothing in the command to scan -> warn/block only.
+    - ``none``        no NEW author-supplied content (bare commit, ``--amend --no-edit``,
+                      ``-C``/``-c``/``--squash``/``--fixup``/``--template`` -> nothing to smuggle)
+    """
+
+    @staticmethod
+    def _filter():
+        return CommitMessageFilter({"enabled": True, "rules": {}})
+
+    # --- scannable: content is inline in argv ---
+
+    def test_inline_message_is_scannable(self):
+        """Plain inline -m message is scannable."""
+        assert self._filter().classify_message_delivery('git commit -m "fix: a bug"') == "scannable"
+
+    def test_inline_heredoc_substitution_is_scannable(self):
+        """-m "$(cat <<'EOF'...EOF)" inline heredoc body is literally in argv -> scannable."""
+        cmd = "git commit -m \"$(cat <<'EOF'\nfix: a bug\nEOF\n)\""
+        assert self._filter().classify_message_delivery(cmd) == "scannable"
+
+    # --- unscannable: content-bearing flag points outside argv ---
+
+    def test_file_flag_short_is_unscannable(self):
+        """git commit -F file -> content on disk, not argv."""
+        assert self._filter().classify_message_delivery("git commit -F /tmp/msg.txt") == "unscannable"
+
+    def test_file_flag_attached_long_is_unscannable(self):
+        """git commit --file=file -> unscannable."""
+        assert self._filter().classify_message_delivery("git commit --file=/tmp/msg.txt") == "unscannable"
+
+    def test_file_flag_separated_long_is_unscannable(self):
+        """git commit --file file -> unscannable."""
+        assert self._filter().classify_message_delivery("git commit --file /tmp/msg.txt") == "unscannable"
+
+    def test_file_flag_attached_short_is_unscannable(self):
+        """git commit -F/tmp/msg.txt (attached) -> unscannable."""
+        assert self._filter().classify_message_delivery("git commit -F/tmp/msg.txt") == "unscannable"
+
+    def test_amend_with_file_is_unscannable(self):
+        """--amend alone would be 'none', but -F supplies content -> unscannable wins."""
+        assert self._filter().classify_message_delivery("git commit --amend -F /tmp/msg.txt") == "unscannable"
+
+    def test_stdin_dash_file_is_unscannable(self):
+        """git commit -F - reads the message from stdin -> unscannable."""
+        assert self._filter().classify_message_delivery("git commit -F -") == "unscannable"
+
+    def test_external_command_substitution_is_scannable(self):
+        """-m "$(cat externalfile)": the literal $(...) text IS in argv -> scannable.
+
+        We scan the literal token (which matches nothing for a pure substitution), so it
+        slips pre-execution; that niche bypass is deferred to the post-commit check. We do
+        NOT treat it as unscannable, because doing so would also stop scanning -m messages
+        that merely embed an incidental substitution alongside a literal trailer.
+        """
+        assert self._filter().classify_message_delivery('git commit -m "$(cat /tmp/msg.txt)"') == "scannable"
+
+    def test_backtick_substitution_is_scannable(self):
+        """-m "`cat externalfile`": the literal backtick text is in argv -> scannable (see above)."""
+        assert self._filter().classify_message_delivery('git commit -m "`cat /tmp/msg.txt`"') == "scannable"
+
+    # --- none: no NEW author-supplied content (legit reuse / defer) ---
+
+    def test_bare_commit_is_none(self):
+        """Bare git commit opens an editor; no new argv content."""
+        assert self._filter().classify_message_delivery("git commit") == "none"
+
+    def test_amend_no_edit_is_none(self):
+        """--amend --no-edit reuses the existing message; nothing to smuggle."""
+        assert self._filter().classify_message_delivery("git commit --amend --no-edit") == "none"
+
+    def test_reuse_message_short_is_none(self):
+        """-C HEAD reuses another commit's message."""
+        assert self._filter().classify_message_delivery("git commit -C HEAD") == "none"
+
+    def test_reuse_message_long_is_none(self):
+        """--reuse-message=HEAD reuses another commit's message."""
+        assert self._filter().classify_message_delivery("git commit --reuse-message=HEAD") == "none"
+
+    def test_reedit_message_is_none(self):
+        """-c HEAD~1 reedits a reused message (editor-based)."""
+        assert self._filter().classify_message_delivery("git commit -c HEAD~1") == "none"
+
+    def test_squash_is_none(self):
+        """--squash=HEAD defers message to rebase."""
+        assert self._filter().classify_message_delivery("git commit --squash=HEAD") == "none"
+
+    def test_fixup_is_none(self):
+        """--fixup=HEAD defers message to rebase."""
+        assert self._filter().classify_message_delivery("git commit --fixup=HEAD") == "none"
+
+    def test_template_is_none(self):
+        """--template populates the editor; no non-interactive content."""
+        assert self._filter().classify_message_delivery("git commit --template=/tmp/tpl.txt") == "none"
+
+    def test_non_git_commit_is_none(self):
+        """Non git-commit commands have no message to classify."""
+        assert self._filter().classify_message_delivery("ls -la") == "none"
+
+    def test_compound_command_with_file_is_unscannable(self):
+        """Locates the git commit segment in a compound command."""
+        cmd = "git add -A && git commit -F /tmp/msg.txt"
+        assert self._filter().classify_message_delivery(cmd) == "unscannable"
+
+    # --- a -m message that embeds substitution chars is still scannable (no false "unscannable") ---
+    # (panel finding A: an earlier quote-aware classifier mis-flagged single-quoted literals; the
+    #  fix is simpler - any extracted -m value is literally in argv, so it is always scannable.)
+
+    def test_single_quoted_dollar_paren_is_scannable(self):
+        """git commit -m 'fix $(x) parsing' is a literal in argv -> scannable."""
+        assert self._filter().classify_message_delivery("git commit -m 'fix $(x) parsing'") == "scannable"
+
+    def test_single_quoted_backtick_is_scannable(self):
+        """git commit -m 'use `make` to build' is a literal in argv -> scannable."""
+        assert self._filter().classify_message_delivery("git commit -m 'use `make` to build'") == "scannable"
+
+    # --- combined short-flag cluster (panel finding B): -aF still delivers via file ---
+
+    def test_combined_short_flag_cluster_is_unscannable(self):
+        """git commit -aF /tmp/msg.txt clusters -a and -F; the -F file delivery must be seen."""
+        assert self._filter().classify_message_delivery("git commit -aF /tmp/msg.txt") == "unscannable"
+
+    # --- DoS guard (panel finding C): oversized command must not parse the whole string ---
+
+    def test_oversized_command_skips_bashlex_parse(self):
+        """An oversized command must never reach bashlex.parse (DoS guard), yet still classify."""
+        cmd = "git commit -F /tmp/msg.txt " + ("a " * 40000)  # > MAX_COMMAND_SIZE, many tokens
+        with patch("schlock.integrations.commit_filter.bashlex.parse") as mock_parse:
+            result = self._filter().classify_message_delivery(cmd)
+        mock_parse.assert_not_called()  # guard short-circuits before parsing the whole string
+        assert result == "unscannable"  # split fallback still sees -F
+
+    # --- compound-command bypass (CodeRabbit): a -F in ANY segment wins over an earlier -m ---
+
+    def test_compound_inline_then_file_is_unscannable(self):
+        """git commit -m "ok" && git commit -F file: the 2nd commit's -F must not be masked."""
+        cmd = 'git commit -m "ok" && git commit -F /tmp/msg.txt'
+        assert self._filter().classify_message_delivery(cmd) == "unscannable"
+
+    # --- option terminator (CodeRabbit): tokens after -- are pathspecs, not message flags ---
+
+    def test_file_flag_after_double_dash_is_not_a_message_flag(self):
+        """git commit -- -F : '-F' is a pathspec here, not a message source -> none."""
+        assert self._filter().classify_message_delivery("git commit -- -F") == "none"
+
+    def test_long_file_flag_after_double_dash_is_not_a_message_flag(self):
+        """git commit -- --file : '--file' is a pathspec here -> none."""
+        assert self._filter().classify_message_delivery("git commit -- --file") == "none"
+
+
+class TestUnscannableMessageAction:
+    """filter_commit_message surfaces a warn/block decision for unscannable
+    content-bearing commits (issue #76), governed by ``unscannable_message_action``
+    (off | warn | block; default warn). ``none`` delivery (reuse/amend) is never flagged,
+    and scannable advertising is still cleaned exactly as before.
+    """
+
+    @staticmethod
+    def _filter(action=None, rules=None):
+        cfg = {"enabled": True, "rules": rules or {}}
+        if action is not None:
+            cfg["unscannable_message_action"] = action
+        return CommitMessageFilter(cfg)
+
+    def test_default_action_is_warn(self):
+        """Unspecified action defaults to warn (non-destructive, but not silent)."""
+        assert self._filter().unscannable_action == "warn"
+
+    def test_invalid_action_falls_back_to_warn(self):
+        """An invalid action value falls back to the safe default rather than raising."""
+        assert self._filter(action="bogus").unscannable_action == "warn"
+
+    def test_off_action_respected(self):
+        """unscannable_message_action: off is preserved on the instance."""
+        assert self._filter(action="off").unscannable_action == "off"
+
+    def test_file_form_warns_by_default(self):
+        """git commit -F file is flagged warn by default, command left unmodified."""
+        result = self._filter().filter_commit_message("git commit -F /tmp/msg.txt")
+        assert result.message_delivery == "unscannable"
+        assert result.unscannable_decision == "warn"
+        assert not result.was_modified
+        assert result.unscannable_reason  # non-empty human explanation
+        assert result.cleaned_command == "git commit -F /tmp/msg.txt"
+
+    def test_file_form_blocks_when_configured(self):
+        """unscannable_message_action: block surfaces a block decision."""
+        result = self._filter(action="block").filter_commit_message("git commit -F /tmp/msg.txt")
+        assert result.message_delivery == "unscannable"
+        assert result.unscannable_decision == "block"
+
+    def test_file_form_silent_when_off(self):
+        """unscannable_message_action: off restores today's silent fail-open (no decision)."""
+        result = self._filter(action="off").filter_commit_message("git commit -F /tmp/msg.txt")
+        assert result.message_delivery == "unscannable"
+        assert result.unscannable_decision is None
+        assert not result.was_modified
+
+    def test_stdin_form_warns(self):
+        """git commit -F - (message on stdin) is flagged unscannable -> warn."""
+        result = self._filter().filter_commit_message("git commit -F -")
+        assert result.message_delivery == "unscannable"
+        assert result.unscannable_decision == "warn"
+
+    def test_inline_substitution_is_scannable_not_flagged(self):
+        """-m "$(cat externalfile)": literal $(...) is in argv -> scannable, never warn/block."""
+        result = self._filter().filter_commit_message('git commit -m "$(cat /tmp/msg.txt)"')
+        assert result.message_delivery == "scannable"
+        assert result.unscannable_decision is None
+
+    def test_amend_no_edit_not_flagged(self):
+        """--amend --no-edit reuses a message; never flagged regardless of action."""
+        result = self._filter(action="block").filter_commit_message("git commit --amend --no-edit")
+        assert result.message_delivery == "none"
+        assert result.unscannable_decision is None
+        assert not result.was_modified
+
+    def test_reuse_message_not_flagged(self):
+        """-C HEAD reuses a message; never flagged."""
+        result = self._filter(action="block").filter_commit_message("git commit -C HEAD")
+        assert result.message_delivery == "none"
+        assert result.unscannable_decision is None
+
+    def test_scannable_advertising_still_cleaned(self):
+        """Regression: scannable inline advertising is still detected and cleaned."""
+        rules = {
+            "advertising": {
+                "enabled": True,
+                "patterns": [{"pattern": "Generated with Claude Code", "description": "ad", "replacement": ""}],
+            }
+        }
+        cmd = 'git commit -m "feat: x\\n\\nGenerated with Claude Code"'
+        result = self._filter(rules=rules).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+        assert result.unscannable_decision is None
+
+    def test_scannable_clean_message_unmodified(self):
+        """A clean scannable message is neither modified nor flagged."""
+        result = self._filter().filter_commit_message('git commit -m "feat: clean"')
+        assert result.message_delivery == "scannable"
+        assert result.unscannable_decision is None
+        assert not result.was_modified
+
+    def test_inline_substitution_with_literal_trailer_is_still_cleaned(self):
+        """Regression guard: a -m message with an INCIDENTAL substitution but a LITERAL trailer
+        must still be scanned and the trailer stripped. The literal bytes are in argv; an
+        incidental $(...) elsewhere must not disable scanning of the rest."""
+        rules = {
+            "advertising": {
+                "enabled": True,
+                "patterns": [
+                    {"pattern": "\\n*Co-Authored-By:.*Claude.*\\n*", "description": "claude trailer", "replacement": "\n"}
+                ],
+            }
+        }
+        cmd = 'git commit -m "Deploy $(date)\\n\\nCo-Authored-By: Claude <noreply@anthropic.com>"'
+        result = self._filter(rules=rules).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed  # the literal trailer IS caught despite the $(date)
+        assert result.unscannable_decision is None

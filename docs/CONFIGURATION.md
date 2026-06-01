@@ -241,6 +241,47 @@ commit_filter:
 4. **Blocks commit** if patterns found (with clear error message)
 5. **User must remove** advertising and retry
 
+### Messages Not in the Command (file / stdin / substitution)
+
+The blocker scans the **command string**. Some git forms deliver the commit message from
+*outside* the command, so there is nothing in the command to scan (issue #76):
+
+- `git commit -F <file>` / `git commit --file=<file>` — message lives in a file
+- `git commit -F -` and heredocs — message arrives on stdin at execution time
+- `git commit -m "$(cat file)"` / backticks — the substitution is not expanded yet
+
+Because a `PreToolUse` hook runs **before** the command executes, this content does not exist
+where the hook can see it. The `unscannable_message_action` setting decides what happens when
+such a commit is detected:
+
+| Value | Behavior |
+|-------|----------|
+| `off` | Silent pass-through (legacy behavior — the gap is invisible) |
+| `warn` | **Default.** Allow the commit, but tell the model the message was not scanned |
+| `block` | Deny the commit; the message must be inlined with `-m` to be scannable |
+
+The default is `warn`. The value is read from the bundled rules file
+(`data/commit_filter_rules.yaml`):
+
+```yaml
+# data/commit_filter_rules.yaml
+unscannable_message_action: warn   # off | warn | block  (default: warn)
+```
+
+> **Heads up — not yet user-overridable.** `load_filter_config` currently loads only the
+> bundled plugin defaults; user/project override of `commit_filter` settings is not wired,
+> so change this in the rules file above. A reasonable intent if you later raise schlock's
+> risk tolerance: `off` for permissive, `warn` for balanced, `block` for paranoid.
+
+> **Legitimate reuse is never flagged.** `git commit --amend --no-edit`, `-C`/`-c`,
+> `--squash`/`--fixup`, `--template`, and a bare `git commit` (editor) supply no new
+> author-provided content, so they always pass through regardless of this setting.
+
+> **What `warn`/`block` can and cannot do.** This is a *pre-execution* heads-up: it cannot
+> read the file or stdin content, so it cannot confirm a trailer is present — only that the
+> message could not be scanned. The reliable place to catch a trailer that actually landed is
+> *after* the commit exists; detecting post-commit slippage is tracked separately.
+
 ### Why Block Instead of Filter?
 
 **Block-on-detection** (current approach):
