@@ -284,18 +284,24 @@ class CommitMessageFilter:
         extracting twice. ``extracted`` is ``extract_commit_message``'s result for a command
         already known to be a git commit.
 
-        A message that extracted is literally present in argv -> ``scannable`` (scan it,
-        incidental substitutions and all). Otherwise a file/stdin flag means the content exists
-        but not in argv -> ``unscannable``; anything else is reuse/editor deferral -> ``none``.
+        A file/stdin flag in ANY git commit segment means part of the command is content not
+        in argv -> ``unscannable`` (checked FIRST: a compound `git commit -m x && git commit -F
+        y` must not be masked as scannable by the earlier inline message). Otherwise an extracted
+        message is literally in argv -> ``scannable`` (scan it, incidental substitutions and all);
+        anything else is reuse/editor deferral -> ``none``.
         """
+        if self._command_has_file_content_flag(command):
+            return "unscannable"
         if extracted is not None:
             return "scannable"
-        return "unscannable" if self._command_has_file_content_flag(command) else "none"
+        return "none"
 
     def _command_has_file_content_flag(self, command: str) -> bool:
         """True if any git commit segment delivers its message from a file or stdin (-F/--file)."""
         for words in self._git_commit_word_lists(command):
-            for word in words:
+            for word in words[2:]:  # skip "git commit"; flags follow the subcommand
+                if word == "--":
+                    break  # everything after the option terminator is a pathspec, not a flag
                 if word == "--file" or word.startswith("--file="):
                     return True
                 # Single-dash short-flag cluster: -F, attached -Fpath, or clustered -aF / -aFpath.
@@ -621,11 +627,13 @@ class CommitMessageFilter:
             message = self.extract_commit_message(command)
             delivery = self._classify_from_extraction(command, message)
 
-            # Content-bearing but NOT in argv (file / stdin / unevaluated substitution) -> #76.
-            # We cannot scan it pre-execution; surface a warn/block decision per config.
+            # Content-bearing but NOT in argv (file / stdin) -> #76. We cannot scan it
+            # pre-execution; surface a warn/block decision per config.
             if delivery == "unscannable":
                 if self.unscannable_action == "off":
-                    # Opt-out: preserve historical silent fail-open behavior.
+                    # Opt-out: preserve historical silent pass-through. This is a deliberate
+                    # skip, NOT a failure, so `error` stays None (the state is recorded by
+                    # message_delivery="unscannable" + unscannable_decision=None).
                     return FilterResult(
                         cleaned_command=command,
                         original_message="",
@@ -633,7 +641,6 @@ class CommitMessageFilter:
                         was_modified=False,
                         message_delivery="unscannable",
                         unscannable_decision=None,
-                        error="Commit message supplied outside argv; not scanned (action=off)",
                     )
                 logger.warning("[commit-filter] Unscannable commit message (file/stdin); action=%s", self.unscannable_action)
                 return FilterResult(

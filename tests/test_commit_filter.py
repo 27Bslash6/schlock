@@ -544,13 +544,12 @@ class TestErrorHandling:
         filter_instance = CommitMessageFilter(config)
         assert len(filter_instance._compiled_patterns) == 0  # Pattern skipped
 
-    def test_off_action_records_error_without_breaking_commit(self):
+    def test_off_action_passes_through_without_error(self):
         """With unscannable_message_action=off, an unscannable (file-delivered) message
-        passes through with an explanatory, non-fatal error and the command intact.
-
-        This is the genuine graceful-degradation path: schlock cannot scan content that
-        is not in argv, so when the user opts out of warn/block it records WHY and never
-        modifies or breaks the commit.
+        passes through cleanly. ``error`` is reserved for genuine filter FAILURES, so a
+        deliberate config-driven pass-through must NOT set it (else downstream callers and
+        audit data can't tell a chosen skip from a real failure). The skip is recorded by
+        message_delivery="unscannable" + unscannable_decision=None instead.
         """
         filter_instance = CommitMessageFilter({"enabled": True, "rules": {}, "unscannable_message_action": "off"})
 
@@ -559,7 +558,8 @@ class TestErrorHandling:
 
         assert not result.was_modified
         assert result.cleaned_command == cmd  # Original, commit not broken
-        assert result.error is not None  # Explanatory, non-fatal
+        assert result.error is None  # deliberate skip is NOT a failure
+        assert result.message_delivery == "unscannable"
         assert result.unscannable_decision is None  # off -> no warn/block surfaced
 
     def test_catches_unexpected_exceptions(self):
@@ -865,6 +865,23 @@ class TestMessageDeliveryClassification:
             result = self._filter().classify_message_delivery(cmd)
         mock_parse.assert_not_called()  # guard short-circuits before parsing the whole string
         assert result == "unscannable"  # split fallback still sees -F
+
+    # --- compound-command bypass (CodeRabbit): a -F in ANY segment wins over an earlier -m ---
+
+    def test_compound_inline_then_file_is_unscannable(self):
+        """git commit -m "ok" && git commit -F file: the 2nd commit's -F must not be masked."""
+        cmd = 'git commit -m "ok" && git commit -F /tmp/msg.txt'
+        assert self._filter().classify_message_delivery(cmd) == "unscannable"
+
+    # --- option terminator (CodeRabbit): tokens after -- are pathspecs, not message flags ---
+
+    def test_file_flag_after_double_dash_is_not_a_message_flag(self):
+        """git commit -- -F : '-F' is a pathspec here, not a message source -> none."""
+        assert self._filter().classify_message_delivery("git commit -- -F") == "none"
+
+    def test_long_file_flag_after_double_dash_is_not_a_message_flag(self):
+        """git commit -- --file : '--file' is a pathspec here -> none."""
+        assert self._filter().classify_message_delivery("git commit -- --file") == "none"
 
 
 class TestUnscannableMessageAction:

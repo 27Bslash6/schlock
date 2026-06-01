@@ -569,3 +569,30 @@ class TestUnscannableMessageHookHandling:
         hso = response["hookSpecificOutput"]
         assert hso["permissionDecision"] != "deny"
         assert "additionalContext" not in hso
+
+    @patch("pre_tool_use.get_filter")
+    def test_warn_still_validates_rest_of_command(self, mock_get_filter):
+        """Under warn the command is NOT auto-allowed: a dangerous tail is still validated.
+
+        Guards the security property that the warn note rides the FINAL decision rather than
+        short-circuiting with an early allow. `rm -rf /` is BLOCKED in every preset, so the
+        compound command must deny regardless of local risk-tolerance config.
+        """
+        mock_get_filter.return_value = self._filter("warn")
+        response = handle_pre_tool_use(self._input("git commit -F /tmp/msg.txt && rm -rf /"))
+        assert response["hookSpecificOutput"]["permissionDecision"] in {"ask", "deny"}
+
+    @patch("pre_tool_use.get_audit_logger")
+    @patch("pre_tool_use.get_filter")
+    def test_block_audit_violation_is_distinct_not_advertising(self, mock_get_filter, mock_get_audit):
+        """A block on an unscannable message must NOT be audit-logged as 'Advertising' (we do
+        not know there is a trailer); it needs its own violation type for clean audit data."""
+        mock_get_filter.return_value = self._filter("block")
+        mock_audit = mock_get_audit.return_value
+        handle_pre_tool_use(self._input("git commit -F /tmp/msg.txt"))
+        block_calls = [c for c in mock_audit.log_validation.call_args_list if c.kwargs.get("decision") == "block"]
+        assert block_calls, "expected a block audit entry"
+        violations = block_calls[-1].kwargs["violations"]
+        joined = " ".join(violations).lower()
+        assert "advertising" not in joined  # not mislabeled
+        assert "unscannable" in joined  # distinct, descriptive type

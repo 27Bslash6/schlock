@@ -460,8 +460,10 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
 
         # 2. FILTER FIRST (before safety validation)
         # Carries a non-blocking note attached to the final decision when an unscannable
-        # commit message (issue #76) is allowed under unscannable_message_action=warn.
+        # commit message (issue #76) is allowed under unscannable_message_action=warn, plus a
+        # dedicated audit violation so the warn is recorded on the final allow/ask audit entry.
         unscannable_warning = None
+        unscannable_audit_violation = None
         filter_instance = get_filter()
         if filter_instance:
             filter_result = filter_instance.filter_commit_message(command)
@@ -510,16 +512,17 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                     }
                 }
 
-            # Issue #76: message is content-bearing but NOT in argv (file/stdin/unevaluated
-            # substitution), so it could not be scanned. Honor unscannable_message_action:
-            # block denies up front; warn rides a model-visible note on the final decision.
+            # Issue #76: message is content-bearing but NOT in argv (file/stdin), so it could
+            # not be scanned. Honor unscannable_message_action: block denies up front; warn
+            # rides a model-visible note on the final decision. Audit it under its OWN violation
+            # type — NOT "Advertising" (we never saw a trailer; the message was simply unscannable).
             if filter_result.unscannable_decision == "block":
                 logger.warning("[commit-filter] BLOCKED unscannable commit message (content not in argv)")
                 execution_time_ms = (time.perf_counter() - start_time) * 1000
                 audit_logger.log_validation(
                     command=command[:500],
                     risk_level="BLOCKED",
-                    violations=["Advertising: unscannable commit message"],
+                    violations=["commit_filter: unscannable commit message (block)"],
                     decision="block",
                     execution_time_ms=execution_time_ms,
                     context=context,
@@ -534,6 +537,8 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
             if filter_result.unscannable_decision == "warn":
                 logger.warning("[commit-filter] WARN unscannable commit message (content not in argv)")
                 unscannable_warning = filter_result.unscannable_reason
+                # Record the warn on the FINAL allow/ask audit entry (see violations assembly).
+                unscannable_audit_violation = "commit_filter: unscannable commit message (warn)"
 
         # 3. Ensure validator is initialized
         get_validator()
@@ -584,6 +589,11 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         if shellcheck_findings:
             for finding in shellcheck_findings:
                 violations.append(f"ShellCheck {finding.sc_code}: {finding.message}")
+
+        # Record an unscannable-message warn on the final allow/ask audit entry (issue #76) so
+        # the detection is traceable, not just surfaced to the model via additionalContext.
+        if unscannable_audit_violation:
+            violations.append(unscannable_audit_violation)
 
         # 8. Build response and log audit event
         if decision == "allow":
