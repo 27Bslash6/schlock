@@ -42,6 +42,20 @@ logger = logging.getLogger(__name__)
 # Size limit to prevent DoS via huge commands (64KB is generous for commit messages)
 MAX_COMMAND_SIZE = 64 * 1024
 
+# Long form of the -m commit-message flag (issue #77). The blockable content sits in argv for
+# --message "msg" / --message=msg just as it does for -m, but the extractor used to key on -m
+# only, so these slipped (fail-open). git ALSO accepts unambiguous prefixes (--mess, --messa);
+# those are intentionally NOT handled - no agent emits abbreviated flags and this is a fail-open
+# cosmetic filter, not a security boundary (see CLAUDE.md / test_abbreviated_long_flag_*).
+_LONG_MESSAGE_FLAG = "--message"
+_ATTACHED_LONG_PREFIX = _LONG_MESSAGE_FLAG + "="  # "--message="
+
+# Regex fragment matching the flag+separator preceding a commit-message value. Shared by the
+# regex extraction fallback and command reconstruction so the two never drift:
+#   -m<ws>           kept strict with \s+ so existing -m behavior is byte-for-byte unchanged
+#   --message<ws>    or   --message=
+_MSG_FLAG = r"(?:-m\s+|--message(?:\s+|=))"
+
 
 @dataclass(frozen=True)
 class FilterResult:
@@ -402,6 +416,25 @@ class CommitMessageFilter:
             # Fallback to bashlex-parsed word
             return msg_node.word.replace("\\n", "\n")
 
+        def extract_attached_message(flag_node: Any) -> str:
+            """Extract the value of a single --message=VALUE token (issue #77).
+
+            Uses raw position slicing rather than flag_node.word for the same reason
+            extract_msg_from_node does: bashlex drops the backslash of a literal \\n in .word,
+            which would corrupt a multi-line trailer. We slice the original command, strip the
+            ``--message=`` prefix, then strip a matched surrounding quote.
+            """
+            if hasattr(flag_node, "pos"):
+                start, end = flag_node.pos
+                raw = command[start:end]
+                value = raw[len(_ATTACHED_LONG_PREFIX) :] if raw.startswith(_ATTACHED_LONG_PREFIX) else ""
+                if value and value[0] in "\"'" and value[-1] == value[0]:
+                    value = value[1:-1]
+                return value.replace("\\n", "\n")
+            # Fallback: bashlex word (loses a literal \\n backslash, acceptable when pos absent)
+            word = flag_node.word
+            return word[len(_ATTACHED_LONG_PREFIX) :].replace("\\n", "\n") if word.startswith(_ATTACHED_LONG_PREFIX) else ""
+
         def visit(node: Any) -> None:
             """Recursively visit AST nodes to find git commit messages."""
             if hasattr(node, "kind") and node.kind == "command":
@@ -411,10 +444,15 @@ class CommitMessageFilter:
                 if len(words) >= 2 and words[0].word == "git" and words[1].word == "commit":
                     i = 0
                     while i < len(words):
-                        word_node = words[i]
-                        if word_node.word == "-m" and i + 1 < len(words):
+                        word = words[i].word
+                        if word in ("-m", _LONG_MESSAGE_FLAG) and i + 1 < len(words):
+                            # Separate-word form: -m "msg" / --message "msg". Value is next token.
                             messages.append(extract_msg_from_node(words[i + 1]))
-                            i += 2  # Skip past -m and message
+                            i += 2  # Skip past the flag and its message
+                        elif word.startswith(_ATTACHED_LONG_PREFIX):
+                            # Attached form: --message="msg" / --message=word (single token).
+                            messages.append(extract_attached_message(words[i]))
+                            i += 1
                         else:
                             i += 1
 
@@ -447,25 +485,32 @@ class CommitMessageFilter:
             Extracted message or None if not found
         """
         # Pattern 1: Heredoc format (check FIRST - more specific pattern)
-        # Match: -m "$(cat <<'EOF'\nMESSAGE\nEOF\n)"
-        heredoc_match = re.search(r'-m\s+"?\$\(cat\s+<<\'EOF\'\n(.+?)\nEOF\n\)"?', command, re.DOTALL)
+        # Match: -m/--message "$(cat <<'EOF'\nMESSAGE\nEOF\n)"
+        heredoc_match = re.search(rf'{_MSG_FLAG}"?\$\(cat\s+<<\'EOF\'\n(.+?)\nEOF\n\)"?', command, re.DOTALL)
         if heredoc_match:
             return heredoc_match.group(1)
 
-        # Pattern 2: Standard -m "message" or -m 'message'
-        # Use finditer to get ALL -m flags (prevents bypass via multiple -m)
+        # Pattern 2: Standard quoted message - -m "msg", --message 'msg', --message="msg"
+        # Use finditer to get ALL message flags (prevents bypass via multiple flags)
         # Note: This pattern doesn't handle escaped quotes well - bashlex is preferred
-        matches = list(re.finditer(r'-m\s+(["\'])(.+?)\1', command, re.DOTALL))
+        matches = list(re.finditer(rf'{_MSG_FLAG}(["\'])(.+?)\1', command, re.DOTALL))
 
         if matches:
             # Extract all messages and combine with paragraph breaks
             messages = [m.group(2).replace("\\n", "\n") for m in matches]
             return "\n\n".join(messages)
 
-        # Pattern 3: Empty message -m ""
-        empty_match = re.search(r'-m\s+(["\'])\1', command)
+        # Pattern 3: Empty message -m "" / --message=""
+        empty_match = re.search(rf'{_MSG_FLAG}(["\'])\1', command)
         if empty_match:
             return ""
+
+        # Pattern 4: --message=word with an UNQUOTED single-token value (#77). Quoted forms are
+        # caught above; this is the bare attached token (cannot carry a multi-word trailer, but
+        # handled for completeness and parity with the bashlex path).
+        attached = re.search(r"--message=(\S+)", command)
+        if attached:
+            return attached.group(1).replace("\\n", "\n")
 
         # No message found
         return None
@@ -540,15 +585,16 @@ class CommitMessageFilter:
         # Convert actual newlines to literal \n for bash
         escaped_message = escaped_message.replace("\n", "\\n")
 
-        # Pattern to match -m with quoted string (double or single quotes)
-        m_pattern = re.compile(r'-m\s+(["\'])(.+?)\1', re.DOTALL)
+        # Pattern to match -m / --message / --message= with a quoted string (#77). Shares
+        # _MSG_FLAG with extraction so the two recognize exactly the same flag forms.
+        m_pattern = re.compile(rf'{_MSG_FLAG}(["\'])(.+?)\1', re.DOTALL)
 
-        # Find all -m arguments
+        # Find all message-flag arguments
         matches = list(m_pattern.finditer(original_command))
 
         if not matches:
-            # No -m found - shouldn't happen if we got here, but failsafe
-            logger.warning("No -m pattern found in command, cannot reconstruct")
+            # No message flag found - shouldn't happen if we got here, but failsafe
+            logger.warning("No -m/--message pattern found in command, cannot reconstruct")
             return original_command
 
         # Strategy: Replace first -m arg with cleaned message, remove subsequent -m args

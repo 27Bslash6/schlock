@@ -995,3 +995,220 @@ class TestUnscannableMessageAction:
         assert result.message_delivery == "scannable"
         assert result.patterns_removed  # the literal trailer IS caught despite the $(date)
         assert result.unscannable_decision is None
+
+
+class TestLongMessageFlag:
+    """Issue #77: ``git commit --message`` / ``--message=`` deliver the message in argv, but
+    the extractor only recognized ``-m`` - so advertising trailers supplied via the long flag
+    slipped through (fail-open). The message bytes ARE in the command, so this is a plain
+    extraction gap (distinct from #76, where content lives in a file/stdin). Both extraction
+    paths and command reconstruction must recognize the long flag.
+
+    Scope note: abbreviated long flags (``--mess``, ``--messa``) are git-valid unambiguous
+    prefixes of ``--message`` but are NOT covered - no agent emits abbreviated flags and this
+    is a fail-open cosmetic filter, not a security boundary. See ``test_abbreviated_long_flag_
+    is_known_residual_gap`` which documents the residual.
+    """
+
+    # Real Claude co-author trailer pattern, mirroring data/commit_filter_rules.yaml so these
+    # tests exercise the production rule rather than a toy stand-in.
+    CLAUDE_TRAILER_RULES = {
+        "advertising": {
+            "enabled": True,
+            "patterns": [
+                {
+                    "pattern": "\\n*Co-Authored-By:.*(?:Claude|@anthropic\\.com).*\\n*",
+                    "description": "Claude co-author trailer",
+                    "replacement": "\n",
+                },
+                {
+                    "pattern": "\\n*🤖.*Generated with.*\\n*",
+                    "description": "robot-emoji generation notice",
+                    "replacement": "\n",
+                },
+            ],
+        }
+    }
+
+    @staticmethod
+    def _filter(rules=None):
+        return CommitMessageFilter({"enabled": True, "rules": rules or {}})
+
+    # --- extraction: separate-word long flag (--message "msg") ---
+
+    def test_extracts_long_flag_separate_double_quoted(self):
+        """--message "msg" (space-separated, double-quoted) is extracted like -m."""
+        msg = self._filter().extract_commit_message('git commit --message "hello world"')
+        assert msg == "hello world"
+
+    def test_extracts_long_flag_separate_single_quoted(self):
+        """--message 'msg' (space-separated, single-quoted) is extracted."""
+        msg = self._filter().extract_commit_message("git commit --message 'hello world'")
+        assert msg == "hello world"
+
+    def test_extracts_long_flag_separate_with_literal_newlines(self):
+        """--message "L1\\nL2" converts literal \\n to real newlines like -m does."""
+        msg = self._filter().extract_commit_message('git commit --message "Line 1\\nLine 2"')
+        assert msg == "Line 1\nLine 2"
+
+    # --- extraction: attached long flag (--message=msg) ---
+
+    def test_extracts_long_flag_attached_double_quoted(self):
+        """--message="msg" (attached, =) strips the flag prefix and the quotes."""
+        msg = self._filter().extract_commit_message('git commit --message="hello world"')
+        assert msg == "hello world"
+
+    def test_extracts_long_flag_attached_single_quoted(self):
+        """--message='msg' (attached, single-quoted) is extracted."""
+        msg = self._filter().extract_commit_message("git commit --message='hello world'")
+        assert msg == "hello world"
+
+    def test_extracts_long_flag_attached_unquoted(self):
+        """--message=word (attached, no quotes - single shell token) is extracted."""
+        msg = self._filter().extract_commit_message("git commit --message=fix")
+        assert msg == "fix"
+
+    def test_extracts_long_flag_attached_with_literal_newlines(self):
+        """--message="L1\\nL2" must preserve \\n via raw-position slicing (not bashlex .word,
+        which drops the backslash). This is the load-bearing case for multi-line trailers."""
+        msg = self._filter().extract_commit_message('git commit --message="Line 1\\nLine 2"')
+        assert msg == "Line 1\nLine 2"
+
+    # --- extraction: mixed short + long flags accumulate in order ---
+
+    def test_mixed_short_then_long_combined(self):
+        """git commit -m "a" --message "b" combines both into one message."""
+        msg = self._filter().extract_commit_message('git commit -m "first" --message "second"')
+        assert msg == "first\n\nsecond"
+
+    def test_mixed_long_then_short_combined(self):
+        """git commit --message "a" -m "b" combines both in argv order."""
+        msg = self._filter().extract_commit_message('git commit --message "first" -m "second"')
+        assert msg == "first\n\nsecond"
+
+    def test_mixed_attached_long_and_short_combined(self):
+        """--message="a" mixed with -m "b" - all segments scanned."""
+        msg = self._filter().extract_commit_message('git commit --message="first" -m "second"')
+        assert msg == "first\n\nsecond"
+
+    # --- classification: long-flag messages are scannable (content is in argv) ---
+
+    def test_long_flag_separate_is_scannable(self):
+        """--message "x" content is literally in argv -> scannable."""
+        assert self._filter().classify_message_delivery('git commit --message "fix: a bug"') == "scannable"
+
+    def test_long_flag_attached_is_scannable(self):
+        """--message="x" content is literally in argv -> scannable."""
+        assert self._filter().classify_message_delivery('git commit --message="fix: a bug"') == "scannable"
+
+    def test_long_flag_with_incidental_substitution_is_scannable(self):
+        """--message="Deploy $(date)" - the literal $(...) text is in argv -> scannable
+        (consistent with the -m invariant; pre-exec substitution detection is #79, not here)."""
+        assert self._filter().classify_message_delivery('git commit --message="Deploy $(date)"') == "scannable"
+
+    # --- end-to-end: the trailer that prompted #77 no longer slips ---
+
+    def test_attached_long_flag_trailer_is_caught(self):
+        """THE #77 fix: --message="...Co-Authored-By: Claude..." is now blocked (patterns_removed)."""
+        cmd = 'git commit --message="feat: thing\\n\\nCo-Authored-By: Claude <noreply@anthropic.com>"'
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed  # hook denies on this
+
+    def test_separate_long_flag_trailer_is_caught(self):
+        """--message "...🤖 Generated with..." (space-separated) is now blocked."""
+        cmd = 'git commit --message "feat: thing\\n\\n🤖 Generated with Claude Code"'
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_clean_long_flag_message_is_not_flagged(self):
+        """A clean --message commit is scannable, unmodified, and never flagged."""
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message('git commit --message="feat: clean"')
+        assert result.message_delivery == "scannable"
+        assert not result.patterns_removed
+        assert not result.was_modified
+
+    # --- reconstruct_command: the long flag must be rewritten, not left dirty ---
+
+    def test_reconstructs_separate_long_flag(self):
+        """reconstruct_command rewrites --message "dirty" with the cleaned message."""
+        out = self._filter().reconstruct_command('git commit --message "dirty message"', "cleaned")
+        assert "cleaned" in out
+
+    def test_reconstructs_attached_long_flag(self):
+        """reconstruct_command rewrites --message="dirty" with the cleaned message."""
+        out = self._filter().reconstruct_command('git commit --message="dirty message"', "cleaned")
+        assert "cleaned" in out
+
+    def test_reconstruct_long_flag_drops_original_dirty_text(self):
+        """Latent-bug guard: reconstruct used to return the ORIGINAL command verbatim when no
+        -m was present, leaking the dirty text. The removed content must NOT survive."""
+        out = self._filter().reconstruct_command('git commit --message "REMOVE_ME keep"', "keep")
+        assert "REMOVE_ME" not in out
+        assert "keep" in out
+
+    # --- regression: short -m behavior is byte-for-byte unchanged by the shared fragment ---
+
+    def test_short_flag_extraction_unchanged(self):
+        """Refactor guard: plain -m "x" still extracts exactly "x"."""
+        assert self._filter().extract_commit_message('git commit -m "x"') == "x"
+
+    def test_short_flag_equals_not_treated_as_attached_message(self):
+        """Refactor guard: -m=foo must NOT be newly captured (the shared fragment keeps -m
+        strict with \\s+, so attached-short forms behave exactly as before: not extracted)."""
+        assert self._filter().extract_commit_message("git commit -m=foo") is None
+
+    # --- regex fallback path (bashlex bypassed) ---
+    # extract_commit_message tries bashlex first and returns before the regex fallback for any
+    # well-formed command, so the new --message handling in _extract_via_regex is NOT reached by
+    # the other tests. These target the fallback directly (and via heredocs, which make bashlex
+    # raise) so a regression in the shared _MSG_FLAG fragment cannot pass CI silently.
+
+    def test_regex_fallback_extracts_quoted_long_flag(self):
+        """_extract_via_regex handles --message "msg" (Pattern 2)."""
+        assert self._filter()._extract_via_regex('git commit --message "hi there"') == "hi there"
+
+    def test_regex_fallback_extracts_attached_long_flag(self):
+        """_extract_via_regex handles --message="msg" (Pattern 2 with =)."""
+        assert self._filter()._extract_via_regex('git commit --message="hi there"') == "hi there"
+
+    def test_regex_fallback_extracts_unquoted_attached_long_flag(self):
+        """_extract_via_regex handles --message=word (Pattern 4 - the new branch, guarded ONLY
+        here since the bashlex path otherwise masks it through the public API)."""
+        assert self._filter()._extract_via_regex("git commit --message=fix") == "fix"
+
+    def test_regex_fallback_extracts_empty_long_flag(self):
+        """_extract_via_regex returns '' for --message="" (Pattern 3)."""
+        assert self._filter()._extract_via_regex('git commit --message=""') == ""
+
+    def test_heredoc_long_flag_drives_regex_fallback(self):
+        """A --message heredoc makes bashlex raise, so the public API must extract via the regex
+        fallback (Pattern 1) - the realistic load-bearing form for this path."""
+        heredoc_cmd = """git commit --message "$(cat <<'EOF'
+Multi-line
+message
+EOF
+)\""""
+        assert self._filter().extract_commit_message(heredoc_cmd) == "Multi-line\nmessage"
+
+    def test_heredoc_long_flag_trailer_is_caught(self):
+        """End-to-end through the regex fallback: a --message heredoc carrying a Claude trailer
+        is still blocked (patterns_removed). Proves #77 closes for the heredoc long-flag form."""
+        heredoc_cmd = """git commit --message "$(cat <<'EOF'
+feat: thing
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+EOF
+)\""""
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(heredoc_cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    # --- documented residual (NOT a fix; pins current behavior so a future change is deliberate) ---
+
+    def test_abbreviated_long_flag_is_known_residual_gap(self):
+        """--mess (a git-valid unambiguous prefix of --message) is intentionally NOT extracted.
+        Documented residual: out of scope for #77, not worth gold-plating a fail-open cosmetic
+        filter. If this ever changes, it should be a deliberate decision, not an accident."""
+        assert self._filter().extract_commit_message('git commit --mess "abbrev"') is None
