@@ -1210,18 +1210,26 @@ EOF
     # so a classifier/extraction regression on a compound segment cannot pass CI.
 
     def test_compound_attached_long_flag_trailer_is_caught(self):
-        """git add . && git commit --message="...trailer" is scanned and blocked."""
+        """git add . && git commit --message="...trailer" is scanned and blocked, and the
+        `git add . &&` prefix survives reconstruction (only the trailer is removed)."""
         cmd = 'git add . && git commit --message="feat: thing\\n\\nCo-Authored-By: Claude <noreply@anthropic.com>"'
         result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
         assert result.message_delivery == "scannable"
         assert result.patterns_removed
+        assert result.was_modified
+        assert "git add . &&" in result.cleaned_command  # compound prefix preserved
+        assert "Co-Authored" not in result.cleaned_command  # trailer stripped
 
     def test_compound_separate_long_flag_trailer_is_caught(self):
-        """git add . && git commit --message "...trailer" (space-separated) is scanned and blocked."""
+        """git add . && git commit --message "...trailer" (space-separated) is scanned and
+        blocked, and the `git add . &&` prefix survives reconstruction."""
         cmd = 'git add . && git commit --message "feat: thing\\n\\n🤖 Generated with Claude Code"'
         result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
         assert result.message_delivery == "scannable"
         assert result.patterns_removed
+        assert result.was_modified
+        assert "git add . &&" in result.cleaned_command  # compound prefix preserved
+        assert "Generated with" not in result.cleaned_command  # trailer stripped
 
     def test_clean_compound_long_flag_message_is_not_flagged(self):
         """A clean --message in a compound command is scannable, unmodified, not flagged."""
@@ -1248,9 +1256,9 @@ EOF
         assert "escaped" in msg
 
     def test_long_flag_attached_backslashes(self):
-        """--message="Path: C:\\\\Users\\\\test" (backslashes) extracts without crashing."""
+        """--message="Path: C:\\\\Users\\\\test" preserves backslashes exactly (not corrupted)."""
         msg = self._filter().extract_commit_message(r'git commit --message="Path: C:\\Users\\test"')
-        assert msg is not None
+        assert msg == r"Path: C:\\Users\\test"
 
     def test_multiple_long_flags_combined(self):
         """Two --message flags combine into paragraphs, like multiple -m."""
@@ -1258,11 +1266,14 @@ EOF
         assert msg == "first\n\nsecond"
 
     def test_multiple_long_flags_trailer_in_second_is_caught(self):
-        """Extraction-bypass guard: a trailer in the SECOND --message is still scanned/blocked."""
+        """Extraction-bypass guard: a trailer in the SECOND --message is scanned/blocked, and the
+        clean FIRST paragraph survives (only the trailer paragraph is removed)."""
         cmd = 'git commit --message="feat: clean" --message="Co-Authored-By: Claude <noreply@anthropic.com>"'
         result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
         assert result.message_delivery == "scannable"
         assert result.patterns_removed
+        assert result.cleaned_message == "feat: clean"  # clean paragraph preserved
+        assert "Co-Authored" not in result.cleaned_message  # trailer removed
 
     # --- documented residual (NOT a fix; pins current behavior so a future change is deliberate) ---
 
