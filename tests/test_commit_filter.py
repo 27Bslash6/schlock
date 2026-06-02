@@ -1205,6 +1205,65 @@ EOF
         assert result.message_delivery == "scannable"
         assert result.patterns_removed
 
+    # --- compound commands (git commit --message after &&/;) (CodeRabbit #81) ---
+    # The -m path has compound coverage (TestMessageExtraction); these give the long flag parity
+    # so a classifier/extraction regression on a compound segment cannot pass CI.
+
+    def test_compound_attached_long_flag_trailer_is_caught(self):
+        """git add . && git commit --message="...trailer" is scanned and blocked."""
+        cmd = 'git add . && git commit --message="feat: thing\\n\\nCo-Authored-By: Claude <noreply@anthropic.com>"'
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_compound_separate_long_flag_trailer_is_caught(self):
+        """git add . && git commit --message "...trailer" (space-separated) is scanned and blocked."""
+        cmd = 'git add . && git commit --message "feat: thing\\n\\n🤖 Generated with Claude Code"'
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_clean_compound_long_flag_message_is_not_flagged(self):
+        """A clean --message in a compound command is scannable, unmodified, not flagged."""
+        cmd = 'git add . && git commit --message="feat: clean compound"'
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert not result.patterns_removed
+        assert not result.was_modified
+
+    # --- security edge cases: escaped quotes / backslashes / multiple long flags (CodeRabbit #81) ---
+    # Parity with the -m edge cases in TestBashlexEdgeCases. Escaped-quote handling is imperfect
+    # for both flags, so (like test_nested_escaped_quotes) these assert loosely on substrings.
+
+    def test_long_flag_separate_escaped_quotes(self):
+        """--message "with \\"quotes\\"" extracts a non-None message containing the inner text."""
+        msg = self._filter().extract_commit_message(r'git commit --message "Message with \"escaped\" quotes"')
+        assert msg is not None
+        assert "escaped" in msg
+
+    def test_long_flag_attached_escaped_quotes(self):
+        """--message="with \\"quotes\\"" extracts a non-None message containing the inner text."""
+        msg = self._filter().extract_commit_message(r'git commit --message="Message with \"escaped\" quotes"')
+        assert msg is not None
+        assert "escaped" in msg
+
+    def test_long_flag_attached_backslashes(self):
+        """--message="Path: C:\\\\Users\\\\test" (backslashes) extracts without crashing."""
+        msg = self._filter().extract_commit_message(r'git commit --message="Path: C:\\Users\\test"')
+        assert msg is not None
+
+    def test_multiple_long_flags_combined(self):
+        """Two --message flags combine into paragraphs, like multiple -m."""
+        msg = self._filter().extract_commit_message('git commit --message="first" --message="second"')
+        assert msg == "first\n\nsecond"
+
+    def test_multiple_long_flags_trailer_in_second_is_caught(self):
+        """Extraction-bypass guard: a trailer in the SECOND --message is still scanned/blocked."""
+        cmd = 'git commit --message="feat: clean" --message="Co-Authored-By: Claude <noreply@anthropic.com>"'
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
     # --- documented residual (NOT a fix; pins current behavior so a future change is deliberate) ---
 
     def test_abbreviated_long_flag_is_known_residual_gap(self):
