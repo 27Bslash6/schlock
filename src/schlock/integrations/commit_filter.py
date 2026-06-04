@@ -490,28 +490,26 @@ class CommitMessageFilter:
         if heredoc_match:
             return heredoc_match.group(1)
 
-        # Pattern 2: Standard quoted message - -m "msg", --message 'msg', --message="msg"
-        # Use finditer to get ALL message flags (prevents bypass via multiple flags)
-        # Note: This pattern doesn't handle escaped quotes well - bashlex is preferred
-        matches = list(re.finditer(rf'{_MSG_FLAG}(["\'])(.+?)\1', command, re.DOTALL))
-
-        if matches:
-            # Extract all messages and combine with paragraph breaks
-            messages = [m.group(2).replace("\\n", "\n") for m in matches]
+        # Pattern 2: every message value, in ONE left-to-right pass so quoted AND unquoted
+        # attached forms AGGREGATE in argv order. A single pass (rather than separate quoted /
+        # empty / unquoted searches with early returns) is what makes mixed commands like
+        # `--message="clean" --message=adtoken` keep BOTH paragraphs (#77, CodeRabbit #81) — a
+        # quoted flag must not short-circuit and drop a later unquoted token. Two alternatives:
+        #   - quoted (any flag):      -m "x" / --message 'x' / --message="x"  (group 2 = value;
+        #     .*? also matches the empty message ""). The quoted span is consumed as a UNIT, so a
+        #     literal --message= INSIDE a value cannot be re-matched as an attached flag.
+        #   - unquoted attached long: --message=word (group 3). The first char is non-quote so it
+        #     never swallows an empty "" (left to the quoted branch), and -m stays strict (no
+        #     unquoted -m) — preserving existing -m behavior byte-for-byte.
+        # Escaped quotes inside a value remain imperfect here; bashlex is preferred and tried first.
+        combined = re.compile(rf'{_MSG_FLAG}(["\'])(.*?)\1' + r'|--message=([^\s"\']\S*)', re.DOTALL)
+        messages = []
+        for m in combined.finditer(command):
+            value = m.group(2) if m.group(2) is not None else m.group(3)
+            if value is not None:
+                messages.append(value.replace("\\n", "\n"))
+        if messages:
             return "\n\n".join(messages)
-
-        # Pattern 3: Empty message -m "" / --message=""
-        empty_match = re.search(rf'{_MSG_FLAG}(["\'])\1', command)
-        if empty_match:
-            return ""
-
-        # Pattern 4: --message=word with an UNQUOTED single-token value (#77). Quoted forms are
-        # caught above; this is the bare attached token. Collect ALL such tokens (findall, not
-        # search) for parity with Pattern 2 — otherwise a single-token ad in a later flag (e.g.
-        # `--message=ok --message=claude.com/claude-code`) would slip the regex fallback.
-        attached = re.findall(r"--message=(\S+)", command)
-        if attached:
-            return "\n\n".join(a.replace("\\n", "\n") for a in attached)
 
         # No message found
         return None

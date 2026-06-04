@@ -1184,6 +1184,15 @@ class TestLongMessageFlag:
         regex fallback (e.g. --message=ok --message=claude.com/claude-code)."""
         assert self._filter()._extract_via_regex("git commit --message=first --message=second") == "first\n\nsecond"
 
+    def test_regex_fallback_mixed_quoted_and_unquoted_long_flags(self):
+        """CodeRabbit #81 (r4): a quoted --message must NOT short-circuit the fallback and drop a
+        later UNQUOTED --message= token — both are kept, in argv order."""
+        assert self._filter()._extract_via_regex('git commit --message="clean" --message=adtoken') == "clean\n\nadtoken"
+
+    def test_regex_fallback_unquoted_then_quoted_long_flags(self):
+        """Order preserved the other way too: unquoted before quoted keeps both, in order."""
+        assert self._filter()._extract_via_regex('git commit --message=adtoken --message="clean"') == "adtoken\n\nclean"
+
     def test_regex_fallback_extracts_empty_long_flag(self):
         """_extract_via_regex returns '' for --message="" (Pattern 3)."""
         assert self._filter()._extract_via_regex('git commit --message=""') == ""
