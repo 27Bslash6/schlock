@@ -506,11 +506,12 @@ class CommitMessageFilter:
             return ""
 
         # Pattern 4: --message=word with an UNQUOTED single-token value (#77). Quoted forms are
-        # caught above; this is the bare attached token (cannot carry a multi-word trailer, but
-        # handled for completeness and parity with the bashlex path).
-        attached = re.search(r"--message=(\S+)", command)
+        # caught above; this is the bare attached token. Collect ALL such tokens (findall, not
+        # search) for parity with Pattern 2 — otherwise a single-token ad in a later flag (e.g.
+        # `--message=ok --message=claude.com/claude-code`) would slip the regex fallback.
+        attached = re.findall(r"--message=(\S+)", command)
         if attached:
-            return attached.group(1).replace("\\n", "\n")
+            return "\n\n".join(a.replace("\\n", "\n") for a in attached)
 
         # No message found
         return None
@@ -589,7 +590,14 @@ class CommitMessageFilter:
         # _MSG_FLAG with extraction so the two recognize exactly the same flag forms.
         m_pattern = re.compile(rf'{_MSG_FLAG}(["\'])(.+?)\1', re.DOTALL)
 
-        # Find all message-flag arguments
+        # KNOWN LIMITATION (CodeRabbit #81): matches are taken over the WHOLE original_command,
+        # so in a contrived compound command a `-m "..."` / `--message "..."` token OUTSIDE the
+        # git commit invocation could in principle be rewritten. This is deliberately NOT scoped
+        # to the git-commit segment because reconstruct_command's output (FilterResult.cleaned_
+        # command) is OFF the hook's block path: pre_tool_use.py denies on `patterns_removed` and
+        # never executes cleaned_command. Threading the extraction span through to here to scope
+        # the replacement would add machinery to a field nothing consumes (YAGNI). If a future
+        # caller ever EXECUTES cleaned_command, this must be scoped to the commit segment first.
         matches = list(m_pattern.finditer(original_command))
 
         if not matches:

@@ -1178,6 +1178,12 @@ class TestLongMessageFlag:
         here since the bashlex path otherwise masks it through the public API)."""
         assert self._filter()._extract_via_regex("git commit --message=fix") == "fix"
 
+    def test_regex_fallback_collects_multiple_unquoted_long_flags(self):
+        """CodeRabbit #81: Pattern 4 must collect ALL unquoted --message= tokens (parity with the
+        quoted Pattern 2), not just the first — else a single-token ad in a later flag slips the
+        regex fallback (e.g. --message=ok --message=claude.com/claude-code)."""
+        assert self._filter()._extract_via_regex("git commit --message=first --message=second") == "first\n\nsecond"
+
     def test_regex_fallback_extracts_empty_long_flag(self):
         """_extract_via_regex returns '' for --message="" (Pattern 3)."""
         assert self._filter()._extract_via_regex('git commit --message=""') == ""
