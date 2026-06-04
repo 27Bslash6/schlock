@@ -1193,6 +1193,23 @@ class TestLongMessageFlag:
         """Order preserved the other way too: unquoted before quoted keeps both, in order."""
         assert self._filter()._extract_via_regex('git commit --message=adtoken --message="clean"') == "adtoken\n\nclean"
 
+    def test_regex_fallback_mixed_preserves_ad_token_so_cleaner_catches_it(self):
+        """CodeRabbit #81 (r4) named example: `--message="ok" --message=claude.com/claude-code`.
+        The quoted flag must not short-circuit and drop the later UNQUOTED single-token ad URL —
+        the fallback keeps BOTH, so the cleaner still strips the ad (the bypass is closed end to
+        end, not merely at extraction)."""
+        rules = {
+            "advertising": {
+                "enabled": True,
+                "patterns": [{"pattern": r"claude\.com/claude-code", "description": "ad url", "replacement": ""}],
+            }
+        }
+        f = self._filter(rules=rules)
+        extracted = f._extract_via_regex('git commit --message="ok" --message=claude.com/claude-code')
+        assert extracted == "ok\n\nclaude.com/claude-code"  # both tokens preserved through the fallback
+        _, removed, _ = f.clean_message(extracted)
+        assert removed  # the preserved ad token is detected by the cleaner
+
     def test_regex_fallback_extracts_empty_long_flag(self):
         """_extract_via_regex returns '' for --message="" (Pattern 3)."""
         assert self._filter()._extract_via_regex('git commit --message=""') == ""
