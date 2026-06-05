@@ -5,6 +5,14 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.0...schlock-v0.7.1) (2026-06-05)
+
+
+### Bug Fixes
+
+* **commit-filter:** extract git commit --message / --message= long flag ([#77](https://github.com/27Bslash6/schlock/issues/77)) ([#81](https://github.com/27Bslash6/schlock/issues/81)) ([249dace](https://github.com/27Bslash6/schlock/commit/249dacef50e128f70ddb683af41bbe2b1e4b1c46))
+* **commit-filter:** recognize git global options before the commit subcommand ([#82](https://github.com/27Bslash6/schlock/issues/82)) ([#83](https://github.com/27Bslash6/schlock/issues/83)) ([91a967a](https://github.com/27Bslash6/schlock/commit/91a967a7b19f5d7ee8dc71159549d35510f3b552))
+
 ## [0.7.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.6.0...schlock-v0.7.0) (2026-06-01)
 
 
