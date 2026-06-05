@@ -42,6 +42,15 @@ logger = logging.getLogger(__name__)
 # Size limit to prevent DoS via huge commands (64KB is generous for commit messages)
 MAX_COMMAND_SIZE = 64 * 1024
 
+# git GLOBAL options that consume the FOLLOWING word as a value, in separate-word form (issue
+# #82). When one precedes the subcommand (e.g. `git -C <path> commit`), the next token is its
+# value, NOT the subcommand — so _commit_subcommand_index skips both. Everything else dashed is
+# treated as a value-less global flag (`-p`, `--no-pager`, `--bare`, …) or an attached-value
+# form (`--git-dir=…`), which consume only their own token.
+_GIT_GLOBAL_VALUE_OPTS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"}
+)
+
 # Long form of the -m commit-message flag (issue #77). The blockable content sits in argv for
 # --message "msg" / --message=msg just as it does for -m, but the extractor used to key on -m
 # only, so these slipped (fail-open). git ALSO accepts unambiguous prefixes (--mess, --messa);
@@ -183,24 +192,61 @@ class CommitMessageFilter:
                 logger.warning(f"Invalid custom pattern: {e}. Skipping.")
                 continue
 
-    def is_git_commit_command(self, command: str) -> bool:
-        """Check if command contains a git commit.
+    @staticmethod
+    def _commit_subcommand_index(words: list[str]) -> int:
+        """Index of the ``commit`` subcommand within a git argv word list, tolerating leading git
+        GLOBAL options (issue #82): ``git -C <path> commit``, ``git -c k=v commit``,
+        ``git --git-dir=… commit``, ``git --work-tree … commit``, ``git --no-pager commit``.
 
-        Handles compound commands like:
+        Returns -1 if ``words`` is not a ``git … commit`` invocation. Fail-open bias: value-taking
+        globals (``-C`` etc., see _GIT_GLOBAL_VALUE_OPTS) consume their following word so a path is
+        never mistaken for the subcommand; any other dashed token is treated as a value-less flag.
+        """
+        if len(words) < 2 or words[0] != "git":
+            return -1
+        i = 1
+        while i < len(words):
+            word = words[i]
+            if word == "commit":
+                return i
+            if not word.startswith("-"):
+                return -1  # first non-option token is some other subcommand (status, log, push…)
+            if "=" in word or word not in _GIT_GLOBAL_VALUE_OPTS:
+                i += 1  # attached-value (--git-dir=…) or value-less flag — consume just this token
+            else:
+                i += 2  # separate-word value (e.g. -C <path>) — consume the option AND its value
+        return -1
+
+    def is_git_commit_command(self, command: str) -> bool:
+        """Check if the command contains a git commit invocation.
+
+        Handles compound commands AND git GLOBAL options before the subcommand (issue #82):
         - git commit -m "msg"
         - git add . && git commit -m "msg"
         - cd project && git add -A && git commit -m "msg"
-        - git add .; git commit -m "msg"
+        - git -C /path commit -m "msg"      (global option between `git` and `commit`)
+        - git -c key=val commit -m "msg"
 
         Args:
             command: Bash command string
 
         Returns:
-            True if command contains 'git commit'
+            True if any segment is a ``git [global-opts] commit`` invocation.
         """
-        # Check for 'git commit' anywhere in the command
-        # Use word boundary to avoid matching 'git-commit' or 'git_commit'
-        return bool(re.search(r"\bgit\s+commit\b", command))
+        # Fast reject: a git commit needs both "git" and a standalone "commit" token. Skips
+        # parsing the overwhelming majority of commands (which contain neither).
+        if "git" not in command or not re.search(r"\bcommit\b", command):
+            return False
+        # Oversized: skip bashlex (DoS guard) and use a tolerant regex.
+        if len(command) > MAX_COMMAND_SIZE:
+            return bool(re.search(r"\bgit\b.*?\bcommit\b", command, re.DOTALL))
+        # Precise: bashlex AST, tolerant of global options. AST detection also avoids the old
+        # `\bgit\s+commit\b` false positive on strings like `echo "git commit"`. A parse failure
+        # must not silently disable detection, so fall back to a tolerant regex (over-detect-safe).
+        try:
+            return bool(self._commit_arg_word_lists(command))
+        except Exception:  # noqa: BLE001 - bashlex raises various types; fail-open to regex
+            return bool(re.search(r"\bgit\b.*?\bcommit\b", command, re.DOTALL))
 
     def extract_commit_message(self, command: str) -> Optional[str]:
         """Extract commit message from git command using dual-mode parsing.
@@ -312,8 +358,8 @@ class CommitMessageFilter:
 
     def _command_has_file_content_flag(self, command: str) -> bool:
         """True if any git commit segment delivers its message from a file or stdin (-F/--file)."""
-        for words in self._git_commit_word_lists(command):
-            for word in words[2:]:  # skip "git commit"; flags follow the subcommand
+        for args in self._git_commit_arg_lists(command):  # args already start AFTER `commit`
+            for word in args:
                 if word == "--":
                     break  # everything after the option terminator is a pathspec, not a flag
                 if word == "--file" or word.startswith("--file="):
@@ -346,28 +392,22 @@ class CommitMessageFilter:
         "scanning, or remove any unwanted trailer manually."
     )
 
-    def _git_commit_word_lists(self, command: str) -> list[list[str]]:
-        """Return the argv word lists of every ``git commit`` invocation in the command.
+    def _commit_arg_word_lists(self, command: str) -> list[list[str]]:
+        """For each ``git … commit`` invocation, the argument words FOLLOWING ``commit`` (the
+        global options and the subcommand itself stripped). Tolerates global options between
+        ``git`` and ``commit`` via _commit_subcommand_index (issue #82).
 
-        Uses bashlex to isolate the git commit segment(s) of a compound command. On parse
-        failure (or an oversized command) falls back to splitting the whole command -
-        over-detecting a file flag and warning is safer than silently missing it for this
-        fail-open filter, and never parsing an oversized string avoids a DoS on the hook.
+        RAISES if bashlex cannot parse — callers decide the fallback. Callers must size-guard
+        before calling (no DoS check here).
         """
-        if len(command) > MAX_COMMAND_SIZE:  # DoS guard: never run bashlex on an oversized command
-            return [command.split()]
-        try:
-            parts = bashlex.parse(command)
-        except Exception:  # noqa: BLE001 - bashlex raises various types; fail-open to split
-            return [command.split()]
-
         results: list[list[str]] = []
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
                 words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
-                if len(words) >= 2 and words[0] == "git" and words[1] == "commit":
-                    results.append(words)
+                idx = self._commit_subcommand_index(words)
+                if idx != -1:
+                    results.append(words[idx + 1 :])
             for attr in ("parts", "list", "command"):
                 child = getattr(node, attr, None)
                 if child is None:
@@ -375,9 +415,21 @@ class CommitMessageFilter:
                 for item in child if isinstance(child, list) else [child]:
                     visit(item)
 
-        for part in parts:
+        for part in bashlex.parse(command):
             visit(part)
+        return results
 
+    def _git_commit_arg_lists(self, command: str) -> list[list[str]]:
+        """_commit_arg_word_lists with fail-open fallbacks for the file-flag scan: on oversized
+        input, parse failure, or no match, return a single naive split of the whole command so a
+        file flag (-F/--file) is over-detected rather than silently missed.
+        """
+        if len(command) > MAX_COMMAND_SIZE:  # DoS guard: never run bashlex on an oversized command
+            return [command.split()]
+        try:
+            results = self._commit_arg_word_lists(command)
+        except Exception:  # noqa: BLE001 - bashlex raises various types; fail-open to split
+            return [command.split()]
         return results if results else [command.split()]
 
     def _extract_via_bashlex(self, command: str) -> Optional[str]:
@@ -440,9 +492,10 @@ class CommitMessageFilter:
             if hasattr(node, "kind") and node.kind == "command":
                 words = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
 
-                # Check if this is 'git commit'
-                if len(words) >= 2 and words[0].word == "git" and words[1].word == "commit":
-                    i = 0
+                # Check if this is 'git [global-opts] commit' (issue #82: tolerate -C/-c/etc.)
+                idx = self._commit_subcommand_index([w.word for w in words])
+                if idx != -1:
+                    i = idx + 1  # scan the commit's own args, starting AFTER the `commit` token
                     while i < len(words):
                         word = words[i].word
                         if word in ("-m", _LONG_MESSAGE_FLAG) and i + 1 < len(words):
