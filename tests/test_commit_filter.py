@@ -995,3 +995,108 @@ class TestUnscannableMessageAction:
         assert result.message_delivery == "scannable"
         assert result.patterns_removed  # the literal trailer IS caught despite the $(date)
         assert result.unscannable_decision is None
+
+
+class TestGitGlobalOptions:
+    """Issue #82: git accepts GLOBAL options between `git` and the `commit` subcommand
+    (`git -C <path> commit`, `git -c k=v commit`, `git --git-dir=… commit`, `git --work-tree …
+    commit`). The filter assumed adjacency (`git commit`), so these forms bypassed detection,
+    extraction, file-flag classification, and ultimately the advertising blocker entirely.
+    """
+
+    CLAUDE_TRAILER_RULES = {
+        "advertising": {
+            "enabled": True,
+            "patterns": [
+                {
+                    "pattern": "\\n*Co-Authored-By:.*(?:Claude|@anthropic\\.com).*\\n*",
+                    "description": "Claude co-author trailer",
+                    "replacement": "\n",
+                }
+            ],
+        }
+    }
+
+    @staticmethod
+    def _filter(rules=None):
+        return CommitMessageFilter({"enabled": True, "rules": rules or {}})
+
+    # --- detection: is_git_commit_command tolerates global options ---
+
+    def test_detects_chdir_option(self):
+        """git -C <path> commit is a git commit."""
+        assert self._filter().is_git_commit_command('git -C /tmp/r commit -m "x"')
+
+    def test_detects_dash_c_config(self):
+        """git -c key=val commit is a git commit (the value is not mistaken for the subcommand)."""
+        assert self._filter().is_git_commit_command('git -c user.name=Ada commit -m "x"')
+
+    def test_detects_git_dir_attached(self):
+        """git --git-dir=<dir> commit is a git commit."""
+        assert self._filter().is_git_commit_command('git --git-dir=/tmp/r/.g commit -m "x"')
+
+    def test_detects_work_tree_separate(self):
+        """git --work-tree <dir> commit (separate-word value) is a git commit."""
+        assert self._filter().is_git_commit_command('git --work-tree /tmp/r commit -m "x"')
+
+    def test_detects_valueless_global_flag(self):
+        """git --no-pager commit (value-less global flag) is a git commit."""
+        assert self._filter().is_git_commit_command('git --no-pager commit -m "x"')
+
+    def test_detects_global_options_in_compound(self):
+        """Compound command with a global-option git commit is detected."""
+        assert self._filter().is_git_commit_command('cd proj && git -C /tmp/r commit -m "x"')
+
+    # --- detection regressions: must NOT over-match ---
+
+    def test_chdir_option_with_non_commit_subcommand_is_not_a_commit(self):
+        """git -C <path> status is NOT a commit (the subcommand is status, not commit)."""
+        assert not self._filter().is_git_commit_command("git -C /tmp/r status")
+
+    def test_plain_forms_unchanged(self):
+        """Plain detection is unchanged by the global-option support."""
+        f = self._filter()
+        assert f.is_git_commit_command('git commit -m "x"')
+        assert not f.is_git_commit_command("git status")
+        assert not f.is_git_commit_command("git push")
+        assert not f.is_git_commit_command("ls -la")
+
+    # --- extraction through a global-option invocation ---
+
+    def test_extracts_message_with_chdir_option(self):
+        """The -m message is extracted from a git -C … commit invocation."""
+        assert self._filter().extract_commit_message('git -C /tmp/r commit -m "hello"') == "hello"
+
+    def test_extracts_multiple_m_with_global_config(self):
+        """Multiple -m flags still combine when global options precede commit."""
+        msg = self._filter().extract_commit_message('git -c core.editor=true commit -m "a" -m "b"')
+        assert msg == "a\n\nb"
+
+    # --- delivery classification ---
+
+    def test_global_option_inline_is_scannable(self):
+        assert self._filter().classify_message_delivery('git -C /tmp/r commit -m "x"') == "scannable"
+
+    def test_global_option_file_is_unscannable(self):
+        """git -C … commit -F file delivers from a file -> unscannable (was missed -> 'none')."""
+        assert self._filter().classify_message_delivery("git -C /tmp/r commit -F msg.txt") == "unscannable"
+
+    # --- end-to-end: the bypass is closed ---
+
+    def test_global_option_trailer_is_caught(self):
+        """THE #82 fix: git -C … commit -m "…trailer" is now scanned and blocked."""
+        cmd = 'git -C /tmp/r commit -m "feat: x\\n\\nCo-Authored-By: Claude <noreply@anthropic.com>"'
+        result = self._filter(rules=self.CLAUDE_TRAILER_RULES).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_global_option_file_warns(self):
+        """git -C … commit -F file triggers the #76 unscannable decision (default warn)."""
+        result = self._filter().filter_commit_message("git -C /tmp/r commit -F msg.txt")
+        assert result.message_delivery == "unscannable"
+        assert result.unscannable_decision == "warn"
+
+    # --- file-flag regression: plain form still detected ---
+
+    def test_plain_file_flag_still_unscannable(self):
+        assert self._filter().classify_message_delivery("git commit -F msg.txt") == "unscannable"
