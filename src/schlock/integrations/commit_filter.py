@@ -303,7 +303,18 @@ class CommitMessageFilter:
         except Exception as e:
             logger.warning(f"Regex extraction failed: {e}")
 
-        # Both methods failed → fail-open (return None)
+        # Fallback: stdin heredoc feeding `git commit -F-` (issue #87). The bashlex/-m and regex
+        # attempts above don't see it (the body is a redirect, not a -m value), but the bytes are
+        # in the command string, so it is scannable.
+        try:
+            message = self._extract_heredoc_stdin_message(command)
+            if message is not None:
+                logger.debug("Extracted message via stdin-heredoc fallback")
+                return message
+        except Exception as e:  # noqa: BLE001 - fail-open cosmetic filter
+            logger.warning(f"Heredoc stdin extraction failed: {e}")
+
+        # All methods failed → fail-open (return None)
         return None
 
     def classify_message_delivery(self, command: str) -> str:
@@ -351,6 +362,11 @@ class CommitMessageFilter:
         anything else is reuse/editor deferral -> ``none``.
         """
         if self._command_has_file_content_flag(command):
+            # Issue #87: a `-F-`/`--file -` fed by an in-command heredoc has its bytes in argv,
+            # so it is scannable, NOT unscannable. A real file (-F path), piped stdin, or no
+            # heredoc returns None here and stays unscannable.
+            if extracted is not None and self._extract_heredoc_stdin_message(command) is not None:
+                return "scannable"
             return "unscannable"
         if extracted is not None:
             return "scannable"
@@ -383,6 +399,74 @@ class CommitMessageFilter:
             if ch in "mCc":  # argument-taking flag; the rest of the token is its value, not flags
                 return False
         return False
+
+    @staticmethod
+    def _arg_targets_stdin(args: list[str]) -> bool:
+        """True if a -F/--file flag in these post-``commit`` args reads the message from STDIN
+        (target ``-`` or ``/dev/stdin``) rather than a real file — i.e. a heredoc-feedable
+        delivery. Walks short-flag clusters like _short_cluster_has_file_flag: an argument-taking
+        flag (m/C/c) reached before F means the remainder is that flag's value, not a file flag.
+        """
+        stdin_targets = ("-", "/dev/stdin")
+        i = 0
+        while i < len(args):
+            word = args[i]
+            if word == "--":
+                break  # pathspec terminator
+            if word == "--file":
+                return i + 1 < len(args) and args[i + 1] in stdin_targets
+            if word.startswith("--file="):
+                return word[len("--file=") :] in stdin_targets
+            if word.startswith("-") and not word.startswith("--"):
+                rest = word[1:]
+                for j, ch in enumerate(rest):
+                    if ch in "mCc":
+                        break  # argument-taking flag swallows the remainder as its value
+                    if ch == "F":
+                        attached = rest[j + 1 :]
+                        if attached:
+                            return attached in stdin_targets  # -F-, -F/dev/stdin, -aF-
+                        return i + 1 < len(args) and args[i + 1] in stdin_targets  # -F -
+            i += 1
+        return False
+
+    # Cheap, LINEAR (non-backtracking) heredoc-opener counter. Used to bail out of the more
+    # expensive O(n^2)-prone body regex unless there is EXACTLY one heredoc — see
+    # _extract_heredoc_stdin_message. Matches <<EOF / <<'EOF' / <<"EOF" / <<-EOF / << EOF.
+    _HEREDOC_OPENER_RE = re.compile(r"<<-?[ \t]*['\"]?\w+")
+
+    # Heredoc body feeding `git commit -F-` / `--file -`. Matches <<EOF, <<'EOF', <<"EOF",
+    # <<-EOF, << EOF and arbitrary \w+ delimiter names; captures the body up to a line that is
+    # the (optionally tab-indented) delimiter alone. DOTALL so the body spans lines.
+    _HEREDOC_BODY_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n[ \t]*\2(?:\n|$)", re.DOTALL)
+
+    def _extract_heredoc_stdin_message(self, command: str) -> Optional[str]:
+        """Commit message of a ``git commit -F-`` / ``--file -`` fed by an in-command heredoc.
+
+        Returns the heredoc body when (a) some ``git … commit`` segment reads its message from
+        stdin (``-F -`` / ``--file -`` / ``/dev/stdin``) AND (b) a heredoc body is present in the
+        command string; otherwise ``None``. This reclassifies the stdin-heredoc form from
+        ``unscannable`` to ``scannable`` (issue #87) — its bytes ARE in argv, unlike ``-F file``
+        (on disk) or ``cat f | git commit -F-`` (in a prior pipe segment), both of which return
+        ``None`` here and stay unscannable. Fail-open: any uncertainty → ``None``.
+
+        bashlex raises on quoted-delimiter heredocs (``<<'EOF'``), so the STDIN gate reuses the
+        tolerant ``_git_commit_arg_lists`` infra while the BODY is taken by regex (uniform across
+        quoted and unquoted forms).
+        """
+        if len(command) > MAX_COMMAND_SIZE:
+            return None  # DoS guard: never run the DOTALL body regex on an oversized command
+        if not any(self._arg_targets_stdin(args) for args in self._git_commit_arg_lists(command)):
+            return None
+        # Only the UNAMBIGUOUS single-heredoc case can be bound to the stdin-fed commit segment.
+        # With 0 or 2+ heredocs, binding by position would guess wrong — leaking an ad behind a
+        # clean leading heredoc, or false-blocking a clean commit whose sibling heredoc contains
+        # the token — so fail open to unscannable instead. The linear opener count also starves
+        # the O(n^2) DOTALL body search of any multi-`<<` adversarial input within MAX_COMMAND_SIZE.
+        if len(self._HEREDOC_OPENER_RE.findall(command)) != 1:
+            return None
+        match = self._HEREDOC_BODY_RE.search(command)
+        return match.group(3) if match else None
 
     # Explanation surfaced when an unscannable commit is warned/blocked. Unscannable always
     # means file/stdin delivery (-F/--file), so a single static message suffices.

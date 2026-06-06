@@ -1437,6 +1437,115 @@ EOF
         assert self._filter().extract_commit_message('git commit --mess "abbrev"') is None
 
 
+class TestHeredocStdinExtraction:
+    """Issue #87: a commit message delivered via a stdin heredoc (git commit -F- <<EOF) has its
+    bytes in the command string, so it is SCANNABLE — not unscannable. A real file (-F path), a
+    pipe (cat f | git commit -F-), or interactive stdin (no heredoc) stays unscannable."""
+
+    @staticmethod
+    def _filter(rules=None):
+        return CommitMessageFilter({"enabled": True, "rules": rules or {}})
+
+    @staticmethod
+    def _ad_rules():
+        return {
+            "advertising": {
+                "enabled": True,
+                "patterns": [{"pattern": "Generated with Claude Code", "description": "ad", "replacement": ""}],
+            }
+        }
+
+    def test_unquoted_heredoc_is_scannable(self):
+        cmd = "git commit -F- <<EOF\nfeat: x\nEOF"
+        assert self._filter().classify_message_delivery(cmd) == "scannable"
+
+    def test_quoted_heredoc_is_scannable(self):
+        # bashlex cannot parse <<'EOF'; the regex body-extractor must.
+        cmd = "git commit -F- <<'EOF'\nfeat: x\nEOF"
+        assert self._filter().classify_message_delivery(cmd) == "scannable"
+
+    def test_unquoted_heredoc_advertising_blocked(self):
+        cmd = "git commit -F- <<EOF\nfeat: x\n\nGenerated with Claude Code\nEOF"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_quoted_heredoc_advertising_blocked(self):
+        cmd = "git commit -F- <<'EOF'\nfeat: x\n\nGenerated with Claude Code\nEOF"
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
+
+    def test_clean_heredoc_not_flagged(self):
+        cmd = "git commit -F- <<'EOF'\nfeat: totally clean\nEOF"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert not result.patterns_removed
+        assert result.unscannable_decision is None
+
+    def test_dash_strip_and_custom_delimiter(self):
+        cmd = "git commit -F- <<-MSG\n\tfeat: x\n\tGenerated with Claude Code\n\tMSG"
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
+
+    def test_separate_dash_form(self):
+        cmd = "git commit -F - <<EOF\nfeat: x\n\nGenerated with Claude Code\nEOF"
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
+
+    def test_compound_with_heredoc(self):
+        cmd = "git add -A && git commit -F- <<EOF\nfeat: x\n\nGenerated with Claude Code\nEOF"
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
+
+    def test_real_file_stays_unscannable(self):
+        assert self._filter().classify_message_delivery("git commit -F /tmp/msg.txt") == "unscannable"
+
+    def test_piped_stdin_stays_unscannable(self):
+        # bytes live in a prior pipe segment, not a heredoc in the command
+        assert self._filter().classify_message_delivery("cat /tmp/ad.txt | git commit -F-") == "unscannable"
+
+    def test_bare_stdin_no_heredoc_unscannable(self):
+        assert self._filter().classify_message_delivery("git commit -F -") == "unscannable"
+
+    def test_inline_m_unaffected(self):
+        assert self._filter().classify_message_delivery('git commit -m "feat: clean"') == "scannable"
+
+    def test_double_quoted_delimiter(self):
+        cmd = 'git commit -F- <<"EOF"\nfeat: x\n\nGenerated with Claude Code\nEOF'
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
+
+    def test_space_before_delimiter(self):
+        cmd = "git commit -F- << EOF\nfeat: x\n\nGenerated with Claude Code\nEOF"
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
+
+    def test_dev_stdin_target_scannable(self):
+        cmd = "git commit -F /dev/stdin <<EOF\nfeat: x\n\nGenerated with Claude Code\nEOF"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_preceding_clean_heredoc_does_not_mask_commit_ad(self):
+        # Two heredocs: clean leading one + the real commit carrying an ad. Must NOT be scanned
+        # as clean-scannable (that would let the ad through) — fall back to unscannable.
+        cmd = "cat <<DATA\nsome clean data\nDATA\ngit commit -F- <<EOF\nfeat: x\n\nGenerated with Claude Code\nEOF"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "unscannable"
+        assert not result.patterns_removed
+
+    def test_preceding_dirty_heredoc_does_not_block_clean_commit(self):
+        # Two heredocs: a leading file heredoc that contains the token + a CLEAN commit.
+        # Must NOT be blocked — fall back to unscannable.
+        cmd = (
+            "tee notes.txt <<NOTES\nGenerated with Claude Code\nNOTES\n"
+            "git add notes.txt && git commit -F- <<MSG\ndocs: add notes\nMSG"
+        )
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert not result.patterns_removed
+        assert result.message_delivery == "unscannable"
+
+    def test_multiple_heredocs_stay_unscannable(self):
+        # >1 heredoc: binding is ambiguous, so refuse to guess and stay unscannable (also covers
+        # the O(n^2) body-regex ReDoS input shape, which is exactly many `<<` openers).
+        cmd = "git commit -F- <<A\na\nA\ncat <<B\nb\nB"
+        assert self._filter().classify_message_delivery(cmd) == "unscannable"
+
+
 class TestPatternCaseWhitespace:
     """Issue #85: shipped advertising patterns must match case-insensitively and tolerate
     variable inter-word whitespace, while user custom_patterns keep case-sensitive semantics.
