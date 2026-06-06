@@ -180,7 +180,7 @@ The `self_protection` category contains BLOCKED rules that prevent LLM agents fr
 
 1. **YAML rules** (BLOCKED) — standard rule matching, cannot be overridden
 2. **Hardcoded allowlist check** — when a config path is detected in a command, only known read-only commands (cat, grep, ls, head, tail, stat, diff, jq, etc.) are permitted; all other commands are blocked
-3. **Hook file_path check** — blocks Write/Edit tool calls targeting config files
+3. **Dedicated PreToolUse hook** (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting config files
 
 The allowlist approach (layer 2) is secure by default: new or unknown commands are blocked without needing to enumerate every possible write tool. This prevents bypass via obscure commands like `ln`, `dd`, `rsync`, or scripting languages.
 

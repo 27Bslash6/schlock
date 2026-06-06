@@ -80,7 +80,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 **Self-Protection**: Three-layer defense prevents LLM agents from modifying schlock config:
 1. YAML rules (`14_self_protection.yaml`, BLOCKED) — can't be overridden
 2. Hardcoded validator check (`_check_self_protection`) — independent of YAML rules
-3. Hook file_path check — blocks Write/Edit tool calls targeting config files
+3. Dedicated PreToolUse hook (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting config files
 
 ## Installation
 
