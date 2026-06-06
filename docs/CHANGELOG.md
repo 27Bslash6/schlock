@@ -5,6 +5,14 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.1...schlock-v0.7.2) (2026-06-06)
+
+
+### Bug Fixes
+
+* **commit-filter:** case-insensitive, whitespace-tolerant advertising patterns ([#85](https://github.com/27Bslash6/schlock/issues/85)) ([#88](https://github.com/27Bslash6/schlock/issues/88)) ([d35abe9](https://github.com/27Bslash6/schlock/commit/d35abe9398fcc687219dc565a4fcdd71bc01aa16))
+* **commit-filter:** scan stdin-heredoc commit messages ([#87](https://github.com/27Bslash6/schlock/issues/87)) ([#89](https://github.com/27Bslash6/schlock/issues/89)) ([c989921](https://github.com/27Bslash6/schlock/commit/c9899218f74df65ddbafb0fb90cd69b156c78c5c))
+
 ## [0.7.1](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.0...schlock-v0.7.1) (2026-06-05)
 
 
