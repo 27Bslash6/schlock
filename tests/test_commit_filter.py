@@ -1673,3 +1673,23 @@ class TestParseMemoization:
         # Fail-open: the regex fallback handles extraction; the command is not broken.
         assert result.error is None
         assert result.cleaned_command  # non-empty, command preserved/handled
+
+    def test_repeated_identical_command_cached_across_calls(self):
+        """The per-instance memo persists across calls: a repeated identical command re-parses 0 times."""
+        import bashlex  # noqa: PLC0415
+
+        cmd = "git commit " + " ".join(["-a"] * 10)
+        filt = self._filter()
+        filt.filter_commit_message(cmd)  # warm the cache (parses once)
+        with patch("schlock.integrations.commit_filter.bashlex.parse", wraps=bashlex.parse) as spy:
+            filt.filter_commit_message(cmd)  # second identical call: fully served from cache
+        assert spy.call_count == 0, f"expected 0 parses on repeat, got {spy.call_count}"
+
+    def test_parse_cache_is_bounded_by_max(self):
+        """The parse cache never exceeds _PARSE_CACHE_MAX entries (bounded memory / LRU eviction)."""
+        from schlock.integrations.commit_filter import _PARSE_CACHE_MAX  # noqa: PLC0415
+
+        filt = self._filter()
+        for i in range(_PARSE_CACHE_MAX + 50):
+            filt._parse(f"git commit -m msg{i}")  # each distinct command is a distinct cache entry
+        assert len(filt._parse_cache) == _PARSE_CACHE_MAX
