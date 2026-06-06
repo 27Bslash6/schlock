@@ -30,6 +30,8 @@ DO NOT merge these parsers. Different failure semantics require separate code pa
 
 import logging
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -64,6 +66,12 @@ _ATTACHED_LONG_PREFIX = _LONG_MESSAGE_FLAG + "="  # "--message="
 #   -m<ws>           kept strict with \s+ so existing -m behavior is byte-for-byte unchanged
 #   --message<ws>    or   --message=
 _MSG_FLAG = r"(?:-m\s+|--message(?:\s+|=))"
+
+# Upper bound on memoized bashlex parses per CommitMessageFilter instance (issue #91). The filter
+# is a process-level singleton in the hook; this caps memory while still deduping the repeated
+# parses within a single filter_commit_message call (the actual win). Small: a process rarely sees
+# this many distinct git-commit commands.
+_PARSE_CACHE_MAX = 64
 
 
 @dataclass(frozen=True)
@@ -139,6 +147,11 @@ class CommitMessageFilter:
         """
         self.config = config
         self.enabled = config.get("enabled", True)  # Default: enabled
+
+        # Per-instance memo for bashlex.parse (issue #91). Maps command string -> (ok, value):
+        # (True, parsed_node_list) on success, (False, exception) on parse failure. Bounded LRU.
+        self._parse_cache: OrderedDict[str, tuple[bool, Any]] = OrderedDict()
+        self._parse_lock = threading.Lock()
 
         # Policy for commit messages whose content is NOT in argv (issue #76): file/stdin
         # delivery or unevaluated substitution. "warn" is the safe default — non-destructive
@@ -476,6 +489,51 @@ class CommitMessageFilter:
         "scanning, or remove any unwanted trailer manually."
     )
 
+    def _parse(self, command: str) -> list[Any]:
+        """Memoized ``bashlex.parse`` chokepoint (issue #91).
+
+        Returns a materialized (re-iterable) list of AST nodes. Both call sites
+        (_commit_arg_word_lists, _extract_via_bashlex) route through here so a command is
+        parsed once per filter call. Caches BOTH outcomes keyed by exact command string:
+        success -> (True, nodes), failure -> (False, exc). On a failure hit the original
+        exception is re-raised, so callers' fail-open handling is byte-for-byte unchanged.
+
+        Callers MUST size-guard (MAX_COMMAND_SIZE) before calling, exactly as before — this
+        method intentionally has no DoS guard so the oversized short-circuit never reaches it.
+        """
+        with self._parse_lock:
+            hit = self._parse_cache.get(command)
+            if hit is not None:
+                self._parse_cache.move_to_end(command)
+                ok, val = hit
+                if ok:
+                    return val
+                # Reset the traceback before each re-raise: re-raising one stored instance would
+                # otherwise accumulate frames on every cache hit (the cache outlives a single call).
+                # Type/message/args are preserved, so callers' typed except handling is unchanged.
+                raise val.with_traceback(None)
+        # Parse OUTSIDE the lock: never hold the lock across a ~300ms parse. A concurrent
+        # double-miss on the same command just parses twice harmlessly (idempotent, last write wins).
+        try:
+            parsed = list(bashlex.parse(command))
+        except Exception as exc:  # noqa: BLE001 - memoize the failure, then re-raise verbatim
+            with self._parse_lock:
+                self._store(command, (False, exc))
+            raise
+        with self._parse_lock:
+            self._store(command, (True, parsed))
+        return parsed
+
+    def _store(self, command: str, value: tuple[bool, Any]) -> None:
+        """Insert into the parse cache with LRU eviction. Caller holds self._parse_lock."""
+        if command in self._parse_cache:
+            self._parse_cache.move_to_end(command)
+            self._parse_cache[command] = value
+            return
+        if len(self._parse_cache) >= _PARSE_CACHE_MAX:
+            self._parse_cache.popitem(last=False)
+        self._parse_cache[command] = value
+
     def _commit_arg_word_lists(self, command: str) -> list[list[str]]:
         """For each ``git … commit`` invocation, the argument words FOLLOWING ``commit`` (the
         global options and the subcommand itself stripped). Tolerates global options between
@@ -499,7 +557,7 @@ class CommitMessageFilter:
                 for item in child if isinstance(child, list) else [child]:
                     visit(item)
 
-        for part in bashlex.parse(command):
+        for part in self._parse(command):
             visit(part)
         return results
 
@@ -537,7 +595,7 @@ class CommitMessageFilter:
             We use position info to extract the RAW message from the original
             command, then handle `\\n` → newline conversion ourselves.
         """
-        parts = bashlex.parse(command)
+        parts = self._parse(command)
         messages: list[str] = []
 
         def extract_msg_from_node(msg_node: Any) -> str:
