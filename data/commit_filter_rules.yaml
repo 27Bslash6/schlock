@@ -26,36 +26,36 @@ rules:
     enabled: true  # Default: enabled (most users want clean commits)
     patterns:
       # Broad line-level patterns FIRST (prevent partial matches from mangling lines)
-      - pattern: "\\n*🤖.*Generated with.*\\n*"
+      - pattern: "(?i)\\n*🤖.*Generated\\s+with.*\\n*"
         description: "Any line with robot emoji and 'Generated with'"
         replacement: "\n"
 
-      - pattern: "\\n*Co-Authored-By:.*(?:Claude|@anthropic\\.com).*\\n*"
+      - pattern: "(?i)\\n*Co-Authored-By:.*(?:Claude|@anthropic\\.com).*\\n*"
         description: "Any Co-Authored-By line mentioning Claude or Anthropic"
         replacement: "\n"
 
       # Specific patterns (catch remnants the broad patterns might miss)
-      - pattern: "🤖\\s*Generated with \\[Claude Code\\]\\(https://claude\\.com/claude-code\\)"
+      - pattern: "(?i)🤖\\s*Generated\\s+with\\s+\\[Claude\\s+Code\\]\\(https://claude\\.com/claude-code\\)"
         description: "Claude Code promotional link with emoji"
         replacement: ""
 
-      - pattern: "Co-Authored-By:\\s*Claude\\s*<noreply@anthropic\\.com>"
+      - pattern: "(?i)Co-Authored-By:\\s*Claude\\s*<noreply@anthropic\\.com>"
         description: "Claude Code co-author attribution line"
         replacement: ""
 
-      - pattern: "Generated with Claude Code"
+      - pattern: "(?i)Generated\\s+with\\s+Claude\\s+Code"
         description: "Claude Code generation notice (text-only)"
         replacement: ""
 
-      - pattern: "claude\\.com/claude-code"
+      - pattern: "(?i)claude\\.com/claude-code"
         description: "Claude Code website link"
         replacement: ""
 
-      - pattern: "noreply@anthropic\\.com"
+      - pattern: "(?i)noreply@anthropic\\.com"
         description: "Anthropic noreply email address"
         replacement: ""
 
-      - pattern: "Co-Authored-By:\\s*Claude(?![\\w])"
+      - pattern: "(?i)Co-Authored-By:\\s*Claude(?![\\w])"
         description: "Claude co-author attribution (generic)"
         replacement: ""
 
