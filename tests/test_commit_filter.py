@@ -1435,3 +1435,56 @@ EOF
         Documented residual: out of scope for #77, not worth gold-plating a fail-open cosmetic
         filter. If this ever changes, it should be a deliberate decision, not an accident."""
         assert self._filter().extract_commit_message('git commit --mess "abbrev"') is None
+
+
+class TestPatternCaseWhitespace:
+    """Issue #85: shipped advertising patterns must match case-insensitively and tolerate
+    variable inter-word whitespace, while user custom_patterns keep case-sensitive semantics.
+    Tests run against the REAL bundled rules (load_filter_config())."""
+
+    @staticmethod
+    def _filter():
+        return CommitMessageFilter(load_filter_config())
+
+    def _blocks(self, body):
+        cmd = f'git commit -m "feat: x\\n\\n{body}"'
+        return bool(self._filter().filter_commit_message(cmd).patterns_removed)
+
+    def test_lowercase_blocked(self):
+        assert self._blocks("generated with claude code")
+
+    def test_mixed_case_blocked(self):
+        assert self._blocks("GeNeRaTeD WiTh ClAuDe CoDe")
+
+    def test_double_spaces_blocked(self):
+        assert self._blocks("Generated  with  Claude  Code")
+
+    def test_tab_separated_blocked(self):
+        assert self._blocks("Generated\twith\tClaude\tCode")
+
+    def test_canonical_still_blocked(self):
+        # No-regression anchor: exact canonical trailer must still be caught.
+        assert self._blocks("Generated with Claude Code")
+
+    def test_canonical_full_trailer_still_blocked(self):
+        body = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        assert self._blocks(body)
+
+    def test_lowercase_coauthored_blocked(self):
+        assert self._blocks("co-authored-by: claude <noreply@anthropic.com>")
+
+    def test_clean_message_not_blocked(self):
+        # No false positive: a legitimate message containing the word "generated" elsewhere.
+        cmd = 'git commit -m "feat: regenerated the cache index"'
+        assert not self._filter().filter_commit_message(cmd).patterns_removed
+
+    def test_custom_patterns_remain_case_sensitive(self):
+        # The YAML edit must not flip user custom_patterns to case-insensitive.
+        cfg = {
+            "enabled": True,
+            "rules": {},
+            "custom_patterns": [{"pattern": "SECRET", "description": "c", "replacement": ""}],
+        }
+        filt = CommitMessageFilter(cfg)
+        _cleaned, patterns, _ = filt.clean_message("has secret lowercase")
+        assert not patterns  # lowercase 'secret' must NOT match the case-sensitive custom pattern
