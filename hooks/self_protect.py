@@ -22,6 +22,7 @@ tests/test_self_protect.py asserts it stays in sync with validator.SELF_PROTECTI
 """
 
 import json
+import os
 import sys
 from typing import Optional
 
@@ -41,10 +42,16 @@ _DENY_REASON = (
 def _targets_protected(path: str) -> bool:
     """True if a file path resolves to a protected schlock config file.
 
-    Suffix match (not substring) so 'not-schlock-config.yaml-backup' does NOT match while
-    both the bare filename and an absolute '.../.config/schlock/config.yaml' do.
+    Normalizes the path first (collapsing '..' and '//') so a roundabout target like
+    '.../.config/schlock/../schlock/config.yaml' can't slip past the suffix check. normpath
+    is pure string manipulation — no filesystem access, so no TOCTOU. Suffix match (not
+    substring) so 'not-schlock-config.yaml-backup' does NOT match, while both the bare
+    filename and an absolute '.../.config/schlock/config.yaml' do.
     """
-    return bool(path) and any(path == p or path.endswith("/" + p) for p in SELF_PROTECTION_PATHS)
+    if not path:
+        return False
+    norm = os.path.normpath(path)
+    return any(norm == p or norm.endswith("/" + p) for p in SELF_PROTECTION_PATHS)
 
 
 def decide(input_data: dict) -> Optional[dict]:

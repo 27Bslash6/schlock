@@ -30,6 +30,8 @@ class TestSelfProtectDecide:
             ("MultiEdit", {"file_path": ".claude/hooks/schlock-config.yaml", "edits": []}),
             ("NotebookEdit", {"notebook_path": "/x/.config/schlock/config.yaml", "new_source": "x"}),
             ("Write", {"file_path": "schlock-config.yaml", "content": "x"}),  # bare filename
+            ("Write", {"file_path": "/home/user/.config/schlock/../schlock/config.yaml", "content": "x"}),  # .. traversal
+            ("Write", {"file_path": ".config/schlock//config.yaml", "content": "x"}),  # double slash
         ],
     )
     def test_blocks_write_to_config(self, tool_name, tool_input):
