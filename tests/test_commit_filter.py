@@ -1597,3 +1597,79 @@ class TestPatternCaseWhitespace:
         filt = CommitMessageFilter(cfg)
         _cleaned, patterns, _ = filt.clean_message("has secret lowercase")
         assert not patterns  # lowercase 'secret' must NOT match the case-sensitive custom pattern
+
+
+class TestParseMemoization:
+    """#91 — bashlex.parse must run at most once per command per filter call."""
+
+    def _filter(self):
+        # Minimal real filter: advertising category enabled so the scannable path is exercised.
+        return CommitMessageFilter(
+            {
+                "enabled": True,
+                "rules": {
+                    "advertising": {
+                        "enabled": True,
+                        "patterns": [
+                            {
+                                "pattern": r"\n*Generated with .*",
+                                "description": "ad",
+                                "replacement": "",
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+
+    def test_filter_parses_once_no_heredoc(self):
+        """The #91 repro: `git commit -a -a -a ...` (no message, no heredoc) parsed once."""
+        import bashlex  # noqa: PLC0415
+
+        cmd = "git commit " + " ".join(["-a"] * 50)
+        filt = self._filter()
+        with patch("schlock.integrations.commit_filter.bashlex.parse", wraps=bashlex.parse) as spy:
+            filt.filter_commit_message(cmd)
+        assert spy.call_count == 1, f"expected 1 parse, got {spy.call_count}"
+
+    def test_scannable_message_parses_once_and_result_unchanged(self):
+        """A scannable `-m` commit: parsed once AND the cleaned result matches a fresh run."""
+        import bashlex  # noqa: PLC0415
+
+        cmd = 'git commit -m "Add feature\\n\\nGenerated with Claude Code"'
+
+        baseline = self._filter().filter_commit_message(cmd)  # fresh instance, no spy
+
+        filt = self._filter()
+        with patch("schlock.integrations.commit_filter.bashlex.parse", wraps=bashlex.parse) as spy:
+            result = filt.filter_commit_message(cmd)
+
+        assert spy.call_count == 1, f"expected 1 parse, got {spy.call_count}"
+        assert result.was_modified is True
+        assert result.cleaned_message == baseline.cleaned_message
+        assert result.message_delivery == baseline.message_delivery == "scannable"
+
+    def test_classify_message_delivery_parses_once(self):
+        """classify_message_delivery is a public entry point; it too must parse once."""
+        import bashlex  # noqa: PLC0415
+
+        cmd = "git commit " + " ".join(["-a"] * 50)
+        filt = self._filter()
+        with patch("schlock.integrations.commit_filter.bashlex.parse", wraps=bashlex.parse) as spy:
+            filt.classify_message_delivery(cmd)
+        assert spy.call_count == 1, f"expected 1 parse, got {spy.call_count}"
+
+    def test_parse_failure_memoized_once_and_fails_open(self):
+        """A quoted-heredoc commit makes bashlex raise; the raise is cached (called once),
+        and filtering still fails open (returns the original command unmodified)."""
+        import bashlex  # noqa: PLC0415
+
+        # bashlex cannot parse <<'EOF' (quoted delimiter) -> every parse attempt raises.
+        cmd = "git commit -m \"$(cat <<'EOF'\nhello\nEOF\n)\""
+        filt = self._filter()
+        with patch("schlock.integrations.commit_filter.bashlex.parse", wraps=bashlex.parse) as spy:
+            result = filt.filter_commit_message(cmd)
+        assert spy.call_count == 1, f"expected 1 parse, got {spy.call_count}"
+        # Fail-open: the regex fallback handles extraction; the command is not broken.
+        assert result.error is None
+        assert result.cleaned_command  # non-empty, command preserved/handled
