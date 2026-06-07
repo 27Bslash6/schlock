@@ -420,8 +420,9 @@ _DANGEROUS_GIT_CONFIGS = frozenset(
 def dangerous_git_config(args: list[str]) -> str | None:
     """Return a reason string if `args` (a git command's word-args) sets a -c config that
     executes arbitrary commands, else None. Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
-    `alias.` is dangerous only when the value contains `!` (shell-command alias). Pure; the
-    single source of truth shared by SubstitutionValidator and top-level validation.
+    `alias.` is dangerous only when the alias VALUE starts with `!` (shell-command alias);
+    a `!` elsewhere (e.g. a `--grep` pattern) is an ordinary git alias. Pure; the single
+    source of truth shared by SubstitutionValidator and top-level validation.
     """
     for i, arg in enumerate(args):
         config_val = None
@@ -434,8 +435,12 @@ def dangerous_git_config(args: list[str]) -> str | None:
         config_lower = config_val.lower()
         for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
             if config_lower.startswith(dangerous_prefix):
-                if dangerous_prefix == "alias." and "!" not in config_val:
-                    continue
+                if dangerous_prefix == "alias.":
+                    # git runs an alias as a shell command only when its VALUE starts with '!'
+                    # (alias.<name>=!cmd). A '!' elsewhere is a normal git-subcommand alias.
+                    _, _, alias_value = config_val.partition("=")
+                    if not alias_value.lstrip().startswith("!"):
+                        continue
                 return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
     return None
 

