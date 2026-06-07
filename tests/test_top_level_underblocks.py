@@ -1,5 +1,7 @@
 """Top-level under-block fixes: pipe-to-shell + git -c exec (security)."""
 
+import pytest
+
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import validate_command
 
@@ -206,3 +208,12 @@ class TestPipeToShellValueFlagBypass:
             "ls | grep x",
         ]:
             assert validate_command(cmd).risk_level != RiskLevel.BLOCKED, cmd
+
+
+class TestSymmetryTopLevelVsSubstitution:
+    """A dangerous form must block identically at top level AND wrapped in $()."""
+
+    @pytest.mark.parametrize("inner", ["date | bash", "git -c alias.x=!sh status"])
+    def test_blocks_both_top_level_and_in_substitution(self, inner):
+        assert validate_command(inner).risk_level == RiskLevel.BLOCKED
+        assert validate_command(f"echo $({inner})").risk_level == RiskLevel.BLOCKED
