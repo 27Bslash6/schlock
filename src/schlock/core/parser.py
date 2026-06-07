@@ -17,6 +17,66 @@ from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
 
+# Interpreters that EXECUTE their standard input as a program when given no program source.
+# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
+# those run a *named* command, not stdin-as-program, and are covered by the download->shell
+# and wrapper-command checks.
+STDIN_EXEC_INTERPRETERS = frozenset(
+    {
+        "bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "busybox",
+        "python", "python2", "python3",
+        "perl", "ruby", "node",
+        "php", "php7", "php8",
+        "lua", "lua5.1", "lua5.2", "lua5.3", "lua5.4", "luajit",
+        "R", "Rscript", "julia",
+        "tclsh", "wish", "pwsh", "powershell",
+        "gawk", "mawk", "nawk",
+    }
+)
+
+# Per-interpreter flags whose presence supplies an INLINE program (so the interpreter is NOT
+# executing piped stdin). Interpreter-specific on purpose: bash -e/-m are NOT code flags
+# (errexit/monitor) and must stay dangerous, whereas perl/ruby -e and python -m ARE code.
+_INLINE_CODE_FLAGS = {
+    "bash": frozenset({"-c"}), "sh": frozenset({"-c"}), "zsh": frozenset({"-c"}),
+    "dash": frozenset({"-c"}), "ksh": frozenset({"-c"}), "ash": frozenset({"-c"}),
+    "fish": frozenset({"-c"}), "busybox": frozenset({"-c"}),
+    "python": frozenset({"-c", "-m"}), "python2": frozenset({"-c", "-m"}), "python3": frozenset({"-c", "-m"}),
+    "perl": frozenset({"-e", "-E"}), "ruby": frozenset({"-e", "-E"}),
+    "node": frozenset({"-e", "--eval", "-p", "--print"}),
+    "php": frozenset({"-r"}),
+    "lua": frozenset({"-e"}), "lua5.1": frozenset({"-e"}), "lua5.2": frozenset({"-e"}),
+    "lua5.3": frozenset({"-e"}), "lua5.4": frozenset({"-e"}), "luajit": frozenset({"-e"}),
+    "R": frozenset({"-e"}), "Rscript": frozenset({"-e"}), "julia": frozenset({"-e"}),
+    "pwsh": frozenset({"-c", "-Command", "-EncodedCommand"}),
+    "powershell": frozenset({"-c", "-Command", "-EncodedCommand"}),
+    # tclsh/wish/awk family: program is a positional file/arg -> no inline-code flag needed
+}
+
+
+def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
+    """True if interpreter `cmd_name` would execute its STDIN as a program given `args`.
+
+    Exempt (return False) when a program SOURCE is present:
+      - a positional (non-dash) argument -> script path / awk program;
+      - an inline-code flag valid for THIS interpreter (-c / -e / -m / ...), separate or attached.
+    Explicit stdin requests ('-', '-s') -> True. No program source found -> True.
+    Default biases toward True (dangerous) so a missed case fails CLOSED.
+    """
+    inline_flags = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
+    for arg in args:
+        if arg in ("-", "-s"):
+            return True  # explicit stdin
+        if not arg.startswith("-"):
+            return False  # positional token = script/program path
+        if arg in inline_flags:
+            return False  # exact inline-code flag (value follows) -> runs that, not stdin
+        # attached short form, e.g. -c'...', -e'...' (bashlex concatenates the quoted value)
+        if len(arg) >= 2 and f"-{arg[1]}" in inline_flags:
+            return False
+        # otherwise a stdin-neutral flag (-x, -u, -e for bash, ...): keep scanning
+    return True
+
 
 class BashCommandParser:
     """Parse bash commands using bashlex AST analysis.

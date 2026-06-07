@@ -82,3 +82,45 @@ class TestTopLevelGitC:
 
     def test_fsmonitor_blocks_top_level(self):
         assert validate_command("git -c core.fsmonitor=/tmp/evil status").risk_level == RiskLevel.BLOCKED
+
+
+class TestReadsStdinAsProgram:
+    def _f(self):
+        from schlock.core.parser import _reads_stdin_as_program
+
+        return _reads_stdin_as_program
+
+    def test_bare_interpreter_reads_stdin(self):
+        assert self._f()("bash", []) is True
+        assert self._f()("python3", []) is True
+
+    def test_script_path_is_exempt(self):
+        assert self._f()("bash", ["app.sh"]) is False
+        assert self._f()("python3", ["app.py"]) is False
+
+    def test_inline_c_is_exempt(self):
+        assert self._f()("bash", ["-c", "echo hi"]) is False
+        assert self._f()("python3", ["-c", "print(1)"]) is False
+
+    def test_attached_inline_c_is_exempt(self):
+        assert self._f()("bash", ["-cecho hi"]) is False
+
+    def test_perl_ruby_node_e_is_exempt(self):
+        assert self._f()("perl", ["-e", "code"]) is False
+        assert self._f()("node", ["-e", "code"]) is False
+
+    def test_python_m_is_exempt(self):
+        assert self._f()("python3", ["-m", "http.server"]) is False
+
+    def test_bash_dash_e_is_NOT_exempt(self):
+        assert self._f()("bash", ["-e"]) is True
+
+    def test_bash_dash_m_is_NOT_exempt(self):
+        assert self._f()("bash", ["-m"]) is True
+
+    def test_explicit_stdin_dash_is_dangerous(self):
+        assert self._f()("bash", ["-s"]) is True
+        assert self._f()("python3", ["-"]) is True
+
+    def test_neutral_flag_then_script_is_exempt(self):
+        assert self._f()("python3", ["-u", "app.py"]) is False
