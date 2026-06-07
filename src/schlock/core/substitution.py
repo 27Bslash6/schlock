@@ -397,6 +397,44 @@ def _is_truthy_flag_value(value: str) -> bool:
     return value.lower() in ("true", "1", "yes", "y", "t")
 
 
+# git -c config keys that execute arbitrary commands when set via -c (top-level under-block fix).
+# Lowercased for case-insensitive match against the config key.
+_DANGEROUS_GIT_CONFIGS = frozenset(
+    {
+        "alias.",  # alias.x=!cmd executes a shell command
+        "core.sshcommand",  # executed during SSH operations
+        "core.pager",  # executed when paging output
+        "core.editor",  # executed when editing messages
+        "credential.helper",  # executed for authentication
+        "diff.external",  # executed during diff
+        "merge.tool",  # executed during merge
+    }
+)
+
+
+def dangerous_git_config(args: list[str]) -> str | None:
+    """Return a reason string if `args` (a git command's word-args) sets a -c config that
+    executes arbitrary commands, else None. Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
+    `alias.` is dangerous only when the value contains `!` (shell-command alias). Pure; the
+    single source of truth shared by SubstitutionValidator and top-level validation.
+    """
+    for i, arg in enumerate(args):
+        config_val = None
+        if arg == "-c" and i + 1 < len(args):
+            config_val = args[i + 1]
+        elif arg.startswith("-c") and len(arg) > 2:
+            config_val = arg[2:]
+        if not config_val:
+            continue
+        config_lower = config_val.lower()
+        for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
+            if config_lower.startswith(dangerous_prefix):
+                if dangerous_prefix == "alias." and "!" not in config_val:
+                    continue
+                return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
+    return None
+
+
 @dataclass
 class SubstitutionNode:
     """Represents a command or process substitution in the AST."""
@@ -809,38 +847,10 @@ class SubstitutionValidator:
                 if hasattr(part, "word"):
                     args.append(part.word)
 
-            # Check for git -c config options that execute commands
-            # These config keys run arbitrary commands when set via -c:
-            # - alias.NAME=!cmd (shell command alias)
-            # - core.sshCommand, core.pager, core.editor (tool execution)
-            # - credential.helper (auth command execution)
-            # - diff.external, merge.tool (diff/merge tool execution)
             if base_command == "git" and args:
-                dangerous_git_configs = {
-                    "alias.",  # alias.x=!cmd executes shell command
-                    "core.sshcommand",  # executed during SSH operations
-                    "core.pager",  # executed when paging output
-                    "core.editor",  # executed when editing messages
-                    "credential.helper",  # executed for authentication
-                    "diff.external",  # executed during diff
-                    "merge.tool",  # executed during merge
-                }
-                for i, arg in enumerate(args):
-                    config_val = None
-                    if arg == "-c" and i + 1 < len(args):
-                        config_val = args[i + 1]
-                    # Also check combined form: -cvalue
-                    elif arg.startswith("-c") and len(arg) > 2:
-                        config_val = arg[2:]
-
-                    if config_val:
-                        config_lower = config_val.lower()
-                        for dangerous_prefix in dangerous_git_configs:
-                            if config_lower.startswith(dangerous_prefix):
-                                # Special case: alias requires ! for shell execution
-                                if dangerous_prefix == "alias." and "!" not in config_val:
-                                    continue
-                                return True, f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
+                git_reason = dangerous_git_config(args)
+                if git_reason:
+                    return True, git_reason
 
             # Check for find with command execution flags
             # -exec, -execdir, -ok, -okdir run arbitrary commands
