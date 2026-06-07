@@ -372,6 +372,27 @@ def _check_dangerous_command_flags(
                             matched_rules=[f"ast_dangerous_combo:{base_name}"],
                         )
 
+        # git -c config keys that execute arbitrary commands (top-level parity with the
+        # SubstitutionValidator check). Lazy import avoids the documented substitution<->validator
+        # mutual-import hazard.
+        if base_name == "git":
+            from schlock.core.substitution import dangerous_git_config  # noqa: PLC0415
+
+            git_reason = dangerous_git_config(args)
+            if git_reason:
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: {git_reason}",
+                    alternatives=[
+                        "Remove the -c config override",
+                        "Run git without the dangerous -c key (alias=!cmd, core.sshCommand, core.pager, credential.helper, diff.external, merge.tool)",
+                    ],
+                    exit_code=1,
+                    error=None,
+                    matched_rules=["ast_dangerous_combo:git"],
+                )
+
     return None
 
 

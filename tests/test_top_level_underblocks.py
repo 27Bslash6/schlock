@@ -34,3 +34,20 @@ class TestDangerousGitConfigHelper:
         from schlock.core.substitution import dangerous_git_config
 
         assert dangerous_git_config(["status"]) is None
+
+
+class TestTopLevelGitC:
+    def test_alias_bang_blocks(self):
+        assert validate_command("git -c alias.x=!sh status").risk_level == RiskLevel.BLOCKED
+
+    def test_ssh_command_blocks(self):
+        assert validate_command("git -c core.sshCommand=pwn clone https://x").risk_level == RiskLevel.BLOCKED
+
+    def test_benign_git_c_not_blocked(self):
+        assert validate_command("git -c user.name=x commit -m y").risk_level != RiskLevel.BLOCKED
+
+    def test_plain_git_status_not_blocked(self):
+        assert validate_command("git status").risk_level != RiskLevel.BLOCKED
+
+    def test_alias_without_bang_not_blocked(self):
+        assert validate_command("git -c alias.x=status status").risk_level != RiskLevel.BLOCKED
