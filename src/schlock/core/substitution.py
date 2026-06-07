@@ -402,12 +402,17 @@ def _is_truthy_flag_value(value: str) -> bool:
 _DANGEROUS_GIT_CONFIGS = frozenset(
     {
         "alias.",  # alias.x=!cmd executes a shell command
-        "core.sshcommand",  # executed during SSH operations
-        "core.pager",  # executed when paging output
+        "core.askpass",  # program invoked to obtain credentials -> RCE
         "core.editor",  # executed when editing messages
+        "core.fsmonitor",  # external file-system-monitor program git spawns -> RCE
+        "core.hookspath",  # redirects all git hooks to an attacker-controlled dir -> RCE
+        "core.pager",  # executed when paging output
+        "core.sshcommand",  # executed during SSH operations
         "credential.helper",  # executed for authentication
         "diff.external",  # executed during diff
+        "gpg.program",  # binary invoked to sign/verify commits/tags -> RCE
         "merge.tool",  # executed during merge
+        "sequence.editor",  # program invoked during interactive rebase -> RCE
     }
 )
 

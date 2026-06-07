@@ -35,6 +35,31 @@ class TestDangerousGitConfigHelper:
 
         assert dangerous_git_config(["status"]) is None
 
+    def test_fsmonitor_is_dangerous(self):
+        from schlock.core.substitution import dangerous_git_config
+
+        assert dangerous_git_config(["-c", "core.fsmonitor=/tmp/evil", "status"]) is not None
+
+    def test_hooks_path_is_dangerous(self):
+        from schlock.core.substitution import dangerous_git_config
+
+        assert dangerous_git_config(["-c", "core.hooksPath=/tmp/h", "commit"]) is not None
+
+    def test_sequence_editor_is_dangerous(self):
+        from schlock.core.substitution import dangerous_git_config
+
+        assert dangerous_git_config(["-c", "sequence.editor=evil", "rebase", "-i", "HEAD~2"]) is not None
+
+    def test_gpg_program_is_dangerous(self):
+        from schlock.core.substitution import dangerous_git_config
+
+        assert dangerous_git_config(["-c", "gpg.program=/tmp/evil", "commit", "-S"]) is not None
+
+    def test_askpass_is_dangerous(self):
+        from schlock.core.substitution import dangerous_git_config
+
+        assert dangerous_git_config(["-c", "core.askPass=/tmp/evil", "clone", "u"]) is not None
+
 
 class TestTopLevelGitC:
     def test_alias_bang_blocks(self):
@@ -51,3 +76,9 @@ class TestTopLevelGitC:
 
     def test_alias_without_bang_not_blocked(self):
         assert validate_command("git -c alias.x=status status").risk_level != RiskLevel.BLOCKED
+
+    def test_hooks_path_blocks_top_level(self):
+        assert validate_command("git -c core.hooksPath=/tmp/h status").risk_level == RiskLevel.BLOCKED
+
+    def test_fsmonitor_blocks_top_level(self):
+        assert validate_command("git -c core.fsmonitor=/tmp/evil status").risk_level == RiskLevel.BLOCKED
