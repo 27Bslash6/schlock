@@ -386,7 +386,8 @@ def _check_dangerous_command_flags(
                     message=f"BLOCKED: {git_reason}",
                     alternatives=[
                         "Remove the -c config override",
-                        "Run git without the dangerous -c key (alias=!cmd, core.sshCommand, core.pager, credential.helper, diff.external, merge.tool)",
+                        "Avoid -c keys that execute commands: alias=!cmd, core.sshCommand,",
+                        "core.pager, credential.helper, diff.external, merge.tool",
                     ],
                     exit_code=1,
                     error=None,
