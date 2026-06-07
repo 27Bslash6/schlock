@@ -42,7 +42,7 @@ _INLINE_CODE_FLAGS = {
     "dash": frozenset({"-c"}), "ksh": frozenset({"-c"}), "ash": frozenset({"-c"}),
     "fish": frozenset({"-c"}), "busybox": frozenset({"-c"}),
     "python": frozenset({"-c", "-m"}), "python2": frozenset({"-c", "-m"}), "python3": frozenset({"-c", "-m"}),
-    "perl": frozenset({"-e", "-E"}), "ruby": frozenset({"-e", "-E"}),
+    "perl": frozenset({"-e", "-E"}), "ruby": frozenset({"-e"}),
     "node": frozenset({"-e", "--eval", "-p", "--print"}),
     "php": frozenset({"-r"}),
     "lua": frozenset({"-e"}), "lua5.1": frozenset({"-e"}), "lua5.2": frozenset({"-e"}),
@@ -54,27 +54,38 @@ _INLINE_CODE_FLAGS = {
 }
 
 
+# Tokens that explicitly designate STDIN as the program source.
+_STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+
+
 def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     """True if interpreter `cmd_name` would execute its STDIN as a program given `args`.
 
-    Exempt (return False) when a program SOURCE is present:
-      - a positional (non-dash) argument -> script path / awk program;
-      - an inline-code flag valid for THIS interpreter (-c / -e / -m / ...), separate or attached.
-    Explicit stdin requests ('-', '-s') -> True. No program source found -> True.
-    Default biases toward True (dangerous) so a missed case fails CLOSED.
+    Fail-CLOSED model (a security check must not guess flag arity): the interpreter is exempt
+    (returns False) only when a program source is UNAMBIGUOUS —
+      - an inline-code flag valid for this interpreter (-c / -e / -m / ...), separate or attached; or
+      - a positional (non-dash) script token appearing BEFORE any option flag.
+    Once an option flag is seen, a following non-dash token is treated as that flag's VALUE
+    (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
+    (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
+    Explicit stdin paths ('-', '/dev/stdin', ...) -> True. No unambiguous program -> True.
     """
-    inline_flags = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
+    inline = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
+    saw_option = False
     for arg in args:
-        if arg in ("-", "-s"):
-            return True  # explicit stdin
-        if not arg.startswith("-"):
-            return False  # positional token = script/program path
-        if arg in inline_flags:
-            return False  # exact inline-code flag (value follows) -> runs that, not stdin
-        # attached short form, e.g. -c'...', -e'...' (bashlex concatenates the quoted value)
-        if len(arg) >= 2 and f"-{arg[1]}" in inline_flags:
+        # Inline code (separate flag, or attached like -c'...') -> runs that program, not stdin.
+        if arg in inline or (len(arg) > 2 and arg[0] == "-" and f"-{arg[1]}" in inline):
             return False
-        # otherwise a stdin-neutral flag (-x, -u, -e for bash, ...): keep scanning
+        # Explicit stdin designator -> reads stdin.
+        if arg in _STDIN_PATHS:
+            return True
+        if not arg.startswith("-"):
+            # A leading positional (before any option) is a script file -> runs it.
+            # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
+            if not saw_option:
+                return False
+            continue
+        saw_option = True
     return True
 
 
