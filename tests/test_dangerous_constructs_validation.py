@@ -217,7 +217,10 @@ class TestSubstitutionBypassVectors:
         result = validate_command('echo "$(date | bash)"')
         assert not result.allowed
         assert result.risk_level == RiskLevel.BLOCKED
-        assert "pipeline" in result.message.lower()
+        # Blocked by either the substitution layer ("pipeline in substitution") or, when the
+        # generalized construct check fires first, "data piped into shell interpreter: bash".
+        msg = result.message.lower()
+        assert "pipeline" in msg or "shell interpreter" in msg
 
     def test_chain_semicolon_bypass_blocked(self):
         """Chain $(date; rm -rf /) should be blocked.

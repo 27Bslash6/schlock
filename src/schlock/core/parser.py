@@ -17,6 +17,133 @@ from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
 
+# Interpreters that EXECUTE their standard input as a program when given no program source.
+# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
+# those run a *named* command, not stdin-as-program, and are covered by the download->shell
+# and wrapper-command checks.
+STDIN_EXEC_INTERPRETERS = frozenset(
+    {
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "ash",
+        "fish",
+        "python",
+        "python2",
+        "python3",
+        "perl",
+        "ruby",
+        "node",
+        "php",
+        "php7",
+        "php8",
+        "lua",
+        "lua5.1",
+        "lua5.2",
+        "lua5.3",
+        "lua5.4",
+        "luajit",
+        "R",
+        "Rscript",
+        "julia",
+        "tclsh",
+        "wish",
+        "pwsh",
+        "powershell",
+        "gawk",
+        "mawk",
+        "nawk",
+    }
+)
+
+# Per-interpreter flags whose presence supplies an INLINE program (so the interpreter is NOT
+# executing piped stdin). Interpreter-specific on purpose: bash -e/-m are NOT code flags
+# (errexit/monitor) and must stay dangerous, whereas perl/ruby -e and python -m ARE code.
+_INLINE_CODE_FLAGS = {
+    "bash": frozenset({"-c"}),
+    "sh": frozenset({"-c"}),
+    "zsh": frozenset({"-c"}),
+    "dash": frozenset({"-c"}),
+    "ksh": frozenset({"-c"}),
+    "ash": frozenset({"-c"}),
+    "fish": frozenset({"-c"}),
+    "python": frozenset({"-c", "-m"}),
+    "python2": frozenset({"-c", "-m"}),
+    "python3": frozenset({"-c", "-m"}),
+    "perl": frozenset({"-e", "-E"}),
+    "ruby": frozenset({"-e"}),
+    "node": frozenset({"-e", "--eval", "-p", "--print"}),
+    "php": frozenset({"-r"}),
+    "lua": frozenset({"-e"}),
+    "lua5.1": frozenset({"-e"}),
+    "lua5.2": frozenset({"-e"}),
+    "lua5.3": frozenset({"-e"}),
+    "lua5.4": frozenset({"-e"}),
+    "luajit": frozenset({"-e"}),
+    "R": frozenset({"-e"}),
+    "Rscript": frozenset({"-e"}),
+    "julia": frozenset({"-e"}),
+    "pwsh": frozenset({"-c", "-Command", "-EncodedCommand"}),
+    "powershell": frozenset({"-c", "-Command", "-EncodedCommand"}),
+    # tclsh/wish/awk family: program is a positional file/arg -> no inline-code flag needed
+}
+
+
+# Tokens that explicitly designate STDIN as the program source.
+_STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+
+# Multicall binaries dispatch to an applet named by their first positional arg
+# (`busybox sh`, `toybox cat`). Classify the pipeline stage by the resolved applet, not the
+# wrapper, so `cat x | busybox sh` is seen as a shell sink while bare `busybox` (no applet) is not.
+_MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
+
+
+def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
+    """Resolve a multicall binary to its effective applet and that applet's args.
+
+    `busybox sh -c x` -> ('sh', ['-c', 'x']); `busybox ls` -> ('ls', []); bare `busybox` or
+    `busybox --help` (no applet) -> unchanged. Non-multicall commands pass through untouched.
+    """
+    if cmd_name not in _MULTICALL_BINARIES:
+        return cmd_name, args
+    for i, arg in enumerate(args):
+        if not arg.startswith("-"):
+            return arg, args[i + 1 :]
+    return cmd_name, args
+
+
+def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
+    """True if interpreter `cmd_name` would execute its STDIN as a program given `args`.
+
+    Fail-CLOSED model (a security check must not guess flag arity): the interpreter is exempt
+    (returns False) only when a program source is UNAMBIGUOUS —
+      - an inline-code flag valid for this interpreter (-c / -e / -m / ...), separate or attached; or
+      - a positional (non-dash) script token appearing BEFORE any option flag.
+    Once an option flag is seen, a following non-dash token is treated as that flag's VALUE
+    (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
+    (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
+    Explicit stdin paths ('-', '/dev/stdin', ...) -> True. No unambiguous program -> True.
+    """
+    inline = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
+    saw_option = False
+    for arg in args:
+        # Inline code (separate flag, or attached like -c'...') -> runs that program, not stdin.
+        if arg in inline or (len(arg) > 2 and arg[0] == "-" and f"-{arg[1]}" in inline):
+            return False
+        # Explicit stdin designator -> reads stdin.
+        if arg in _STDIN_PATHS:
+            return True
+        if not arg.startswith("-"):
+            # A leading positional (before any option) is a script file -> runs it.
+            # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
+            if not saw_option:
+                return False
+            continue
+        saw_option = True
+    return True
+
 
 class BashCommandParser:
     """Parse bash commands using bashlex AST analysis.
@@ -640,70 +767,59 @@ class BashCommandParser:
             "hg",  # VCS tools that can fetch remote content
         }
 
-        # Shell interpreters that execute piped input
-        shell_interpreters = {
-            "bash",
-            "sh",
-            "zsh",
-            "dash",
-            "ksh",
-            "ash",
-            "fish",
-            "python",
-            "python2",
-            "python3",
-            "perl",
-            "ruby",
-            "node",
-            # Additional interpreters (FINDING-002)
-            "env",  # CRITICAL: env bash executes bash with modified environment
-            "xargs",  # xargs sh executes shell with piped args
-            "lua",
-            "lua5.1",
-            "lua5.2",
-            "lua5.3",
-            "lua5.4",
-            "luajit",
-            "php",
-            "php7",
-            "php8",
-            "Rscript",
-            "R",
-            "julia",
-            "pwsh",
-            "powershell",  # PowerShell Core (cross-platform)
-            "tclsh",
-            "wish",  # Tcl interpreters
-            "gawk",
-            "mawk",
-            "nawk",  # awk variants (can execute via system())
-            "busybox",  # Often contains sh applet
-        }
+        # Shell interpreters that execute piped input. Reuse the module constant; the
+        # download->shell check historically also treated env/xargs as interpreters, so extend
+        # locally for THAT check only.
+        shell_interpreters = STDIN_EXEC_INTERPRETERS | {"env", "xargs"}
+
+        def _stage_args(part) -> list[str]:
+            """Word-args AFTER the command name for a pipeline stage command node."""
+            words = []
+            seen_name = False
+            for sub in getattr(part, "parts", []):
+                if getattr(sub, "kind", None) in ("assignment", "redirect"):
+                    continue
+                if hasattr(sub, "word"):
+                    if not seen_name:
+                        seen_name = True  # first word is the command name
+                        continue
+                    words.append(sub.word)
+            return words
 
         def check_pipeline(node):
             """Check a pipeline node for dangerous patterns."""
             if not hasattr(node, "parts"):
                 return
 
-            # Extract command names from pipeline parts
-            commands_in_pipeline = []
+            # Extract (command name, args) per command stage, in order.
+            stages = []
             for part in node.parts:
-                if hasattr(part, "kind"):
-                    if part.kind == "command":
-                        cmd_name = self._get_command_name(part)
-                        if cmd_name:
-                            commands_in_pipeline.append(cmd_name)
-                    elif part.kind == "pipe":
-                        continue  # Skip pipe operators
+                if getattr(part, "kind", None) == "command":
+                    cmd_name = self._get_command_name(part)
+                    if cmd_name:
+                        # Resolve multicall wrappers (busybox/toybox) to their applet so the
+                        # stage is classified by what actually runs (`busybox sh` -> `sh`).
+                        stages.append(_resolve_multicall(cmd_name, _stage_args(part)))
 
-            # Check for download -> shell pattern
-            if len(commands_in_pipeline) >= 2:
-                first_cmd = commands_in_pipeline[0]
-                if first_cmd in download_tools:
-                    for subsequent_cmd in commands_in_pipeline[1:]:
-                        if subsequent_cmd in shell_interpreters:
-                            dangers.append(f"remote code execution: {first_cmd} piped to {subsequent_cmd}")
-                            break  # One warning per pipeline is enough
+            if len(stages) < 2:
+                return
+
+            names = [s[0] for s in stages]
+
+            # (1) Existing remote-code-execution pattern: download tool -> shell interpreter.
+            first_cmd = names[0]
+            if first_cmd in download_tools:
+                for subsequent_cmd in names[1:]:
+                    if subsequent_cmd in shell_interpreters:
+                        dangers.append(f"remote code execution: {first_cmd} piped to {subsequent_cmd}")
+                        break
+
+            # (2) Generalized pipe-to-shell: ANY downstream stage that executes its stdin as a
+            # program (no program-source arg) is RCE on the piped data, regardless of producer.
+            for name, stage_args in stages[1:]:
+                if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, stage_args):
+                    dangers.append(f"data piped into shell interpreter: {name}")
+                    break
 
         def visit(node):
             """Recursively visit AST to find pipeline nodes."""
