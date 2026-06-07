@@ -5,6 +5,18 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.2...schlock-v0.7.3) (2026-06-07)
+
+
+### Bug Fixes
+
+* **validator:** block pipe-to-shell and git -c exec at the top level ([#98](https://github.com/27Bslash6/schlock/issues/98)) ([f75454b](https://github.com/27Bslash6/schlock/commit/f75454b1cb5760ce96ee054888a2799d7e93d72e))
+
+
+### Performance Improvements
+
+* **commit-filter:** memoize bashlex parse per command ([#91](https://github.com/27Bslash6/schlock/issues/91)) ([#95](https://github.com/27Bslash6/schlock/issues/95)) ([c8d21c1](https://github.com/27Bslash6/schlock/commit/c8d21c1e93b0e8fbc9d9b2011b930e92ff758aba))
+
 ## [0.7.2](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.1...schlock-v0.7.2) (2026-06-06)
 
 
