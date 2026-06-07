@@ -700,70 +700,57 @@ class BashCommandParser:
             "hg",  # VCS tools that can fetch remote content
         }
 
-        # Shell interpreters that execute piped input
-        shell_interpreters = {
-            "bash",
-            "sh",
-            "zsh",
-            "dash",
-            "ksh",
-            "ash",
-            "fish",
-            "python",
-            "python2",
-            "python3",
-            "perl",
-            "ruby",
-            "node",
-            # Additional interpreters (FINDING-002)
-            "env",  # CRITICAL: env bash executes bash with modified environment
-            "xargs",  # xargs sh executes shell with piped args
-            "lua",
-            "lua5.1",
-            "lua5.2",
-            "lua5.3",
-            "lua5.4",
-            "luajit",
-            "php",
-            "php7",
-            "php8",
-            "Rscript",
-            "R",
-            "julia",
-            "pwsh",
-            "powershell",  # PowerShell Core (cross-platform)
-            "tclsh",
-            "wish",  # Tcl interpreters
-            "gawk",
-            "mawk",
-            "nawk",  # awk variants (can execute via system())
-            "busybox",  # Often contains sh applet
-        }
+        # Shell interpreters that execute piped input. Reuse the module constant; the
+        # download->shell check historically also treated env/xargs as interpreters, so extend
+        # locally for THAT check only.
+        shell_interpreters = STDIN_EXEC_INTERPRETERS | {"env", "xargs"}
+
+        def _stage_args(part) -> list[str]:
+            """Word-args AFTER the command name for a pipeline stage command node."""
+            words = []
+            seen_name = False
+            for sub in getattr(part, "parts", []):
+                if getattr(sub, "kind", None) in ("assignment", "redirect"):
+                    continue
+                if hasattr(sub, "word"):
+                    if not seen_name:
+                        seen_name = True  # first word is the command name
+                        continue
+                    words.append(sub.word)
+            return words
 
         def check_pipeline(node):
             """Check a pipeline node for dangerous patterns."""
             if not hasattr(node, "parts"):
                 return
 
-            # Extract command names from pipeline parts
-            commands_in_pipeline = []
+            # Extract (command name, args) per command stage, in order.
+            stages = []
             for part in node.parts:
-                if hasattr(part, "kind"):
-                    if part.kind == "command":
-                        cmd_name = self._get_command_name(part)
-                        if cmd_name:
-                            commands_in_pipeline.append(cmd_name)
-                    elif part.kind == "pipe":
-                        continue  # Skip pipe operators
+                if getattr(part, "kind", None) == "command":
+                    cmd_name = self._get_command_name(part)
+                    if cmd_name:
+                        stages.append((cmd_name, _stage_args(part)))
 
-            # Check for download -> shell pattern
-            if len(commands_in_pipeline) >= 2:
-                first_cmd = commands_in_pipeline[0]
-                if first_cmd in download_tools:
-                    for subsequent_cmd in commands_in_pipeline[1:]:
-                        if subsequent_cmd in shell_interpreters:
-                            dangers.append(f"remote code execution: {first_cmd} piped to {subsequent_cmd}")
-                            break  # One warning per pipeline is enough
+            if len(stages) < 2:
+                return
+
+            names = [s[0] for s in stages]
+
+            # (1) Existing remote-code-execution pattern: download tool -> shell interpreter.
+            first_cmd = names[0]
+            if first_cmd in download_tools:
+                for subsequent_cmd in names[1:]:
+                    if subsequent_cmd in shell_interpreters:
+                        dangers.append(f"remote code execution: {first_cmd} piped to {subsequent_cmd}")
+                        break
+
+            # (2) Generalized pipe-to-shell: ANY downstream stage that executes its stdin as a
+            # program (no program-source arg) is RCE on the piped data, regardless of producer.
+            for name, stage_args in stages[1:]:
+                if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, stage_args):
+                    dangers.append(f"data piped into shell interpreter: {name}")
+                    break
 
         def visit(node):
             """Recursively visit AST to find pipeline nodes."""

