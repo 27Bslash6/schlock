@@ -1,9 +1,12 @@
 """Tests for the Write/Edit self-protection hook (hooks/self_protect.py, issue #92)."""
 
 import json
+import ntpath
+import posixpath
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,3 +116,54 @@ class TestSelfProtectPathSync:
         from schlock.core.validator import SELF_PROTECTION_PATHS as VALIDATOR_PATHS  # noqa: PLC0415
 
         assert set(self_protect.SELF_PROTECTION_PATHS) == set(VALIDATOR_PATHS)
+
+
+class TestSelfProtectWindowsPaths:
+    """Separator/case coverage across platforms.
+
+    _targets_protected uses only os.path.{normpath,normcase,sep}, so swapping the
+    module-local ``os`` binding to a namespace backed by ntpath / posixpath exercises
+    Windows / POSIX path semantics on ANY host (both modules emulate the other platform).
+    This gives real coverage on the Linux CI runner instead of a Windows-only skipif that
+    never executes there. Note: backslash paths CANNOT be added to the POSIX deny-list
+    (TestSelfProtectDecide) — on POSIX '\\' is a literal filename char, not a separator,
+    so such a path is a genuinely different file and is correctly allowed
+    (see test_posix_backslash_is_literal).
+    """
+
+    def _decide(self, monkeypatch, pathmod, file_path):
+        monkeypatch.setattr(self_protect, "os", SimpleNamespace(path=pathmod))
+        return decide({"tool_name": "Write", "tool_input": {"file_path": file_path, "content": "x"}})
+
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            r".config\schlock\config.yaml",  # relative, backslash separators
+            r"C:\Users\user\.config\schlock\config.yaml",  # absolute Windows path
+            r"project\.claude\hooks\schlock-config.yaml",  # project config, backslash
+            ".config/schlock\\config.yaml",  # mixed forward/back separators
+            r".CONFIG\SCHLOCK\CONFIG.YAML",  # case-insensitive on Windows (normcase folds)
+        ],
+    )
+    def test_windows_paths_blocked(self, monkeypatch, file_path):
+        result = self._decide(monkeypatch, ntpath, file_path)
+        assert result is not None
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            # Ends with 'schlock\config.yaml' but NOT '.config\schlock\config.yaml' — a real,
+            # different file (suffix precision holds on Windows too, not just POSIX).
+            r"C:\Users\user\AppData\Roaming\schlock\config.yaml",
+            r"C:\Users\user\src\main.py",
+            r"not-schlock-config.yaml-backup",  # substring, not suffix
+        ],
+    )
+    def test_windows_non_config_allowed(self, monkeypatch, file_path):
+        assert self._decide(monkeypatch, ntpath, file_path) is None
+
+    def test_posix_backslash_is_literal(self, monkeypatch):
+        # Documents WHY the Windows cases go through ntpath rather than the POSIX deny-list:
+        # under posixpath a backslash path is one literal filename component, not the config.
+        assert self._decide(monkeypatch, posixpath, r".config\schlock\config.yaml") is None

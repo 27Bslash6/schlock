@@ -42,16 +42,25 @@ _DENY_REASON = (
 def _targets_protected(path: str) -> bool:
     """True if a file path resolves to a protected schlock config file.
 
-    Normalizes the path first (collapsing '..' and '//') so a roundabout target like
-    '.../.config/schlock/../schlock/config.yaml' can't slip past the suffix check. normpath
-    is pure string manipulation — no filesystem access, so no TOCTOU. Suffix match (not
-    substring) so 'not-schlock-config.yaml-backup' does NOT match, while both the bare
-    filename and an absolute '.../.config/schlock/config.yaml' do.
+    Normalizes BOTH sides with normcase(normpath(...)) so the suffix check is correct on
+    every platform: normpath collapses '..' and '//' and (on Windows) rewrites '/' to the
+    backslash separator; normcase folds case + separators on Windows and is a no-op on
+    POSIX; os.path.sep is the platform separator. So a roundabout target like
+    '.../schlock/../schlock/config.yaml' OR a Windows-style backslash/drive-letter path
+    can't slip past — the latter previously did, because a hard-coded '/' suffix never
+    matches normpath's backslash output on Windows. normpath/normcase are pure string
+    manipulation — no filesystem access, so no TOCTOU. Suffix match (not substring) so
+    'not-schlock-config.yaml-backup' does NOT match, while both the bare filename and an
+    absolute '.../.config/schlock/config.yaml' do.
     """
     if not path:
         return False
-    norm = os.path.normpath(path)
-    return any(norm == p or norm.endswith("/" + p) for p in SELF_PROTECTION_PATHS)
+    norm = os.path.normcase(os.path.normpath(path))
+    for protected in SELF_PROTECTION_PATHS:
+        protected_norm = os.path.normcase(os.path.normpath(protected))
+        if norm == protected_norm or norm.endswith(os.path.sep + protected_norm):
+            return True
+    return False
 
 
 def decide(input_data: dict) -> Optional[dict]:
