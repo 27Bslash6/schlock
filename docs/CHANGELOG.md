@@ -5,6 +5,14 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.3...schlock-v0.7.4) (2026-06-08)
+
+
+### Bug Fixes
+
+* **ci:** make osv-scanner download resilient to release-CDN failures ([#103](https://github.com/27Bslash6/schlock/issues/103)) ([57f55c8](https://github.com/27Bslash6/schlock/commit/57f55c818e1a6bcf575152a09a45eca81f858104))
+* **self-protection:** dedicated Write/Edit hook so config protection actually runs ([#92](https://github.com/27Bslash6/schlock/issues/92)) ([#94](https://github.com/27Bslash6/schlock/issues/94)) ([09e554c](https://github.com/27Bslash6/schlock/commit/09e554ce9ae39ac9cd16b4f4e02b2347cb11a53c))
+
 ## [0.7.3](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.2...schlock-v0.7.3) (2026-06-07)
 
 
