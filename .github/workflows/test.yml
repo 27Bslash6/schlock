@@ -80,7 +80,9 @@ jobs:
           --lockfile=uv.lock
 
     - name: semgrep
-      run: uvx semgrep scan --config p/security-audit --config p/python
+      # Pinned for reproducible runs. Bump manually — Dependabot can't see versions
+      # embedded in a uvx run-string (unlike the SHA-pinned `uses:` actions above).
+      run: uvx semgrep@1.165.0 scan --config p/security-audit --config p/python
 
     - name: gitleaks
       uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
