@@ -67,13 +67,23 @@ jobs:
     - name: pip-audit
       run: uv export --no-hashes | uvx pip-audit -r /dev/stdin --ignore-vuln CVE-2026-4539  # pygments 2.19.2, no fix available (transitive dev dep via pytest)
 
-    - name: osv-scanner
+    # Advisory scan: a transient GitHub release-CDN failure must not fail the job, but the
+    # skip must be conspicuous. continue-on-error surfaces a soft-failure (orange) in the UI;
+    # the ::error:: annotation states the scan was skipped. The scan runs only on success.
+    - name: Download osv-scanner
+      id: osv_download
+      continue-on-error: true
       run: |
-        curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 15 \
-          https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner \
-          || { echo "::warning::osv-scanner download failed after retries (e.g. GitHub release CDN 504); skipping advisory scan"; exit 0; }
+        if ! curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 15 \
+             https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner; then
+          echo "::error::osv-scanner download failed (GitHub release CDN); advisory OSV scan SKIPPED this run"
+          exit 1
+        fi
         chmod +x osv-scanner
-        ./osv-scanner --lockfile=uv.lock || true
+
+    - name: osv-scanner
+      if: steps.osv_download.outcome == 'success'
+      run: ./osv-scanner --lockfile=uv.lock || true
 
     - name: semgrep
       run: uvx semgrep scan --config p/security-audit --config p/python
