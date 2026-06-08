@@ -33,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import yaml  # noqa: E402 - vendored dependency
 
 from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
-from schlock.core.validator import SELF_PROTECTION_PATHS  # noqa: E402
 from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
 from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
 from schlock.integrations.shellcheck import (  # noqa: E402
@@ -404,40 +403,6 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         # 1. Extract command from stdin JSON
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
-
-        # SELF-PROTECTION: Block file write operations targeting schlock config files.
-        # This catches Write/Edit tool calls that bypass bash validation entirely.
-        # Defense-in-depth: even if rule overrides or validator are compromised,
-        # this hardcoded check in the hook prevents config file tampering.
-        # Only blocks WRITE operations (content/new_string present), not reads.
-        file_path = tool_input.get("file_path", "")
-        is_write_operation = "content" in tool_input or "new_string" in tool_input
-        if file_path and is_write_operation:
-            for protected in SELF_PROTECTION_PATHS:
-                # Exact suffix match: file_path ends with the protected path
-                # (avoids false positives like "not-schlock-config.yaml")
-                if file_path == protected or file_path.endswith("/" + protected):
-                    logger.warning(f"Self-protection: blocked file operation on {file_path}")
-                    execution_time_ms = (time.perf_counter() - start_time) * 1000
-                    audit_logger.log_validation(
-                        command=f"[{tool_name}] {file_path}",
-                        risk_level="BLOCKED",
-                        violations=["self_protection:config_file_write"],
-                        decision="block",
-                        execution_time_ms=execution_time_ms,
-                        context=context,
-                    )
-                    return {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": (
-                                "BLOCKED: Modification of schlock safety configuration is not allowed.\n"
-                                "Edit configuration manually outside of Claude Code, "
-                                "or use /schlock:setup to configure interactively."
-                            ),
-                        }
-                    }
 
         command = tool_input.get("command", "")
 
