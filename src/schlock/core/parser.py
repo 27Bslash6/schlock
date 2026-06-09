@@ -114,6 +114,31 @@ def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     return cmd_name, args
 
 
+def _first_command_node(node: Any) -> Optional[Any]:
+    """Return the first `command`-kind node reachable from `node`, in source order, else None.
+
+    Used to classify a subshell/group pipeline stage (`(bash)`, `{ bash; }`): the piped data lands
+    on the FIRST command inside the group (its stdin sink). Inner *pipelines* within the group are
+    handled separately by the recursive walk, so first-command is the right target here. See #97.
+    """
+    if not hasattr(node, "kind"):
+        return None
+    if node.kind == "command":
+        return node
+    for attr in ("list", "parts", "command"):
+        child = getattr(node, attr, None)
+        if isinstance(child, list):
+            for item in child:
+                found = _first_command_node(item)
+                if found is not None:
+                    return found
+        elif child is not None:
+            found = _first_command_node(child)
+            if found is not None:
+                return found
+    return None
+
+
 def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     """True if interpreter `cmd_name` would execute its STDIN as a program given `args`.
 
@@ -794,12 +819,17 @@ class BashCommandParser:
             # Extract (command name, args) per command stage, in order.
             stages = []
             for part in node.parts:
-                if getattr(part, "kind", None) == "command":
-                    cmd_name = self._get_command_name(part)
+                kind = getattr(part, "kind", None)
+                # A subshell/group stage (`(bash)`, `{ bash; }`) receives the pipe on its first
+                # inner command - classify by that command so a wrapped shell sink is not missed
+                # (#97). Inner pipelines within the group are caught separately by the recursive walk.
+                stage_node = part if kind == "command" else (_first_command_node(part) if kind == "compound" else None)
+                if stage_node is not None:
+                    cmd_name = self._get_command_name(stage_node)
                     if cmd_name:
                         # Resolve multicall wrappers (busybox/toybox) to their applet so the
                         # stage is classified by what actually runs (`busybox sh` -> `sh`).
-                        stages.append(_resolve_multicall(cmd_name, _stage_args(part)))
+                        stages.append(_resolve_multicall(cmd_name, _stage_args(stage_node)))
 
             if len(stages) < 2:
                 return

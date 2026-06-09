@@ -44,7 +44,7 @@ rules:
   - name: find_exec_dangerous
     description: Find with dangerous exec commands
     risk_level: HIGH
-    patterns: ['find.{0,200}-exec\s+(rm|sh|bash|python|perl|ruby|node|curl|wget|dd|mkfs|fdisk|mount)', 'find.{0,200}-exec.{0,100}\|.{0,50}bash', 'find.{0,200}-exec.{0,100}\|.{0,50}sh']
+    patterns: ['find.{0,200}-(execdir|exec|okdir|ok)\s+(rm|sh|bash|python|perl|ruby|node|curl|wget|dd|mkfs|fdisk|mount)', 'find.{0,200}-(execdir|exec|okdir|ok).{0,100}\|.{0,50}bash', 'find.{0,200}-(execdir|exec|okdir|ok).{0,100}\|.{0,50}sh']
     alternatives: ["Review what will be executed", "Use xargs instead", "Test on small subset first"]
 
   - name: interpreter_dangerous_execution
