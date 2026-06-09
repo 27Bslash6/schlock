@@ -397,6 +397,17 @@ def _is_truthy_flag_value(value: str) -> bool:
     return value.lower() in ("true", "1", "yes", "y", "t")
 
 
+# git boolean-literal values. A git -c config whose value is a boolean selects a built-in and
+# names no executable (e.g. core.fsmonitor=true uses git's built-in monitor), so it cannot be RCE.
+# Empty string covers a bare `-c key` (no =VALUE), which git treats as key=true.
+_GIT_BOOLEAN_VALUES = frozenset({"true", "false", "yes", "no", "on", "off", "1", "0", ""})
+
+
+def _is_git_boolean(value: str) -> bool:
+    """True if `value` is a git boolean literal (so it names no executable program)."""
+    return value.strip().lower() in _GIT_BOOLEAN_VALUES
+
+
 # git -c config keys that execute arbitrary commands when set via -c (top-level under-block fix).
 # Lowercased for case-insensitive match against the config key.
 _DANGEROUS_GIT_CONFIGS = frozenset(
@@ -441,7 +452,90 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     _, _, alias_value = config_val.partition("=")
                     if not alias_value.lstrip().startswith("!"):
                         continue
+                else:
+                    # A boolean value selects a built-in and names no executable
+                    # (e.g. core.fsmonitor=true); only a path/command value is RCE. A bare
+                    # `-c key` (no =VALUE) is key=true to git -> also benign. See #97.
+                    _, _, value = config_val.partition("=")
+                    if _is_git_boolean(value):
+                        continue
                 return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
+    return None
+
+
+# find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir) or delete files (-delete).
+_DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
+
+
+def dangerous_find(args: list[str]) -> str | None:
+    """Return a reason if a find arg list runs commands or deletes files, else None.
+
+    Used by the SubstitutionValidator, which is conservative: ANY -exec*/-ok*/-delete inside a
+    substitution is dangerous regardless of the command run. (Top-level find stays command-aware
+    via the find_exec_dangerous / recursive_delete YAML rules, so read-only `find -exec grep` is
+    still allowed there.) Order-independent and indifferent to a leading "find" token. See #97.
+    """
+    for arg in args:
+        if arg in _DANGEROUS_FIND_FLAGS:
+            return f"find {arg} executes commands or modifies files"
+    return None
+
+
+def dangerous_kubectl(args: list[str]) -> str | None:  # noqa: PLR0911, PLR0912 - subcommand dispatch
+    """Return a reason if a kubectl arg list modifies cluster state, executes code, or exposes
+    secrets/credentials, else None.
+
+    Safety depends on the subcommand: get/describe/logs are read-only; exec/apply/delete/run modify
+    state or execute code. Uses an allowlist of safe subcommands (default-deny for unknown) plus
+    argument-level checks within otherwise-safe subcommands. Pure; the single source of truth shared
+    by SubstitutionValidator and top-level validation. `_find_kubectl_subcommand` skips a leading
+    "kubectl" token if present, so `args` may or may not include it.
+    """
+    subcommand = _find_kubectl_subcommand(args)
+    if not subcommand:
+        return "kubectl without an identifiable subcommand"
+
+    if subcommand not in _SAFE_KUBECTL_SUBCOMMANDS:
+        return f"kubectl {subcommand} modifies cluster state or executes code"
+
+    # --- Argument-level checks for otherwise-safe subcommands (position-independent) ---
+    # Block --raw on get (accesses arbitrary API paths, bypasses resource-type checks).
+    if subcommand == "get" and any(arg == "--raw" or arg.startswith("--raw=") for arg in args):
+        return "kubectl get --raw accesses raw API paths"
+
+    # Block secret/secrets resource access on get/describe. Positional args only, to avoid
+    # false positives on paths like --kubeconfig /etc/secrets/kubeconfig.
+    if subcommand in ("get", "describe"):
+        for positional in _iter_kubectl_positionals(args):
+            tokens = [t for part in positional.lower().replace(",", "/").split("/") if (t := part.split(".")[0])]
+            if any(t in ("secret", "secrets") for t in tokens):
+                return f"kubectl {subcommand} accesses secrets"
+
+    # kubectl config view -> safe, but set-context/etc. modify kubeconfig; --raw/--flatten expose creds.
+    if subcommand == "config":
+        sub_sub = _find_sub_subcommand(args, "config")
+        if sub_sub and sub_sub in _DANGEROUS_KUBECTL_CONFIG_OPS:
+            return f"kubectl config {sub_sub} modifies kubeconfig"
+        if sub_sub == "view":
+            for flag in ("--raw", "--flatten"):
+                if any(arg == flag for arg in args):
+                    return "kubectl config view --raw/--flatten exposes credentials"
+                prefix = flag + "="
+                for arg in args:
+                    if arg.startswith(prefix) and _is_truthy_flag_value(arg.split("=", 1)[1]):
+                        return "kubectl config view --raw/--flatten exposes credentials"
+
+    if subcommand == "auth" and _find_sub_subcommand(args, "auth") == "reconcile":
+        return "kubectl auth reconcile modifies RBAC"
+
+    if subcommand == "rollout":
+        sub_sub = _find_sub_subcommand(args, "rollout")
+        if sub_sub and sub_sub in _DANGEROUS_KUBECTL_ROLLOUT_OPS:
+            return f"kubectl rollout {sub_sub} modifies deployment state"
+
+    if subcommand == "cluster-info" and _find_sub_subcommand(args, "cluster-info") == "dump":
+        return "kubectl cluster-info dump exfiltrates cluster data"
+
     return None
 
 
@@ -862,82 +956,18 @@ class SubstitutionValidator:
                 if git_reason:
                     return True, git_reason
 
-            # Check for find with command execution flags
-            # -exec, -execdir, -ok, -okdir run arbitrary commands
-            # -delete removes files (dangerous side effect)
+            # find (-exec*/-ok*/-delete) and kubectl (state-modifying subcommands) via shared
+            # helpers. dangerous_kubectl is reused at the top level (HIGH); top-level find stays
+            # command-aware via the find_exec_dangerous / recursive_delete YAML rules. See #97.
             if base_command == "find" and args:
-                dangerous_find_flags = {"-exec", "-execdir", "-ok", "-okdir", "-delete"}
-                for arg in args:
-                    if arg in dangerous_find_flags:
-                        return True, f"find {arg} executes commands or modifies files"
+                find_reason = dangerous_find(args)
+                if find_reason:
+                    return True, find_reason
 
-            # Check for kubectl with dangerous subcommands
-            # kubectl safety depends on the subcommand: get/describe/logs are read-only,
-            # exec/apply/delete/run modify state or execute code.
-            # Uses an allowlist of safe subcommands (default-deny for unknown).
             if base_command == "kubectl" and args:
-                subcommand = _find_kubectl_subcommand(args)
-
-                if not subcommand:
-                    return True, "kubectl without identifiable subcommand in substitution"
-
-                if subcommand not in _SAFE_KUBECTL_SUBCOMMANDS:
-                    return True, f"kubectl {subcommand} modifies cluster state or executes code"
-
-                # --- Argument-level checks for safe subcommands ---
-                # These catch dangerous patterns within otherwise-safe subcommands.
-                # Position-independent (scans all args), unlike YAML regex.
-
-                # Block --raw on get (accesses arbitrary API paths, bypasses resource-type checks)
-                # Handles both --raw and --raw=<path> forms
-                if subcommand == "get":
-                    if any(arg == "--raw" or arg.startswith("--raw=") for arg in args):
-                        return True, "kubectl get --raw accesses raw API paths"
-
-                # Block secret/secrets resource access on get/describe
-                # Only check positional args (via shared helper) to avoid
-                # false positives on paths like --kubeconfig /etc/secrets/kubeconfig
-                if subcommand in ("get", "describe"):
-                    for positional in _iter_kubectl_positionals(args):
-                        # Normalize: split on commas and slashes for multi-resource forms,
-                        # then strip dotted API group suffixes (secrets.v1 → secrets)
-                        tokens = [t for part in positional.lower().replace(",", "/").split("/") if (t := part.split(".")[0])]
-                        if any(t in ("secret", "secrets") for t in tokens):
-                            return True, f"kubectl {subcommand} secret access blocked in substitution"
-
-                # Multi-level subcommand checks:
-                # kubectl config view → safe, kubectl config set-context → dangerous
-                # Only match the first positional token after the subcommand,
-                # not flag values that happen to share names with dangerous ops.
-                if subcommand == "config":
-                    sub_sub = _find_sub_subcommand(args, "config")
-                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_CONFIG_OPS:
-                        return True, f"kubectl config {sub_sub} modifies kubeconfig"
-                    # config view --raw/--flatten exposes certificates, keys, and tokens.
-                    # Bare flags are dangerous; --flag=<val> only when truthy.
-                    if sub_sub == "view":
-                        for flag in ("--raw", "--flatten"):
-                            if any(arg == flag for arg in args):
-                                return True, "kubectl config view --raw/--flatten exposes credentials"
-                            prefix = flag + "="
-                            for arg in args:
-                                if arg.startswith(prefix) and _is_truthy_flag_value(arg.split("=", 1)[1]):
-                                    return True, "kubectl config view --raw/--flatten exposes credentials"
-
-                if subcommand == "auth":
-                    sub_sub = _find_sub_subcommand(args, "auth")
-                    if sub_sub == "reconcile":
-                        return True, f"kubectl auth {sub_sub} modifies RBAC"
-
-                if subcommand == "rollout":
-                    sub_sub = _find_sub_subcommand(args, "rollout")
-                    if sub_sub and sub_sub in _DANGEROUS_KUBECTL_ROLLOUT_OPS:
-                        return True, f"kubectl rollout {sub_sub} modifies deployment state"
-
-                if subcommand == "cluster-info":
-                    sub_sub = _find_sub_subcommand(args, "cluster-info")
-                    if sub_sub == "dump":
-                        return True, f"kubectl cluster-info {sub_sub} exfiltrates cluster data"
+                kubectl_reason = dangerous_kubectl(args)
+                if kubectl_reason:
+                    return True, kubectl_reason
 
         return False, ""
 
