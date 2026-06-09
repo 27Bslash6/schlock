@@ -31,10 +31,14 @@ rules:
       # A bare '.' is also a sentence period; anchor it to command position so
       # "echo done. see https://..." is not read as remote sourcing. See #105.
       - '(^|[\n;&|]\s*)\.\s+(https?|ftps?|ssh)://'
-      # source/. a process substitution that downloads: source <(curl URL)
+      # Shell reading a process substitution that downloads: <interp> <(curl URL).
+      # NOTE: at runtime SubstitutionValidator is the primary layer for <(...)
+      # (curl/wget -> BLOCKED, fetch/aria2c -> HIGH 'unknown command'); these YAML
+      # patterns are a backstop, kept on one shared downloader+scheme list so the
+      # four interpreter forms stay consistent.
       - '(source|\.)\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
-      - 'bash\s+<\(.{0,100}(curl|wget).{0,100}(https?|ftps?)://'
-      - 'sh\s+<\(.{0,100}(curl|wget).{0,100}(https?|ftps?)://'
+      - 'bash\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
+      - 'sh\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
       - 'source\s+/tmp/.{0,100}\.(sh|bash)'
       - '\.\s+/tmp/.{0,100}\.(sh|bash)'
     alternatives: ["Download first, inspect, then run", "Use package managers"]
