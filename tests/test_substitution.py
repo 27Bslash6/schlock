@@ -16,7 +16,7 @@ from schlock.core.substitution import (
     SubstitutionValidationResult,
     SubstitutionValidator,
 )
-from schlock.core.validator import load_rules
+from schlock.core.validator import load_rules, validate_command
 
 
 @pytest.fixture
@@ -223,9 +223,8 @@ class TestCompoundCommandCoverage:
             assert subs[0].substitution_type == SubstitutionType.COMMAND
 
     def test_command_list_in_substitution(self, validator, parser):
-        """Command lists should be handled."""
-        # Note: bashlex doesn't handle $(cmd1 && cmd2) well, use semicolon instead
-        ast = parser.parse("echo $(pwd; date)")
+        """Command lists should be handled, including && / || (see _apply_andor_substitution_correction)."""
+        ast = parser.parse("echo $(pwd && date)")
         subs = validator.extract_substitutions(ast)
         if subs:
             assert subs[0].substitution_type == SubstitutionType.COMMAND
@@ -1465,7 +1464,13 @@ class TestRemainingBranchCoverage:
         assert result is not None
 
     def test_list_operator_without_op(self, validator):
-        """List with operator that has no 'op' attribute."""
+        """A list operator missing its 'op' attribute renders to None (fail closed).
+
+        Real bashlex operators always carry 'op'; a missing one is a malformed/synthetic node.
+        Rather than emit "echo" and silently drop the unknown connector (which would
+        misrepresent the command to the rule engine and audit log), the renderer fails closed.
+        The list substitution is still validated per-segment from its AST.
+        """
 
         class MockWord:
             word = "echo"
@@ -1486,8 +1491,7 @@ class TestRemainingBranchCoverage:
             command = MockList()
 
         result = validator._extract_inner_command_text(MockNode())
-        assert result is not None
-        assert "echo" in result
+        assert result is None
 
     def test_list_part_without_parts(self, validator):
         """List command part without 'parts' attribute."""
@@ -1689,3 +1693,66 @@ class TestRemainingBranchCoverage:
 
         result = validator.extract_substitutions([MockCmd()])
         assert isinstance(result, list)
+
+
+class TestAndOrListSegmentValidation:
+    """Per-segment validation of && / || / ; / & lists inside $( ) (issue #96, Piece 2).
+
+    Each segment is validated independently; the list is allowed only if every segment is.
+    These cases were all hard-blocked before the grammar correction (ParseError -> fail closed).
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(date && pwd)"',
+            'echo "$(cd /tmp && ls)"',
+            'echo "$(pwd; whoami)"',
+            'echo "$(git rev-parse HEAD && date)"',
+            'echo "$(date & pwd)"',
+            'echo "$(cd /tmp && ls && pwd && date)"',
+            'echo "$(date && echo $(whoami))"',
+        ],
+    )
+    def test_all_safe_segments_allowed(self, validator, parser, command):
+        """A list whose every segment is safe/whitelisted is allowed."""
+        ast = parser.parse(command)
+        results = validator.validate_all_substitutions(ast)
+        assert results, "expected at least one substitution result"
+        assert all(r.allowed for r in results), [r.message for r in results if not r.allowed]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(date; rm -rf /)"',  # blacklisted later segment
+            'echo "$(true && rm -rf /)"',
+            'echo "$(rm -rf / & pwd)"',  # blacklisted first segment, backgrounded
+            'echo "$(date && unknowncmd)"',  # unknown later segment -> default deny
+            'echo "$(date && echo $(rm -rf /))"',  # nested substitution inside a segment
+            'echo "$(pwd && git -c core.sshCommand=rm fetch)"',  # dangerous git config in a segment
+            'echo "$(date && { rm -rf /; })"',  # compound segment -> fail closed
+            'echo "$(date && (rm -rf /))"',  # subshell compound segment -> fail closed
+        ],
+    )
+    def test_dangerous_segment_blocks_whole_list(self, validator, parser, command):
+        """If any segment is dangerous/unrenderable the whole list is blocked."""
+        ast = parser.parse(command)
+        results = validator.validate_all_substitutions(ast)
+        assert results, "expected at least one substitution result"
+        assert any(not r.allowed for r in results), "expected the list to be blocked"
+
+    def test_canonical_repro_allowed_end_to_end(self):
+        """The canonical #96 repro is allowed by the top-level validator regardless of preset."""
+        result = validate_command('X=$(cd "$(git rev-parse --git-dir)" && pwd)')
+        assert result.allowed, result.message
+
+    def test_inner_command_text_renders_pipeline_segment(self, validator, parser):
+        """A pipeline segment is rendered faithfully (not truncated) for rule matching/audit."""
+        ast = parser.parse("echo $(foo && bar | baz)")
+        subs = validator.extract_substitutions(ast)
+        assert subs
+        assert subs[0].inner_command == "foo && bar | baz"
+
+    def test_cd_is_whitelisted(self, validator):
+        """cd is now a whitelisted substitution command (subshell-pure)."""
+        assert validator.is_whitelisted("cd")
