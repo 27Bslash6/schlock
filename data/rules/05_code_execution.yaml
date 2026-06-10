@@ -23,7 +23,24 @@ rules:
   - name: source_remote_script
     description: Sourcing or executing remote scripts is extremely dangerous
     risk_level: BLOCKED
-    patterns: ['source\s+.{0,200}(https?|ftps?|ssh)://', '\.\s+.{0,200}(https?|ftps?|ssh)://', 'bash\s+<\(.{0,100}(curl|wget).{0,100}(https?|ftps?)://', 'sh\s+<\(.{0,100}(curl|wget).{0,100}(https?|ftps?)://', 'source\s+/tmp/.{0,100}\.(sh|bash)', '\.\s+/tmp/.{0,100}\.(sh|bash)']
+    patterns:
+      # source/. a remote URL directly (also catches --source <remote-url>).
+      # Adjacency - no .{0,200} gap - so a local --source path plus an
+      # unrelated URL elsewhere on the line no longer matches. See #105.
+      - 'source\s+(https?|ftps?|ssh)://'
+      # A bare '.' is also a sentence period; anchor it to command position so
+      # "echo done. see https://..." is not read as remote sourcing. See #105.
+      - '(^|[\n;&|]\s*)\.\s+(https?|ftps?|ssh)://'
+      # Shell reading a process substitution that downloads: <interp> <(curl URL).
+      # NOTE: at runtime SubstitutionValidator is the primary layer for <(...)
+      # (curl/wget -> BLOCKED, fetch/aria2c -> HIGH 'unknown command'); these YAML
+      # patterns are a backstop, kept on one shared downloader+scheme list so the
+      # four interpreter forms stay consistent.
+      - '(source|\.)\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
+      - 'bash\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
+      - 'sh\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
+      - 'source\s+/tmp/.{0,100}\.(sh|bash)'
+      - '\.\s+/tmp/.{0,100}\.(sh|bash)'
     alternatives: ["Download first, inspect, then run", "Use package managers"]
 
   - name: command_substitution_dangerous
@@ -112,9 +129,10 @@ rules:
       - 'secret-tool\s+lookup'
       - 'secret-tool\s+search'
       - '(cat|less|strings|cp|tar)\s+[^;|&]*\.local/share/keyrings/'
-      # pass password manager
-      - 'pass\s+show'
-      - 'pass\s+[^;|&]*-c'
+      # pass password manager (\b anchors 'pass' as its own word so it does not
+      # match inside bypass/compass/surpass - see #100)
+      - '\bpass\b\s+show'
+      - '\bpass\b\s+[^;|&]*-c'
       # GPG private keys
       - '(cat|less|strings|cp|tar)\s+[^;|&]*\.gnupg/private-keys'
       - 'gpg\s+[^;|&]*--export-secret-keys'
