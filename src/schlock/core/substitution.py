@@ -32,6 +32,10 @@ if TYPE_CHECKING:
 # Maximum recursion depth for nested substitution validation
 MAX_SUBSTITUTION_DEPTH = 10
 
+# Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
+# segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
+_LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
+
 # Commands that are ALWAYS safe inside substitution
 # These are read-only, pure, or security-critical tools that don't modify state
 SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
@@ -88,6 +92,10 @@ SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         "cksum",
         # Git (read-only operations - write ops would fail in substitution anyway)
         "git",
+        # Directory change (subshell-pure: only affects cwd inside the $() subshell, no exec).
+        # Safe to whitelist now that $(cd … && …) parses; without it the canonical repro
+        # X=$(cd "$(git rev-parse --git-dir)" && pwd) still hard-blocks on unknown "cd".
+        "cd",
         # Path manipulation (pure functions)
         "basename",
         "dirname",
@@ -544,11 +552,23 @@ class SubstitutionNode:
     """Represents a command or process substitution in the AST."""
 
     substitution_type: SubstitutionType
-    inner_command: str  # The command text inside the substitution
+    inner_command: str | None  # The command text inside the substitution (None if unrenderable, e.g. compound list segment)
     base_command: str | None  # First word of inner command (e.g., "op" from "op read ...")
     ast_node: Any  # The bashlex AST node
     nested_substitutions: list[SubstitutionNode] = field(default_factory=list)
     depth: int = 0  # Nesting depth
+
+
+class _ListSegment:
+    """Minimal stand-in that exposes one segment of a command list as a substitution's
+    ``.command``, so the extraction/validation helpers (which read ``node.command``) can be reused
+    to validate each `&&`/`||`/`;`/`&` segment independently.
+    """
+
+    __slots__ = ("command",)
+
+    def __init__(self, command: Any) -> None:
+        self.command = command
 
 
 @dataclass
@@ -645,7 +665,14 @@ class SubstitutionValidator:
             SubstitutionNode or None if extraction fails
         """
         inner_command = self._extract_inner_command_text(node)
-        if not inner_command:
+        # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
+        # survive even when text rendering is partial (e.g. a compound segment renders to None).
+        # Dropping it here would silently skip validation -> fail OPEN. Per-segment logic blocks
+        # the unrenderable segment instead. Non-list substitutions with no extractable command
+        # stay dropped (genuinely unparseable).
+        cmd_node = getattr(node, "command", None)
+        is_list = getattr(cmd_node, "kind", None) == "list"
+        if not inner_command and not is_list:
             return None
 
         base_command = self._extract_base_command(node)
@@ -698,20 +725,24 @@ class SubstitutionValidator:
                             parts_text.append("|")
             return " ".join(parts_text) if parts_text else None
 
-        # Handle command list: $(cmd1; cmd2) or $(cmd1 && cmd2)
+        # Handle command list: $(cmd1; cmd2), $(cmd1 && cmd2), $(cmd1 | cmd2 || cmd3), ...
+        # This text feeds the Layer-4 YAML rule match and the audit log, so it must render EVERY
+        # segment faithfully. A segment that cannot be rendered returns None (fail closed) rather
+        # than a truncated string that would hide a dropped pipeline/compound from the rule engine.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
-            # For command lists, extract all parts
             parts_text = []
             if hasattr(cmd_node, "parts"):
                 for part in cmd_node.parts:
-                    if hasattr(part, "kind") and part.kind == "command":
-                        if hasattr(part, "parts"):
-                            cmd_words = [p.word for p in part.parts if hasattr(p, "word")]
-                            if cmd_words:
-                                parts_text.append(" ".join(cmd_words))
-                    elif hasattr(part, "kind") and part.kind == "operator":
-                        if hasattr(part, "op"):
-                            parts_text.append(part.op)
+                    kind = getattr(part, "kind", None)
+                    if kind == "operator":
+                        if not hasattr(part, "op"):
+                            return None
+                        parts_text.append(part.op)
+                        continue
+                    rendered = self._render_segment_text(part)
+                    if rendered is None:
+                        return None  # unrenderable segment -> fail closed
+                    parts_text.append(rendered)
             return " ".join(parts_text) if parts_text else None
 
         # Handle simple command: try to get from parts
@@ -734,7 +765,58 @@ class SubstitutionValidator:
 
         return None
 
-    def _extract_base_command(self, node: Any) -> str | None:  # noqa: PLR0911
+    def _segment_base_command(self, node: Any) -> str | None:
+        """First word of a list segment (a `command`, or the first command of a `pipeline`).
+
+        Returns None for a compound segment or anything without a leading word, which the caller
+        treats as fail-closed (base_command=None -> blocked).
+        """
+        kind = getattr(node, "kind", None)
+        if kind == "command":
+            parts = getattr(node, "parts", None)
+            if parts and hasattr(parts[0], "word"):
+                return parts[0].word
+            return None
+        if kind == "pipeline":
+            for part in getattr(node, "parts", []):
+                if getattr(part, "kind", None) == "command":
+                    parts = getattr(part, "parts", None)
+                    if parts and hasattr(parts[0], "word"):
+                        return parts[0].word
+                    return None
+            return None
+        return None
+
+    def _render_segment_text(self, node: Any) -> str | None:
+        """Render one list segment (command or pipeline) to faithful command text.
+
+        Returns None for anything that cannot be rendered verbatim (compound `{ … }`/`( … )`,
+        a pipeline containing a reserved word like `!`, or an empty command). Callers treat None
+        as fail-closed: the segment is still validated structurally via its AST node, but it never
+        contributes a truncated string to the rule engine or audit log. Redirections are dropped
+        from the text (they are detected structurally), matching the simple-command rendering.
+        """
+        kind = getattr(node, "kind", None)
+        if kind == "command":
+            words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+            return " ".join(words) if words else None
+        if kind == "pipeline":
+            rendered: list[str] = []
+            for part in getattr(node, "parts", []):
+                part_kind = getattr(part, "kind", None)
+                if part_kind == "pipe":
+                    rendered.append("|")
+                elif part_kind == "command":
+                    words = [p.word for p in getattr(part, "parts", []) if hasattr(p, "word")]
+                    if not words:
+                        return None
+                    rendered.append(" ".join(words))
+                else:
+                    return None  # reserved word / unexpected node -> fail closed
+            return " ".join(rendered) if rendered else None
+        return None  # compound or unknown segment -> cannot render faithfully
+
+    def _extract_base_command(self, node: Any) -> str | None:  # noqa: PLR0911, PLR0912
         """Extract the base command (first word) from a substitution.
 
         Args:
@@ -748,6 +830,16 @@ class SubstitutionValidator:
 
         cmd_node = node.command
         if not cmd_node:
+            return None
+
+        # Handle command list: $(cmd1 && cmd2) / $(cmd1; cmd2) -> first segment's base command.
+        # Without this the list base_command is None and validate_substitution falls through to
+        # the "Cannot determine command in substitution" hard block.
+        if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
+            for part in getattr(cmd_node, "parts", []):
+                if getattr(part, "kind", None) == "operator":
+                    continue
+                return self._segment_base_command(part)
             return None
 
         # Handle pipeline - get first command in pipeline
@@ -1011,6 +1103,100 @@ class SubstitutionValidator:
 
         return None
 
+    def _is_valid_list_topology(self, parts: list[Any]) -> bool:
+        """True if ``parts`` is a well-formed bashlex command list: strictly alternating
+        segment / operator, odd length >= 1, ending on a segment, with every operator slot a
+        recognized list operator. Anything else is a malformed AST and the caller fails closed.
+        """
+        if not parts or len(parts) % 2 == 0:
+            return False
+        for index, part in enumerate(parts):
+            is_operator = getattr(part, "kind", None) == "operator"
+            if index % 2 == 0:
+                if is_operator:
+                    return False  # segment slot occupied by an operator
+            elif not is_operator or getattr(part, "op", None) not in _LIST_OPERATORS:
+                return False  # operator slot missing a recognized op
+        return True
+
+    def _validate_list_segments(self, sub_node: SubstitutionNode, cmd_node: Any, depth: int) -> SubstitutionValidationResult:
+        """Validate a command-list substitution segment-by-segment.
+
+        Each non-operator segment ($(a && b) -> [a, b]) is wrapped as its own substitution and
+        run through the full ``validate_substitution`` pipeline at the SAME depth (decomposition,
+        not nesting). The list is allowed only if every segment is allowed; the combined risk is
+        the max over segments and it is whitelisted only if every segment is. The whole rendered
+        text is then re-checked against the YAML rules to catch cross-segment patterns.
+
+        Fail-closed: a segment we cannot turn into a substitution node (e.g. a compound
+        ``{ … }``/``( … )``/``if`` segment) blocks the whole list.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        risk_order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
+        parts = list(getattr(cmd_node, "parts", []))
+        # Validate the raw topology BEFORE dropping operators: a well-formed list strictly
+        # alternates segment/operator and ends on a segment. A malformed shape (e.g. a trailing or
+        # op-less operator node) must block rather than silently validate the surviving segments.
+        if not self._is_valid_list_topology(parts):
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="Malformed list topology in substitution",
+            )
+
+        # A valid topology guarantees at least one segment (index 0 is always a segment slot),
+        # so there is no separate empty-list branch.
+        segments = [p for p in parts if getattr(p, "kind", None) != "operator"]
+
+        inner_results: list[SubstitutionValidationResult] = []
+        max_risk = RiskLevel.SAFE
+        all_whitelisted = True
+
+        for segment in segments:
+            child = self._create_substitution_node(_ListSegment(segment), sub_node.substitution_type, depth)
+            if child is None:
+                # Unrenderable segment (compound command, empty, etc.) -> block fail-closed.
+                return SubstitutionValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message="Cannot determine command in substitution segment",
+                    inner_results=inner_results,
+                )
+            result = self.validate_substitution(child, depth)
+            inner_results.append(result)
+            if not result.allowed:
+                return SubstitutionValidationResult(
+                    allowed=False,
+                    risk_level=result.risk_level,
+                    message=result.message,
+                    inner_results=inner_results,
+                )
+            if risk_order.index(result.risk_level) > risk_order.index(max_risk):
+                max_risk = result.risk_level
+            all_whitelisted = all_whitelisted and result.whitelisted
+
+        # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
+        if sub_node.inner_command and self.rule_engine is not None:
+            rule_match = self.rule_engine.match_command(sub_node.inner_command)
+            if rule_match and rule_match.matched:
+                amplified_risk = self._amplify_risk(rule_match.risk_level)
+                if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+                    return SubstitutionValidationResult(
+                        allowed=False,
+                        risk_level=RiskLevel.BLOCKED,
+                        message=f"Inner command blocked: {rule_match.message}",
+                        inner_results=inner_results,
+                    )
+
+        return SubstitutionValidationResult(
+            allowed=True,
+            risk_level=max_risk,
+            message="Command list segments validated",
+            whitelisted=all_whitelisted,
+            inner_results=inner_results,
+        )
+
     def validate_substitution(  # noqa: PLR0911, PLR0912
         self, sub_node: SubstitutionNode, depth: int = 0
     ) -> SubstitutionValidationResult:
@@ -1034,6 +1220,14 @@ class SubstitutionValidator:
                 message=f"Substitution nesting depth exceeded (max {MAX_SUBSTITUTION_DEPTH})",
                 depth_exceeded=True,
             )
+
+        # Command list: $(a && b), $(a; b), $(a & b), $(a || b). Validate each segment
+        # independently and combine. Done BEFORE the whitelist fast path because a list's
+        # base_command is just its FIRST segment's command — fast-pathing the whole chain on that
+        # would skip validation of later segments (e.g. $(date; rm -rf /)).
+        cmd_node = getattr(sub_node.ast_node, "command", None)
+        if getattr(cmd_node, "kind", None) == "list":
+            return self._validate_list_segments(sub_node, cmd_node, depth)
 
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):

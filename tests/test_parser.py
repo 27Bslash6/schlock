@@ -1,7 +1,11 @@
 """Tests for BashCommandParser."""
 
+import logging
+
+import bashlex
 import pytest
 
+from schlock.core import parser as parser_mod
 from schlock.exceptions import ParseError
 
 
@@ -333,3 +337,253 @@ class TestEvalExecDetection:
         assert has_eval_exec == should_detect, (
             f"{description}: command='{command}' expected detect={should_detect}, got {has_eval_exec}. dangers={dangers}"
         )
+
+
+def _inner_subst_command(nodes):
+    """Return the `command` node inside the first command-substitution reachable from `nodes`.
+
+    Accepts either a single node or the list returned by ``parser.parse``.
+    """
+    found = []
+
+    def walk(n):
+        if found:
+            return
+        if getattr(n, "kind", None) == "commandsubstitution":
+            found.append(n.command)
+            return
+        for attr in ("parts", "command", "list"):
+            child = getattr(n, attr, None)
+            if isinstance(child, list):
+                for item in child:
+                    walk(item)
+            elif child is not None and hasattr(child, "kind"):
+                walk(child)
+
+    if isinstance(nodes, list):
+        for node in nodes:
+            walk(node)
+    else:
+        walk(nodes)
+    return found[0] if found else None
+
+
+def _op_signature(node):
+    """Flatten a node into a list of operator ops + leaf words, in source order."""
+    sig = []
+
+    def walk(n):
+        kind = getattr(n, "kind", None)
+        if kind == "operator":
+            sig.append(("op", n.op))
+        elif kind == "word" and not getattr(n, "parts", None):
+            sig.append(("word", n.word))
+        for attr in ("parts", "command", "list"):
+            child = getattr(n, attr, None)
+            if isinstance(child, list):
+                for item in child:
+                    walk(item)
+            elif child is not None and hasattr(child, "kind"):
+                walk(child)
+
+    walk(node)
+    return sig
+
+
+class TestAndOrSubstitutionCorrection:
+    """The vendored bashlex grammar correction for AND-OR lists inside $( ) (issue #96).
+
+    Without the correction, &&/||/& inside a command substitution raise ParsingError, which the
+    fail-closed validator turns into a hard block of legitimate commands.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(a && b)",
+            "echo $(a || b)",
+            "echo $(a & b)",
+            "echo $(a && b && c)",
+            "echo $(a || b || c)",
+            "echo $(a && b || c)",
+            "echo $(a; b && c)",
+            'X=$(cd "$(git rev-parse --git-dir)" && pwd)',
+            "echo $(a &&\n b)",
+            "diff <(a && b) <(c)",
+        ],
+    )
+    def test_andor_lists_inside_substitution_now_parse(self, parser, command):
+        """AND-OR list operators inside $( ) parse instead of raising ParseError."""
+        ast = parser.parse(command)
+        assert ast is not None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(a &&)",
+            "echo $(&& a)",
+            "echo $(a ||)",
+            "echo $(a && && b)",
+        ],
+    )
+    def test_malformed_lists_still_rejected(self, parser, command):
+        """The correction must not make bashlex accept malformed bash (no over-lenience)."""
+        with pytest.raises(ParseError):
+            parser.parse(command)
+
+    @pytest.mark.parametrize(
+        "inner",
+        ["a && b", "a || b && c", "a & b", "a; b && c"],
+    )
+    def test_substitution_ast_matches_top_level(self, parser, inner):
+        """The inner list AST must be structurally identical to the same list parsed top-level.
+
+        Security-critical: the validator walks this AST, so a mis-parse that under-represented the
+        operators or commands would let danger through. The flat list/operator signature of the
+        substitution body must equal the top-level parse.
+        """
+        sub_ast = parser.parse(f"echo $({inner})")
+        inner_cmd = _inner_subst_command(sub_ast)
+        assert inner_cmd is not None
+        top_ast = parser.parse(inner)
+        assert _op_signature(inner_cmd) == _op_signature(top_ast[0])
+
+    def test_correction_is_idempotent(self):
+        """Re-running the correction never clobbers existing actions (guarded fill-only-None)."""
+        yp = bashlex.parser.yaccparser
+        s2 = yp.goto[0]["simple_list1"]
+        amp_state = yp.goto[yp.action[s2]["AMPERSAND"]]["simple_list1"]
+        before = yp.action[amp_state].get("RIGHT_PAREN")
+        assert before is not None  # applied at import
+        parser_mod._apply_andor_substitution_correction()
+        assert yp.action[amp_state].get("RIGHT_PAREN") == before
+
+    def test_self_check_reverts_on_bad_table(self):
+        """If the derived reduce is wrong (self-check fails), every patched cell is reverted.
+
+        This guards the fail-closed degrade path: a future bashlex/arch table drift must fall back
+        to today's conservative over-block, never to a structurally wrong AST.
+
+        We swap ``bashlex.parse`` by hand (not the monkeypatch fixture) so the restore in ``finally``
+        runs with the REAL parser — otherwise the self-check would fail again and never restore the
+        shared parse tables, breaking every later test.
+        """
+        yp = bashlex.parser.yaccparser
+        s2 = yp.goto[0]["simple_list1"]
+        states = [
+            yp.goto[yp.action[s2]["AMPERSAND"]]["simple_list1"],
+            yp.goto[yp.goto[yp.action[s2]["AND_AND"]]["newline_list"]]["simple_list1"],
+            yp.goto[yp.goto[yp.action[s2]["OR_OR"]]["newline_list"]]["simple_list1"],
+        ]
+        saved = {st: yp.action[st].get("RIGHT_PAREN") for st in states}
+        real_parse = bashlex.parse
+        try:
+            # Reset to virgin (cells absent) so the guarded patch will re-apply.
+            for st in states:
+                yp.action[st].pop("RIGHT_PAREN", None)
+
+            # Force the self-check to fail: a "must parse" form raises.
+            def fake_parse(s, *a, **k):
+                if s == "echo $(a && b)":
+                    raise bashlex.errors.ParsingError("forced", s, 0)
+                return real_parse(s, *a, **k)
+
+            bashlex.parse = fake_parse
+            parser_mod._apply_andor_substitution_correction()
+
+            # Reverted: cells back to absent, not left half-patched.
+            for st in states:
+                assert yp.action[st].get("RIGHT_PAREN") is None
+        finally:
+            bashlex.parse = real_parse  # restore BEFORE re-applying the correction
+            for st in states:
+                yp.action[st].pop("RIGHT_PAREN", None)
+            parser_mod._apply_andor_substitution_correction()
+        # Tables are healthy again for subsequent tests.
+        for st, val in saved.items():
+            assert yp.action[st].get("RIGHT_PAREN") == val
+
+    def test_derivation_miss_warns_not_silent(self, caplog):
+        """A spec that cannot be derived (table drift) must trigger the self-check and warn,
+        even though nothing was patched — a silent degrade to fail-closed over-block is a
+        silent failure.
+        """
+        yp = bashlex.parser.yaccparser
+        s2 = yp.goto[0]["simple_list1"]
+        states = [
+            yp.goto[yp.action[s2]["AMPERSAND"]]["simple_list1"],
+            yp.goto[yp.goto[yp.action[s2]["AND_AND"]]["newline_list"]]["simple_list1"],
+            yp.goto[yp.goto[yp.action[s2]["OR_OR"]]["newline_list"]]["simple_list1"],
+        ]
+        saved = {st: yp.action[st].get("RIGHT_PAREN") for st in states}
+        real_specs = parser_mod._ANDOR_CORRECTION_SPECS
+        try:
+            # Clear the cells so AND-OR no longer parses -> the self-check will fail.
+            for st in states:
+                yp.action[st].pop("RIGHT_PAREN", None)
+            # Every spec fails to derive a production (bogus RHS) -> missed=True, patched empty.
+            parser_mod._ANDOR_CORRECTION_SPECS = (("AMPERSAND", ("simple_list1", "NONEXISTENT"), False),)
+            with caplog.at_level(logging.WARNING, logger="schlock.core.parser"):
+                parser_mod._apply_andor_substitution_correction()
+            assert any("failed self-check" in r.message for r in caplog.records), (
+                "a derivation miss with a failing self-check must warn, not silently degrade"
+            )
+            # Nothing was patched, so nothing to revert.
+            for st in states:
+                assert yp.action[st].get("RIGHT_PAREN") is None
+        finally:
+            parser_mod._ANDOR_CORRECTION_SPECS = real_specs
+            for st in states:
+                yp.action[st].pop("RIGHT_PAREN", None)
+            parser_mod._apply_andor_substitution_correction()
+        for st, val in saved.items():
+            assert yp.action[st].get("RIGHT_PAREN") == val
+
+    def test_correction_never_breaks_import_on_unexpected_error(self, caplog):
+        """Any unexpected error while poking the tables is swallowed (best-effort) and warned —
+        the import must never break, it just degrades to the fail-closed over-block.
+        """
+        real_yacc = bashlex.parser.yaccparser
+
+        class _Boom:
+            goto: dict = {}
+            productions: list = []
+
+            @property
+            def action(self):
+                raise RuntimeError("simulated table access failure")
+
+        try:
+            bashlex.parser.yaccparser = _Boom()
+            with caplog.at_level(logging.WARNING, logger="schlock.core.parser"):
+                parser_mod._apply_andor_substitution_correction()  # must not raise
+            assert any("could not be applied" in r.message for r in caplog.records)
+        finally:
+            bashlex.parser.yaccparser = real_yacc
+            parser_mod._apply_andor_substitution_correction()  # restore the real correction
+
+    def test_continuation_state_drift_paths(self, caplog):
+        """A drifted action table (missing shift / missing newline_list goto) makes the state
+        walk return None for every operator -> nothing patched, but the miss still warns.
+
+        Crafted tables exercise both `continuation_state` early-return branches:
+        AMPERSAND/OR_OR have no shift action (missing key); AND_AND shifts to a state whose goto
+        lacks `newline_list`.
+        """
+        real_yacc = bashlex.parser.yaccparser
+
+        class _Drifted:
+            # goto[0]['simple_list1'] = 1 ; action[1] only has AND_AND -> 5 ; goto[5] lacks newline_list
+            goto = {0: {"simple_list1": 1}, 5: {}}
+            action = {1: {"AND_AND": 5}}
+            productions: list = []
+
+        try:
+            bashlex.parser.yaccparser = _Drifted()
+            with caplog.at_level(logging.WARNING, logger="schlock.core.parser"):
+                parser_mod._apply_andor_substitution_correction()  # must not raise
+            # No cell could be derived, so nothing was added to the drifted action table.
+            assert "RIGHT_PAREN" not in _Drifted.action.get(1, {})
+        finally:
+            bashlex.parser.yaccparser = real_yacc
+            parser_mod._apply_andor_substitution_correction()  # restore the real correction

@@ -16,7 +16,7 @@ from schlock.core.substitution import (
     SubstitutionValidationResult,
     SubstitutionValidator,
 )
-from schlock.core.validator import load_rules
+from schlock.core.validator import load_rules, validate_command
 
 
 @pytest.fixture
@@ -223,9 +223,8 @@ class TestCompoundCommandCoverage:
             assert subs[0].substitution_type == SubstitutionType.COMMAND
 
     def test_command_list_in_substitution(self, validator, parser):
-        """Command lists should be handled."""
-        # Note: bashlex doesn't handle $(cmd1 && cmd2) well, use semicolon instead
-        ast = parser.parse("echo $(pwd; date)")
+        """Command lists should be handled, including && / || (see _apply_andor_substitution_correction)."""
+        ast = parser.parse("echo $(pwd && date)")
         subs = validator.extract_substitutions(ast)
         if subs:
             assert subs[0].substitution_type == SubstitutionType.COMMAND
@@ -1465,7 +1464,13 @@ class TestRemainingBranchCoverage:
         assert result is not None
 
     def test_list_operator_without_op(self, validator):
-        """List with operator that has no 'op' attribute."""
+        """A list operator missing its 'op' attribute renders to None (fail closed).
+
+        Real bashlex operators always carry 'op'; a missing one is a malformed/synthetic node.
+        Rather than emit "echo" and silently drop the unknown connector (which would
+        misrepresent the command to the rule engine and audit log), the renderer fails closed.
+        The list substitution is still validated per-segment from its AST.
+        """
 
         class MockWord:
             word = "echo"
@@ -1486,8 +1491,7 @@ class TestRemainingBranchCoverage:
             command = MockList()
 
         result = validator._extract_inner_command_text(MockNode())
-        assert result is not None
-        assert "echo" in result
+        assert result is None
 
     def test_list_part_without_parts(self, validator):
         """List command part without 'parts' attribute."""
@@ -1689,3 +1693,248 @@ class TestRemainingBranchCoverage:
 
         result = validator.extract_substitutions([MockCmd()])
         assert isinstance(result, list)
+
+
+class TestAndOrListSegmentValidation:
+    """Per-segment validation of && / || / ; / & lists inside $( ) (issue #96, Piece 2).
+
+    Each segment is validated independently; the list is allowed only if every segment is.
+    These cases were all hard-blocked before the grammar correction (ParseError -> fail closed).
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(date && pwd)"',
+            'echo "$(cd /tmp && ls)"',
+            'echo "$(pwd; whoami)"',
+            'echo "$(git rev-parse HEAD && date)"',
+            'echo "$(date & pwd)"',
+            'echo "$(true || date)"',  # OR operator, both segments safe
+            'echo "$(cd /tmp && ls && pwd && date)"',
+            'echo "$(date && echo $(whoami))"',
+        ],
+    )
+    def test_all_safe_segments_allowed(self, validator, parser, command):
+        """A list whose every segment is safe/whitelisted is allowed."""
+        ast = parser.parse(command)
+        results = validator.validate_all_substitutions(ast)
+        assert results, "expected at least one substitution result"
+        assert all(r.allowed for r in results), [r.message for r in results if not r.allowed]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(date; rm -rf /)"',  # blacklisted later segment
+            'echo "$(true && rm -rf /)"',
+            'echo "$(date || rm -rf /)"',  # OR operator, blacklisted second segment
+            'echo "$(rm -rf / & pwd)"',  # blacklisted first segment, backgrounded
+            'echo "$(date && unknowncmd)"',  # unknown later segment -> default deny
+            'echo "$(date && echo $(rm -rf /))"',  # nested substitution inside a segment
+            'echo "$(pwd && git -c core.sshCommand=rm fetch)"',  # dangerous git config in a segment
+            'echo "$(date && { rm -rf /; })"',  # compound segment -> fail closed
+            'echo "$(date && (rm -rf /))"',  # subshell compound segment -> fail closed
+        ],
+    )
+    def test_dangerous_segment_blocks_whole_list(self, validator, parser, command):
+        """If any segment is dangerous/unrenderable the whole list is blocked."""
+        ast = parser.parse(command)
+        results = validator.validate_all_substitutions(ast)
+        assert results, "expected at least one substitution result"
+        assert any(not r.allowed for r in results), "expected the list to be blocked"
+
+    @pytest.mark.parametrize(
+        "parts_spec,expected",
+        [
+            ([("command", None), ("operator", "&&"), ("command", None)], True),
+            ([("command", None), ("operator", ";"), ("command", None)], True),
+            ([("pipeline", None), ("operator", "||"), ("command", None)], True),
+            ([("command", None)], True),  # degenerate single segment
+            ([], False),  # empty
+            ([("command", None), ("operator", "&&")], False),  # trailing operator (even length)
+            ([("command", None), ("operator", None), ("command", None)], False),  # op missing .op
+            ([("command", None), ("operator", "XX"), ("command", None)], False),  # unrecognized op
+            ([("operator", "&&"), ("command", None), ("command", None)], False),  # op in segment slot
+        ],
+    )
+    def test_list_topology_validation(self, validator, parts_spec, expected):
+        """_is_valid_list_topology accepts only strictly alternating, segment-terminated lists."""
+
+        def make(kind, op):
+            attrs = {"kind": kind}
+            if op is not None:
+                attrs["op"] = op
+            return type("_Part", (), attrs)()
+
+        parts = [make(kind, op) for kind, op in parts_spec]
+        assert validator._is_valid_list_topology(parts) is expected
+
+    def test_malformed_list_topology_blocked_end_to_end(self, validator):
+        """A malformed list AST (operator without op) blocks instead of validating surviving segments."""
+
+        class _Op:
+            kind = "operator"  # deliberately no .op attribute
+
+        class _Cmd:
+            kind = "command"
+            parts: list = []
+
+        class _List:
+            kind = "list"
+            parts = [_Cmd(), _Op()]  # even length + op-less operator
+
+        class _Node:
+            command = _List()
+
+        sub = SubstitutionNode(
+            substitution_type=SubstitutionType.COMMAND,
+            inner_command=None,
+            base_command=None,
+            ast_node=_Node(),
+        )
+        result = validator.validate_substitution(sub)
+        assert not result.allowed
+        assert "Malformed list topology" in result.message
+
+    def test_canonical_repro_allowed_end_to_end(self):
+        """The canonical #96 repro is allowed by the top-level validator regardless of preset."""
+        result = validate_command('X=$(cd "$(git rev-parse --git-dir)" && pwd)')
+        assert result.allowed, result.message
+
+    def test_inner_command_text_renders_pipeline_segment(self, validator, parser):
+        """A pipeline segment is rendered faithfully (not truncated) for rule matching/audit."""
+        ast = parser.parse("echo $(foo && bar | baz)")
+        subs = validator.extract_substitutions(ast)
+        assert subs
+        assert subs[0].inner_command == "foo && bar | baz"
+
+    def test_cd_is_whitelisted(self, validator):
+        """cd is now a whitelisted substitution command (subshell-pure)."""
+        assert validator.is_whitelisted("cd")
+
+
+def _mock(kind, **attrs):
+    return type("_Mock", (), {"kind": kind, **attrs})()
+
+
+class TestListSegmentBranchCoverage:
+    """Direct branch coverage of the per-segment list helpers (issue #96)."""
+
+    # --- _segment_base_command ---
+
+    def test_segment_base_command_command_without_word(self, validator):
+        """A command segment with no leading word -> None (fail-closed base)."""
+        assert validator._segment_base_command(_mock("command", parts=[])) is None
+
+    def test_segment_base_command_pipeline_first_command(self, validator):
+        """A pipeline segment resolves to the first command's first word."""
+        pipeline = _mock(
+            "pipeline",
+            parts=[_mock("command", parts=[_mock("word", word="grep")]), _mock("pipe"), _mock("command", parts=[])],
+        )
+        assert validator._segment_base_command(pipeline) == "grep"
+
+    def test_segment_base_command_pipeline_command_without_word(self, validator):
+        """A pipeline whose first command has no word -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("command", parts=[])])
+        assert validator._segment_base_command(pipeline) is None
+
+    def test_segment_base_command_pipeline_without_command(self, validator):
+        """A pipeline with no command part (e.g. only a reserved word) -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("reservedword")])
+        assert validator._segment_base_command(pipeline) is None
+
+    def test_segment_base_command_compound_returns_none(self, validator):
+        """A compound segment has no leading word -> None."""
+        assert validator._segment_base_command(_mock("compound")) is None
+
+    # --- _render_segment_text ---
+
+    def test_render_segment_text_command_without_words(self, validator):
+        """A command with no words renders to None (fail-closed)."""
+        assert validator._render_segment_text(_mock("command", parts=[])) is None
+
+    def test_render_segment_text_pipeline(self, validator):
+        """A pipeline renders as 'cmd | cmd' with words preserved."""
+        pipeline = _mock(
+            "pipeline",
+            parts=[
+                _mock("command", parts=[_mock("word", word="grep"), _mock("word", word="x")]),
+                _mock("pipe"),
+                _mock("command", parts=[_mock("word", word="head")]),
+            ],
+        )
+        assert validator._render_segment_text(pipeline) == "grep x | head"
+
+    def test_render_segment_text_pipeline_with_reserved_word(self, validator):
+        """A pipeline containing a reserved word (e.g. `!`) is unrenderable -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("reservedword"), _mock("command", parts=[_mock("word", word="x")])])
+        assert validator._render_segment_text(pipeline) is None
+
+    def test_render_segment_text_pipeline_command_without_words(self, validator):
+        """A pipeline whose command has no words is unrenderable -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("command", parts=[])])
+        assert validator._render_segment_text(pipeline) is None
+
+    def test_render_segment_text_compound_returns_none(self, validator):
+        """A compound segment cannot be rendered faithfully -> None."""
+        assert validator._render_segment_text(_mock("compound")) is None
+
+    # --- _extract_base_command list branch (operator handling) ---
+
+    def test_extract_base_command_list_skips_leading_operator(self, validator):
+        """A leading operator slot is skipped; the first real segment supplies the base command."""
+        node = _mock(
+            "x",
+            command=_mock(
+                "list",
+                parts=[_mock("operator", op="&&"), _mock("command", parts=[_mock("word", word="date")])],
+            ),
+        )
+        # _extract_base_command reads node.command
+        assert validator._extract_base_command(node) == "date"
+
+    def test_extract_base_command_list_all_operators(self, validator):
+        """A list of only operators yields no base command -> None."""
+        node = _mock("x", command=_mock("list", parts=[_mock("operator", op="&&"), _mock("operator", op="||")]))
+        assert validator._extract_base_command(node) is None
+
+    # --- _validate_list_segments: cross-segment rule match + risk aggregation ---
+
+    def test_cross_segment_rule_match_blocks(self, parser):
+        """The full rendered list text is re-checked against the rules even when every segment
+        passes individually; a HIGH/BLOCKED match blocks the whole list (defense-in-depth)."""
+
+        class _Match:
+            matched = True
+            risk_level = RiskLevel.HIGH
+            message = "mock cross-segment rule"
+
+        class _Engine:
+            def match_command(self, command):  # noqa: ARG002
+                return _Match()
+
+        v = SubstitutionValidator(parser, _Engine())
+        ast = parser.parse('echo "$(date && pwd)"')  # both segments whitelisted -> pass per-segment
+        results = v.validate_all_substitutions(ast)
+        assert results and not results[0].allowed
+        assert "Inner command blocked" in results[0].message
+
+    def test_list_segment_risk_aggregation(self, validator, parser):
+        """The combined risk is the max over segments (verified by forcing a non-SAFE allowed
+        segment — synthetic, since real allowed segments are always SAFE)."""
+        ast = parser.parse('echo "$(date && pwd)"')
+        sub = validator.extract_substitutions(ast)[0]
+        cmd_node = sub.ast_node.command
+        original = validator.validate_substitution
+
+        def fake(child, depth):  # noqa: ARG001
+            return SubstitutionValidationResult(allowed=True, risk_level=RiskLevel.MEDIUM, message="x")
+
+        validator.validate_substitution = fake
+        try:
+            result = validator._validate_list_segments(sub, cmd_node, 0)
+        finally:
+            validator.validate_substitution = original
+        assert result.allowed
+        assert result.risk_level == RiskLevel.MEDIUM

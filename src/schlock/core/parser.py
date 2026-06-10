@@ -17,6 +17,108 @@ from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
 
+
+# Each AND-OR list operator and the `simple_list1` production its `$( … )` close should reduce
+# through (discovered by table-walk, never by hardcoded index). The 4-symbol AND_AND/OR_OR rules
+# need an extra `newline_list` hop vs the 3-symbol AMPERSAND rule.
+_ANDOR_CORRECTION_SPECS = (
+    ("AMPERSAND", ("simple_list1", "AMPERSAND", "simple_list1"), False),
+    ("AND_AND", ("simple_list1", "AND_AND", "newline_list", "simple_list1"), True),
+    ("OR_OR", ("simple_list1", "OR_OR", "newline_list", "simple_list1"), True),
+)
+
+
+def _parse_succeeds(src: str) -> bool:
+    """True if vendored bashlex parses ``src`` without raising (used by the correction self-check)."""
+    try:
+        bashlex.parse(src)
+        return True
+    except Exception:  # noqa: BLE001 - any failure means "did not parse", which is all we need
+        return False
+
+
+def _andor_correction_self_check() -> bool:
+    """Previously-failing AND-OR forms must now parse AND malformed bash must still be rejected."""
+    must_parse = ("echo $(a && b)", "echo $(a || b)", "echo $(a & b)")
+    must_reject = ("echo $(a &&)", "echo $(&& a)", "echo $(a ||)", "echo $(a && && b)")
+    if not all(_parse_succeeds(s) for s in must_parse):
+        return False
+    return not any(_parse_succeeds(s) for s in must_reject)
+
+
+def _apply_andor_substitution_correction() -> None:
+    """Teach bashlex to parse AND-OR lists (``&&``/``||``/``&``) inside ``$( … )``.
+
+    bashlex 0.18 only accepts ``;``-separated lists inside a command substitution: an AND-OR
+    operator there raises ``ParsingError``. Because schlock's safety validator is fail-closed,
+    that turns legitimate commands like ``X=$(cd "$(git rev-parse --git-dir)" && pwd)`` into a
+    hard block. Upstream (idank/bashlex#54) is unfixed and 0.18 is the latest release, so we
+    correct the parser ourselves.
+
+    Root cause: bashlex's own import-time hack ``get_correction_rightparen_states`` adds a
+    ``RIGHT_PAREN`` reduce action only to the SEMICOLON continuation state. The sibling AMPERSAND
+    / AND_AND / OR_OR continuation states have no ``RIGHT_PAREN`` action, so the closing ``)`` of
+    the substitution lands on an error cell. We mirror bashlex's technique and fill those cells.
+
+    Safety: an LALR parse never visits an error (absent) cell, so adding an action to a cell that
+    is currently absent cannot change the parse of any input that already parsed — only the
+    inputs that previously hit ``p_error`` are affected. We therefore patch a cell ONLY when it is
+    absent, and reduce via each operator's own ``simple_list1`` production so the resulting AST
+    matches a top-level ``a && b`` list.
+
+    Degrades gracefully: if the table layout ever drifts (new bashlex / arch) and the walk derives
+    a wrong cell, a self-check reverts every patched cell and logs a warning, leaving the
+    fail-closed status quo (over-block) rather than risking a structurally wrong AST.
+    """
+    try:
+        yp = bashlex.parser.yaccparser
+        action, goto, productions = yp.action, yp.goto, yp.productions
+        prod_index = {(p.name, tuple(p.prod)): i for i, p in enumerate(productions)}
+
+        def continuation_state(op: str, *, via_newline_list: bool) -> Optional[int]:
+            """State reached after shifting ``op`` from the initial ``simple_list1`` state."""
+            shifted = action[goto[0]["simple_list1"]].get(op)
+            if shifted is None or shifted < 0:  # must be a shift (positive state)
+                return None
+            table = goto[shifted]
+            if via_newline_list:
+                nl = table.get("newline_list")
+                if nl is None:
+                    return None
+                table = goto[nl]
+            return table.get("simple_list1")
+
+        patched: list[int] = []
+        missed = False
+        for op, rhs, via_nl in _ANDOR_CORRECTION_SPECS:
+            state = continuation_state(op, via_newline_list=via_nl)
+            prod = prod_index.get(("simple_list1", rhs))
+            if state is None or prod is None:
+                # Could not derive this correction — the table layout may have drifted.
+                missed = True
+                continue
+            if action[state].get("RIGHT_PAREN") is not None:
+                continue  # already supported/applied — natively fine, never clobber it
+            action[state]["RIGHT_PAREN"] = -prod
+            patched.append(state)
+
+        # Run the self-check whenever we changed the tables OR a spec failed to derive (drift
+        # signal). Only skip it when every spec was already natively supported (nothing patched,
+        # nothing missed) — there is then nothing to verify. A bare derivation miss must still
+        # warn: a silent degrade to fail-closed over-block is a silent failure.
+        if (patched or missed) and not _andor_correction_self_check():
+            for state in patched:
+                action[state].pop("RIGHT_PAREN", None)
+            logger.warning(
+                "bashlex AND-OR substitution correction failed self-check; reverted "
+                "(legitimate $(a && b) substitutions will be conservatively blocked)"
+            )
+    except Exception:  # noqa: BLE001 - correction is best-effort; never break import
+        logger.warning("bashlex AND-OR substitution correction could not be applied", exc_info=True)
+
+
+_apply_andor_substitution_correction()
+
 # Interpreters that EXECUTE their standard input as a program when given no program source.
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
 # those run a *named* command, not stdin-as-program, and are covered by the download->shell
