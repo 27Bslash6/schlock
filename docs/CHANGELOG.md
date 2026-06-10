@@ -5,6 +5,15 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.4...schlock-v0.7.5) (2026-06-10)
+
+
+### Bug Fixes
+
+* **parser:** parse AND-OR lists inside $() to stop fail-closed over-blocks ([#96](https://github.com/27Bslash6/schlock/issues/96)) ([#111](https://github.com/27Bslash6/schlock/issues/111)) ([c454182](https://github.com/27Bslash6/schlock/commit/c45418217892f68d0480343a9d7d1b88727a080a))
+* **rules:** anchor keyword matches to stop false-positive blocks ([#100](https://github.com/27Bslash6/schlock/issues/100), [#105](https://github.com/27Bslash6/schlock/issues/105)) ([#107](https://github.com/27Bslash6/schlock/issues/107)) ([02bc2c9](https://github.com/27Bslash6/schlock/commit/02bc2c93801f562582e9b193aa92d24ea2f8c99b))
+* **validator:** top-level parity for kubectl, compound pipe sinks, find flags ([#97](https://github.com/27Bslash6/schlock/issues/97)) ([#109](https://github.com/27Bslash6/schlock/issues/109)) ([fac2d99](https://github.com/27Bslash6/schlock/commit/fac2d995f9d9e3a8e9228ff283c70a5c3284c3fb))
+
 ## [0.7.4](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.3...schlock-v0.7.4) (2026-06-08)
 
 
