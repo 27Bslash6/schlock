@@ -75,7 +75,7 @@ def _apply_andor_substitution_correction() -> None:
         action, goto, productions = yp.action, yp.goto, yp.productions
         prod_index = {(p.name, tuple(p.prod)): i for i, p in enumerate(productions)}
 
-        def continuation_state(op: str, *, via_newline_list: bool) -> int | None:
+        def continuation_state(op: str, *, via_newline_list: bool) -> Optional[int]:
             """State reached after shifting ``op`` from the initial ``simple_list1`` state."""
             shifted = action[goto[0]["simple_list1"]].get(op)
             if shifted is None or shifted < 0:  # must be a shift (positive state)
