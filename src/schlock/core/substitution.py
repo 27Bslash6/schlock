@@ -32,6 +32,10 @@ if TYPE_CHECKING:
 # Maximum recursion depth for nested substitution validation
 MAX_SUBSTITUTION_DEPTH = 10
 
+# Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
+# segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
+_LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
+
 # Commands that are ALWAYS safe inside substitution
 # These are read-only, pure, or security-critical tools that don't modify state
 SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
@@ -1099,6 +1103,22 @@ class SubstitutionValidator:
 
         return None
 
+    def _is_valid_list_topology(self, parts: list[Any]) -> bool:
+        """True if ``parts`` is a well-formed bashlex command list: strictly alternating
+        segment / operator, odd length >= 1, ending on a segment, with every operator slot a
+        recognized list operator. Anything else is a malformed AST and the caller fails closed.
+        """
+        if not parts or len(parts) % 2 == 0:
+            return False
+        for index, part in enumerate(parts):
+            is_operator = getattr(part, "kind", None) == "operator"
+            if index % 2 == 0:
+                if is_operator:
+                    return False  # segment slot occupied by an operator
+            elif not is_operator or getattr(part, "op", None) not in _LIST_OPERATORS:
+                return False  # operator slot missing a recognized op
+        return True
+
     def _validate_list_segments(self, sub_node: SubstitutionNode, cmd_node: Any, depth: int) -> SubstitutionValidationResult:
         """Validate a command-list substitution segment-by-segment.
 
@@ -1114,7 +1134,18 @@ class SubstitutionValidator:
         from .rules import RiskLevel  # noqa: PLC0415
 
         risk_order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
-        segments = [p for p in getattr(cmd_node, "parts", []) if getattr(p, "kind", None) != "operator"]
+        parts = list(getattr(cmd_node, "parts", []))
+        # Validate the raw topology BEFORE dropping operators: a well-formed list strictly
+        # alternates segment/operator and ends on a segment. A malformed shape (e.g. a trailing or
+        # op-less operator node) must block rather than silently validate the surviving segments.
+        if not self._is_valid_list_topology(parts):
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="Malformed list topology in substitution",
+            )
+
+        segments = [p for p in parts if getattr(p, "kind", None) != "operator"]
         if not segments:
             return SubstitutionValidationResult(
                 allowed=False,

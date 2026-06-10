@@ -89,15 +89,24 @@ def _apply_andor_substitution_correction() -> None:
             return table.get("simple_list1")
 
         patched: list[int] = []
+        missed = False
         for op, rhs, via_nl in _ANDOR_CORRECTION_SPECS:
             state = continuation_state(op, via_newline_list=via_nl)
             prod = prod_index.get(("simple_list1", rhs))
-            if state is None or prod is None or action[state].get("RIGHT_PAREN") is not None:
-                continue  # absent state/production, or never clobber an existing action
+            if state is None or prod is None:
+                # Could not derive this correction — the table layout may have drifted.
+                missed = True
+                continue
+            if action[state].get("RIGHT_PAREN") is not None:
+                continue  # already supported/applied — natively fine, never clobber it
             action[state]["RIGHT_PAREN"] = -prod
             patched.append(state)
 
-        if patched and not _andor_correction_self_check():
+        # Run the self-check whenever we changed the tables OR a spec failed to derive (drift
+        # signal). Only skip it when every spec was already natively supported (nothing patched,
+        # nothing missed) — there is then nothing to verify. A bare derivation miss must still
+        # warn: a silent degrade to fail-closed over-block is a silent failure.
+        if (patched or missed) and not _andor_correction_self_check():
             for state in patched:
                 action[state].pop("RIGHT_PAREN", None)
             logger.warning(

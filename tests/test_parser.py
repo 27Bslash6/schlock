@@ -1,5 +1,7 @@
 """Tests for BashCommandParser."""
 
+import logging
+
 import bashlex
 import pytest
 
@@ -498,5 +500,41 @@ class TestAndOrSubstitutionCorrection:
                 yp.action[st].pop("RIGHT_PAREN", None)
             parser_mod._apply_andor_substitution_correction()
         # Tables are healthy again for subsequent tests.
+        for st, val in saved.items():
+            assert yp.action[st].get("RIGHT_PAREN") == val
+
+    def test_derivation_miss_warns_not_silent(self, caplog):
+        """A spec that cannot be derived (table drift) must trigger the self-check and warn,
+        even though nothing was patched — a silent degrade to fail-closed over-block is a
+        silent failure.
+        """
+        yp = bashlex.parser.yaccparser
+        s2 = yp.goto[0]["simple_list1"]
+        states = [
+            yp.goto[yp.action[s2]["AMPERSAND"]]["simple_list1"],
+            yp.goto[yp.goto[yp.action[s2]["AND_AND"]]["newline_list"]]["simple_list1"],
+            yp.goto[yp.goto[yp.action[s2]["OR_OR"]]["newline_list"]]["simple_list1"],
+        ]
+        saved = {st: yp.action[st].get("RIGHT_PAREN") for st in states}
+        real_specs = parser_mod._ANDOR_CORRECTION_SPECS
+        try:
+            # Clear the cells so AND-OR no longer parses -> the self-check will fail.
+            for st in states:
+                yp.action[st].pop("RIGHT_PAREN", None)
+            # Every spec fails to derive a production (bogus RHS) -> missed=True, patched empty.
+            parser_mod._ANDOR_CORRECTION_SPECS = (("AMPERSAND", ("simple_list1", "NONEXISTENT"), False),)
+            with caplog.at_level(logging.WARNING, logger="schlock.core.parser"):
+                parser_mod._apply_andor_substitution_correction()
+            assert any("failed self-check" in r.message for r in caplog.records), (
+                "a derivation miss with a failing self-check must warn, not silently degrade"
+            )
+            # Nothing was patched, so nothing to revert.
+            for st in states:
+                assert yp.action[st].get("RIGHT_PAREN") is None
+        finally:
+            parser_mod._ANDOR_CORRECTION_SPECS = real_specs
+            for st in states:
+                yp.action[st].pop("RIGHT_PAREN", None)
+            parser_mod._apply_andor_substitution_correction()
         for st, val in saved.items():
             assert yp.action[st].get("RIGHT_PAREN") == val

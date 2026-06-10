@@ -1710,6 +1710,7 @@ class TestAndOrListSegmentValidation:
             'echo "$(pwd; whoami)"',
             'echo "$(git rev-parse HEAD && date)"',
             'echo "$(date & pwd)"',
+            'echo "$(true || date)"',  # OR operator, both segments safe
             'echo "$(cd /tmp && ls && pwd && date)"',
             'echo "$(date && echo $(whoami))"',
         ],
@@ -1726,6 +1727,7 @@ class TestAndOrListSegmentValidation:
         [
             'echo "$(date; rm -rf /)"',  # blacklisted later segment
             'echo "$(true && rm -rf /)"',
+            'echo "$(date || rm -rf /)"',  # OR operator, blacklisted second segment
             'echo "$(rm -rf / & pwd)"',  # blacklisted first segment, backgrounded
             'echo "$(date && unknowncmd)"',  # unknown later segment -> default deny
             'echo "$(date && echo $(rm -rf /))"',  # nested substitution inside a segment
@@ -1740,6 +1742,59 @@ class TestAndOrListSegmentValidation:
         results = validator.validate_all_substitutions(ast)
         assert results, "expected at least one substitution result"
         assert any(not r.allowed for r in results), "expected the list to be blocked"
+
+    @pytest.mark.parametrize(
+        "parts_spec,expected",
+        [
+            ([("command", None), ("operator", "&&"), ("command", None)], True),
+            ([("command", None), ("operator", ";"), ("command", None)], True),
+            ([("pipeline", None), ("operator", "||"), ("command", None)], True),
+            ([("command", None)], True),  # degenerate single segment
+            ([], False),  # empty
+            ([("command", None), ("operator", "&&")], False),  # trailing operator (even length)
+            ([("command", None), ("operator", None), ("command", None)], False),  # op missing .op
+            ([("command", None), ("operator", "XX"), ("command", None)], False),  # unrecognized op
+            ([("operator", "&&"), ("command", None), ("command", None)], False),  # op in segment slot
+        ],
+    )
+    def test_list_topology_validation(self, validator, parts_spec, expected):
+        """_is_valid_list_topology accepts only strictly alternating, segment-terminated lists."""
+
+        def make(kind, op):
+            attrs = {"kind": kind}
+            if op is not None:
+                attrs["op"] = op
+            return type("_Part", (), attrs)()
+
+        parts = [make(kind, op) for kind, op in parts_spec]
+        assert validator._is_valid_list_topology(parts) is expected
+
+    def test_malformed_list_topology_blocked_end_to_end(self, validator):
+        """A malformed list AST (operator without op) blocks instead of validating surviving segments."""
+
+        class _Op:
+            kind = "operator"  # deliberately no .op attribute
+
+        class _Cmd:
+            kind = "command"
+            parts: list = []
+
+        class _List:
+            kind = "list"
+            parts = [_Cmd(), _Op()]  # even length + op-less operator
+
+        class _Node:
+            command = _List()
+
+        sub = SubstitutionNode(
+            substitution_type=SubstitutionType.COMMAND,
+            inner_command=None,
+            base_command=None,
+            ast_node=_Node(),
+        )
+        result = validator.validate_substitution(sub)
+        assert not result.allowed
+        assert "Malformed list topology" in result.message
 
     def test_canonical_repro_allowed_end_to_end(self):
         """The canonical #96 repro is allowed by the top-level validator regardless of preset."""
