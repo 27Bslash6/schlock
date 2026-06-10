@@ -1145,13 +1145,9 @@ class SubstitutionValidator:
                 message="Malformed list topology in substitution",
             )
 
+        # A valid topology guarantees at least one segment (index 0 is always a segment slot),
+        # so there is no separate empty-list branch.
         segments = [p for p in parts if getattr(p, "kind", None) != "operator"]
-        if not segments:
-            return SubstitutionValidationResult(
-                allowed=False,
-                risk_level=RiskLevel.BLOCKED,
-                message="Empty command list in substitution",
-            )
 
         inner_results: list[SubstitutionValidationResult] = []
         max_risk = RiskLevel.SAFE

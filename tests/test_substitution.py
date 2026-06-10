@@ -1811,3 +1811,130 @@ class TestAndOrListSegmentValidation:
     def test_cd_is_whitelisted(self, validator):
         """cd is now a whitelisted substitution command (subshell-pure)."""
         assert validator.is_whitelisted("cd")
+
+
+def _mock(kind, **attrs):
+    return type("_Mock", (), {"kind": kind, **attrs})()
+
+
+class TestListSegmentBranchCoverage:
+    """Direct branch coverage of the per-segment list helpers (issue #96)."""
+
+    # --- _segment_base_command ---
+
+    def test_segment_base_command_command_without_word(self, validator):
+        """A command segment with no leading word -> None (fail-closed base)."""
+        assert validator._segment_base_command(_mock("command", parts=[])) is None
+
+    def test_segment_base_command_pipeline_first_command(self, validator):
+        """A pipeline segment resolves to the first command's first word."""
+        pipeline = _mock(
+            "pipeline",
+            parts=[_mock("command", parts=[_mock("word", word="grep")]), _mock("pipe"), _mock("command", parts=[])],
+        )
+        assert validator._segment_base_command(pipeline) == "grep"
+
+    def test_segment_base_command_pipeline_command_without_word(self, validator):
+        """A pipeline whose first command has no word -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("command", parts=[])])
+        assert validator._segment_base_command(pipeline) is None
+
+    def test_segment_base_command_pipeline_without_command(self, validator):
+        """A pipeline with no command part (e.g. only a reserved word) -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("reservedword")])
+        assert validator._segment_base_command(pipeline) is None
+
+    def test_segment_base_command_compound_returns_none(self, validator):
+        """A compound segment has no leading word -> None."""
+        assert validator._segment_base_command(_mock("compound")) is None
+
+    # --- _render_segment_text ---
+
+    def test_render_segment_text_command_without_words(self, validator):
+        """A command with no words renders to None (fail-closed)."""
+        assert validator._render_segment_text(_mock("command", parts=[])) is None
+
+    def test_render_segment_text_pipeline(self, validator):
+        """A pipeline renders as 'cmd | cmd' with words preserved."""
+        pipeline = _mock(
+            "pipeline",
+            parts=[
+                _mock("command", parts=[_mock("word", word="grep"), _mock("word", word="x")]),
+                _mock("pipe"),
+                _mock("command", parts=[_mock("word", word="head")]),
+            ],
+        )
+        assert validator._render_segment_text(pipeline) == "grep x | head"
+
+    def test_render_segment_text_pipeline_with_reserved_word(self, validator):
+        """A pipeline containing a reserved word (e.g. `!`) is unrenderable -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("reservedword"), _mock("command", parts=[_mock("word", word="x")])])
+        assert validator._render_segment_text(pipeline) is None
+
+    def test_render_segment_text_pipeline_command_without_words(self, validator):
+        """A pipeline whose command has no words is unrenderable -> None."""
+        pipeline = _mock("pipeline", parts=[_mock("command", parts=[])])
+        assert validator._render_segment_text(pipeline) is None
+
+    def test_render_segment_text_compound_returns_none(self, validator):
+        """A compound segment cannot be rendered faithfully -> None."""
+        assert validator._render_segment_text(_mock("compound")) is None
+
+    # --- _extract_base_command list branch (operator handling) ---
+
+    def test_extract_base_command_list_skips_leading_operator(self, validator):
+        """A leading operator slot is skipped; the first real segment supplies the base command."""
+        node = _mock(
+            "x",
+            command=_mock(
+                "list",
+                parts=[_mock("operator", op="&&"), _mock("command", parts=[_mock("word", word="date")])],
+            ),
+        )
+        # _extract_base_command reads node.command
+        assert validator._extract_base_command(node) == "date"
+
+    def test_extract_base_command_list_all_operators(self, validator):
+        """A list of only operators yields no base command -> None."""
+        node = _mock("x", command=_mock("list", parts=[_mock("operator", op="&&"), _mock("operator", op="||")]))
+        assert validator._extract_base_command(node) is None
+
+    # --- _validate_list_segments: cross-segment rule match + risk aggregation ---
+
+    def test_cross_segment_rule_match_blocks(self, parser):
+        """The full rendered list text is re-checked against the rules even when every segment
+        passes individually; a HIGH/BLOCKED match blocks the whole list (defense-in-depth)."""
+
+        class _Match:
+            matched = True
+            risk_level = RiskLevel.HIGH
+            message = "mock cross-segment rule"
+
+        class _Engine:
+            def match_command(self, command):  # noqa: ARG002
+                return _Match()
+
+        v = SubstitutionValidator(parser, _Engine())
+        ast = parser.parse('echo "$(date && pwd)"')  # both segments whitelisted -> pass per-segment
+        results = v.validate_all_substitutions(ast)
+        assert results and not results[0].allowed
+        assert "Inner command blocked" in results[0].message
+
+    def test_list_segment_risk_aggregation(self, validator, parser):
+        """The combined risk is the max over segments (verified by forcing a non-SAFE allowed
+        segment — synthetic, since real allowed segments are always SAFE)."""
+        ast = parser.parse('echo "$(date && pwd)"')
+        sub = validator.extract_substitutions(ast)[0]
+        cmd_node = sub.ast_node.command
+        original = validator.validate_substitution
+
+        def fake(child, depth):  # noqa: ARG001
+            return SubstitutionValidationResult(allowed=True, risk_level=RiskLevel.MEDIUM, message="x")
+
+        validator.validate_substitution = fake
+        try:
+            result = validator._validate_list_segments(sub, cmd_node, 0)
+        finally:
+            validator.validate_substitution = original
+        assert result.allowed
+        assert result.risk_level == RiskLevel.MEDIUM

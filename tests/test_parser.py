@@ -538,3 +538,52 @@ class TestAndOrSubstitutionCorrection:
             parser_mod._apply_andor_substitution_correction()
         for st, val in saved.items():
             assert yp.action[st].get("RIGHT_PAREN") == val
+
+    def test_correction_never_breaks_import_on_unexpected_error(self, caplog):
+        """Any unexpected error while poking the tables is swallowed (best-effort) and warned —
+        the import must never break, it just degrades to the fail-closed over-block.
+        """
+        real_yacc = bashlex.parser.yaccparser
+
+        class _Boom:
+            goto: dict = {}
+            productions: list = []
+
+            @property
+            def action(self):
+                raise RuntimeError("simulated table access failure")
+
+        try:
+            bashlex.parser.yaccparser = _Boom()
+            with caplog.at_level(logging.WARNING, logger="schlock.core.parser"):
+                parser_mod._apply_andor_substitution_correction()  # must not raise
+            assert any("could not be applied" in r.message for r in caplog.records)
+        finally:
+            bashlex.parser.yaccparser = real_yacc
+            parser_mod._apply_andor_substitution_correction()  # restore the real correction
+
+    def test_continuation_state_drift_paths(self, caplog):
+        """A drifted action table (missing shift / missing newline_list goto) makes the state
+        walk return None for every operator -> nothing patched, but the miss still warns.
+
+        Crafted tables exercise both `continuation_state` early-return branches:
+        AMPERSAND/OR_OR have no shift action (missing key); AND_AND shifts to a state whose goto
+        lacks `newline_list`.
+        """
+        real_yacc = bashlex.parser.yaccparser
+
+        class _Drifted:
+            # goto[0]['simple_list1'] = 1 ; action[1] only has AND_AND -> 5 ; goto[5] lacks newline_list
+            goto = {0: {"simple_list1": 1}, 5: {}}
+            action = {1: {"AND_AND": 5}}
+            productions: list = []
+
+        try:
+            bashlex.parser.yaccparser = _Drifted()
+            with caplog.at_level(logging.WARNING, logger="schlock.core.parser"):
+                parser_mod._apply_andor_substitution_correction()  # must not raise
+            # No cell could be derived, so nothing was added to the drifted action table.
+            assert "RIGHT_PAREN" not in _Drifted.action.get(1, {})
+        finally:
+            bashlex.parser.yaccparser = real_yacc
+            parser_mod._apply_andor_substitution_correction()  # restore the real correction
