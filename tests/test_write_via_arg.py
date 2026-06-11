@@ -102,6 +102,10 @@ class TestWriteViaArgTopLevel:
     def test_sort_read_only_stays_safe(self):
         assert validate_command("sort in.txt").risk_level == RiskLevel.SAFE
 
+    def test_sdiff_output_to_benign_file_stays_safe(self):
+        # FP guard — sdiff parity with the sort benign-target guard.
+        assert validate_command("sdiff -o out.txt a b").risk_level == RiskLevel.SAFE
+
     def test_sort_combined_short_flags_to_sensitive_is_high(self):
         # -ro = -r (reverse) + -o (output); the top-level rule must catch the combined form
         assert validate_command("sort -ro /etc/cron.d/pwn payload").risk_level == RiskLevel.HIGH
