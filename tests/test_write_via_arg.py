@@ -1,6 +1,8 @@
 """#113: write-via-arg file writes (sort/sdiff/xxd) blocked in substitution; top-level target-aware."""
 
+from schlock.core.rules import RiskLevel
 from schlock.core.substitution import _WRITE_ARG_COMMANDS, dangerous_write_arg
+from schlock.core.validator import validate_command
 
 
 class TestDangerousWriteArgHelper:
@@ -52,3 +54,30 @@ class TestDangerousWriteArgHelper:
         }
         for cmd in _WRITE_ARG_COMMANDS:
             assert dangerous_write_arg(cmd, invocations[cmd]) is not None, cmd
+
+
+class TestWriteViaArgSubstitution:
+    """Blunt: any write-via-arg target inside a substitution is BLOCKED (#113)."""
+
+    def test_sort_output_in_command_substitution_blocked(self):
+        assert validate_command('echo "$(sort -o /etc/cron.d/pwn /tmp/payload)"').risk_level == RiskLevel.BLOCKED
+
+    def test_sdiff_output_in_substitution_blocked(self):
+        assert validate_command('echo "$(sdiff -o /etc/cron.d/pwn a b)"').risk_level == RiskLevel.BLOCKED
+
+    def test_xxd_reverse_in_substitution_blocked(self):
+        assert validate_command('echo "$(xxd -r -p payload /etc/cron.d/pwn)"').risk_level == RiskLevel.BLOCKED
+
+    def test_sort_output_to_nonsensitive_in_substitution_blocked(self):
+        # Accepted false-positive cost: writing ANY file inside $() is blunt-blocked.
+        assert validate_command('X="$(sort -o tmpfile in.txt)"').risk_level == RiskLevel.BLOCKED
+
+    def test_sort_read_only_in_substitution_still_safe(self):
+        assert validate_command('X="$(sort in.txt)"').allowed is True
+
+    def test_xxd_forward_in_substitution_still_safe(self):
+        assert validate_command('X="$(xxd -p in.txt)"').allowed is True
+
+    def test_tee_in_substitution_still_blocked_regression(self):
+        # tee is covered by the existing truncation YAML rule, not the helper.
+        assert validate_command('echo "$(tee /etc/cron.d/pwn)"').risk_level == RiskLevel.BLOCKED
