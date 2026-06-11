@@ -1105,8 +1105,10 @@ class SubstitutionValidator:
                     return True, kubectl_reason
 
             # Write-via-arg: sort/sdiff/xxd are whitelisted and would otherwise take the SAFE fast
-            # path, bypassing the YAML rules that catch these at the top level. Blunt: any write
-            # target inside a substitution is dangerous. See #113.
+            # path, bypassing the YAML rules that catch these at the top level (sort/sdiff ->
+            # write_via_arg_persistence in 08_system_modification.yaml; xxd -> code_obfuscation in
+            # 05_code_execution.yaml). Blunt: any write target inside a substitution is dangerous.
+            # See #113.
             if base_command in _WRITE_ARG_COMMANDS and args:
                 write_reason = dangerous_write_arg(base_command, args)
                 if write_reason:
