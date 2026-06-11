@@ -297,6 +297,8 @@ DANGEROUS_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         # Network exfiltration
         "curl",
         "wget",
+        "fetch",  # FreeBSD/macOS HTTP(S) downloader — parity with curl/wget (#108)
+        "aria2c",  # multi-protocol downloader — parity with curl/wget (#108)
         "nc",
         "netcat",
         "ncat",
