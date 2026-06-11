@@ -81,3 +81,36 @@ class TestWriteViaArgSubstitution:
     def test_tee_in_substitution_still_blocked_regression(self):
         # tee is covered by the existing truncation YAML rule, not the helper.
         assert validate_command('echo "$(tee /etc/cron.d/pwn)"').risk_level == RiskLevel.BLOCKED
+
+
+class TestWriteViaArgTopLevel:
+    """Target-aware: sort/sdiff -o to a SENSITIVE path -> HIGH; benign target stays SAFE (#113)."""
+
+    def test_sort_output_to_cron_is_high(self):
+        assert validate_command("sort -o /etc/cron.d/pwn payload").risk_level == RiskLevel.HIGH
+
+    def test_sort_output_equals_cron_is_high(self):
+        assert validate_command("sort --output=/etc/cron.d/pwn payload").risk_level == RiskLevel.HIGH
+
+    def test_sdiff_output_to_authorized_keys_is_high(self):
+        assert validate_command("sdiff -o ~/.ssh/authorized_keys a b").risk_level == RiskLevel.HIGH
+
+    def test_sort_output_to_benign_file_stays_safe(self):
+        # FP guard — must NOT be flagged.
+        assert validate_command("sort -o out.txt in.txt").risk_level == RiskLevel.SAFE
+
+    def test_sort_read_only_stays_safe(self):
+        assert validate_command("sort in.txt").risk_level == RiskLevel.SAFE
+
+    def test_sort_combined_short_flags_to_sensitive_is_high(self):
+        # -ro = -r (reverse) + -o (output); the top-level rule must catch the combined form
+        assert validate_command("sort -ro /etc/cron.d/pwn payload").risk_level == RiskLevel.HIGH
+
+    def test_sort_attached_output_to_sensitive_is_high(self):
+        assert validate_command("sort -o/etc/cron.d/pwn payload").risk_level == RiskLevel.HIGH
+
+    def test_sort_quoted_sensitive_target_is_high(self):
+        assert validate_command('sort -o "/etc/cron.d/pwn" payload').risk_level == RiskLevel.HIGH
+
+    def test_sort_output_to_root_ssh_is_high(self):
+        assert validate_command("sort -o /root/.ssh/authorized_keys k").risk_level == RiskLevel.HIGH

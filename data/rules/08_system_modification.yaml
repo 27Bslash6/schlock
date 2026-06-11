@@ -96,6 +96,22 @@ rules:
       - "Attackers use this for backdoor persistence"
       - "Use proper configuration management instead"
 
+  - name: write_via_arg_persistence
+    description: sort/sdiff writing output (-o) to a sensitive system path enables persistence or privilege escalation
+    risk_level: HIGH
+    patterns:
+      # sort/sdiff -o / --output (cluster ending in 'o', e.g. -o or -ro), space/'='-separated,
+      # optional quote, then a sensitive target. '-[a-zA-Z]*o' catches combined short flags like
+      # -ro (-r + -o). The /etc/cron (and similar) prefixes intentionally match anything beneath
+      # those dirs — writing under /etc at all is privileged. [^;|&\n] cannot cross a command
+      # boundary or newline (avoids cross-command misattribution). See #113.
+      - '\b(sort|sdiff)\b[^;|&\n]*(-[a-zA-Z]*o|--output)[=\s]+["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
+      # attached short form: -o<sensitive-path> or -ro<sensitive-path>
+      - '\b(sort|sdiff)\b[^;|&\n]*-[a-zA-Z]*o["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
+    alternatives:
+      - "Writing to a system config/persistence path via -o is a backdoor vector"
+      - "Write to a non-system path, or use proper configuration management"
+
   - name: system_service_modification
     description: System configuration and startup modification
     risk_level: HIGH
