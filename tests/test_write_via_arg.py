@@ -55,6 +55,16 @@ class TestDangerousWriteArgHelper:
         for cmd in _WRITE_ARG_COMMANDS:
             assert dangerous_write_arg(cmd, invocations[cmd]) is not None, cmd
 
+    def test_double_dash_ends_options_sort(self):
+        # After `--`, `-o` is a positional filename (input), not the output flag.
+        assert dangerous_write_arg("sort", ["sort", "--", "-o"]) is None
+
+    def test_double_dash_ends_options_xxd(self):
+        assert dangerous_write_arg("xxd", ["xxd", "--", "-r"]) is None
+
+    def test_output_before_double_dash_still_detected(self):
+        assert dangerous_write_arg("sort", ["sort", "-o", "/etc/cron.d/x", "--", "foo"]) is not None
+
 
 class TestWriteViaArgSubstitution:
     """Blunt: any write-via-arg target inside a substitution is BLOCKED (#113)."""
@@ -118,3 +128,9 @@ class TestWriteViaArgTopLevel:
 
     def test_sort_output_to_root_ssh_is_high(self):
         assert validate_command("sort -o /root/.ssh/authorized_keys k").risk_level == RiskLevel.HIGH
+
+    def test_sort_output_to_braced_home_is_high(self):
+        assert validate_command('sort -o "${HOME}/.bashrc" in').risk_level == RiskLevel.HIGH
+
+    def test_sort_output_to_braced_home_ssh_is_high(self):
+        assert validate_command('sort -o "${HOME}/.ssh/authorized_keys" k').risk_level == RiskLevel.HIGH
