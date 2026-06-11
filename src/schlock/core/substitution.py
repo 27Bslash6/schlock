@@ -557,6 +557,19 @@ def dangerous_kubectl(args: list[str]) -> str | None:  # noqa: PLR0911, PLR0912 
 _WRITE_ARG_COMMANDS: frozenset[str] = frozenset({"sort", "sdiff", "xxd"})
 
 
+def _options_before_double_dash(args: list[str]) -> Iterator[str]:
+    """Yield tokens up to a ``--`` end-of-options marker (exclusive).
+
+    After ``--`` the shell treats everything as positionals, so a later ``-o``/``-r`` is a filename,
+    not a flag, and must not be scanned as a write flag (e.g. ``sort -- -o`` reads a file named
+    ``-o``). See #113.
+    """
+    for arg in args:
+        if arg == "--":
+            return
+        yield arg
+
+
 def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
     """Return a reason if `base_command` writes to a file via its arguments, else None.
 
@@ -569,7 +582,7 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
         return None
 
     if base_command in ("sort", "sdiff"):
-        for arg in args:
+        for arg in _options_before_double_dash(args):
             # long form: --output or --output=FILE
             if arg == "--output" or arg.startswith("--output="):
                 return f"{base_command} -o writes output to a file"
@@ -580,7 +593,7 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
             if arg.startswith("-") and not arg.startswith("--") and "o" in arg[1:]:
                 return f"{base_command} -o writes output to a file"
     elif base_command == "xxd":
-        for arg in args:
+        for arg in _options_before_double_dash(args):
             if arg in ("-r", "--reverse"):
                 return "xxd -r decodes hex to raw bytes (write/obfuscation vector)"
             # combined short flags, e.g. -rp / -pr
