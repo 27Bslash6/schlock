@@ -547,6 +547,62 @@ def dangerous_kubectl(args: list[str]) -> str | None:  # noqa: PLR0911, PLR0912 
     return None
 
 
+# Commands that write to a file via an ARGUMENT (not a shell redirect). Inside a substitution any
+# such write is dangerous: a substitution's job is to produce a value, so a file write as a side
+# effect is suspicious — mirrors the "any output redirection in $() is BLOCKED" rule. These three
+# are also in SAFE_SUBSTITUTION_COMMANDS, so without this check they take the whitelist fast path
+# and bypass the YAML rules that would catch them at the top level. `tee` is intentionally absent:
+# it is not whitelisted, never reaches _has_dangerous_inner_structure, and is already BLOCKED in
+# substitution by the truncation YAML rule. See #113.
+_WRITE_ARG_COMMANDS: frozenset[str] = frozenset({"sort", "sdiff", "xxd"})
+
+
+def _options_before_double_dash(args: list[str]) -> Iterator[str]:
+    """Yield tokens up to a ``--`` end-of-options marker (exclusive).
+
+    After ``--`` the shell treats everything as positionals, so a later ``-o``/``-r`` is a filename,
+    not a flag, and must not be scanned as a write flag (e.g. ``sort -- -o`` reads a file named
+    ``-o``). See #113.
+    """
+    for arg in args:
+        if arg == "--":
+            return
+        yield arg
+
+
+def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
+    """Return a reason if `base_command` writes to a file via its arguments, else None.
+
+    Pure; the single source of truth for the SubstitutionValidator's write-via-arg check. `args` is
+    the command's word list and may include the leading command token (harmless to the flag scans
+    below). Blunt by design — ANY write target is dangerous inside a substitution, regardless of the
+    destination path. See #113.
+    """
+    if base_command not in _WRITE_ARG_COMMANDS:
+        return None
+
+    if base_command in ("sort", "sdiff"):
+        for arg in _options_before_double_dash(args):
+            # long form: --output or --output=FILE
+            if arg == "--output" or arg.startswith("--output="):
+                return f"{base_command} -o writes output to a file"
+            # Any short-flag cluster containing 'o' is sort/sdiff's -o (write output to a file):
+            # covers -o, -ofile, -ro, -rofile. 'o' is the ONLY short flag of sort/sdiff that uses
+            # that letter, so an attached value char ('o' as another flag's value, e.g. -to) only
+            # ever over-matches — an acceptable blunt over-block inside a substitution. See #113.
+            if arg.startswith("-") and not arg.startswith("--") and "o" in arg[1:]:
+                return f"{base_command} -o writes output to a file"
+    elif base_command == "xxd":
+        for arg in _options_before_double_dash(args):
+            if arg in ("-r", "--reverse"):
+                return "xxd -r decodes hex to raw bytes (write/obfuscation vector)"
+            # combined short flags, e.g. -rp / -pr
+            if arg.startswith("-") and not arg.startswith("--") and "r" in arg[1:]:
+                return "xxd -r decodes hex to raw bytes (write/obfuscation vector)"
+
+    return None
+
+
 @dataclass
 class SubstitutionNode:
     """Represents a command or process substitution in the AST."""
@@ -1060,6 +1116,16 @@ class SubstitutionValidator:
                 kubectl_reason = dangerous_kubectl(args)
                 if kubectl_reason:
                     return True, kubectl_reason
+
+            # Write-via-arg: sort/sdiff/xxd are whitelisted and would otherwise take the SAFE fast
+            # path, bypassing the YAML rules that catch these at the top level (sort/sdiff ->
+            # write_via_arg_persistence in 08_system_modification.yaml; xxd -> code_obfuscation in
+            # 05_code_execution.yaml). Blunt: any write target inside a substitution is dangerous.
+            # See #113.
+            if base_command in _WRITE_ARG_COMMANDS and args:
+                write_reason = dangerous_write_arg(base_command, args)
+                if write_reason:
+                    return True, write_reason
 
         return False, ""
 
