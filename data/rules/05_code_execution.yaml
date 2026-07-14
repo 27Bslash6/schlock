@@ -33,9 +33,9 @@ rules:
       - '(^|[\n;&|]\s*)\.\s+(https?|ftps?|ssh)://'
       # Shell reading a process substitution that downloads: <interp> <(curl URL).
       # NOTE: at runtime SubstitutionValidator is the primary layer for <(...)
-      # (curl/wget -> BLOCKED, fetch/aria2c -> HIGH 'unknown command'); these YAML
-      # patterns are a backstop, kept on one shared downloader+scheme list so the
-      # four interpreter forms stay consistent.
+      # (curl/wget/fetch/aria2c -> all BLOCKED via DANGEROUS_SUBSTITUTION_COMMANDS);
+      # these YAML patterns are a defense-in-depth backstop, kept on one shared
+      # downloader+scheme list so the four interpreter forms stay consistent.
       - '(source|\.)\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
       - 'bash\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
       - 'sh\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
