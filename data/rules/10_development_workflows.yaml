@@ -16,6 +16,17 @@ rules:
     patterns: ['git\s+reset\s+--hard']
     alternatives: ["Use git stash first"]
 
+  - name: git_blanket_staging
+    description: Blanket staging sweeps build artifacts, secrets, and unrelated edits into the index
+    risk_level: HIGH  # -> ask under balanced preset (MEDIUM would be a silent allow)
+    patterns:
+      - 'git\s+add\b[^;|&]{0,100}\s(--all|-A|-a)(\s|$)'
+      - 'git\s+add\b[^;|&]{0,100}\s\.(\s|$)'
+    alternatives:
+      - "Stage explicit paths: git add <path> ..."
+      - "Review first: git status --short"
+      - "Stage interactively: git add -p"
+
   - name: database_drop
     description: Dropping databases is irreversible
     risk_level: HIGH
