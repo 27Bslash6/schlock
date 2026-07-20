@@ -127,6 +127,12 @@ SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         "grep",
         "egrep",
         "fgrep",
+        # Stream editors (read-only pipeline stages — the common case).
+        # NOTE: awk requires contextual check for system()/getline/pipes/writes,
+        # sed for -i/-f/e/w-class script commands, in _has_dangerous_inner_structure(). See #104.
+        "awk",
+        "sed",
+        "jq",
         # Common pure utilities
         "true",
         "false",
@@ -279,6 +285,7 @@ DANGEROUS_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         "eval",
         "exec",
         "source",
+        "xargs",  # exec trampoline: pipes data into an arbitrary command (#104)
         # System modification
         "dd",
         "mkfs",
@@ -488,6 +495,128 @@ def dangerous_find(args: list[str]) -> str | None:
     for arg in args:
         if arg in _DANGEROUS_FIND_FLAGS:
             return f"find {arg} executes commands or modifies files"
+    return None
+
+
+# awk constructs that execute commands or write files from inside the program text. Blunt regex
+# scan over ALL args (program text, -v values, separators alike): over-blocking a rare string
+# comparison like `$1 > "m"` inside a substitution is acceptable; missing system()/pipe-to-command/
+# file writes is not. Known ceiling: a pipe/redirect target held in a VARIABLE (`print | c`) evades
+# this text scan — the parser's pipe-to-shell layer and YAML rules remain as backstops. See #104.
+_AWK_DANGEROUS_TEXT = re.compile(
+    r"system\s*\("  # system("cmd") — arbitrary exec
+    r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
+    r'|\|\s*"'  # print | "cmd" — pipe to a command
+    r'|"\s*\|'  # "cmd" | … — command string on the left of a pipe
+    r"|\|&"  # gawk |& coprocess
+    r'|>\s*"'  # print > "file" / >> "file" — file write from inside awk
+    r"|@load|@include"  # gawk: load extension / include external source
+)
+
+# awk flags that load external program code (contents unknown -> fail closed) or enable writes.
+# Prefix match covers attached forms (-fprog.awk). Case-sensitive: -F (field separator) is safe.
+_AWK_DANGEROUS_FLAG_PREFIXES = ("-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec")
+
+
+def dangerous_awk(args: list[str]) -> str | None:
+    """Return a reason if an awk arg list executes commands, writes files, or loads external
+    program code, else None. Pure; used by the SubstitutionValidator's contextual whitelist check.
+    `args` may include the leading "awk" token (harmless to both scans).
+    """
+    for arg in args:
+        if arg != "awk" and arg.startswith(_AWK_DANGEROUS_FLAG_PREFIXES):
+            return f"awk {arg} loads external program code or enables writes"
+        if _AWK_DANGEROUS_TEXT.search(arg):
+            return "awk program executes commands or writes files (system/getline/pipe/redirect)"
+    return None
+
+
+# sed is allowed inside substitution only in a conservative read-only form: clusterable boolean
+# flags -n/-r/-E/-s/-z/-u plus scripts limited to s///, y///, p, d, q, = with optional addresses.
+# Everything else — -i in-place writes, -f external scripts, e/w/r/W commands, the GNU s///e exec
+# flag, unknown flags — fails closed. Blunt over-block is acceptable in substitution context.
+_SED_SAFE_SHORT_FLAGS = re.compile(r"-[nrEszu]+\Z")
+_SED_SAFE_LONG_FLAGS = frozenset(
+    {
+        "--quiet",
+        "--silent",
+        "--regexp-extended",
+        "--posix",
+        "--separate",
+        "--null-data",
+        "--unbuffered",
+        "--sandbox",
+    }
+)
+
+# One sed command: optional address(es) (N / $ / /regex/), then s|y with any delimiter (safe flags
+# only — no e/w), or p/d/=/q. The (.) delimiter backreference keeps s|a|b|e (delimiter '|') safe
+# while rejecting the GNU exec FLAG in s/a/b/e. Scripts are split on ;/newline before matching;
+# a split inside an s/// replacement only over-blocks (both fragments fail), never under-blocks.
+_SED_ADDR = r"(?:[0-9]+|\$|/(?:\\.|[^/])*/)"
+_SED_SAFE_COMMAND = re.compile(
+    r"^\s*(?:" + _SED_ADDR + r"(?:\s*,\s*" + _SED_ADDR + r")?)?\s*"
+    r"(?:"
+    r"[sy](.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gIiMmp0-9]*"
+    r"|[pd=]"
+    r"|q[0-9]*"
+    r")?\s*\Z"
+)
+
+
+def dangerous_sed(args: list[str]) -> str | None:  # noqa: PLR0911, PLR0912 - flag dispatch
+    """Return a reason if a sed arg list falls outside the safe read-only subset, else None.
+
+    Identifies script args (values of -e/--expression, or the first positional when no -e is
+    given; remaining positionals are input files) and requires every ;/newline-separated command
+    to match _SED_SAFE_COMMAND. Pure; used by the SubstitutionValidator's contextual whitelist
+    check. `args` may include the leading "sed" token.
+    """
+    scripts: list[str] = []
+    positionals: list[str] = []
+    saw_expression = False
+    expect_expression_value = False
+    after_double_dash = False
+    rest = args[1:] if args and args[0] == "sed" else list(args)
+    for arg in rest:
+        if expect_expression_value:
+            scripts.append(arg)
+            expect_expression_value = False
+            continue
+        if not after_double_dash and arg.startswith("-") and arg != "-":
+            if arg == "--":
+                after_double_dash = True
+                continue
+            if arg in ("-e", "--expression"):
+                saw_expression = True
+                expect_expression_value = True
+                continue
+            if arg.startswith("-e") and not arg.startswith("--"):
+                saw_expression = True
+                scripts.append(arg[2:])
+                continue
+            if arg.startswith("--expression="):
+                saw_expression = True
+                scripts.append(arg.split("=", 1)[1])
+                continue
+            if arg.startswith(("-i", "--in-place")):
+                return "sed -i writes files in place"
+            if arg.startswith(("-f", "--file")):
+                return "sed -f loads an external script (contents unknown)"
+            if arg.startswith("--"):
+                if arg in _SED_SAFE_LONG_FLAGS:
+                    continue
+                return f"sed flag {arg} is outside the safe read-only subset"
+            if _SED_SAFE_SHORT_FLAGS.match(arg):
+                continue
+            return f"sed flag {arg} is outside the safe read-only subset"
+        positionals.append(arg)
+    if not saw_expression and positionals:
+        scripts.append(positionals[0])  # first positional is THE script; the rest are input files
+    for script in scripts:
+        for piece in re.split(r"[;\n]", script):
+            if not _SED_SAFE_COMMAND.match(piece):
+                return f"sed script {piece!r} is outside the safe read-only subset (s///, y///, p, d, q)"
     return None
 
 
@@ -1095,7 +1224,13 @@ class SubstitutionValidator:
                 # Output redirection: $(echo x > file) or $(echo x >> file)
                 if hasattr(part, "kind") and part.kind == "redirect":
                     if hasattr(part, "type") and part.type in (">", ">>", ">&"):
-                        return True, "output redirection in substitution"
+                        # >/dev/null and 2>/dev/null DISCARD output — nothing is written, so the
+                        # common noise-suppression idiom $(ls dir 2>/dev/null | wc -l) stays
+                        # allowed. Any other target (including >&2, whose output is an int fd,
+                        # not a word) keeps the blunt no-writes-in-substitution block. See #104.
+                        target = getattr(getattr(part, "output", None), "word", None)
+                        if target != "/dev/null":
+                            return True, "output redirection in substitution"
 
                 # Collect arguments for dangerous pattern checks
                 if hasattr(part, "word"):
@@ -1118,6 +1253,19 @@ class SubstitutionValidator:
                 kubectl_reason = dangerous_kubectl(args)
                 if kubectl_reason:
                     return True, kubectl_reason
+
+            # awk/sed are whitelisted as read-only pipeline stages but carry exec/write escape
+            # hatches (awk system()/getline/pipes, sed -i/-f/e/w commands) — same contextual
+            # pattern as find above. See #104.
+            if base_command == "awk" and args:
+                awk_reason = dangerous_awk(args)
+                if awk_reason:
+                    return True, awk_reason
+
+            if base_command == "sed" and args:
+                sed_reason = dangerous_sed(args)
+                if sed_reason:
+                    return True, sed_reason
 
             # Write-via-arg: sort/sdiff/xxd are whitelisted and would otherwise take the SAFE fast
             # path, bypassing the YAML rules that catch these at the top level (sort/sdiff ->
@@ -1190,18 +1338,11 @@ class SubstitutionValidator:
     def _validate_list_segments(self, sub_node: SubstitutionNode, cmd_node: Any, depth: int) -> SubstitutionValidationResult:
         """Validate a command-list substitution segment-by-segment.
 
-        Each non-operator segment ($(a && b) -> [a, b]) is wrapped as its own substitution and
-        run through the full ``validate_substitution`` pipeline at the SAME depth (decomposition,
-        not nesting). The list is allowed only if every segment is allowed; the combined risk is
-        the max over segments and it is whitelisted only if every segment is. The whole rendered
-        text is then re-checked against the YAML rules to catch cross-segment patterns.
-
-        Fail-closed: a segment we cannot turn into a substitution node (e.g. a compound
-        ``{ … }``/``( … )``/``if`` segment) blocks the whole list.
+        Each non-operator segment ($(a && b) -> [a, b]) is validated independently via
+        ``_validate_segments``. Fail-closed: a malformed list topology blocks the whole list.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
-        risk_order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
         parts = list(getattr(cmd_node, "parts", []))
         # Validate the raw topology BEFORE dropping operators: a well-formed list strictly
         # alternates segment/operator and ends on a segment. A malformed shape (e.g. a trailing or
@@ -1216,6 +1357,63 @@ class SubstitutionValidator:
         # A valid topology guarantees at least one segment (index 0 is always a segment slot),
         # so there is no separate empty-list branch.
         segments = [p for p in parts if getattr(p, "kind", None) != "operator"]
+        return self._validate_segments(sub_node, segments, depth, "Command list segments validated")
+
+    def _is_valid_pipeline_topology(self, parts: list[Any]) -> bool:
+        """True if ``parts`` is a well-formed bashlex pipeline: strictly alternating
+        stage / pipe, odd length >= 3, ending on a stage. Anything else — including a leading
+        ``!`` negation (reservedword makes the length even) — fails closed.
+        """
+        if len(parts) < 3 or len(parts) % 2 == 0:  # noqa: PLR2004 - a pipeline is cmd,pipe,cmd
+            return False
+        for index, part in enumerate(parts):
+            is_pipe = getattr(part, "kind", None) == "pipe"
+            if index % 2 == 0:
+                if is_pipe:
+                    return False  # stage slot occupied by a pipe
+            elif not is_pipe:
+                return False  # pipe slot missing a pipe node
+        return True
+
+    def _validate_pipeline_stages(self, sub_node: SubstitutionNode, cmd_node: Any, depth: int) -> SubstitutionValidationResult:
+        """Validate a pipeline substitution stage-by-stage.
+
+        Each stage ($(a | b) -> [a, b]) is validated independently via ``_validate_segments``, so
+        a pipeline is allowed exactly when every stage would be allowed on its own: whitelisted
+        readers pass, blacklisted/unknown commands and dangerous per-command modes (find -exec,
+        git -c, awk system(), …) block. A pipe only moves data between stages; the danger lives in
+        the stages themselves. Fail-closed on any non-alternating topology. See #104.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        parts = list(getattr(cmd_node, "parts", []))
+        if not self._is_valid_pipeline_topology(parts):
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="Unsupported or malformed pipeline topology in substitution",
+            )
+
+        stages = [p for p in parts if getattr(p, "kind", None) != "pipe"]
+        return self._validate_segments(sub_node, stages, depth, "Pipeline stages validated")
+
+    def _validate_segments(
+        self, sub_node: SubstitutionNode, segments: list[Any], depth: int, success_message: str
+    ) -> SubstitutionValidationResult:
+        """Shared segment loop for command lists and pipelines.
+
+        Each segment is wrapped as its own substitution and run through the full
+        ``validate_substitution`` pipeline at the SAME depth (decomposition, not nesting). The
+        whole is allowed only if every segment is allowed; the combined risk is the max over
+        segments and it is whitelisted only if every segment is. The whole rendered text is then
+        re-checked against the YAML rules to catch cross-segment patterns.
+
+        Fail-closed: a segment we cannot turn into a substitution node (e.g. a compound
+        ``{ … }``/``( … )``/``if`` segment) blocks the whole substitution.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        risk_order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
 
         inner_results: list[SubstitutionValidationResult] = []
         max_risk = RiskLevel.SAFE
@@ -1260,7 +1458,7 @@ class SubstitutionValidator:
         return SubstitutionValidationResult(
             allowed=True,
             risk_level=max_risk,
-            message="Command list segments validated",
+            message=success_message,
             whitelisted=all_whitelisted,
             inner_results=inner_results,
         )
@@ -1296,6 +1494,14 @@ class SubstitutionValidator:
         cmd_node = getattr(sub_node.ast_node, "command", None)
         if getattr(cmd_node, "kind", None) == "list":
             return self._validate_list_segments(sub_node, cmd_node, depth)
+
+        # Pipeline: $(a | b). Validate each stage independently and combine, same as lists above —
+        # a pure-reader pipeline ($(ls | wc -l)) is allowed, while any blacklisted/unknown stage
+        # or dangerous per-command mode blocks. Done BEFORE the whitelist fast path because a
+        # pipeline's base_command is just its FIRST stage's command — fast-pathing the whole
+        # pipeline on that would skip validation of later stages ($(date | bash)). See #104.
+        if getattr(cmd_node, "kind", None) == "pipeline":
+            return self._validate_pipeline_stages(sub_node, cmd_node, depth)
 
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):

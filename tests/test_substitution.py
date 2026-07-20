@@ -15,6 +15,8 @@ from schlock.core.substitution import (
     SubstitutionType,
     SubstitutionValidationResult,
     SubstitutionValidator,
+    dangerous_awk,
+    dangerous_sed,
 )
 from schlock.core.validator import load_rules, validate_command
 
@@ -1415,8 +1417,16 @@ class TestNestedSubstitutionValidation:
 class TestWhitelistedWithDangerousStructure:
     """Test whitelisted commands with dangerous structures."""
 
-    def test_date_with_pipeline_blocked(self, validator):
-        """date | bash should be blocked even though date is whitelisted."""
+    def test_date_with_pipeline_blocked(self, validator, parser):
+        """date | bash is blocked: pipelines validate per stage, and bash is blacklisted."""
+        ast = parser.parse('echo "$(date | bash)"')
+        results = validator.validate_all_substitutions(ast)
+        assert results
+        assert results[0].allowed is False
+        assert "bash" in results[0].message
+
+    def test_pipeline_without_parts_blocked(self, validator):
+        """A pipeline node with no parts (malformed AST) fails closed on topology."""
 
         class MockPipeline:
             kind = "pipeline"
@@ -1435,7 +1445,7 @@ class TestWhitelistedWithDangerousStructure:
 
         result = validator.validate_substitution(node)
         assert result.allowed is False
-        assert "Dangerous structure" in result.message
+        assert "pipeline topology" in result.message
 
 
 class TestRemainingBranchCoverage:
@@ -1962,3 +1972,194 @@ class TestDownloaderUnderblock108:
     def test_fetch_and_aria2c_in_dangerous_set(self):
         assert "fetch" in DANGEROUS_SUBSTITUTION_COMMANDS
         assert "aria2c" in DANGEROUS_SUBSTITUTION_COMMANDS
+
+
+class TestReaderPipelineInSubstitution:
+    """Pure read-only pipelines inside $() are allowed; any dangerous stage still blocks (#104).
+
+    Pipelines are decomposed per stage (like command lists), so each stage carries the full
+    whitelist/blacklist/structural/YAML validation on its own.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The two GitHub #104 repro cases verbatim
+            "count=$(ls some/dir/*.json 2>/dev/null | wc -l)",
+            'first=$(grep -rln "needle" some/dir | head -1)',
+            # Common benign idioms
+            "x=$(ps aux | grep foo)",
+            "x=$(cat f | wc -l)",
+            "x=$(cat f | sort | uniq -c | sort -rn | head -5)",
+            'x=$(find . -name "*.py" | head -3)',
+            "x=$(ps aux | awk '{print $2}')",
+            "x=$(cat f | awk 'NR>1 {print $2}')",
+            "x=$(cat f.txt | sed 's/a/b/g')",
+            "x=$(cat f | sed -n '1,10p')",
+            "x=$(cat f | sed 's/a/b/;s/c/d/')",
+            "x=$(cat f.json | jq -r .name)",
+            "x=$(ls |& wc -l)",
+            # Reader pipeline as a command-list segment
+            "x=$(cd /tmp && ls | wc -l)",
+        ],
+    )
+    def test_pure_reader_pipeline_allowed(self, command):
+        result = validate_command(command)
+        assert result.allowed, f"{command!r} blocked: {result.message}"
+
+    def test_pure_reader_pipeline_is_whitelisted_safe(self, validator, parser):
+        """Every stage whitelisted -> combined result is SAFE and whitelisted."""
+        ast = parser.parse('x="$(grep -rln needle dir | head -1)"')
+        results = validator.validate_all_substitutions(ast)
+        assert len(results) == 1
+        assert results[0].allowed is True
+        assert results[0].whitelisted is True
+        assert results[0].risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Shell/interpreter sinks
+            "x=$(date | bash)",
+            "x=$(cat f | sh)",
+            "x=$(echo x | zsh)",
+            'x=$(cat f | python3 -c "import os")',
+            "x=$(echo x | eval)",
+            # Exec trampoline
+            "x=$(ls | xargs rm -rf)",
+            # Unknown command: default-deny
+            "x=$(ls | some_unknown_tool_xyz)",
+            # Mutating / write-capable stages
+            "x=$(ls | tee /etc/cron.d/evil)",
+            "x=$(sort -o /etc/passwd f | wc -l)",
+            # find with exec/delete-class flags
+            "x=$(find . -exec rm {} + | wc -l)",
+            "x=$(find . -name x -delete | wc -l)",
+            # Redirections inside a stage (except /dev/null)
+            "x=$(ls > /tmp/out | wc -l)",
+            "x=$(ls 2>/tmp/errs | wc -l)",
+            # git -c command execution
+            'x=$(git -c core.pager="rm -rf /" log | cat)',
+            # kubectl secrets access
+            "x=$(kubectl get secrets | grep token)",
+            # Nested dangerous substitution inside a stage
+            "x=$(cat $(rm -rf /) | wc -l)",
+            # awk escape hatches
+            "x=$(ps | awk '{system(\"rm -rf /\")}')",
+            "x=$(ps | awk '{print | \"bash\"}')",
+            "x=$(ps | awk 'BEGIN{\"id\" | getline l; print l}')",
+            "x=$(ps | awk '{print > \"/etc/cron.d/x\"}')",
+            "x=$(ls | awk -f evil.awk)",
+            # sed escape hatches
+            "x=$(ls | sed -i 's/a/b/' f)",
+            "x=$(ls | sed '1e rm -rf /')",
+            "x=$(ls | sed 's/a/b/e')",
+            "x=$(ls | sed 's/a/b/w /tmp/x')",
+            "x=$(ls | sed 'w /etc/passwd')",
+            "x=$(ls | sed -f evil.sed)",
+        ],
+    )
+    def test_pipeline_with_dangerous_stage_blocked(self, command):
+        result = validate_command(command)
+        assert not result.allowed, f"{command!r} allowed: {result.message}"
+
+    def test_negated_pipeline_fails_closed(self, validator, parser):
+        """A `!`-negated pipeline has an even part count -> unsupported topology, blocked."""
+        ast = parser.parse('x="$(! grep -q needle f | wc -l)"')
+        results = validator.validate_all_substitutions(ast)
+        assert results
+        assert results[0].allowed is False
+
+    def test_dev_null_redirect_allowed_in_single_command(self):
+        """The /dev/null carve-out also applies to non-pipeline substitutions."""
+        assert validate_command("x=$(ls missing/dir 2>/dev/null)").allowed
+
+
+class TestDangerousAwkHelper:
+    """Unit tests for the dangerous_awk arg scan."""
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["awk", "{print $2}"],
+            ["awk", "-F,", "{print $1, $3}"],
+            ["awk", "/error/ {c++} END {print c}"],
+            ["awk", "NR>1 {print $2}"],  # numeric comparison, not a redirect
+            ["awk", "-v", "n=3", "{print $n}"],
+            ["awk", "-F|", "{print $1}"],  # pipe as field separator, not pipe-to-command
+        ],
+    )
+    def test_safe_awk(self, args):
+        assert dangerous_awk(args) is None
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["awk", '{system("rm -rf /")}'],
+            ["awk", 'BEGIN{system ("id")}'],
+            ["awk", '{print | "bash"}'],
+            ["awk", 'BEGIN{"id" | getline l; print l}'],
+            ["awk", '{print > "/etc/cron.d/x"}'],
+            ["awk", '{print >> "/tmp/log"}'],
+            ["awk", '{print $0 |& "coproc"}'],
+            ["awk", '@load "extension"', "{}"],
+            ["awk", "-f", "prog.awk"],
+            ["awk", "-fprog.awk"],
+            ["awk", "--file=prog.awk"],
+            ["awk", "-i", "inplace", "{print}"],
+            ["awk", "-l", "ext", "{}"],
+            ["awk", "-E", "prog.awk"],
+        ],
+    )
+    def test_dangerous_awk(self, args):
+        assert dangerous_awk(args) is not None
+
+
+class TestDangerousSedHelper:
+    """Unit tests for the dangerous_sed safe-subset check."""
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["sed", "s/a/b/"],
+            ["sed", "s/a/b/g", "file.txt"],
+            ["sed", "-n", "1,10p", "f"],
+            ["sed", "-e", "s/a/b/", "-e", "s/c/d/g"],
+            ["sed", "s/a/b/;s/c/d/"],
+            ["sed", "/^#/d", "f"],
+            ["sed", "-E", "s/(a|b)+/x/", "f"],
+            ["sed", "y/abc/xyz/"],
+            ["sed", "$d", "f"],
+            ["sed", "-n", "$="],  # count lines
+            ["sed", "s|a|b|"],  # alternate delimiter
+            ["sed", "10q", "f"],
+            ["sed", "-nrz", "s/a/b/p"],  # clustered safe flags
+            ["sed", "--", "s/a/b/", "-weird-filename"],
+        ],
+    )
+    def test_safe_sed(self, args):
+        assert dangerous_sed(args) is None
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["sed", "-i", "s/a/b/", "f"],  # in-place write
+            ["sed", "-i.bak", "s/a/b/", "f"],
+            ["sed", "--in-place", "s/a/b/", "f"],
+            ["sed", "-f", "evil.sed"],  # external script
+            ["sed", "--file=evil.sed"],
+            ["sed", "1e rm -rf /"],  # GNU e command executes
+            ["sed", "s/a/b/e"],  # GNU s///e flag executes result
+            ["sed", "s/a/b/w /tmp/x"],  # s///w writes a file
+            ["sed", "w /etc/passwd"],  # w command writes
+            ["sed", "-e", "e id"],
+            ["sed", "--debug", "s/a/b/"],  # unknown long flag: fail closed
+            ["sed", "-l", "80", "s/a/b/"],  # unknown short flag: fail closed
+        ],
+    )
+    def test_dangerous_sed(self, args):
+        assert dangerous_sed(args) is not None
+
+    def test_alternate_delimiter_does_not_hide_exec_flag(self):
+        """s|a|b|e with delimiter '|' still has the trailing e exec flag -> blocked."""
+        assert dangerous_sed(["sed", "s|a|b|e"]) is not None
