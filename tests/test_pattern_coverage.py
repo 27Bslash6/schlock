@@ -283,10 +283,16 @@ class TestHighPatternCoverage:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.HIGH, f"Blanket staging not HIGH: {cmd}"
 
-        # Should NOT mark as HIGH (explicit-path or interactive adds)
+        # Should NOT mark as HIGH (explicit-path, interactive, or dry-run adds)
         safe = [
             "git add src/foo.py",
             "git add -p",
+            "git add -p .",
+            "git add . --patch",
+            "git add -i .",
+            "git add -n .",
+            "git add --dry-run -A",
+            "git add ./",
             "git add .gitignore",
             "git add ../other/file.txt",
             "git add README.md docs/guide.md",
