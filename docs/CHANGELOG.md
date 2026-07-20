@@ -5,6 +5,14 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.5...schlock-v0.7.6) (2026-07-14)
+
+
+### Bug Fixes
+
+* **substitution:** block fetch/aria2c downloaders in substitution ([#108](https://github.com/27Bslash6/schlock/issues/108)) ([#114](https://github.com/27Bslash6/schlock/issues/114)) ([0ce55a0](https://github.com/27Bslash6/schlock/commit/0ce55a0d97b0c630e616edc1ab86cf0e2c88f33a))
+* **validator:** block write-via-arg file writes (sort/sdiff/xxd) ([#113](https://github.com/27Bslash6/schlock/issues/113)) ([#115](https://github.com/27Bslash6/schlock/issues/115)) ([e8b96c2](https://github.com/27Bslash6/schlock/commit/e8b96c2f2023e89233921a8a46e9ba9c7cfd85a6))
+
 ## [0.7.5](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.4...schlock-v0.7.5) (2026-06-10)
 
 
