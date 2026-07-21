@@ -49,11 +49,19 @@ schlock/
 
 ## Development Workflow
 
-1. **Create feature branch**: `git checkout -b feature/your-feature`
+1. **Create feature branch**: `git checkout -b fix/your-fix` — if the work has a ticket, put the identifier in the branch name (`lab-123-short-slug`)
 2. **Make changes**: Follow coding standards below
 3. **Run tests**: `uv run pytest` (must pass)
 4. **Update docs**: If adding features
-5. **Submit PR**: Target `main` branch
+5. **Submit PR**: Target `main` branch; the title must be a valid Conventional Commit (see below)
+
+### PR Titles (release-critical)
+
+schlock is squash-merge only and GitHub uses the **PR title verbatim** as the squash commit subject. release-please parses that subject as a [Conventional Commit](https://www.conventionalcommits.org/) to decide version bumps — a subject that doesn't start with a recognized type is **silently skipped**: no bump, no release, the change strands on `main`.
+
+- PR titles MUST begin with a Conventional Commit type: `feat(scope): …`, `fix(scope): …`, `docs: …`, `chore: …` (`feat` → minor, `fix` → patch).
+- Ticket identifiers (e.g. `LAB-405`) go in the **branch name**, never as a leading title prefix. If you want the ref visible in the title, append it as a trailing suffix: `feat(commit-filter): strip co-author trailer (LAB-405)`.
+- Why: a title like `LAB-405: feat(…): …` makes release-please read `LAB-405` as the commit type — unrecognized, so the commit is dropped from release calculation (this stranded the v0.8.0 feature; see PR #121).
 
 ## Coding Standards
 
@@ -219,11 +227,11 @@ hooks/ → integrations/ → core/ → external (bashlex, pyyaml)
 
 ## Release Process
 
-1. **Update version**: `pyproject.toml` (semver: 0.x.y)
-2. **Update CHANGELOG**: Document changes
-3. **Run full test suite**: `make test`
-4. **Tag release**: `git tag v0.x.y`
-5. **Push to marketplace**: Claude Code auto-installs
+Releases are automated by [release-please](https://github.com/googleapis/release-please) (`.github/workflows/release-please.yml`); never hand-edit versions, changelogs, or tags:
+
+1. Squash-merge PRs with Conventional Commit titles (see **PR Titles** above)
+2. release-please opens/updates a `chore(main): release schlock x.y.z` PR with the changelog and version bumps (`pyproject.toml` and plugin manifests, per `release-please-config.json`)
+3. Merging the release PR publishes the GitHub release + tag; the marketplace picks it up from there
 
 ## Questions?
 
