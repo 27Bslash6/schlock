@@ -834,7 +834,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         risk_level=sub_result.risk_level,
                         message=f"BLOCKED: {sub_result.message}",
                         alternatives=[
-                            "Use whitelisted commands in substitution: op, date, git, pwd, whoami, hostname",
+                            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
                             "Run the command directly instead of using substitution",
                             "If this command is safe, request it be added to the whitelist",
                         ],
