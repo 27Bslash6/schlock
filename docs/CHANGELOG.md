@@ -5,6 +5,13 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2](https://github.com/27Bslash6/schlock/compare/schlock-v0.8.1...schlock-v0.8.2) (2026-07-22)
+
+
+### Bug Fixes
+
+* **substitution:** forbid backslash s/y delimiter to close residual sed ReDoS (LAB-554) ([#129](https://github.com/27Bslash6/schlock/issues/129)) ([5f3bfd4](https://github.com/27Bslash6/schlock/commit/5f3bfd40e9667b4eab624f6bb09d2703bf3ed7d8))
+
 ## [0.8.1](https://github.com/27Bslash6/schlock/compare/schlock-v0.8.0...schlock-v0.8.1) (2026-07-22)
 
 
