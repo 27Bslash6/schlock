@@ -3,6 +3,8 @@
 Targeted tests to improve coverage on uncovered code paths.
 """
 
+import time
+
 import pytest
 
 from schlock.core.parser import BashCommandParser
@@ -2163,3 +2165,23 @@ class TestDangerousSedHelper:
     def test_alternate_delimiter_does_not_hide_exec_flag(self):
         """s|a|b|e with delimiter '|' still has the trailing e exec flag -> blocked."""
         assert dangerous_sed(["sed", "s|a|b|e"]) is not None
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            "s/" + "\\" * 3000,  # backslash run in s/// body, no closing delimiter
+            "/" + "\\" * 3000,  # backslash run in /regex/ address, unterminated
+            "s/" + "\\a" * 1500 + "\\",  # escape pairs ending in a bare backslash
+        ],
+    )
+    def test_no_catastrophic_backtracking_on_backslash_runs(self, script):
+        """Pathological backslash runs must fail closed in linear time (ReDoS regression).
+
+        The escaped-pair and single-char branches of _SED_SAFE_COMMAND must stay mutually
+        exclusive on backslash; overlapping branches made these inputs exponential.
+        """
+        start = time.time()
+        result = dangerous_sed(["sed", script])
+        elapsed = time.time() - start
+        assert result is not None  # fail closed
+        assert elapsed < 1.0, f"ReDoS detected: {elapsed:.3f}s for pathological sed script"
