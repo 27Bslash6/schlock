@@ -553,11 +553,16 @@ _SED_SAFE_LONG_FLAGS = frozenset(
 # only — no e/w), or p/d/=/q. The (.) delimiter backreference keeps s|a|b|e (delimiter '|') safe
 # while rejecting the GNU exec FLAG in s/a/b/e. Scripts are split on ;/newline before matching;
 # a split inside an s/// replacement only over-blocks (both fragments fail), never under-blocks.
-_SED_ADDR = r"(?:[0-9]+|\$|/(?:\\.|[^/])*/)"
+# The escaped-pair / single-char alternatives must stay mutually exclusive on backslash
+# (\\. vs [^\\]): if both can consume a backslash, a run of backslashes with no closing
+# delimiter backtracks exponentially (ReDoS on the hook path). Valid sed never has a bare
+# trailing backslash — every \ starts a 2-char escape — so excluding it only over-blocks
+# commands sed itself rejects as unterminated.
+_SED_ADDR = r"(?:[0-9]+|\$|/(?:\\.|[^\\/])*/)"
 _SED_SAFE_COMMAND = re.compile(
     r"^\s*(?:" + _SED_ADDR + r"(?:\s*,\s*" + _SED_ADDR + r")?)?\s*"
     r"(?:"
-    r"[sy](.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gIiMmp0-9]*"
+    r"[sy](.)(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1[gIiMmp0-9]*"
     r"|[pd=]"
     r"|q[0-9]*"
     r")?\s*\Z"
