@@ -5,6 +5,22 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.6...schlock-v0.8.0) (2026-07-21)
+
+
+### Features
+
+* **commit-filter:** strip Multica agent co-author trailer (LAB-405) ([f0978c5](https://github.com/27Bslash6/schlock/commit/f0978c5fb4cfdf36034e84d99eb33cb1510a0327))
+* **rules:** guard blanket git staging (git add -A/--all/-a/.) as HIGH (LAB-400) ([#120](https://github.com/27Bslash6/schlock/issues/120)) ([0eaa148](https://github.com/27Bslash6/schlock/commit/0eaa14861e60db5a90d91dfaf436941f15918ce4))
+
+## [0.7.6](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.5...schlock-v0.7.6) (2026-07-14)
+
+
+### Bug Fixes
+
+* **substitution:** block fetch/aria2c downloaders in substitution ([#108](https://github.com/27Bslash6/schlock/issues/108)) ([#114](https://github.com/27Bslash6/schlock/issues/114)) ([0ce55a0](https://github.com/27Bslash6/schlock/commit/0ce55a0d97b0c630e616edc1ab86cf0e2c88f33a))
+* **validator:** block write-via-arg file writes (sort/sdiff/xxd) ([#113](https://github.com/27Bslash6/schlock/issues/113)) ([#115](https://github.com/27Bslash6/schlock/issues/115)) ([e8b96c2](https://github.com/27Bslash6/schlock/commit/e8b96c2f2023e89233921a8a46e9ba9c7cfd85a6))
+
 ## [0.7.5](https://github.com/27Bslash6/schlock/compare/schlock-v0.7.4...schlock-v0.7.5) (2026-06-10)
 
 

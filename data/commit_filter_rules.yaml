@@ -30,8 +30,8 @@ rules:
         description: "Any line with robot emoji and 'Generated with'"
         replacement: "\n"
 
-      - pattern: "(?i)\\n*Co-Authored-By:.*(?:Claude|@anthropic\\.com).*\\n*"
-        description: "Any Co-Authored-By line mentioning Claude or Anthropic"
+      - pattern: "(?i)\\n*Co-Authored-By:.*(?:Claude|@anthropic\\.com|@multica\\.ai).*\\n*"
+        description: "Any Co-Authored-By line mentioning Claude, Anthropic, or Multica"
         replacement: "\n"
 
       # Specific patterns (catch remnants the broad patterns might miss)
