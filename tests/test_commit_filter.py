@@ -1599,6 +1599,61 @@ class TestPatternCaseWhitespace:
         assert not patterns  # lowercase 'secret' must NOT match the case-sensitive custom pattern
 
 
+class TestMulticaAttribution:
+    """LAB-405: strip the Multica agent co-author trailer (adspam) exactly like the
+    Claude/Anthropic one, while preserving functional `Multica: LAB-xxx` annotations
+    that drive PR auto-linking. Tests run against the REAL bundled rules."""
+
+    @staticmethod
+    def _filter():
+        return CommitMessageFilter(load_filter_config())
+
+    def _result(self, body):
+        cmd = f'git commit -m "feat: x\\n\\n{body}"'
+        return self._filter().filter_commit_message(cmd)
+
+    def test_reference_trailer_stripped(self):
+        # Exact casing/shape verified against cachekit-io/cachekit-py#218.
+        result = self._result("Co-authored-by: multica-agent <github@multica.ai>")
+        assert result.was_modified
+        assert "multica" not in result.cleaned_message.lower()
+
+    def test_uppercase_trailer_stripped(self):
+        result = self._result("Co-Authored-By: Multica-Agent <GitHub@Multica.AI>")
+        assert result.was_modified
+        assert "multica" not in result.cleaned_message.lower()
+
+    def test_whitespace_tolerant_trailer_stripped(self):
+        result = self._result("co-authored-by:   multica-agent   <github@multica.ai>")
+        assert result.was_modified
+        assert "multica" not in result.cleaned_message.lower()
+
+    def test_sidebar_annotation_preserved(self):
+        # `· Multica: LAB-xxx` is the functional PR auto-link identifier — NEVER strip it.
+        result = self._result("Closes #170 · Multica: LAB-108")
+        assert not result.patterns_removed
+        assert not result.was_modified
+
+    def test_bare_sidebar_annotation_preserved(self):
+        result = self._result("Multica: LAB-108")
+        assert not result.patterns_removed
+        assert not result.was_modified
+
+    def test_prose_mention_not_stripped(self):
+        # No over-strip: only the co-author trailer shape matches, not the word itself.
+        result = self._result("Document the multica CLI and Multica workspace setup")
+        assert not result.patterns_removed
+        assert not result.was_modified
+
+    def test_trailer_stripped_but_annotation_survives_in_same_message(self):
+        # The two can coexist in one body: adspam goes, the sidebar identifier stays.
+        body = "Closes #170 · Multica: LAB-108\\n\\nCo-authored-by: multica-agent <github@multica.ai>"
+        result = self._result(body)
+        assert result.was_modified
+        assert "Co-authored-by" not in result.cleaned_message
+        assert "Multica: LAB-108" in result.cleaned_message
+
+
 class TestParseMemoization:
     """#91 — bashlex.parse must run at most once per command per filter call."""
 

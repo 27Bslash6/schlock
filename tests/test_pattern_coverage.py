@@ -263,6 +263,44 @@ class TestHighPatternCoverage:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level != RiskLevel.HIGH, f"False positive on: {cmd}"
 
+    def test_git_blanket_staging_patterns(self, safety_rules_path):
+        """Test git_blanket_staging pattern matching (GH #116).
+
+        Blanket staging sweeps build artifacts and secrets into the index.
+        HIGH so the balanced preset prompts (MEDIUM would be a silent allow).
+        """
+        # Should mark as HIGH
+        dangerous = [
+            "git add -A",
+            "git add --all",
+            "git add -a",
+            "git add .",
+            "git add -A .",
+            "git add -v -A",
+            "git add . && git commit -m 'wip'",
+        ]
+        for cmd in dangerous:
+            result = validate_command(cmd, config_path=safety_rules_path)
+            assert result.risk_level == RiskLevel.HIGH, f"Blanket staging not HIGH: {cmd}"
+
+        # Should NOT mark as HIGH (explicit-path, interactive, or dry-run adds)
+        safe = [
+            "git add src/foo.py",
+            "git add -p",
+            "git add -p .",
+            "git add . --patch",
+            "git add -i .",
+            "git add -n .",
+            "git add --dry-run -A",
+            "git add ./",
+            "git add .gitignore",
+            "git add ../other/file.txt",
+            "git add README.md docs/guide.md",
+        ]
+        for cmd in safe:
+            result = validate_command(cmd, config_path=safety_rules_path)
+            assert result.risk_level != RiskLevel.HIGH, f"False positive on: {cmd}"
+
     def test_chmod_777_patterns(self, safety_rules_path):
         """Test chmod_777 pattern matching (including recursive)."""
         # Should mark as HIGH (chmod_777 rule)
