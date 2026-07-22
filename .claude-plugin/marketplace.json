@@ -13,7 +13,7 @@
       "name": "schlock",
       "source": "./",
       "description": "LLM command safety validator. Blocks dangerous bash commands and Claude advertising spam.",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "author": {
         "name": "27B.io"
       },
