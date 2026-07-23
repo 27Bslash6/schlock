@@ -21,6 +21,17 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.py"
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
