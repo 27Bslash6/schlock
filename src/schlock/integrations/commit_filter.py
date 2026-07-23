@@ -912,6 +912,17 @@ class CommitMessageFilter:
                 )
 
             # delivery == "scannable": by the classifier contract `message` is non-None here.
+            # Guard anyway - this method never raises (fail-open contract), and the check
+            # narrows the type for static analysis.
+            if message is None:
+                return FilterResult(
+                    cleaned_command=command,
+                    original_message="",
+                    cleaned_message="",
+                    was_modified=False,
+                    message_delivery="scannable",
+                    error="internal: scannable delivery but no message extracted",
+                )
 
             # Clean message
             cleaned, patterns_removed, categories = self.clean_message(message)
