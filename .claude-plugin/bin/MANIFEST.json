@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "mvdan_sh": "v3.13.1",
+  "go": "go1.26.1",
+  "build": "CGO_ENABLED=0 GOFLAGS=-trimpath go build -buildvcs=false -ldflags=\"-s -w\"",
+  "binaries": {
+    "darwin-amd64/schlock-parse": "28b81690790076e83a8a5027c7d8f9bca20d6ac9b8a0e32ee2b42604f32889a0",
+    "darwin-arm64/schlock-parse": "f1e1eea3662c5f9055566e9605d2a10d4cabde59b050305b63ee47b6ebdb9b2f",
+    "linux-amd64/schlock-parse": "694095a44bac4ea84a705dbe76557e0bf0d0d8be8b87a8f4316fff0cff8e3364",
+    "linux-arm64/schlock-parse": "89091baf162dc8d8e3adfc25ac30d860c969eea730e12df18a80f30c064181b9",
+    "windows-amd64/schlock-parse.exe": "61a5b51bd0daaaa38a8d7fc46a95df03d36ff365d7963ed5a46a6872d0101d7d"
+  }
+}
