@@ -549,15 +549,25 @@ _SED_SAFE_LONG_FLAGS = frozenset(
     }
 )
 
-# One sed command: optional address(es) (N / $ / /regex/), then s|y with any delimiter (safe flags
-# only — no e/w), or p/d/=/q. The (.) delimiter backreference keeps s|a|b|e (delimiter '|') safe
-# while rejecting the GNU exec FLAG in s/a/b/e. Scripts are split on ;/newline before matching;
-# a split inside an s/// replacement only over-blocks (both fragments fail), never under-blocks.
-_SED_ADDR = r"(?:[0-9]+|\$|/(?:\\.|[^/])*/)"
+# One sed command: optional address(es) (N / $ / /regex/), then s|y with any delimiter except
+# backslash (safe flags only — no e/w), or p/d/=/q. The ([^\\]) delimiter backreference keeps
+# s|a|b|e (delimiter '|') safe while rejecting the GNU exec FLAG in s/a/b/e. Scripts are split on
+# ;/newline before matching; a split inside an s/// replacement only over-blocks (both fragments
+# fail), never under-blocks.
+# Two backslash-exclusions keep this linear-time (ReDoS lives on the ~1ms hook path):
+#   1. The escaped-pair / single-char body alternatives are mutually exclusive on backslash
+#      (\\. vs (?!\1)[^\\]) — if both consumed a backslash, a run of them with no closing
+#      delimiter would backtrack exponentially.
+#   2. The delimiter is ([^\\]), not (.) — a backslash delimiter makes \1 == '\', so \\.'s
+#      escape-pairs and the two \1 group-separators can each partition a backslash run O(n)
+#      ways, i.e. O(n^2) backtracking on a failing match (LAB-554 follow-up).
+# Valid sed never has a bare trailing backslash (every \ opens a 2-char escape) and never uses
+# '\' as an s/y delimiter, so both exclusions only over-block commands sed itself rejects.
+_SED_ADDR = r"(?:[0-9]+|\$|/(?:\\.|[^\\/])*/)"
 _SED_SAFE_COMMAND = re.compile(
     r"^\s*(?:" + _SED_ADDR + r"(?:\s*,\s*" + _SED_ADDR + r")?)?\s*"
     r"(?:"
-    r"[sy](.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gIiMmp0-9]*"
+    r"[sy]([^\\])(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1[gIiMmp0-9]*"
     r"|[pd=]"
     r"|q[0-9]*"
     r")?\s*\Z"
