@@ -150,6 +150,13 @@ class TestNoFalsePositives:
         monkeypatch.setattr(post_tool_use.subprocess, "run", boom)
         assert handle_post_tool_use(hook_input("echo hello", git_repo)) is None
 
+    def test_text_mention_of_git_commit_is_silent(self, git_repo):
+        """`echo "git commit"` is not a commit invocation — even with a fresh dirty HEAD."""
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        run_bash("git commit -F msg.txt", git_repo)  # fresh trailer-bearing HEAD in cwd
+
+        assert handle_post_tool_use(hook_input('echo "git commit"', git_repo)) is None
+
     def test_non_repo_cwd_is_silent(self, tmp_path):
         assert handle_post_tool_use(hook_input("git commit -m x", tmp_path)) is None
 
@@ -188,9 +195,82 @@ class TestGitGlobalOptionForms:
 
         assert handle_post_tool_use(hook_input(command, git_repo)) is not None
 
+    def test_git_dash_upper_c_external_repo_is_not_inspected(self, git_repo, tmp_path):
+        """`git -C <other-repo> commit` commits elsewhere — cwd's HEAD says nothing about it.
+
+        The hook must stay silent (documented limit: external targets are not inspected),
+        NOT judge the session cwd's repository.
+        """
+        env = git_env()
+        other = tmp_path / "other-repo"
+        other.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other, env=env, check=True)
+        (other / "f.txt").write_text("x\n")
+        subprocess.run(["git", "-C", str(other), "add", "f.txt"], env=env, check=True)
+        (other / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+
+        command = f"git -C {other} commit -F {other / 'msg.txt'}"
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+    def test_external_repo_commit_never_flags_cwd_head(self, git_repo, tmp_path):
+        """A fresh trailer-bearing HEAD in cwd must NOT be blamed on a `git -C` command
+        that committed to a different repository (the wrong-commit amend-prompt hazard)."""
+        # Fresh trailer commit in cwd (was flagged by its own hook run when it happened).
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        run_bash("git commit -F msg.txt", git_repo)
+
+        env = git_env()
+        other = tmp_path / "other-repo"
+        other.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other, env=env, check=True)
+        (other / "f.txt").write_text("x\n")
+        subprocess.run(["git", "-C", str(other), "add", "f.txt"], env=env, check=True)
+
+        command = f'git -C {other} commit -m "clean elsewhere"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+    def test_mixed_chain_with_cwd_commit_is_still_inspected(self, git_repo, tmp_path):
+        """External skip applies only when EVERY commit invocation is redirected."""
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = f"git -C {tmp_path} status; git commit -F msg.txt"
+        run_bash("git commit -F msg.txt", git_repo)
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+
 
 class TestHelpers:
     def test_read_head_commit_returns_none_outside_repo(self, tmp_path):
+        assert read_head_commit(str(tmp_path)) is None
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            OSError("git binary missing"),
+            subprocess.TimeoutExpired(cmd="git log", timeout=5),
+        ],
+        ids=["oserror", "timeout"],
+    )
+    def test_read_head_commit_fails_open_on_subprocess_errors(self, tmp_path, monkeypatch, exc):
+        def raise_exc(*args, **kwargs):
+            raise exc
+
+        monkeypatch.setattr(post_tool_use.subprocess, "run", raise_exc)
+        assert read_head_commit(str(tmp_path)) is None
+
+    def test_read_head_commit_fails_open_on_garbage_output(self, tmp_path, monkeypatch):
+        """Unparseable timestamp (ValueError path) must not raise."""
+
+        class Fake:
+            returncode = 0
+            stdout = "not-a-timestamp abc123\nmessage\n"
+
+        monkeypatch.setattr(post_tool_use.subprocess, "run", lambda *a, **k: Fake())
         assert read_head_commit(str(tmp_path)) is None
 
     def test_read_head_commit_parses_head(self, git_repo):

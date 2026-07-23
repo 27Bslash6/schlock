@@ -13,8 +13,9 @@ Behavior:
   `hookSpecificOutput.additionalContext` instructing the model to `git commit --amend`.
 - Fail-open: any error, missing git, non-repo cwd, or stale HEAD -> silent exit 0.
   This is a cosmetic filter, not a security boundary.
-- Cheap-gated: substring check on the command before any subprocess or heavy import
-  (the hook runs on every Bash call; latency is load-bearing).
+- Cheap-gated: substring check on the command first (the hook runs on every Bash call;
+  latency is load-bearing), then the PreToolUse filter's bashlex-backed recognizer binds
+  to real `git … commit` invocations before any subprocess runs.
 - Freshness-gated: the Bash tool "succeeds" even when `git commit` exits non-zero, so
   only a HEAD committed within FRESHNESS_WINDOW_SECONDS is inspected — a failed re-run
   must not re-flag a stale commit.
@@ -125,10 +126,29 @@ def handle_post_tool_use(input_data: dict) -> Optional[dict]:  # noqa: PLR0911 -
 
     command = input_data.get("tool_input", {}).get("command", "")
     # Cheap gate: cost is on every Bash call. Substrings (not "git commit" literal) so
-    # global-option forms like `git -C <path> commit` still pass. Precision comes free
-    # from the freshness gate + the fact that we scan HEAD's actual message: a false
-    # pass here costs one git subprocess and can never mis-flag a clean commit.
+    # global-option forms like `git -C <path> commit` still reach the precise recognizer.
     if "git" not in command or "commit" not in command:
+        return None
+
+    # Heavy imports only after the cheap gate passed.
+    try:
+        from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: PLC0415 - lazy
+
+        config = load_filter_config()
+        commit_filter = CommitMessageFilter(config)
+        if not commit_filter.enabled:
+            return None
+        # Precision gate: the same bashlex-backed recognizer the PreToolUse filter uses.
+        # Rejects text mentions (`echo "git commit"`) and binds to real commit invocations.
+        if not commit_filter.is_git_commit_command(command):
+            return None
+        # A commit redirected to another repository (git -C <path> / --git-dir / --work-tree)
+        # cannot be judged by THIS directory's HEAD — skip rather than flag the wrong commit.
+        # (Documented limit: such commits are not inspected.)
+        if commit_filter.commit_targets_external_repo(command):
+            return None
+    except Exception as e:
+        logger.warning(f"Post-commit filter failed: {e}. Skipping (fail-open).")
         return None
 
     head = read_head_commit(input_data.get("cwd"))
@@ -141,14 +161,7 @@ def handle_post_tool_use(input_data: dict) -> Optional[dict]:  # noqa: PLR0911 -
     if time.time() - committed_at > FRESHNESS_WINDOW_SECONDS:
         return None
 
-    # Heavy imports only after all cheap gates passed.
     try:
-        from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: PLC0415 - lazy
-
-        config = load_filter_config()
-        commit_filter = CommitMessageFilter(config)
-        if not commit_filter.enabled:
-            return None
         _cleaned, patterns_removed, categories = commit_filter.clean_message(message)
     except Exception as e:
         logger.warning(f"Post-commit filter failed: {e}. Skipping (fail-open).")

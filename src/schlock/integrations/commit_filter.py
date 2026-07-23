@@ -261,6 +261,50 @@ class CommitMessageFilter:
         except Exception:  # noqa: BLE001 - bashlex raises various types; fail-open to regex
             return bool(re.search(r"\bgit\b.*?\bcommit\b", command, re.DOTALL))
 
+    # Git global options that redirect which repository a commit lands in. A `git log` run in
+    # the process working directory says nothing about such a commit, so the post-commit
+    # detector must skip these rather than judge the wrong repo's HEAD (issue #79 review).
+    _GIT_REPO_TARGET_OPTS = frozenset({"-C", "--git-dir", "--work-tree"})
+
+    def commit_targets_external_repo(self, command: str) -> bool:
+        """True when every ``git … commit`` invocation redirects its target repository via a
+        global ``-C`` / ``--git-dir`` / ``--work-tree`` option — i.e. the repo in the current
+        working directory is NOT the one committed to.
+
+        Fail-open toward False (= inspect cwd): oversized or unparseable commands are treated
+        as targeting cwd, matching is_git_commit_command's over-detection bias. Downstream
+        freshness + message gates make over-inspection harmless.
+        """
+        if len(command) > MAX_COMMAND_SIZE:
+            return False
+        invocations_external: list[bool] = []
+
+        def visit(node: Any) -> None:
+            if getattr(node, "kind", None) == "command":
+                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                idx = self._commit_subcommand_index(words)
+                if idx != -1:
+                    globals_before = words[1:idx]
+                    invocations_external.append(
+                        any(
+                            w in self._GIT_REPO_TARGET_OPTS or w.startswith(("--git-dir=", "--work-tree="))
+                            for w in globals_before
+                        )
+                    )
+            for attr in ("parts", "list", "command"):
+                child = getattr(node, attr, None)
+                if child is None:
+                    continue
+                for item in child if isinstance(child, list) else [child]:
+                    visit(item)
+
+        try:
+            for part in self._parse(command):
+                visit(part)
+        except Exception:  # noqa: BLE001 - bashlex raises various types; fail toward inspecting
+            return False
+        return bool(invocations_external) and all(invocations_external)
+
     def extract_commit_message(self, command: str) -> Optional[str]:
         """Extract commit message from git command using dual-mode parsing.
 
