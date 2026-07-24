@@ -2,7 +2,7 @@
 
 This document describes how to configure schlock features, customize safety rules, and integrate with your development workflow.
 
-> **⚠️ Note on Code Formatting**: The `formatter` configuration options documented below are **non-functional** because Claude Code does not support PostToolUse hooks for plugins. For code formatting, use [pre-commit hooks](https://pre-commit.com/) (industry standard).
+> **⚠️ Note on Code Formatting**: The `formatter` configuration options documented below are **not implemented**. (Earlier versions of this note claimed Claude Code doesn't support PostToolUse hooks for plugins — that is stale; plugin `PostToolUse` registration works as of Claude Code v2.1.214 and schlock's post-commit advertising detector relies on it.) For code formatting, use [pre-commit hooks](https://pre-commit.com/) (industry standard).
 
 ## Table of Contents
 
@@ -280,7 +280,32 @@ unscannable_message_action: warn   # off | warn | block  (default: warn)
 > **What `warn`/`block` can and cannot do.** This is a *pre-execution* heads-up: it cannot
 > read the file or stdin content, so it cannot confirm a trailer is present — only that the
 > message could not be scanned. The reliable place to catch a trailer that actually landed is
-> *after* the commit exists; detecting post-commit slippage is tracked separately.
+> *after* the commit exists — that is the post-commit slippage detector below.
+
+### Post-Commit Slippage Detection (PostToolUse)
+
+A `PostToolUse` hook (`hooks/post_tool_use.py`) closes the gap above durably. After any Bash
+command mentioning `git` + `commit`, it reads the **actual committed message** from the commit
+object (`git log -1 --format=%B`) and runs the same advertising patterns over it. Because the
+message has materialized by then, one detector covers *every* delivery form — `-F <file>`,
+`--file=`, stdin/heredoc, and `$(cat file)` substitution — with no file-content reading and
+none of the TOCTOU/symlink risks that ruled out scanning the `-F` target pre-execution.
+
+On detection it **never rewrites history**: it injects feedback (`additionalContext`) naming
+the offending content and instructing the model to `git commit --amend` it away (and to leave
+already-pushed commits alone). The amend re-fires the hook; a clean message produces silence,
+terminating the loop.
+
+Guard rails:
+
+- **Freshness gate**: the Bash tool "succeeds" even when `git commit` was a no-op, so only a
+  HEAD committed within the last 30 seconds is inspected — a failed re-run cannot re-flag an
+  old commit.
+- **Fail-open + cheap-gated**: errors and non-repo directories are silent; the hook does no
+  real work unless the command looks like a commit. Disabling the commit filter
+  (`enabled: false`) disables this detector too.
+- **Known limit**: the message is read from the session's working directory, so a commit made
+  in a *different* repo (`git -C /elsewhere commit`) is not inspected.
 
 ### Why Block Instead of Filter?
 

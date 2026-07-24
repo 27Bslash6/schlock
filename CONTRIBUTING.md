@@ -77,7 +77,7 @@ pre-commit install
 uv run ruff format .
 ```
 
-**Note**: schlock's built-in formatter feature is **non-functional** because Claude Code does not support PostToolUse hooks for plugins. Use standard pre-commit hooks for code formatting.
+**Note**: schlock's built-in formatter feature is **not implemented**. Earlier docs claimed Claude Code doesn't support PostToolUse hooks for plugins — that is stale: verified on Claude Code v2.1.214 (2026-07) that a plugin `hooks/hooks.json` registers `PostToolUse` fine (schlock's post-commit advertising detector uses it). The formatter is now revivable but remains unbuilt; use standard pre-commit hooks for code formatting.
 
 ### Python Style
 
