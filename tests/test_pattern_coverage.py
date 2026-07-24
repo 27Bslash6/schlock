@@ -276,7 +276,8 @@ class TestHighPatternCoverage:
             "git add -a",
             "git add .",
             "git add -A .",
-            "git add -v -A",
+            "git add -v -A",  # flag-only, blanket flag last
+            "git add -A -v",  # flag-only, blanket flag first (order-independent)
             "git add . && git commit -m 'wip'",
         ]
         for cmd in dangerous:
@@ -296,6 +297,12 @@ class TestHighPatternCoverage:
             "git add .gitignore",
             "git add ../other/file.txt",
             "git add README.md docs/guide.md",
+            # LAB-525: a blanket flag scoped to an explicit pathspec is not a
+            # whole-tree sweep — the pathspec limits it, so it stays below HIGH.
+            "git add -A src/foo.py",
+            "git add src/foo.py --all",
+            "git add --all src/foo.py",
+            "git add -a src/foo.py",
         ]
         for cmd in safe:
             result = validate_command(cmd, config_path=safety_rules_path)
