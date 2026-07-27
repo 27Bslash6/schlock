@@ -227,7 +227,7 @@ class RuleEngine:
         engine.rules = []
         engine.compiled_patterns = {}
         engine.whitelist_patterns = []
-        engine._original_risk_levels: dict[str, RiskLevel] = {}
+        engine._original_risk_levels = {}
 
         # Load rules from all YAML files in directory
         engine._load_rules_from_directory(rules_dir)

@@ -23,7 +23,7 @@ This roadmap outlines schlock's evolution. Priorities are driven by user feedbac
 **Known Limitations**:
 - **No per-rule overrides**: Can't customize individual rule severity
 - **No code quality rules**: Only security-focused rules exist
-- **Code formatter**: Non-functional (Claude Code doesn't support PostToolUse hooks)
+- **Code formatter**: Not implemented (the old "Claude Code doesn't support PostToolUse hooks for plugins" blocker is gone — verified working on v2.1.214 — so this is revivable if demand appears)
 
 ---
 
@@ -137,7 +137,7 @@ Default risk level: **HIGH** (prompts in balanced mode, users can override to BL
 
 | Feature | Reason |
 |---------|--------|
-| Code formatter | Claude Code doesn't support PostToolUse hooks |
+| Code formatter | No demand; former PostToolUse-for-plugins blocker is gone (verified on v2.1.214), revivable if demand appears |
 | Telemetry | Privacy concerns, unclear value |
 | Web dashboard | CLI-first is sufficient |
 | PyPI package | No demand signal yet |
