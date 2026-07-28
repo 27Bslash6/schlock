@@ -288,6 +288,93 @@ class TestRedirects:
         assert not hasattr(cmd.parts[1], "heredoc")
 
 
+@needs_binary
+class TestPanelFindings:
+    """Regressions from the LAB-911 expert-panel review (all under-block class)."""
+
+    def test_command_span_includes_trailing_redirect(self):
+        # Panel CRIT: mvdan hangs Redirs off the Stmt, so a command node pos
+        # taken from CallExpr alone excludes the redirect — and the sliced
+        # segment text drops a dangerous redirect target (e.g. /dev/sda).
+        command = "echo x > /dev/sda && ls"
+        (node,) = view(command)
+        segments = BashCommandParser().extract_command_segments(command, [node])
+        assert segments == ["echo x > /dev/sda", "ls"]
+
+    def test_redirect_prefix_extends_command_span_left(self):
+        (cmd,) = view("2>&1 cmd")
+        assert cmd.pos == (0, 8)
+
+    def test_backslash_escape_in_word_raises(self):
+        # Panel CRIT: bashlex unescapes `r\m` to `rm`; passing the raw escaped
+        # text through would defeat every rule keyed on the command name.
+        # Until T3 implements the per-WordPart unescape, escapes must raise
+        # (→ bashlex tier, which unescapes correctly today).
+        with pytest.raises(UnmappedNodeError, match="escape"):
+            view("rm\\ -rf\\ /")
+        with pytest.raises(UnmappedNodeError, match="escape"):
+            view("r\\m -rf /")
+
+    def test_backslash_in_single_quotes_is_literal_and_allowed(self):
+        # Single quotes disable escape processing in bash, so a backslash
+        # there is plain text — no divergence from bashlex, no raise.
+        (cmd,) = view("echo 'a\\b'")
+        assert cmd.parts[1].word == "a\\b"
+
+    def test_non_ascii_input_raises(self):
+        # Panel CRIT: mvdan emits BYTE offsets; the walkers char-index the
+        # string, and a mis-sliced segment is silently DROPPED by their
+        # bounds guard. Until T3 lands byte→char conversion, any non-ASCII
+        # input must raise (→ bashlex tier).
+        with pytest.raises(UnmappedNodeError, match="ASCII"):
+            view("X=café; rm -rf /")
+
+    def test_structurally_malformed_json_raises_bridge_error(self):
+        # Panel MAJ: a KeyError escaping build_ast_view would bypass T5's
+        # NativeBridgeError → bashlex routing and hard-DENY with no context.
+        no_op_binary = {
+            "Type": "File",
+            "Pos": {"Offset": 0},
+            "End": {"Offset": 6},
+            "Stmts": [
+                {
+                    "Pos": {"Offset": 0},
+                    "End": {"Offset": 6},
+                    "Cmd": {"Type": "BinaryCmd", "Pos": {"Offset": 0}, "End": {"Offset": 6}},
+                }
+            ],
+        }
+        with pytest.raises(NativeBridgeError, match="malformed"):
+            build_ast_view("a && b", no_op_binary)
+
+    def test_missing_pos_raises_bridge_error(self):
+        with pytest.raises(NativeBridgeError):
+            build_ast_view("a", {"Type": "File", "End": {"Offset": 1}, "Stmts": [{}]})
+
+    def test_nodes_carry_the_tabled_child_attribute(self):
+        # Panel MAJ: the mapping table must DRIVE the converter, not decorate
+        # it. Every produced node whose kind is in the table must carry the
+        # tabled child attribute (pipeline shares `parts` via BINARY_OPS).
+        child_by_kind = {kind: child for kind, child in MVDAN_NODE_MAP.values() if child is not None}
+        child_by_kind["pipeline"] = "parts"
+        samples = ["echo $(a && b) > f", "X=$(a) diff <(b) f | c", "(a; b)", "echo ${HOME}"]
+
+        def walk(node):
+            assert node.kind in BASHLEX_KINDS or node.kind == "heredoc"
+            child_attr = child_by_kind.get(node.kind)
+            if child_attr is not None:
+                assert hasattr(node, child_attr), f"{node.kind} node missing .{child_attr}"
+            for attr in ("parts", "list", "command", "output", "heredoc"):
+                child = getattr(node, attr, None)
+                for item in child if isinstance(child, list) else [child]:
+                    if isinstance(item, AstView):
+                        walk(item)
+
+        for sample in samples:
+            for node in view(sample):
+                walk(node)
+
+
 class TestUnmappedRaises:
     """Anything without an explicit mapping must raise → fallback tier.
 
