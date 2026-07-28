@@ -120,6 +120,18 @@ class NativeBridge:
             self._binary_path = resolve_binary()
         return self._binary_path
 
+    def parse(self, command: str) -> "list":
+        """Parse `command` into bashlex-shaped `AstView` nodes (spec §3.2).
+
+        Raises:
+            ParseError: the binary rejected the command as unparseable.
+            NativeBridgeError: subprocess failure, a prefix parse, or a
+                construct without an explicit mapping (→ fallback tier).
+        """
+        from schlock.core.ast_view import build_ast_view  # noqa: PLC0415 - avoids an import cycle
+
+        return build_ast_view(command, self.parse_json(command))
+
     def parse_json(self, command: str) -> str:
         """Parse `command` and return the typed-JSON AST as text.
 
