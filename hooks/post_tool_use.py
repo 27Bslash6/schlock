@@ -23,6 +23,9 @@ Behavior:
   output, ending the loop. A pathological re-add of the trailer re-flags — that is the
   correct response, and since the hook only ever informs (never blocks), no state is
   needed to bound it.
+- File-content scan: only added lines in the fresh HEAD~1..HEAD diff are checked for the
+  exact canonical Generated with Claude Code phrase. Schlock's own checkout is skipped
+  because its fixtures and docs legitimately quote the phrase.
 
 Hook Interface:
 - Input: JSON via stdin (tool_input.command, cwd, ...)
@@ -31,6 +34,7 @@ Hook Interface:
 
 import json
 import logging
+import re
 import subprocess
 import sys
 import time
@@ -55,6 +59,86 @@ FRESHNESS_WINDOW_SECONDS = 30
 
 # Timeout for the single git subprocess (seconds).
 GIT_TIMEOUT_SECONDS = 5
+
+# The file-content extension intentionally recognizes only the canonical phrase.
+# Reusing the full commit-message rules here would make ordinary source/docs content
+# containing other advertising patterns noisy.
+CANONICAL_ADVERTISING_PATTERN = re.compile(r"(?i)(?<!\w)Generated with Claude Code(?!\w)")
+
+
+def read_added_lines(cwd: Optional[str]) -> Optional[list[tuple[str, str]]]:
+    """Return (path, line) pairs added by the current commit.
+
+    The scan is deliberately limited to added lines in HEAD~1..HEAD. A commit
+    in schlock's own checkout is excluded because the plugin contains legitimate
+    fixtures and documentation that quote its advertising patterns.
+
+    Returns None when git cannot provide a diff (for example, an initial commit
+    or a non-repository cwd), preserving the hook's fail-open behavior.
+    """
+    try:
+        root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+            cwd=cwd or None,
+        )
+        if root_result.returncode != 0:
+            return None
+
+        repo_root = Path(root_result.stdout.strip()).resolve()
+        schlock_root = Path(__file__).resolve().parent.parent
+        if repo_root == schlock_root:
+            return []
+
+        diff_result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=0",
+                "--no-renames",
+                "HEAD~1",
+                "HEAD",
+                "--",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+            cwd=cwd or None,
+        )
+        if diff_result.returncode != 0:
+            return None
+
+        added_lines: list[tuple[str, str]] = []
+        current_path: Optional[str] = None
+        in_file_header = False
+        for line in diff_result.stdout.splitlines():
+            if line.startswith("diff --git "):
+                current_path = None
+                in_file_header = True
+            elif in_file_header and line.startswith("+++ b/"):
+                current_path = line[6:]
+                in_file_header = False
+            elif line.startswith("@@"):
+                in_file_header = False
+            elif current_path and line.startswith("+") and not line.startswith("+++"):
+                added_lines.append((current_path, line[1:]))
+        return added_lines
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def find_file_advertising(cwd: Optional[str]) -> Optional[list[tuple[str, str]]]:
+    """Find canonical advertising phrases in committed file additions only."""
+    added_lines = read_added_lines(cwd)
+    if added_lines is None:
+        return None
+    return [(path, line) for path, line in added_lines if CANONICAL_ADVERTISING_PATTERN.search(line)]
 
 
 def read_head_commit(cwd: Optional[str]) -> Optional[tuple[int, str, str]]:
@@ -96,6 +180,18 @@ def format_amend_prompt(short_hash: str, patterns_removed: list[dict]) -> str:
         f"Fix it now: rewrite the message with `git commit --amend`, keeping the real message and "
         f"removing ONLY the advertising lines above. Do NOT amend if this commit has already been "
         f"pushed to a shared branch — in that case, tell the user instead of rewriting history."
+    )
+
+
+def format_file_amend_prompt(short_hash: str, matches: list[tuple[str, str]]) -> str:
+    """Build feedback for canonical advertising found in committed file content."""
+    locations = "\n".join(f"  - {path}: {line.strip()}" for path, line in matches)
+    return (
+        f"schlock: advertising content landed in added file content in commit {short_hash}.\n\n"
+        f"Canonical phrase found on these added lines:\n{locations}\n\n"
+        f"Fix it now: remove ONLY those advertising lines from the listed files, then run git commit --amend --no-edit. "
+        f"Do NOT amend if this commit has already been pushed to a shared branch — in that case, tell the user instead of "
+        f"rewriting history."
     )
 
 
@@ -167,17 +263,27 @@ def handle_post_tool_use(input_data: dict) -> Optional[dict]:  # noqa: PLR0911 -
         logger.warning(f"Post-commit filter failed: {e}. Skipping (fail-open).")
         return None
 
-    if not patterns_removed:
+    file_matches = find_file_advertising(input_data.get("cwd"))
+    if not patterns_removed and not file_matches:
         # Clean message — also the amend-loop terminator: a successful amend lands here.
         return None
 
-    logger.warning(f"[commit-filter] post-commit advertising detected in {short_hash} (categories: {', '.join(categories)})")
-    audit_detection(command, categories, input_data.get("cwd"), start_time)
+    detected_categories = categories + (["file_content"] if file_matches else [])
+    logger.warning(
+        f"[commit-filter] post-commit advertising detected in {short_hash} (categories: {', '.join(detected_categories)})"
+    )
+    audit_detection(command, detected_categories, input_data.get("cwd"), start_time)
+
+    contexts = []
+    if patterns_removed:
+        contexts.append(format_amend_prompt(short_hash, patterns_removed))
+    if file_matches:
+        contexts.append(format_file_amend_prompt(short_hash, file_matches))
 
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": format_amend_prompt(short_hash, patterns_removed),
+            "additionalContext": "\n\n".join(contexts),
         }
     }
 

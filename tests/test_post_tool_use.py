@@ -26,6 +26,7 @@ import post_tool_use
 from post_tool_use import handle_post_tool_use, read_head_commit
 
 TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
+FILE_TRAILER = "Generated with Claude Code"
 CLEAN_MESSAGE = "feat: add the flux capacitor"
 
 
@@ -162,6 +163,43 @@ class TestNoFalsePositives:
 
     def test_missing_command_is_silent(self, git_repo):
         assert handle_post_tool_use({"tool_input": {}, "cwd": str(git_repo)}) is None
+
+    def test_file_content_trailer_is_detected(self, git_repo):
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "source.py").write_text(f"def flux():\n    return {FILE_TRAILER!r}\n")
+        subprocess.run(["git", "add", "source.py"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        assert "source.py" in context
+        assert FILE_TRAILER in context
+        assert "git commit --amend --no-edit" in context
+
+    def test_clean_file_content_is_silent(self, git_repo):
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "source.py").write_text("def flux():\n    return 42\n")
+        subprocess.run(["git", "add", "source.py"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+    def test_schlock_tree_is_excluded(self, monkeypatch, git_repo):
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        monkeypatch.setattr(post_tool_use, "__file__", str(git_repo / "hooks" / "post_tool_use.py"))
+        (git_repo / "fixture.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "fixture.md"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
 
 
 class TestAmendLoopTerminates:
