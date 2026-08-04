@@ -10,6 +10,7 @@ assert on what the hook sees in `git log`.
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -219,7 +220,9 @@ class TestNoFalsePositives:
         assert post_tool_use.find_file_advertising(str(git_repo)) == []
 
     def test_pure_rename_is_not_reflagged(self, git_repo):
-        """`git mv` of a phrase-bearing file adds no lines — must stay silent."""
+        """`git mv` of a phrase-bearing file adds no lines — must stay silent even
+        when ambient config disables rename detection (--find-renames pins it on)."""
+        subprocess.run(["git", "config", "diff.renames", "false"], cwd=git_repo, env=git_env(), check=True)
         (git_repo / "notes.md").write_text(f"{FILE_TRAILER}\n")
         assert run_bash('git add -A && git commit -m "initial"', git_repo).returncode == 0
         assert run_bash('git mv notes.md renamed.md && git commit -m "rename"', git_repo).returncode == 0
@@ -302,6 +305,62 @@ class TestFileContentDetection:
         context = response["hookSpecificOutput"]["additionalContext"]
         assert "SMUGGLED_INSTRUCTION_CANARY" not in context
         assert "vendored.py:1" in context
+
+    def test_undecodable_bytes_do_not_abort_the_scan(self, git_repo):
+        """--text forces binary blobs into the diff; invalid UTF-8 must be replaced,
+        not raise a UnicodeDecodeError that aborts the whole detector."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "blob.bin").write_bytes(b"\xff\xfe\x00\x01\n" + FILE_TRAILER.encode() + b"\n\x80\x81\n")
+        subprocess.run(["git", "add", "blob.bin"], cwd=git_repo, env=git_env(), check=True)
+        assert run_bash(f'git commit -m "{CLEAN_MESSAGE}"', git_repo).returncode == 0
+
+        assert post_tool_use.find_file_advertising(str(git_repo)) == [("blob.bin", 2)]
+
+    def test_quoted_and_spaced_filenames_are_scanned(self, git_repo):
+        """Control characters are C-quoted in diff headers regardless of
+        core.quotePath, and space-bearing paths carry a trailing-TAB separator —
+        both must decode to the real path, and control chars must be escaped in
+        the report so a crafted filename cannot inject line structure."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "na\tme.md").write_text(f"{FILE_TRAILER}\n")
+        (git_repo / "my file.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "-A"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        assert "na\\x09me.md:1" in context  # display form: control char escaped
+        assert "my file.md:1" in context
+        add_line = next(line for line in context.splitlines() if "git add --" in line)
+        assert shlex.quote("na\tme.md") in add_line  # staging form: real path, shell-quoted
+        assert shlex.quote("my file.md") in add_line
+
+    def test_truncated_report_stages_exactly_the_listed_files(self, git_repo):
+        """When matches exceed the cap, the add command must name exactly the shown
+        files — never a superset the model was not told about, never a subset of
+        what it was told to edit; the amend re-run reports the next batch."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        for i in range(12):
+            (git_repo / f"f{i:02d}.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "-A"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        add_line = next(line for line in context.splitlines() if "git add --" in line)
+        for i in range(10):  # every listed file is staged...
+            assert f"f{i:02d}.md:1" in context
+            assert f"f{i:02d}.md" in add_line
+        for i in range(10, 12):  # ...and unlisted files appear nowhere
+            assert f"f{i:02d}.md" not in context
+        assert "... and 2 more" in context
+        assert "the amend re-runs this check" in context
 
     def test_report_is_capped(self, git_repo):
         """A generated bundle with hundreds of matches must not flood the session."""

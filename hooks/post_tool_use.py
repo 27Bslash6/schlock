@@ -85,6 +85,11 @@ CANONICAL_ADVERTISING_PICKAXE = (
 # Unified-diff hunk header; group 1 is the new-file start line.
 HUNK_HEADER_PATTERN = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)")
 
+# Git's C-style path quoting: a backslash escape is either three octal digits
+# (a control byte) or a single mnemonic character.
+GIT_QUOTED_PATH_ESCAPE = re.compile(r"\\([0-7]{3}|.)")
+GIT_PATH_SIMPLE_ESCAPES = {"t": "\t", "n": "\n", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v", '"': '"', "\\": "\\"}
+
 # Cap on locations reported in feedback — committed content is untrusted, so the
 # feedback names path:line only (never the matched bytes) and stays bounded.
 MAX_REPORTED_LOCATIONS = 10
@@ -110,6 +115,31 @@ def is_schlock_checkout(cwd: Optional[str]) -> bool:
         return False
 
 
+def unquote_git_path(path: str) -> str:
+    """Decode git's C-style quoted path form (`"na\\tme.md"`, `\\ooo` octal).
+
+    `core.quotePath=false` keeps non-ASCII raw, but quotes, backslashes and
+    control characters are ALWAYS quoted regardless of the setting — left
+    undecoded, the `b/` prefix check would silently skip that file's lines.
+    """
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+
+    def decode(match: "re.Match[str]") -> str:
+        escape = match.group(1)
+        if len(escape) == 3:
+            return chr(int(escape, 8))
+        return GIT_PATH_SIMPLE_ESCAPES.get(escape, escape)
+
+    return GIT_QUOTED_PATH_ESCAPE.sub(decode, path[1:-1])
+
+
+def escape_control_chars(text: str) -> str:
+    """Escape control characters for display — a crafted filename must not inject
+    line structure into the additionalContext report."""
+    return re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
 def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
     """Return (path, line_number) locations of the canonical phrase added by HEAD.
 
@@ -117,9 +147,11 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
     scanned (no parent to resolve), a merge commit is not blamed for lines its
     incoming branch wrote (condensed combined diff yields no `+` lines), and a
     pure rename adds nothing. The diff format is pinned (`-c core.quotePath=false`,
-    `--no-color`, explicit prefixes) so ambient git config — diff.noprefix,
-    color.diff=always, quoted non-ASCII paths — cannot silently blind the parser.
-    `--text` scans paths a .gitattributes `-diff` rule would otherwise hide.
+    `--no-color`, explicit prefixes, `--find-renames` against diff.renames=false)
+    so ambient git config — diff.noprefix, color.diff=always, quoted non-ASCII
+    paths, disabled rename detection — cannot silently blind or noise the parser.
+    `--text` scans paths a .gitattributes `-diff` rule would otherwise hide;
+    undecodable bytes in forced-text diffs are replaced, not fatal.
 
     Fail-open: any git failure returns [] (this is a cosmetic filter).
     """
@@ -140,12 +172,14 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
                 "--text",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
+                "--find-renames",
                 f"-G{CANONICAL_ADVERTISING_PICKAXE}",
                 "HEAD",
                 "--",
             ],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=GIT_TIMEOUT_SECONDS,
             check=False,
             cwd=cwd or None,
@@ -161,9 +195,13 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
             if line.startswith("diff --git "):
                 current_path = None
                 in_file_header = True
-            elif in_file_header and line.startswith("+++ b/"):
-                current_path = line[6:]
-                in_file_header = False
+            elif in_file_header and line.startswith("+++ "):
+                # Path may be C-quoted (control chars/quotes/backslashes) and, when it
+                # contains spaces unquoted, carries git's trailing-TAB separator.
+                target = unquote_git_path(line[4:].rstrip("\t"))
+                if target.startswith("b/"):
+                    current_path = target[2:]
+                    in_file_header = False
             elif line.startswith("@@"):
                 in_file_header = False
                 header = HUNK_HEADER_PATTERN.match(line)
@@ -228,17 +266,29 @@ def format_file_amend_prompt(short_hash: str, matches: list[tuple[str, int]]) ->
     rationale as format_amend_prompt emitting rule descriptions, not content).
     """
     shown = matches[:MAX_REPORTED_LOCATIONS]
-    locations = "\n".join(f"  - {path}:{line_number}" for path, line_number in shown)
-    if len(matches) > len(shown):
-        locations += f"\n  - ... and {len(matches) - len(shown)} more"
-    paths = list(dict.fromkeys(path for path, _ in matches))[:MAX_REPORTED_LOCATIONS]
+    locations = "\n".join(f"  - {escape_control_chars(path)}:{line_number}" for path, line_number in shown)
+    remaining = len(matches) - len(shown)
+    if remaining:
+        locations += f"\n  - ... and {remaining} more"
+    # Stage exactly the files whose locations were shown — never a superset the
+    # model was not told about, never a truncated subset of what it was told to
+    # edit. Locations beyond the cap surface on the next run: the amend re-fires
+    # this hook, which reports the next batch until the commit is clean.
+    paths = list(dict.fromkeys(path for path, _ in shown))
     add_targets = " ".join(shlex.quote(path) for path in paths)
+    rerun_note = (
+        f"This report lists the first {MAX_REPORTED_LOCATIONS} locations only; the amend re-runs "
+        f"this check and it will report the remaining ones.\n"
+        if remaining
+        else ""
+    )
     return (
         f'schlock: the canonical advertising phrase ("Generated with Claude Code") landed in file '
         f"content added by commit {short_hash}.\n\n"
         f"Locations (file:line):\n{locations}\n\n"
         f"Fix it now: remove ONLY the advertising phrase at those locations, then stage and amend:\n"
         f"  git add -- {add_targets} && git commit --amend --no-edit\n"
+        f"{rerun_note}"
         f"Do NOT amend if this commit has already been pushed to a shared branch, and if the phrase "
         f"is quoted deliberately (e.g. documentation discussing the phrase itself), leave it — in "
         f"either case, tell the user instead."
