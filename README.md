@@ -214,7 +214,7 @@ commit_filter:
 Two layers: a **pre-execution** filter blocks advertising visible in the command string, and a
 **post-commit** detector catches messages delivered from outside the command (`-F <file>`,
 stdin/heredocs, `$(cat file)`) by scanning the actual committed message and prompting an amend.
-It also scans only added lines in the fresh commit for the exact `Generated with Claude Code` phrase, while skipping schlock's own checkout (which contains legitimate fixtures/docs). It never rewrites history itself.
+It also scans only added lines in the fresh commit for the canonical `Generated with Claude Code` phrase, while skipping schlock checkouts (whose fixtures/docs legitimately quote it). It never rewrites history itself.
 
 See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for advanced options and team-wide settings.
 

@@ -23,9 +23,12 @@ Behavior:
   output, ending the loop. A pathological re-add of the trailer re-flags — that is the
   correct response, and since the hook only ever informs (never blocks), no state is
   needed to bound it.
-- File-content scan: only added lines in the fresh HEAD~1..HEAD diff are checked for the
-  exact canonical Generated with Claude Code phrase. Schlock's own checkout is skipped
-  because its fixtures and docs legitimately quote the phrase.
+- File-content scan: only lines added by the fresh HEAD commit (`git show`, so root
+  commits are scanned, merge commits are not blamed for their incoming branch, and pure
+  renames stay silent) are checked for the canonical Generated with Claude Code phrase
+  (case-insensitive, plain or linked-markdown form). A schlock checkout — identified by
+  its own .claude-plugin/plugin.json — is skipped because its fixtures and docs
+  legitimately quote the phrase.
 
 Hook Interface:
 - Input: JSON via stdin (tool_input.command, cwd, ...)
@@ -35,6 +38,7 @@ Hook Interface:
 import json
 import logging
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -57,51 +61,86 @@ logger = logging.getLogger(__name__)
 # enough that a later failed/no-op `git commit` doesn't re-flag an old HEAD.
 FRESHNESS_WINDOW_SECONDS = 30
 
-# Timeout for the single git subprocess (seconds).
+# Timeout for each git subprocess (seconds). Two run per fresh commit: log + show.
 GIT_TIMEOUT_SECONDS = 5
 
-# The file-content extension intentionally recognizes only the canonical phrase.
-# Reusing the full commit-message rules here would make ordinary source/docs content
-# containing other advertising patterns noisy.
-CANONICAL_ADVERTISING_PATTERN = re.compile(r"(?i)(?<!\w)Generated with Claude Code(?!\w)")
+# The file-content extension intentionally recognizes only the canonical phrase —
+# plain ("Generated with Claude Code") or linked-markdown ("Generated with
+# [Claude Code](https://claude.ai/code)") — case-insensitively, with any whitespace
+# run between words (matching data/commit_filter_rules.yaml). Reusing the full
+# commit-message rules here would make ordinary source/docs content containing
+# other advertising patterns noisy.
+CANONICAL_ADVERTISING_PATTERN = re.compile(r"(?i)\bGenerated\s+with\s+\[?Claude\s+Code\b")
+
+# POSIX ERE mirror of CANONICAL_ADVERTISING_PATTERN for `git show -G`: restricts the
+# diff to files whose patch actually mentions the phrase, so one generated bundle or
+# vendored artifact cannot flood the hook (measured 7MB of diff without the bound).
+# `-G` has no case-insensitivity flag, hence the per-letter classes; `[[]?` is the
+# optional literal "[" of the linked-markdown form.
+CANONICAL_ADVERTISING_PICKAXE = (
+    "[Gg][Ee][Nn][Ee][Rr][Aa][Tt][Ee][Dd][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+"
+    "[[]?[Cc][Ll][Aa][Uu][Dd][Ee][[:space:]]+[Cc][Oo][Dd][Ee]"
+)
+
+# Unified-diff hunk header; group 1 is the new-file start line.
+HUNK_HEADER_PATTERN = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)")
+
+# Cap on locations reported in feedback — committed content is untrusted, so the
+# feedback names path:line only (never the matched bytes) and stays bounded.
+MAX_REPORTED_LOCATIONS = 10
 
 
-def read_added_lines(cwd: Optional[str]) -> Optional[list[tuple[str, str]]]:
-    """Return (path, line) pairs added by the current commit.
+def is_schlock_checkout(cwd: Optional[str]) -> bool:
+    """True when cwd sits inside a schlock checkout, identified by its plugin manifest.
 
-    The scan is deliberately limited to added lines in HEAD~1..HEAD. A commit
-    in schlock's own checkout is excluded because the plugin contains legitimate
-    fixtures and documentation that quote its advertising patterns.
-
-    Returns None when git cannot provide a diff (for example, an initial commit
-    or a non-repository cwd), preserving the hook's fail-open behavior.
+    Identity-keyed (not path-keyed) so contributor clones and git worktrees are
+    recognized wherever they live — the hook itself runs from the plugin install
+    dir, which never equals a contributor's checkout path. The nearest manifest
+    on the walk up decides. Any read/parse failure means "not schlock": the
+    default is to scan.
     """
     try:
-        root_result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT_SECONDS,
-            check=False,
-            cwd=cwd or None,
-        )
-        if root_result.returncode != 0:
-            return None
+        start = Path(cwd or ".").resolve()
+        for directory in (start, *start.parents):
+            manifest = directory / ".claude-plugin" / "plugin.json"
+            if manifest.is_file():
+                return json.loads(manifest.read_text()).get("name") == "schlock"
+        return False
+    except (OSError, ValueError):
+        return False
 
-        repo_root = Path(root_result.stdout.strip()).resolve()
-        schlock_root = Path(__file__).resolve().parent.parent
-        if repo_root == schlock_root:
-            return []
 
-        diff_result = subprocess.run(
+def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
+    """Return (path, line_number) locations of the canonical phrase added by HEAD.
+
+    `git show HEAD` rather than `git diff HEAD~1 HEAD`: a root commit is still
+    scanned (no parent to resolve), a merge commit is not blamed for lines its
+    incoming branch wrote (condensed combined diff yields no `+` lines), and a
+    pure rename adds nothing. The diff format is pinned (`-c core.quotePath=false`,
+    `--no-color`, explicit prefixes) so ambient git config — diff.noprefix,
+    color.diff=always, quoted non-ASCII paths — cannot silently blind the parser.
+    `--text` scans paths a .gitattributes `-diff` rule would otherwise hide.
+
+    Fail-open: any git failure returns [] (this is a cosmetic filter).
+    """
+    if is_schlock_checkout(cwd):
+        return []
+    try:
+        result = subprocess.run(
             [
                 "git",
-                "diff",
+                "-c",
+                "core.quotePath=false",
+                "show",
+                "--format=",
+                "--unified=0",
+                "--no-color",
                 "--no-ext-diff",
                 "--no-textconv",
-                "--unified=0",
-                "--no-renames",
-                "HEAD~1",
+                "--text",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                f"-G{CANONICAL_ADVERTISING_PICKAXE}",
                 "HEAD",
                 "--",
             ],
@@ -111,13 +150,14 @@ def read_added_lines(cwd: Optional[str]) -> Optional[list[tuple[str, str]]]:
             check=False,
             cwd=cwd or None,
         )
-        if diff_result.returncode != 0:
-            return None
+        if result.returncode != 0:
+            return []
 
-        added_lines: list[tuple[str, str]] = []
+        matches: list[tuple[str, int]] = []
         current_path: Optional[str] = None
         in_file_header = False
-        for line in diff_result.stdout.splitlines():
+        line_number = 0
+        for line in result.stdout.splitlines():
             if line.startswith("diff --git "):
                 current_path = None
                 in_file_header = True
@@ -126,19 +166,15 @@ def read_added_lines(cwd: Optional[str]) -> Optional[list[tuple[str, str]]]:
                 in_file_header = False
             elif line.startswith("@@"):
                 in_file_header = False
-            elif current_path and line.startswith("+") and not line.startswith("+++"):
-                added_lines.append((current_path, line[1:]))
-        return added_lines
+                header = HUNK_HEADER_PATTERN.match(line)
+                line_number = int(header.group(1)) if header else 0
+            elif current_path and not in_file_header and line.startswith("+"):
+                if CANONICAL_ADVERTISING_PATTERN.search(line[1:]):
+                    matches.append((current_path, line_number))
+                line_number += 1
+        return matches
     except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def find_file_advertising(cwd: Optional[str]) -> Optional[list[tuple[str, str]]]:
-    """Find canonical advertising phrases in committed file additions only."""
-    added_lines = read_added_lines(cwd)
-    if added_lines is None:
-        return None
-    return [(path, line) for path, line in added_lines if CANONICAL_ADVERTISING_PATTERN.search(line)]
+        return []
 
 
 def read_head_commit(cwd: Optional[str]) -> Optional[tuple[int, str, str]]:
@@ -183,15 +219,29 @@ def format_amend_prompt(short_hash: str, patterns_removed: list[dict]) -> str:
     )
 
 
-def format_file_amend_prompt(short_hash: str, matches: list[tuple[str, str]]) -> str:
-    """Build feedback for canonical advertising found in committed file content."""
-    locations = "\n".join(f"  - {path}: {line.strip()}" for path, line in matches)
+def format_file_amend_prompt(short_hash: str, matches: list[tuple[str, int]]) -> str:
+    """Build feedback for canonical advertising found in committed file content.
+
+    Reports path:line locations and the canonical phrase ONLY — never the matched
+    bytes. Committed content is untrusted; echoing it verbatim into
+    additionalContext would let a crafted line speak in schlock's voice (same
+    rationale as format_amend_prompt emitting rule descriptions, not content).
+    """
+    shown = matches[:MAX_REPORTED_LOCATIONS]
+    locations = "\n".join(f"  - {path}:{line_number}" for path, line_number in shown)
+    if len(matches) > len(shown):
+        locations += f"\n  - ... and {len(matches) - len(shown)} more"
+    paths = list(dict.fromkeys(path for path, _ in matches))[:MAX_REPORTED_LOCATIONS]
+    add_targets = " ".join(shlex.quote(path) for path in paths)
     return (
-        f"schlock: advertising content landed in added file content in commit {short_hash}.\n\n"
-        f"Canonical phrase found on these added lines:\n{locations}\n\n"
-        f"Fix it now: remove ONLY those advertising lines from the listed files, then run git commit --amend --no-edit. "
-        f"Do NOT amend if this commit has already been pushed to a shared branch — in that case, tell the user instead of "
-        f"rewriting history."
+        f'schlock: the canonical advertising phrase ("Generated with Claude Code") landed in file '
+        f"content added by commit {short_hash}.\n\n"
+        f"Locations (file:line):\n{locations}\n\n"
+        f"Fix it now: remove ONLY the advertising phrase at those locations, then stage and amend:\n"
+        f"  git add -- {add_targets} && git commit --amend --no-edit\n"
+        f"Do NOT amend if this commit has already been pushed to a shared branch, and if the phrase "
+        f"is quoted deliberately (e.g. documentation discussing the phrase itself), leave it — in "
+        f"either case, tell the user instead."
     )
 
 
