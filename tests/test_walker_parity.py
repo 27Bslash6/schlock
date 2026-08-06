@@ -309,20 +309,33 @@ class TestParameterExpansionSubstitutions:
         for command in ("echo ${z:-fallback}", "echo ${#z}", "echo ${!z}", "echo ${z}", "echo $z"):
             assert not _get_substitution_validator().extract_substitutions(NativeBridge().parse(command))
 
+    def test_expansion_words_create_no_literal_suppression_ranges(self):
+        # A quoted default spliced as a generic `word` node would register as a
+        # quoted-literal range and MASK rule matches on its content — bashlex's
+        # childless `parameter` node creates no such range, so this is the
+        # under-block direction (PR #137 review).
+        command = 'echo ${z:-"rm -rf /"}'
+        assert BashCommandParser().extract_string_literals(command, NativeBridge().parse(command)) == []
+
 
 class TestDeepNestingRoutesToFallback:
-    """A converter stack overflow is a BRIDGE failure, not a verdict.
+    """A bridge-side stack overflow is a BRIDGE failure, not a verdict.
 
-    bashlex parses ~350 levels of nesting; the recursive converter blows the
-    Python stack first. Escaping as a bare RecursionError would skip T5's router
-    and hard-deny input the fallback tier handles fine.
+    bashlex parses ~350 levels of nesting; the bridge blows the Python stack
+    first — in the recursive converter, or (3.9) already inside the json
+    decoder. Escaping as a bare RecursionError would skip T5's router and
+    hard-deny input the fallback tier handles fine. The `__cause__` assertion
+    pins the recursion path: without it a healthy bridge that merely rejects
+    the input (any NativeBridgeError) would keep this test green without ever
+    exercising the fail-closed contract it documents.
     """
 
     @needs_binary
     def test_recursion_error_becomes_a_native_bridge_error(self):
         command = "if true; then " * 400 + "rm -rf /" + "; fi" * 400
-        with pytest.raises(NativeBridgeError):
+        with pytest.raises(NativeBridgeError) as excinfo:
             NativeBridge().parse(command)
+        assert isinstance(excinfo.value.__cause__, RecursionError), excinfo.value
 
 
 @needs_binary

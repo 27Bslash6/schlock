@@ -463,7 +463,7 @@ class TestUnmappedRaises:
         # but calls the arithmetic body a COMMAND named after the expression, so
         # a superset-preserving mapping would have to copy that misparse. It is
         # not one of the 7 bashlex-failing constructs, so the fallback tier costs
-        # nothing here. See _clause_expression and tests/test_walker_parity.py.
+        # nothing here. See _clause_test and tests/test_walker_parity.py.
         with pytest.raises(UnmappedNodeError, match="ArithmCmd"):
             view("(( x++ ))")
 

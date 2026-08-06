@@ -518,7 +518,7 @@ class _Converter:
         return [_node("ProcSubst", _pos(part), child=inner)]
 
     def _param_exp_words(self, part: dict) -> "list[AstView]":
-        """Words a `${…}` expansion EVALUATES, spliced in beside the parameter node.
+        """Structural children of the words a `${…}` expansion EVALUATES, spliced in beside the parameter node.
 
         `${z:-$(rm -rf /)}` runs that substitution; so do the replacement words of
         `${z/a/$(…)}`, the offsets of `${z:$(…):1}` and the subscript of
@@ -529,6 +529,14 @@ class _Converter:
         Siblings, not a `.parts` attribute on the parameter node: that is how
         `DblQuoted` already flattens its children, and bashlex's `parameter` node
         carries no `.parts` for a walker to find them under.
+
+        Spliced as the words' STRUCTURAL CHILDREN, not as `word` wrappers: a
+        generic `word` node whose span is quote-delimited becomes a quoted-literal
+        suppression range in `extract_string_literals`, so `echo ${z:-"rm -rf /"}`
+        would mask a rule match that the bashlex tier (childless `parameter`,
+        no range) still catches — the under-block direction (PR #137 review).
+        The wrappers still convert first, so an unmappable word (escapes, ANSI-C
+        quoting) keeps raising `UnmappedNodeError` → fallback tier.
 
         `Length`/`Excl`/`Short`/`Names` are bare flags with no word payload, and
         `Exp.Op` selects WHEN the word is evaluated (`:-` vs `:=` vs `:?`), never
@@ -546,7 +554,7 @@ class _Converter:
         for field in ("Offset", "Length"):
             words.extend(self._expr_words(substring.get(field)))
         words.extend(self._expr_words(part.get("Index")))
-        return words
+        return [child for word in words for child in word.parts]
 
     def convert_assign(self, assign: dict) -> AstView:
         if "Index" in assign or assign.get("Naked"):
@@ -648,7 +656,14 @@ def build_ast_view(command: str, typed_json: "Union[str, bytes, dict]") -> "list
         try:
             typed_json = json.loads(typed_json)
         except ValueError as exc:
-            raise NativeBridgeError(f"native parser emitted malformed JSON: {exc}")
+            raise NativeBridgeError(f"native parser emitted malformed JSON: {exc}") from exc
+        except RecursionError as exc:
+            # Older CPythons (3.9) blow the recursion limit inside the json
+            # decoder itself on a deeply nested AST, before the converter's own
+            # RecursionError guard below can fire. Same contract either way: a
+            # depth overflow anywhere in the bridge is a bridge failure that
+            # routes to the fallback tier, never a bare escape.
+            raise NativeBridgeError(f"native parser output too deeply nested to decode: {exc}") from exc
     if not isinstance(typed_json, dict) or typed_json.get("Type") != "File":
         got = f"Type={typed_json.get('Type')!r}" if isinstance(typed_json, dict) else type(typed_json).__name__
         raise UnmappedNodeError(f"expected a File root, got: {got}")
