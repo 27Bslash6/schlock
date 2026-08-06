@@ -18,8 +18,10 @@ import json
 import pytest
 
 from schlock.core.ast_view import (
+    _CLAUSE_CHILDREN,
     BASHLEX_KINDS,
     BINARY_OPS,
+    EXPR_OPERANDS,
     MVDAN_NODE_MAP,
     AstView,
     UnmappedNodeError,
@@ -59,6 +61,21 @@ class TestMappingTableIsData:
             produced.add(separator)
         assert produced == BASHLEX_KINDS
         assert len(BASHLEX_KINDS) == 12
+
+    def test_clause_handlers_agree_with_the_node_map(self):
+        # The two tables hold the same contract from opposite ends, and drift
+        # produces a MISLEADING error: a key only in _CLAUSE_CHILDREN raises
+        # "malformed typed-JSON structure: KeyError" and blames the binary for a
+        # table bug. Pin them together (LAB-912 panel finding).
+        for node_type in _CLAUSE_CHILDREN:
+            assert MVDAN_NODE_MAP[node_type] == ("compound", "list"), node_type
+
+    def test_expression_operand_table_has_no_empty_rows(self):
+        # An empty tuple would make _expr_words return [] instead of raising —
+        # the silent-drop the fail-closed contract forbids. `Word` is the leaf and
+        # is handled before the lookup, so it must not appear here.
+        assert "Word" not in EXPR_OPERANDS
+        assert all(EXPR_OPERANDS.values())
 
     def test_pipe_is_not_pipeline(self):
         # `|`/`|&` build a `pipeline` whose separator kind is `pipe`;
@@ -451,11 +468,12 @@ class TestUnmappedRaises:
             view("(( x++ ))")
 
     @needs_binary
-    def test_coprocess_statement_raises(self):
+    def test_coprocess_raises(self):
         # `coproc` runs the command behind its own pipes — a shape bashlex has no
-        # node for. Matches either guard: bash mode emits a `CoprocClause`
-        # command, while the `Coprocess` statement flag covers the mksh spelling.
-        with pytest.raises(UnmappedNodeError, match="Coproc"):
+        # node for. It arrives as a CoprocClause COMMAND, so the clause table is
+        # what rejects it (`Stmt.Coprocess` is the mksh `|&` spelling, which this
+        # bash-mode CLI never emits).
+        with pytest.raises(UnmappedNodeError, match="CoprocClause"):
             view("coproc a { sleep 1; }")
 
     @needs_binary

