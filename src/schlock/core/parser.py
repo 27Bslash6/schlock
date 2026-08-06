@@ -472,38 +472,22 @@ class BashCommandParser:
 
         return results
 
-    def extract_command_segments(self, command: str, ast_nodes: list[Any]) -> list[str]:
-        """Extract full command segments from pipelines and command lists.
+    def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
+        """Collect the AST nodes that each form one independently-validated segment.
 
-        SECURITY CRITICAL: Returns the full text of each command segment so
-        each can be validated independently. Prevents bypass via piping/chaining
-        dangerous commands after whitelisted ones.
-
-        Args:
-            command: Original command string
-            ast_nodes: List of bashlex AST nodes from parse()
-
-        Returns:
-            List of command segment strings extracted from the AST
-
-        Example:
-            >>> parser = BashCommandParser()
-            >>> ast = parser.parse("ls | rm -rf / && echo done")
-            >>> parser.extract_command_segments("ls | rm -rf / && echo done", ast)
-            ['ls', 'rm -rf /', 'echo done']
+        Shared by extract_command_segments and extract_command_segments_with_literals
+        so both see the same set of segments; a traversal that drifted between the
+        two would validate one set of segments against another set's string
+        literals, silently suppressing rule matches.
         """
-        segments = []
+        nodes: list[Any] = []
 
         def visit(node):  # noqa: PLR0912 - AST traversal requires multiple branches
-            """Recursively visit AST nodes to extract command segments."""
+            """Recursively visit AST nodes to collect command nodes."""
             if hasattr(node, "kind"):
                 # Command nodes contain individual commands
                 if node.kind == "command" and hasattr(node, "pos"):
-                    start, end = node.pos
-                    if start < len(command) and end <= len(command):
-                        segment = command[start:end].strip()
-                        if segment:
-                            segments.append(segment)
+                    nodes.append(node)
                     return  # Don't recurse into command parts
 
                 # Pipeline nodes - visit each command in the pipeline
@@ -539,7 +523,90 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
 
+        return nodes
+
+    def _locate_segment(self, command: str, node: Any) -> Optional[tuple[str, int]]:
+        """Return (segment text, its start offset in `command`), or None if unusable.
+
+        The offset is where the STRIPPED text begins, which is what makes
+        segment-relative positions derivable without re-parsing the segment.
+        """
+        start, end = node.pos
+        if start >= len(command) or end > len(command):
+            return None
+        raw = command[start:end]
+        text = raw.strip()
+        if not text:
+            return None
+        return text, start + (len(raw) - len(raw.lstrip()))
+
+    def extract_command_segments(self, command: str, ast_nodes: list[Any]) -> list[str]:
+        """Extract full command segments from pipelines and command lists.
+
+        SECURITY CRITICAL: Returns the full text of each command segment so
+        each can be validated independently. Prevents bypass via piping/chaining
+        dangerous commands after whitelisted ones.
+
+        Args:
+            command: Original command string
+            ast_nodes: List of bashlex AST nodes from parse()
+
+        Returns:
+            List of command segment strings extracted from the AST
+
+        Example:
+            >>> parser = BashCommandParser()
+            >>> ast = parser.parse("ls | rm -rf / && echo done")
+            >>> parser.extract_command_segments("ls | rm -rf / && echo done", ast)
+            ['ls', 'rm -rf /', 'echo done']
+        """
+        segments = []
+        for node in self._segment_nodes(ast_nodes):
+            located = self._locate_segment(command, node)
+            if located is not None:
+                segments.append(located[0])
         return segments
+
+    def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[tuple[str, list[tuple]]]:
+        """Segments plus their quoted-string ranges, derived from ONE parse.
+
+        PERF/SECURITY: the segment loop in `validate_command` used to re-parse
+        every segment just to recover its string-literal ranges — N+1 parses per
+        command, which under the native tier (spec §3.2) is N+1 subprocess
+        spawns on a hook that runs before every bash call. Each segment is a
+        slice of `command`, so its word positions are already in the parent AST:
+        walk the segment's own sub-tree and rebase the offsets instead.
+
+        Args:
+            command: Original command string
+            ast_nodes: List of AST nodes from parse() of the WHOLE command
+
+        Returns:
+            List of (segment_text, string_literal_ranges) where the ranges are
+            relative to segment_text — identical to what parsing that segment
+            standalone would have produced.
+        """
+        results: list[tuple[str, list[tuple]]] = []
+        for node in self._segment_nodes(ast_nodes):
+            located = self._locate_segment(command, node)
+            if located is None:
+                continue
+            text, base = located
+            end = base + len(text)
+            results.append(
+                (
+                    text,
+                    [
+                        (start - base, stop - base)
+                        for start, stop in self.extract_string_literals(command, [node])
+                        # A literal outside the stripped span cannot be expressed
+                        # in segment coordinates; dropping it only costs a
+                        # false-positive suppression, never a missed match.
+                        if start >= base and stop <= end
+                    ],
+                )
+            )
+        return results
 
     def reconstruct_command(self, ast_nodes: list[Any]) -> str:
         """Reconstruct command from AST word nodes.

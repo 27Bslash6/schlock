@@ -23,13 +23,22 @@ Two rules carry the security weight:
    so a trailing `# comment` also trips this check; that over-conservatively
    routes commented commands to the bashlex tier, which parses them fine.
 
-Known T2b ceilings — ALL fail closed by raising into the fallback tier:
-backslash escapes in word text and non-ASCII input raise until T3 lands the
-per-WordPart unescape and byte→char offset conversion (passing raw escapes or
-byte offsets through would silently weaken the walkers' view — LAB-911 panel
-CRITs); constructs outside the 12-kind vocabulary — `if`/`for`/`while`/`case`,
-`[[ ]]`, arithmetic, arrays, negation, ANSI-C `$'…'` — raise until T2c widens
-the table.
+T2c widened the table to the constructs bashlex models as `compound` nodes
+(`if`/`for`/`while`/`case`/functions) plus the three it cannot parse at all
+(`[[ ]]`, `$(( ))`, array assignments), each pinned by a walker-output parity
+test in `tests/test_walker_parity.py`. Everything else stays unmapped, and two of
+those are deliberate rather than merely deferred: `!` negation and `(( ))` both
+LOOK trivially mappable, and mapping either measurably weakened the walkers —
+see `convert_stmt` and `_clause_expression` for the specific loosening each one
+caused. Widening is not free just because a construct parses.
+
+Known remaining ceilings — ALL fail closed by raising into the fallback tier:
+backslash escapes in word text, ANSI-C `$'…'` and non-ASCII input raise until T3
+lands the per-WordPart unescape and byte→char offset conversion (passing raw
+escapes or byte offsets through would silently weaken the walkers' view —
+LAB-911 panel CRITs); so do `!`, `coproc`, `(( ))`, indexed/naked assignments,
+redirects on a compound statement, and a trailing `# comment` (the CLI parses
+comments off, so the full-span assertion treats one as a prefix parse).
 """
 
 import json
@@ -74,6 +83,20 @@ MVDAN_NODE_MAP: "dict[str, tuple[str, Optional[str]]]" = {
     "Word": ("word", "parts"),
     "Assign": ("assignment", "parts"),
     "Redir": ("redirect", "output"),
+    # T2c: clause nodes with no bashlex kind of their own. bashlex models
+    # `if`/`for`/`while`/`case`/function bodies as a `compound` whose `.list`
+    # holds the branch statements (its `reservedword` tokens carry no danger and
+    # both walker families ignore them), and it cannot parse `[[ ]]`/`(( ))` at
+    # all. Reusing `compound` gives the walkers a shape they already traverse —
+    # `extract_command_segments` recurses `.list`, so a `rm -rf /` in a loop body
+    # surfaces as its own segment — without teaching them a 13th kind.
+    "IfClause": ("compound", "list"),
+    "WhileClause": ("compound", "list"),
+    "ForClause": ("compound", "list"),
+    "CaseClause": ("compound", "list"),
+    "FuncDecl": ("compound", "list"),
+    "TestClause": ("compound", "list"),
+    "ArithmExp": ("compound", "list"),
 }
 
 #: BinaryCmd numeric op → (operator text, container kind, separator kind).
@@ -122,7 +145,30 @@ WORD_PART_MAP: "dict[str, str]" = {
     "ParamExp": "source",
     "CmdSubst": "source",
     "ProcSubst": "source",
+    "ArithmExp": "source",
 }
+
+#: Test/arithmetic expression node → the operand fields to recurse into.
+#: `[[ … ]]` and `$(( … ))` cannot invoke a command; the only execution either
+#: carries is a word-level expansion (`$(…)`, backquotes, `${…}`), so the walkers
+#: need the operand WORDS and nothing else. The numeric comparison/arithmetic op
+#: is therefore deliberately NOT mapped — unlike a `BinaryCmd` op it selects a
+#: comparison, never a command, so dropping it cannot shrink the danger surface.
+#: An unlisted expression type still raises: a future mvdan node that DOES
+#: introduce execution must not slip through as "just another operand".
+EXPR_OPERANDS: "dict[str, tuple[str, ...]]" = {
+    "Word": (),
+    "UnaryTest": ("X",),
+    "BinaryTest": ("X", "Y"),
+    "ParenTest": ("X",),
+    "UnaryArithm": ("X",),
+    "BinaryArithm": ("X", "Y"),
+    "ParenArithm": ("X",),
+}
+
+#: ForClause loop header → where its words live. `for x in a b` carries Words;
+#: `for ((i=0; i<n; i++))` carries three arithmetic expressions instead.
+FOR_LOOP_KINDS: "dict[str, str]" = {"WordIter": "items", "CStyleLoop": "arithmetic"}
 
 #: WordPart types that also materialize as structural children in a word's
 #: `.parts` (bashlex nests these so walkers can find substitutions in words).
@@ -231,7 +277,17 @@ class _Converter:
             return group[0][0]
         parts: list[AstView] = []
         for node, operator in group:
-            parts.append(node)
+            if node.kind == "list":
+                # bashlex emits ONE FLAT list for `a; b && c` — [a, ;, b, &&, c] —
+                # where mvdan nests the `&&` as its own BinaryCmd. Splice
+                # same-kind children so substitution.py's topology checks see the
+                # shape they were written against: a nested `list` in a segment
+                # slot renders to None and blocks a legitimate `$(pwd; ls && ls)`.
+                # (Only `list` flattens — bashlex keeps a `pipeline` nested, which
+                # `_binary_side` already mirrors for same-kind chains.)
+                parts.extend(node.parts)
+            else:
+                parts.append(node)
             if operator is not None:
                 parts.append(operator)
         return _node("File", (parts[0].pos[0], parts[-1].pos[1]), child=parts)
@@ -248,7 +304,17 @@ class _Converter:
     def convert_stmt(self, stmt: dict) -> AstView:
         for modifier in ("Negated", "Coprocess"):
             if stmt.get(modifier):
-                # Dropping `!`/`coproc` would silently change what executes.
+                # `coproc` runs the command behind its own pipes — a shape
+                # bashlex has no node for.
+                #
+                # `!` looks harmless (it only inverts the exit status) and T2c
+                # trialled mapping it, but the parity sweep caught a REAL
+                # loosening: `substitution.py:_is_valid_pipeline_topology`
+                # deliberately fails closed on `$(! a | b)` because bashlex's
+                # leading `reservedword` makes the parts count even. Dropping the
+                # `!` hands that check a clean pipeline and it ALLOWS what bashlex
+                # BLOCKED. Negation is not one of the 7 bashlex-failing
+                # constructs, so the fallback tier costs nothing here.
                 raise UnmappedNodeError(f"unmapped statement modifier: {modifier}")
         cmd = stmt.get("Cmd")
         if cmd is None:
@@ -263,14 +329,17 @@ class _Converter:
     # -- commands -----------------------------------------------------------
 
     def convert_command(self, cmd: dict, redirects: "list[AstView]") -> AstView:
-        node_type = cmd.get("Type")
+        node_type = cmd.get("Type") or ""
         if node_type == "CallExpr":
             return self._convert_call(cmd, redirects)
         if node_type == "BinaryCmd":
             return self._convert_binary(cmd)
         if node_type in ("Subshell", "Block"):
             return _node(node_type, _pos(cmd), child=self.stmts_to_nodes(cmd.get("Stmts", [])))
-        raise UnmappedNodeError(f"unmapped typed-JSON node type: {node_type}")
+        clause = _CLAUSE_CHILDREN.get(node_type)
+        if clause is None:
+            raise UnmappedNodeError(f"unmapped typed-JSON node type: {node_type}")
+        return _node(node_type, _pos(cmd), child=clause(self, cmd))
 
     def _convert_call(self, cmd: dict, redirects: "list[AstView]") -> AstView:
         parts = [self.convert_assign(a) for a in cmd.get("Assigns", [])]
@@ -317,6 +386,80 @@ class _Converter:
             if inner_op is not None and inner_op[1] == container_kind:
                 return self._convert_binary(inner_cmd).parts
         return [self.convert_stmt(stmt)]
+
+    # -- clauses (T2c) ------------------------------------------------------
+    # Each returns the children of a `compound` node's `.list`. Every branch of
+    # a clause contributes: an `if` whose ELSE arm holds the `rm -rf /` is the
+    # obvious under-block, but so is a `case` whose non-matching arm does — the
+    # walkers validate every reachable command, not the one that happens to run.
+
+    def _clause_if(self, cmd: dict) -> "list[AstView]":
+        children = self.stmts_to_nodes(cmd.get("Cond", []))
+        children.extend(self.stmts_to_nodes(cmd.get("Then", [])))
+        else_clause = cmd.get("Else")
+        if else_clause is not None:
+            # typedjson leaves `Else` untagged because it is a concrete *IfClause
+            # field, not an interface: an `elif` arm carries Cond+Then, a bare
+            # `else` carries Then only. Recursing handles both.
+            children.extend(self._clause_if(else_clause))
+        return children
+
+    def _clause_while(self, cmd: dict) -> "list[AstView]":
+        # `until` is the same node with Until=true; inverting the loop's exit
+        # test does not change which commands run.
+        children = self.stmts_to_nodes(cmd.get("Cond", []))
+        children.extend(self.stmts_to_nodes(cmd.get("Do", [])))
+        return children
+
+    def _clause_for(self, cmd: dict) -> "list[AstView]":
+        loop = cmd.get("Loop") or {}
+        loop_kind = FOR_LOOP_KINDS.get(loop.get("Type", ""))
+        if loop_kind is None:
+            raise UnmappedNodeError(f"unmapped for-loop header: {loop.get('Type')}")
+        if loop_kind == "items":
+            children = [self.convert_word(w) for w in loop.get("Items", [])]
+        else:
+            children = [w for field in ("Init", "Cond", "Post") for w in self._expr_words(loop.get(field))]
+        children.extend(self.stmts_to_nodes(cmd.get("Do", [])))
+        return children
+
+    def _clause_case(self, cmd: dict) -> "list[AstView]":
+        children = [self.convert_word(cmd["Word"])]
+        for item in cmd.get("Items", []):
+            children.extend(self.convert_word(p) for p in item.get("Patterns", []))
+            children.extend(self.stmts_to_nodes(item.get("Stmts", [])))
+        return children
+
+    def _clause_func(self, cmd: dict) -> "list[AstView]":
+        body = cmd.get("Body")
+        if body is None:
+            raise UnmappedNodeError("function declaration without a body is not mapped")
+        return [self.convert_stmt(body)]
+
+    def _clause_expression(self, cmd: dict) -> "list[AstView]":
+        """`[[ … ]]` / `$(( … ))` — one expression tree, operand words only.
+
+        `ArithmCmd` (`(( x++ ))`) is deliberately NOT routed here and keeps
+        raising. bashlex does parse it, but misreads the arithmetic body as a
+        COMMAND whose name is the whole expression (`x++`), so a mapping would
+        have to reproduce that misparse verbatim just to stay a superset of it —
+        encoding a known-wrong model in the table to satisfy a gate. It is not
+        one of the 7 bashlex-failing constructs, so the fallback tier already
+        covers it at no loss; T3's differential oracle is where to revisit.
+        """
+        return self._expr_words(cmd.get("X"))
+
+    def _expr_words(self, expr: "Optional[dict]") -> "list[AstView]":
+        """Collect the operand words of a test/arithmetic expression tree."""
+        if not expr:
+            return []
+        expr_type = expr.get("Type", "")
+        operands = EXPR_OPERANDS.get(expr_type)
+        if operands is None:
+            raise UnmappedNodeError(f"unmapped test/arithmetic expression node: {expr_type}")
+        if expr_type == "Word":
+            return [self.convert_word(expr)]
+        return [word for field in operands for word in self._expr_words(expr.get(field))]
 
     # -- words, assignments, redirects, word parts --------------------------
 
@@ -373,6 +516,10 @@ class _Converter:
         if part_type == "CmdSubst":
             inner = self.stmts_to_single_node(part.get("Stmts", []), "command substitution")
             return [_node("CmdSubst", _pos(part), child=inner)]
+        if part_type == "ArithmExp":
+            # `$(( $(rm -rf /) + 1 ))` executes inside the arithmetic; the
+            # operand words carry that substitution to SubstitutionValidator.
+            return [_node("ArithmExp", _pos(part), child=self._expr_words(part.get("X")))]
         # ProcSubst
         if part.get("Op") not in PROC_SUBST_OPS:
             raise UnmappedNodeError(f"unmapped ProcSubst op code: {part.get('Op')}")
@@ -380,11 +527,13 @@ class _Converter:
         return [_node("ProcSubst", _pos(part), child=inner)]
 
     def convert_assign(self, assign: dict) -> AstView:
-        if "Array" in assign or "Index" in assign or assign.get("Naked"):
-            # a=(1 2 3) and friends are among T2c's 7 newly-parseable
-            # constructs; their bashlex-equivalent shape is pinned there.
-            raise UnmappedNodeError("array/indexed/naked assignment is not mapped yet")
+        if "Index" in assign or assign.get("Naked"):
+            # `a[$(rm -rf /)]=x` and `declare -x foo` need shapes no walker has
+            # been shown yet; they stay fail-closed until a test pins them.
+            raise UnmappedNodeError("indexed/naked assignment is not mapped yet")
         operator = "+=" if assign.get("Append") else "="
+        if "Array" in assign:
+            return self._convert_array_assign(assign, operator)
         value = assign.get("Value")
         if value is None:
             value_text, children = "", []
@@ -392,6 +541,23 @@ class _Converter:
             value_text, children = self._word_content(value)
         word = assign["Name"]["Value"] + operator + value_text
         return _node("Assign", _pos(assign), child=children, word=word)
+
+    def _convert_array_assign(self, assign: dict, operator: str) -> AstView:
+        """`a=(1 2 3)` — bashlex cannot parse this, so there is no shape to match.
+
+        `.word` keeps the SOURCE spelling of the array (the rule engine matches
+        on text, and `a=($(curl x|sh))` must stay recognizable), while every
+        element's word node hangs off `.parts` so a substitution inside an
+        element still reaches SubstitutionValidator.
+        """
+        array = assign["Array"]
+        elements: list[AstView] = []
+        for elem in array.get("Elems", []):
+            elements.extend(self._expr_words(elem.get("Index")))  # a=([i+1]=x)
+            if elem.get("Value"):
+                elements.append(self.convert_word(elem["Value"]))
+        word = assign["Name"]["Value"] + operator + self._slice(*_pos(array))
+        return _node("Assign", _pos(assign), child=elements, word=word)
 
     def convert_redirect(self, redir: dict) -> AstView:
         op_code = redir["Op"]
@@ -422,6 +588,19 @@ class _Converter:
             # slice reproduces that exactly (mvdan's End already covers it).
             attrs["heredoc"] = AstView("heredoc", hdoc_pos, value=self._slice(*hdoc_pos))
         return _node("Redir", _pos(redir), child=output, **attrs)
+
+
+#: Clause node type → the `_Converter` method producing its `compound.list`.
+#: A table, not an if-chain, for the same reason MVDAN_NODE_MAP is: dispatch and
+#: the kind contract stay in one place, and a type absent here RAISES.
+_CLAUSE_CHILDREN = {
+    "IfClause": _Converter._clause_if,
+    "WhileClause": _Converter._clause_while,
+    "ForClause": _Converter._clause_for,
+    "CaseClause": _Converter._clause_case,
+    "FuncDecl": _Converter._clause_func,
+    "TestClause": _Converter._clause_expression,
+}
 
 
 def build_ast_view(command: str, typed_json: "Union[str, bytes, dict]") -> "list[AstView]":

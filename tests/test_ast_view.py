@@ -441,17 +441,28 @@ class TestUnmappedRaises:
         assert issubclass(UnmappedNodeError, NativeBridgeError)
 
     @needs_binary
-    def test_if_clause_unmapped_for_now(self):
-        # IfClause is outside the 12-kind vocabulary — T2c decides its shape.
-        # Until then it must raise (→ bashlex tier), never silently map.
-        with pytest.raises(UnmappedNodeError, match="IfClause"):
-            view("if true; then a; fi")
+    def test_arithmetic_command_unmapped(self):
+        # `(( … ))` stays unmapped by choice, not by omission: bashlex parses it
+        # but calls the arithmetic body a COMMAND named after the expression, so
+        # a superset-preserving mapping would have to copy that misparse. It is
+        # not one of the 7 bashlex-failing constructs, so the fallback tier costs
+        # nothing here. See _clause_expression and tests/test_walker_parity.py.
+        with pytest.raises(UnmappedNodeError, match="ArithmCmd"):
+            view("(( x++ ))")
+
+    @needs_binary
+    def test_coprocess_statement_raises(self):
+        # `coproc` runs the command behind its own pipes — a shape bashlex has no
+        # node for. Matches either guard: bash mode emits a `CoprocClause`
+        # command, while the `Coprocess` statement flag covers the mksh spelling.
+        with pytest.raises(UnmappedNodeError, match="Coproc"):
+            view("coproc a { sleep 1; }")
 
     @needs_binary
     def test_negated_statement_raises(self):
-        # Dropping `!` would silently invert pipeline semantics; bashlex
-        # handles negation today, so route it to the fallback tier.
-        with pytest.raises(UnmappedNodeError, match="egated"):
+        # Dropping `!` would defeat substitution.py's deliberate fail-closed on a
+        # negated pipeline (`_is_valid_pipeline_topology`). See convert_stmt.
+        with pytest.raises(UnmappedNodeError, match="Negated"):
             view("! a")
 
     @needs_binary
