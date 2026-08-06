@@ -28,7 +28,9 @@ repos:
         exclude: ^\.claude-plugin/vendor/
       - id: check-added-large-files
         args: ['--maxkb=500']
-        exclude: ^\.claude-plugin/vendor/
+        # bin/ carries the vendored schlock-parse binaries (~2.4 MB each),
+        # ratified by the LAB-409 spec (§10 Q1: commit them).
+        exclude: ^\.claude-plugin/(vendor|bin)/
       - id: check-merge-conflict
         exclude: ^\.claude-plugin/vendor/
       - id: check-case-conflict

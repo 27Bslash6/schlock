@@ -1,0 +1,122 @@
+[
+  {
+    "name": "andor-in-cmdsub",
+    "script": "echo $(pwd && pwd)",
+    "bashlex_fails": true
+  },
+  {
+    "name": "nested-backquotes",
+    "script": "echo `echo \\`echo hi\\``",
+    "bashlex_fails": true
+  },
+  {
+    "name": "conditional-double-bracket",
+    "script": "[[ -f /etc/passwd && $x == y* ]]",
+    "bashlex_fails": true
+  },
+  {
+    "name": "array-assignment",
+    "script": "a=(1 2 3)",
+    "bashlex_fails": true
+  },
+  {
+    "name": "arithmetic-expansion",
+    "script": "echo $((1 + 2 * 3))",
+    "bashlex_fails": true
+  },
+  {
+    "name": "heredoc-in-cmdsub",
+    "script": "echo \"$(cat <<EOF\nhello world\nEOF\n)\"",
+    "bashlex_fails": true
+  },
+  {
+    "name": "quoted-heredoc",
+    "script": "cat <<'EOF'\nliteral $body `untouched`\nEOF\n",
+    "bashlex_fails": true
+  },
+  {
+    "name": "procsub-input",
+    "script": "diff <(sort a.txt) <(sort b.txt)",
+    "bashlex_fails": false
+  },
+  {
+    "name": "procsub-output",
+    "script": "tee >(gzip > out.gz) < in.txt",
+    "bashlex_fails": false
+  },
+  {
+    "name": "here-string",
+    "script": "grep foo <<< \"$input\"",
+    "bashlex_fails": false
+  },
+  {
+    "name": "comments-and-blank-lines",
+    "script": "# leading comment\n\necho after-blank # trailing",
+    "bashlex_fails": false
+  },
+  {
+    "name": "arith-command",
+    "script": "(( x++ ))",
+    "bashlex_fails": false
+  },
+  {
+    "name": "ansi-c-quoting",
+    "script": "echo $'a\\nb'",
+    "bashlex_fails": false
+  },
+  {
+    "name": "escaped-space-word",
+    "script": "rm\\ -rf\\ /",
+    "bashlex_fails": false
+  },
+  {
+    "name": "pipeline",
+    "script": "ls -la | grep foo | wc -l",
+    "bashlex_fails": false
+  },
+  {
+    "name": "redirects",
+    "script": "cmd > out.log 2>&1",
+    "bashlex_fails": false
+  },
+  {
+    "name": "env-prefix-assignments",
+    "script": "FOO=bar BAZ=qux env",
+    "bashlex_fails": false
+  },
+  {
+    "name": "function-definition",
+    "script": "f() { echo hi; }",
+    "bashlex_fails": false
+  },
+  {
+    "name": "subshell",
+    "script": "(cd /tmp && ls)",
+    "bashlex_fails": false
+  },
+  {
+    "name": "case-statement",
+    "script": "case $1 in a) echo A ;; *) echo other ;; esac",
+    "bashlex_fails": false
+  },
+  {
+    "name": "for-loop",
+    "script": "for i in 1 2 3; do echo $i; done",
+    "bashlex_fails": false
+  },
+  {
+    "name": "if-statement",
+    "script": "if [ -f x ]; then echo yes; else echo no; fi",
+    "bashlex_fails": false
+  },
+  {
+    "name": "git-alias-bang",
+    "script": "git -c alias.x='!sh' status",
+    "bashlex_fails": false
+  },
+  {
+    "name": "pipe-to-shell",
+    "script": "date | bash",
+    "bashlex_fails": false
+  }
+]
