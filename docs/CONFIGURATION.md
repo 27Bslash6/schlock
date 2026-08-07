@@ -291,6 +291,16 @@ message has materialized by then, one detector covers *every* delivery form — 
 `--file=`, stdin/heredoc, and `$(cat file)` substitution — with no file-content reading and
 none of the TOCTOU/symlink risks that ruled out scanning the `-F` target pre-execution.
 
+The same hook scans **added lines only** of the fresh commit (`git show`, so first commits
+are covered, merge commits are not blamed for their incoming branch, and pure renames stay
+silent) for the canonical `Generated with Claude Code` phrase — plain or linked-markdown
+form, case-insensitive. This catches advertising baked into a source file or generated
+document without scanning unchanged content or applying the broader commit-message
+patterns. Feedback names `file:line` locations only (never the surrounding content) and is
+capped at 10 locations. Commits inside a schlock checkout — recognized by its
+`.claude-plugin/plugin.json` manifest, wherever the checkout lives — are excluded because
+its fixtures and docs legitimately quote the phrase.
+
 On detection it **never rewrites history**: it injects feedback (`additionalContext`) naming
 the offending content and instructing the model to `git commit --amend` it away (and to leave
 already-pushed commits alone). The amend re-fires the hook; a clean message produces silence,
@@ -304,7 +314,7 @@ Guard rails:
 - **Fail-open + cheap-gated**: errors and non-repo directories are silent; the hook does no
   real work unless the command looks like a commit. Disabling the commit filter
   (`enabled: false`) disables this detector too.
-- **Known limit**: the message is read from the session's working directory, so a commit made
+- **Known limit**: the message and diff are read from the session's working directory, so a commit made
   in a *different* repo (`git -C /elsewhere commit`) is not inspected.
 
 ### Why Block Instead of Filter?
