@@ -712,17 +712,34 @@ class BashCommandParser:
         Returns:
             List of (start_pos, end_pos) tuples for each quoted string literal
 
+        PARITY (LAB-1584): a range found STRICTLY INSIDE a `parameter` node's span
+        is discarded. Suppression ranges shrink the danger surface, so the native
+        tier must never derive one the bashlex tier would not — and bashlex's
+        `parameter` node is childless, so it derives none from inside `${…}` at
+        any depth. The native tier splices the words a `${…}` EVALUATES in beside
+        the parameter node (`AstView._param_exp_words`, so SubstitutionValidator
+        can see `${z:-$(curl evil)}`); without this filter the quoted words in
+        that spliced subtree would mask rule matches bashlex still catches, e.g.
+        `echo ${z:-$(echo "rm -rf /")}`. STRICTLY inside is the whole contract:
+        `echo "$x"` has word (5,9) → range (6,8) and parameter (6,8), a range
+        bashlex derives too, and equality keeps it. On the bashlex tier the filter
+        is a no-op — a childless node's span can contain no other node.
+
         Example:
             >>> parser = BashCommandParser()
             >>> ast = parser.parse('echo "rm -rf /"')
             >>> literals = parser.extract_string_literals('echo "rm -rf /"', ast)
             >>> # literals = [(6, 14)]  # Position of content inside quotes
         """
-        string_literals = []
+        string_literals: list[tuple] = []
+        expansion_spans: list[tuple] = []
 
         def visit(node):
             """Recursively visit AST nodes to find quoted strings."""
             if hasattr(node, "kind"):
+                if node.kind == "parameter" and hasattr(node, "pos"):
+                    expansion_spans.append(node.pos)
+
                 # Look for word nodes that are quoted strings
                 if node.kind == "word" and hasattr(node, "pos"):
                     start, end = node.pos
@@ -749,7 +766,11 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
 
-        return string_literals
+        return [
+            (start, stop)
+            for start, stop in string_literals
+            if not any(exp_start < start and stop < exp_stop for exp_start, exp_stop in expansion_spans)
+        ]
 
     def has_dangerous_constructs(self, ast_nodes: list[Any]) -> list[str]:
         """Detect dangerous shell constructs in AST.

@@ -538,6 +538,13 @@ class _Converter:
         The wrappers still convert first, so an unmappable word (escapes, ANSI-C
         quoting) keeps raising `UnmappedNodeError` → fallback tier.
 
+        Dropping the wrappers only closed the SHALLOW case: a quoted word NESTED
+        in the spliced subtree (`echo ${z:-$(echo "rm -rf /")}`) is a real word
+        node and registered a range all the same. That is fixed span-side, in
+        `extract_string_literals` — it discards any range strictly inside a
+        `parameter` span, which holds however deep this splices and however the
+        shape changes here (LAB-1584).
+
         `Length`/`Excl`/`Short`/`Names` are bare flags with no word payload, and
         `Exp.Op` selects WHEN the word is evaluated (`:-` vs `:=` vs `:?`), never
         what runs — so neither can shrink the danger surface by going unmapped.
