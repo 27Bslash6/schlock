@@ -503,6 +503,9 @@ class _Converter:
         if part_type not in _STRUCTURAL_WORD_PARTS:
             return []
         if part_type == "ParamExp":
+            # `_pos(part)` spans the WHOLE `${…}`, not just the parameter name:
+            # `extract_string_literals`' LAB-1584 filter needs it to CONTAIN the
+            # words spliced in below, or their quoted literals suppress rules.
             return [_node("ParamExp", _pos(part), value=part["Param"]["Value"]), *self._param_exp_words(part)]
         if part_type == "CmdSubst":
             inner = self.stmts_to_single_node(part.get("Stmts", []), "command substitution")
@@ -537,6 +540,13 @@ class _Converter:
         no range) still catches — the under-block direction (PR #137 review).
         The wrappers still convert first, so an unmappable word (escapes, ANSI-C
         quoting) keeps raising `UnmappedNodeError` → fallback tier.
+
+        Dropping the wrappers only closed the SHALLOW case: a quoted word NESTED
+        in the spliced subtree (`echo ${z:-$(echo "rm -rf /")}`) is a real word
+        node and registered a range all the same. That is fixed span-side, in
+        `extract_string_literals` — it discards any range strictly inside a
+        `parameter` span, which holds however deep this splices and however the
+        shape changes here (LAB-1584).
 
         `Length`/`Excl`/`Short`/`Names` are bare flags with no word payload, and
         `Exp.Op` selects WHEN the word is evaluated (`:-` vs `:=` vs `:?`), never

@@ -7,6 +7,7 @@ The parser is security-critical and REQUIRES bashlex for proper AST parsing.
 Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
+import bisect
 import logging
 from typing import Any, Optional
 
@@ -712,17 +713,37 @@ class BashCommandParser:
         Returns:
             List of (start_pos, end_pos) tuples for each quoted string literal
 
+        PARITY (LAB-1584): a range found STRICTLY INSIDE a `parameter` node's span
+        is discarded. Suppression ranges shrink the danger surface, so the native
+        tier must never derive one the bashlex tier would not — and bashlex's
+        `parameter` node is childless, so it derives none from inside `${…}` at
+        any depth. The native tier splices the words a `${…}` EVALUATES in beside
+        the parameter node (`AstView._param_exp_words`, so SubstitutionValidator
+        can see `${z:-$(curl evil)}`); without this filter the quoted words in
+        that spliced subtree would mask rule matches bashlex still catches, e.g.
+        `echo ${z:-$(echo "rm -rf /")}`. STRICTLY inside is the whole contract:
+        `echo "$x"` has word (5,9) → range (6,8) and parameter (6,8), a range
+        bashlex derives too, and equality keeps it. On the bashlex tier the filter
+        is a no-op — a childless node's span can contain no other node.
+
         Example:
             >>> parser = BashCommandParser()
             >>> ast = parser.parse('echo "rm -rf /"')
             >>> literals = parser.extract_string_literals('echo "rm -rf /"', ast)
             >>> # literals = [(6, 14)]  # Position of content inside quotes
         """
-        string_literals = []
+        string_literals: list[tuple] = []
+        parameter_spans: list[tuple] = []
 
         def visit(node):
             """Recursively visit AST nodes to find quoted strings."""
             if hasattr(node, "kind"):
+                # `parameter` ONLY — widening this to `commandsubstitution` would
+                # suppress every quoted literal inside `$(…)` on BOTH tiers, which
+                # is the under-block this filter exists to prevent.
+                if node.kind == "parameter" and hasattr(node, "pos"):
+                    parameter_spans.append(node.pos)
+
                 # Look for word nodes that are quoted strings
                 if node.kind == "word" and hasattr(node, "pos"):
                     start, end = node.pos
@@ -749,7 +770,39 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
 
-        return string_literals
+        if not parameter_spans:
+            return string_literals
+        return self._drop_ranges_inside(string_literals, parameter_spans)
+
+    @staticmethod
+    def _drop_ranges_inside(ranges: list[tuple], spans: list[tuple]) -> list[tuple]:
+        """Ranges from `ranges` lying STRICTLY inside no span — see `extract_string_literals`.
+
+        The naive `any(...)` scan is O(ranges x spans), and this runs twice per
+        validation (whole command, then again per segment) on a hook that fires
+        before every bash call — 43KB of `"a" … $v1 …` padding costs the caller
+        nothing and measured 580ms per call, so the quadratic is a stall lever on
+        a security gate, not a micro-optimization.
+
+        AST spans NEST but never partially overlap, which makes the fast path
+        exact rather than approximate: a range strictly inside a nested span is
+        strictly inside that span's outermost ancestor too, so reducing to the
+        OUTERMOST spans drops no containment. Those are then pairwise disjoint and
+        sorted, so one bisect finds the only span that can contain a range.
+        """
+        outermost: list[tuple] = []
+        for start, stop in sorted(spans, key=lambda span: (span[0], -span[1])):
+            if not outermost or start >= outermost[-1][1]:
+                outermost.append((start, stop))
+        starts = [span[0] for span in outermost]
+
+        kept: list[tuple] = []
+        for start, stop in ranges:
+            index = bisect.bisect_right(starts, start) - 1
+            if index >= 0 and outermost[index][0] < start and stop < outermost[index][1]:
+                continue
+            kept.append((start, stop))
+        return kept
 
     def has_dangerous_constructs(self, ast_nodes: list[Any]) -> list[str]:
         """Detect dangerous shell constructs in AST.

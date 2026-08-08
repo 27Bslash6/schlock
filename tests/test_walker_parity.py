@@ -31,6 +31,7 @@ from schlock.core.ast_view import UnmappedNodeError
 from schlock.core.native_bridge import NativeBridge, NativeBridgeError, resolve_binary
 from schlock.core.parser import BashCommandParser
 from schlock.core.validator import _get_substitution_validator, clear_caches, validate_command
+from schlock.exceptions import ParseError
 
 CORPUS_PATH = Path(__file__).parent.parent / "tools" / "schlock-parse" / "testdata" / "corpus.json"
 
@@ -317,6 +318,82 @@ class TestParameterExpansionSubstitutions:
         command = 'echo ${z:-"rm -rf /"}'
         assert BashCommandParser().extract_string_literals(command, NativeBridge().parse(command)) == []
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo ${z:-$(echo "rm -rf /")}',  # default value
+            'echo ${z:=$(echo "rm -rf /")}',  # assign-default
+            'echo ${z/x/$(echo "rm -rf /")}',  # replacement
+            'echo ${z:$(echo "rm -rf /"):1}',  # substring offset
+            'echo ${a[$(echo "rm -rf /")]}',  # subscript
+            'echo ${z:-$(echo "a${y:-$(echo "rm -rf /")}b")}',  # two splices deep
+        ],
+    )
+    def test_nested_expansion_words_create_no_literal_suppression_ranges(self, command):
+        """Dropping the `word` wrappers only closed the SHALLOW case (LAB-1584).
+
+        A quoted word NESTED inside the spliced subtree is a genuine `word` node
+        with a quote-delimited span, so it registered a suppression range all the
+        same — `echo ${z:-$(echo "rm -rf /")}` derived `[(18, 26)]` on the native
+        tier against bashlex's `[]`. Suppression SHRINKS the danger surface, so
+        that is the under-block direction and it must be zero at every depth.
+        """
+        parser = BashCommandParser()
+        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == []
+        assert parser.extract_string_literals(command, parser.parse(command)) == []
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ('echo "rm -rf /"', [(6, 14)]),  # plain quoted argument
+            ('echo $(echo "rm -rf /")', [(13, 21)]),  # quoted word inside a plain $( )
+            ('echo "${x:-rm -rf /}"', [(6, 20)]),  # the expansion IS the quoted word
+            ('echo "$x"', [(6, 8)]),  # ditto, shortest form — span equality, not containment
+            ('echo ${z:-$(rm -rf /)} "keep me"', [(24, 31)]),  # sibling of an expansion
+        ],
+    )
+    def test_literal_suppression_outside_expansions_is_unchanged(self, command, expected):
+        """The LAB-1584 filter drops ranges STRICTLY inside a `parameter` span only.
+
+        Equality must keep the range: `echo "$x"` has word (5, 9) → range (6, 8)
+        and parameter (6, 8), and bashlex derives that range too. Over-dropping
+        here would turn quoted data into false positives on both tiers.
+
+        ABSOLUTE expectations, not just a cross-tier compare: the filter runs on
+        BOTH tiers, so an over-drop moves them together and a native-vs-bashlex
+        assertion stays green through it. Relaxing `<` to `<=` is the mutant that
+        proves it — it empties `echo "$x"` on the bashlex tier that ships today,
+        and the equality-only form of this test never noticed (LAB-1584 panel).
+        """
+        parser = BashCommandParser()
+        assert parser.extract_string_literals(command, parser.parse(command)) == expected
+        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == expected
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            '[[ -f "rm -rf /" ]]',
+            'a=("rm -rf /")',
+            'echo $(( "1" ))',
+        ],
+    )
+    def test_native_only_constructs_may_derive_literals_bashlex_never_sees(self, command):
+        """AC-3: the other native-only splice sites need no fix, and here is why.
+
+        `[[ ]]`, array elements and `$(( ))` all splice operand words the same
+        way, so the native tier does derive suppression ranges inside them — but
+        bashlex cannot parse any of the three at all, so there is no bashlex
+        verdict for a native suppression to under-cut. The ranges are also
+        CORRECT (a quoted test operand really is data). The parity contract binds
+        only where bashlex produces a verdict; this test pins the fail-closed
+        premise that argument rests on, so a bashlex upgrade that starts parsing
+        these constructs re-opens the question instead of silently diverging.
+        """
+        parser = BashCommandParser()
+        assert parser.extract_string_literals(command, NativeBridge().parse(command))
+        with pytest.raises(ParseError):
+            parser.parse(command)
+
 
 class TestDeepNestingRoutesToFallback:
     """A bridge-side stack overflow is a BRIDGE failure, not a verdict.
@@ -340,13 +417,30 @@ class TestDeepNestingRoutesToFallback:
 
 @needs_binary
 class TestKnownBashlexUnderDecode:
-    """One divergence the sweep found where native is RIGHT and bashlex is wrong.
+    """Divergences the sweep found where native is RIGHT and bashlex is wrong.
 
-    Pinned so T3 inherits it, and so a bashlex upgrade that changes the fallback
-    tier's decode trips a test. Safe to diverge: the mangling needs an adjacent
-    literal, so the mangled word always carries that literal too and can never
-    collapse to a bare dangerous command.
+    Pinned so T3 inherits them, and so a bashlex upgrade that changes the
+    fallback tier's decode trips a test. Safe to diverge: the mangling needs an
+    adjacent literal, so the mangled word always carries that literal too and can
+    never collapse to a bare dangerous command.
     """
+
+    def test_nested_expansion_span_stops_at_the_first_brace(self):
+        """bashlex's `parameter` span ends at the first `}` when `${…}` nests.
+
+        So the trailing substitution of `${x/${y}/`…`}` falls OUTSIDE bashlex's
+        parameter span and keeps its suppression range, while native's ParamExp
+        span covers the whole construct and the LAB-1584 filter drops it. Native
+        suppresses LESS, i.e. blocks MORE — the superset direction, so the parity
+        contract holds and no fix is owed. Pinned because it is a native-side
+        FALSE POSITIVE the day T8/LAB-532 wires the native tier in, and whoever
+        meets it there should find it documented rather than read it as a
+        regression (LAB-1584 panel).
+        """
+        parser = BashCommandParser()
+        command = 'echo ${x/${y}/`echo "lit"`}'
+        assert parser.extract_string_literals(command, parser.parse(command)) == [(21, 24)]
+        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == []
 
     def test_single_quotes_concatenated_with_a_literal(self):
         # bash's value for `'a"b'x` is `a"bx`; bashlex drops the inner quotes
