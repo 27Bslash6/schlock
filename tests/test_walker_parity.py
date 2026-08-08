@@ -31,6 +31,7 @@ from schlock.core.ast_view import UnmappedNodeError
 from schlock.core.native_bridge import NativeBridge, NativeBridgeError, resolve_binary
 from schlock.core.parser import BashCommandParser
 from schlock.core.validator import _get_substitution_validator, clear_caches, validate_command
+from schlock.exceptions import ParseError
 
 CORPUS_PATH = Path(__file__).parent.parent / "tools" / "schlock-parse" / "testdata" / "corpus.json"
 
@@ -316,6 +317,77 @@ class TestParameterExpansionSubstitutions:
         # under-block direction (PR #137 review).
         command = 'echo ${z:-"rm -rf /"}'
         assert BashCommandParser().extract_string_literals(command, NativeBridge().parse(command)) == []
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo ${z:-$(echo "rm -rf /")}',  # default value
+            'echo ${z:=$(echo "rm -rf /")}',  # assign-default
+            'echo ${z/x/$(echo "rm -rf /")}',  # replacement
+            'echo ${z:$(echo "rm -rf /"):1}',  # substring offset
+            'echo ${a[$(echo "rm -rf /")]}',  # subscript
+            'echo ${z:-$(echo "a${y:-$(echo "rm -rf /")}b")}',  # two splices deep
+        ],
+    )
+    def test_nested_expansion_words_create_no_literal_suppression_ranges(self, command):
+        """Dropping the `word` wrappers only closed the SHALLOW case (LAB-1584).
+
+        A quoted word NESTED inside the spliced subtree is a genuine `word` node
+        with a quote-delimited span, so it registered a suppression range all the
+        same — `echo ${z:-$(echo "rm -rf /")}` derived `[(18, 26)]` on the native
+        tier against bashlex's `[]`. Suppression SHRINKS the danger surface, so
+        that is the under-block direction and it must be zero at every depth.
+        """
+        parser = BashCommandParser()
+        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == []
+        assert parser.extract_string_literals(command, parser.parse(command)) == []
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "rm -rf /"',  # plain quoted argument
+            'echo $(echo "rm -rf /")',  # quoted word inside a plain $( )
+            'echo "${x:-rm -rf /}"',  # the expansion IS the quoted word
+            'echo "$x"',  # ditto, shortest form — span equality, not containment
+            'echo ${z:-$(rm -rf /)} "keep me"',  # sibling of an expansion
+        ],
+    )
+    def test_literal_suppression_outside_expansions_is_unchanged(self, command):
+        """The LAB-1584 filter drops ranges STRICTLY inside a `parameter` span only.
+
+        Equality must keep the range: `echo "$x"` has word (5, 9) → range (6, 8)
+        and parameter (6, 8), and bashlex derives that range too. Over-dropping
+        here would turn quoted data into false positives on both tiers.
+        """
+        parser = BashCommandParser()
+        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == parser.extract_string_literals(
+            command, parser.parse(command)
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            '[[ -f "rm -rf /" ]]',
+            'a=("rm -rf /")',
+            'echo $(( "1" ))',
+        ],
+    )
+    def test_native_only_constructs_may_derive_literals_bashlex_never_sees(self, command):
+        """AC-3: the other native-only splice sites need no fix, and here is why.
+
+        `[[ ]]`, array elements and `$(( ))` all splice operand words the same
+        way, so the native tier does derive suppression ranges inside them — but
+        bashlex cannot parse any of the three at all, so there is no bashlex
+        verdict for a native suppression to under-cut. The ranges are also
+        CORRECT (a quoted test operand really is data). The parity contract binds
+        only where bashlex produces a verdict; this test pins the fail-closed
+        premise that argument rests on, so a bashlex upgrade that starts parsing
+        these constructs re-opens the question instead of silently diverging.
+        """
+        parser = BashCommandParser()
+        assert parser.extract_string_literals(command, NativeBridge().parse(command))
+        with pytest.raises(ParseError):
+            parser.parse(command)
 
 
 class TestDeepNestingRoutesToFallback:
