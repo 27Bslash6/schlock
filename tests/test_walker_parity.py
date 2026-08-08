@@ -343,26 +343,31 @@ class TestParameterExpansionSubstitutions:
         assert parser.extract_string_literals(command, parser.parse(command)) == []
 
     @pytest.mark.parametrize(
-        "command",
+        ("command", "expected"),
         [
-            'echo "rm -rf /"',  # plain quoted argument
-            'echo $(echo "rm -rf /")',  # quoted word inside a plain $( )
-            'echo "${x:-rm -rf /}"',  # the expansion IS the quoted word
-            'echo "$x"',  # ditto, shortest form — span equality, not containment
-            'echo ${z:-$(rm -rf /)} "keep me"',  # sibling of an expansion
+            ('echo "rm -rf /"', [(6, 14)]),  # plain quoted argument
+            ('echo $(echo "rm -rf /")', [(13, 21)]),  # quoted word inside a plain $( )
+            ('echo "${x:-rm -rf /}"', [(6, 20)]),  # the expansion IS the quoted word
+            ('echo "$x"', [(6, 8)]),  # ditto, shortest form — span equality, not containment
+            ('echo ${z:-$(rm -rf /)} "keep me"', [(24, 31)]),  # sibling of an expansion
         ],
     )
-    def test_literal_suppression_outside_expansions_is_unchanged(self, command):
+    def test_literal_suppression_outside_expansions_is_unchanged(self, command, expected):
         """The LAB-1584 filter drops ranges STRICTLY inside a `parameter` span only.
 
         Equality must keep the range: `echo "$x"` has word (5, 9) → range (6, 8)
         and parameter (6, 8), and bashlex derives that range too. Over-dropping
         here would turn quoted data into false positives on both tiers.
+
+        ABSOLUTE expectations, not just a cross-tier compare: the filter runs on
+        BOTH tiers, so an over-drop moves them together and a native-vs-bashlex
+        assertion stays green through it. Relaxing `<` to `<=` is the mutant that
+        proves it — it empties `echo "$x"` on the bashlex tier that ships today,
+        and the equality-only form of this test never noticed (LAB-1584 panel).
         """
         parser = BashCommandParser()
-        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == parser.extract_string_literals(
-            command, parser.parse(command)
-        )
+        assert parser.extract_string_literals(command, parser.parse(command)) == expected
+        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == expected
 
     @pytest.mark.parametrize(
         "command",
@@ -412,13 +417,30 @@ class TestDeepNestingRoutesToFallback:
 
 @needs_binary
 class TestKnownBashlexUnderDecode:
-    """One divergence the sweep found where native is RIGHT and bashlex is wrong.
+    """Divergences the sweep found where native is RIGHT and bashlex is wrong.
 
-    Pinned so T3 inherits it, and so a bashlex upgrade that changes the fallback
-    tier's decode trips a test. Safe to diverge: the mangling needs an adjacent
-    literal, so the mangled word always carries that literal too and can never
-    collapse to a bare dangerous command.
+    Pinned so T3 inherits them, and so a bashlex upgrade that changes the
+    fallback tier's decode trips a test. Safe to diverge: the mangling needs an
+    adjacent literal, so the mangled word always carries that literal too and can
+    never collapse to a bare dangerous command.
     """
+
+    def test_nested_expansion_span_stops_at_the_first_brace(self):
+        """bashlex's `parameter` span ends at the first `}` when `${…}` nests.
+
+        So the trailing substitution of `${x/${y}/`…`}` falls OUTSIDE bashlex's
+        parameter span and keeps its suppression range, while native's ParamExp
+        span covers the whole construct and the LAB-1584 filter drops it. Native
+        suppresses LESS, i.e. blocks MORE — the superset direction, so the parity
+        contract holds and no fix is owed. Pinned because it is a native-side
+        FALSE POSITIVE the day T8/LAB-532 wires the native tier in, and whoever
+        meets it there should find it documented rather than read it as a
+        regression (LAB-1584 panel).
+        """
+        parser = BashCommandParser()
+        command = 'echo ${x/${y}/`echo "lit"`}'
+        assert parser.extract_string_literals(command, parser.parse(command)) == [(21, 24)]
+        assert parser.extract_string_literals(command, NativeBridge().parse(command)) == []
 
     def test_single_quotes_concatenated_with_a_literal(self):
         # bash's value for `'a"b'x` is `a"bx`; bashlex drops the inner quotes
