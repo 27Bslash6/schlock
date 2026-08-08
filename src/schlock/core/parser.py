@@ -7,6 +7,7 @@ The parser is security-critical and REQUIRES bashlex for proper AST parsing.
 Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
+import bisect
 import logging
 from typing import Any, Optional
 
@@ -732,13 +733,16 @@ class BashCommandParser:
             >>> # literals = [(6, 14)]  # Position of content inside quotes
         """
         string_literals: list[tuple] = []
-        expansion_spans: list[tuple] = []
+        parameter_spans: list[tuple] = []
 
         def visit(node):
             """Recursively visit AST nodes to find quoted strings."""
             if hasattr(node, "kind"):
+                # `parameter` ONLY — widening this to `commandsubstitution` would
+                # suppress every quoted literal inside `$(…)` on BOTH tiers, which
+                # is the under-block this filter exists to prevent.
                 if node.kind == "parameter" and hasattr(node, "pos"):
-                    expansion_spans.append(node.pos)
+                    parameter_spans.append(node.pos)
 
                 # Look for word nodes that are quoted strings
                 if node.kind == "word" and hasattr(node, "pos"):
@@ -766,11 +770,39 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
 
-        return [
-            (start, stop)
-            for start, stop in string_literals
-            if not any(exp_start < start and stop < exp_stop for exp_start, exp_stop in expansion_spans)
-        ]
+        if not parameter_spans:
+            return string_literals
+        return self._drop_ranges_inside(string_literals, parameter_spans)
+
+    @staticmethod
+    def _drop_ranges_inside(ranges: list[tuple], spans: list[tuple]) -> list[tuple]:
+        """Ranges from `ranges` lying STRICTLY inside no span — see `extract_string_literals`.
+
+        The naive `any(...)` scan is O(ranges x spans), and this runs twice per
+        validation (whole command, then again per segment) on a hook that fires
+        before every bash call — 43KB of `"a" … $v1 …` padding costs the caller
+        nothing and measured 580ms per call, so the quadratic is a stall lever on
+        a security gate, not a micro-optimization.
+
+        AST spans NEST but never partially overlap, which makes the fast path
+        exact rather than approximate: a range strictly inside a nested span is
+        strictly inside that span's outermost ancestor too, so reducing to the
+        OUTERMOST spans drops no containment. Those are then pairwise disjoint and
+        sorted, so one bisect finds the only span that can contain a range.
+        """
+        outermost: list[tuple] = []
+        for start, stop in sorted(spans, key=lambda span: (span[0], -span[1])):
+            if not outermost or start >= outermost[-1][1]:
+                outermost.append((start, stop))
+        starts = [span[0] for span in outermost]
+
+        kept: list[tuple] = []
+        for start, stop in ranges:
+            index = bisect.bisect_right(starts, start) - 1
+            if index >= 0 and outermost[index][0] < start and stop < outermost[index][1]:
+                continue
+            kept.append((start, stop))
+        return kept
 
     def has_dangerous_constructs(self, ast_nodes: list[Any]) -> list[str]:
         """Detect dangerous shell constructs in AST.

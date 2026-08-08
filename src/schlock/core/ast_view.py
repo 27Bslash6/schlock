@@ -503,6 +503,9 @@ class _Converter:
         if part_type not in _STRUCTURAL_WORD_PARTS:
             return []
         if part_type == "ParamExp":
+            # `_pos(part)` spans the WHOLE `${…}`, not just the parameter name:
+            # `extract_string_literals`' LAB-1584 filter needs it to CONTAIN the
+            # words spliced in below, or their quoted literals suppress rules.
             return [_node("ParamExp", _pos(part), value=part["Param"]["Value"]), *self._param_exp_words(part)]
         if part_type == "CmdSubst":
             inner = self.stmts_to_single_node(part.get("Stmts", []), "command substitution")
