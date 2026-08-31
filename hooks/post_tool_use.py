@@ -24,7 +24,9 @@ Behavior:
   after the WHOLE Bash command, so `git commit && <slow test suite>` must still be
   inspected. Only on first contact with a repo (no recorded HEAD) does a wall-clock
   window decide, because an unseen stale HEAD after a failed re-run is then
-  indistinguishable from a slow compound command's commit.
+  indistinguishable from a slow compound command's commit. A HEAD that changed but
+  predates the last look (git pull, a commit from the user's own terminal) is
+  recorded, never flagged — it is not this command's commit to amend.
 - Self-terminating: the amend re-fires this hook; a clean amended message produces no
   output, ending the loop. A pathological re-add of the trailer re-flags — that is the
   correct response, and since the hook only ever informs (never blocks), no state is
@@ -49,6 +51,7 @@ import shlex
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional
 
@@ -298,28 +301,39 @@ def state_file_path() -> Path:
     return Path(user_data_dir("schlock", "27b.io")) / "post_commit_heads.json"
 
 
-def read_last_seen_head(repo_key: Optional[str]) -> Optional[str]:
-    """Full hash of the HEAD last seen for this repo, or None (unknown/failed)."""
+def read_last_seen(repo_key: Optional[str]) -> Optional[tuple[str, int]]:
+    """(full_hash, seen_at_epoch) last recorded for this repo, or None (unknown/failed)."""
     if repo_key is None:
         return None
     try:
         state = json.loads(state_file_path().read_text())
-        value = state.get(repo_key) if isinstance(state, dict) else None
-        return value if isinstance(value, str) else None
+        entry = state.get(repo_key) if isinstance(state, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        full_hash, seen_at = entry.get("hash"), entry.get("seen_at")
+        if isinstance(full_hash, str) and isinstance(seen_at, (int, float)):
+            return full_hash, int(seen_at)
+        return None
     except (OSError, ValueError):
         return None
 
 
 def record_seen_head(repo_key: Optional[str], full_hash: str) -> None:
-    """Best-effort atomic record of the HEAD just seen for this repo.
+    """Best-effort atomic record of the HEAD just seen for this repo, with the
+    wall-clock time of the look (seen_at) so a later HEAD that PREDATES it can be
+    recognized as externally created.
 
     Write failures are swallowed: with no record, the next run degrades to the
-    bootstrap wall-clock window — the pre-identity behavior. No file locking: a
-    lost update between concurrent sessions only costs a redundant inspection of
-    a commit, and the hook informs, never blocks.
+    bootstrap wall-clock window — the pre-identity behavior. No file locking: the
+    read-modify-replace below leaves a microseconds-wide lost-update window
+    between concurrent sessions, whose worst case is one repo dropping back to
+    the bootstrap window for its next commit (a slow compound command's commit
+    there is missed once); the next record self-heals. Locking is not worth that
+    for a detector that informs, never blocks.
     """
     if repo_key is None:
         return
+    tmp = None
     try:
         path = state_file_path()
         try:
@@ -329,8 +343,10 @@ def record_seen_head(repo_key: Optional[str], full_hash: str) -> None:
         except (OSError, ValueError):
             state = {}
         # Insertion order is recency order: re-insert, then evict the oldest.
+        # seen_at is floored to whole seconds so a commit landing in the same
+        # second as the look still compares as not-older (git %ct is integral).
         state.pop(repo_key, None)
-        state[repo_key] = full_hash
+        state[repo_key] = {"hash": full_hash, "seen_at": int(time.time())}
         if len(state) > MAX_TRACKED_REPOS:
             for key in list(state)[: len(state) - MAX_TRACKED_REPOS]:
                 del state[key]
@@ -341,7 +357,37 @@ def record_seen_head(repo_key: Optional[str], full_hash: str) -> None:
         tmp.write_text(json.dumps(state))
         tmp.replace(path)
     except OSError:
-        pass
+        if tmp is not None:
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
+
+
+def is_uninspected_commit(repo_key: Optional[str], full_hash: str, committed_at: int) -> bool:
+    """True when HEAD is a commit this command may have created and the detector
+    has not yet inspected.
+
+    Records the HEADs it rules out (they are now "seen"); the caller records an
+    inspected HEAD only after a successful scan, so a transient scan failure is
+    retried rather than permanently suppressed.
+    """
+    last_seen = read_last_seen(repo_key)
+    if last_seen is not None and last_seen[0] == full_hash:
+        return False  # no new commit since the last look — failed/no-op re-run
+    if last_seen is None:
+        if time.time() - committed_at > FRESHNESS_WINDOW_SECONDS:
+            # Bootstrap: with no recorded HEAD for this repo (first contact, or state
+            # unavailable), an old HEAD after a failed re-run is indistinguishable from
+            # a slow compound command's commit — fall back to the wall-clock window
+            # rather than re-flag a stale commit. Record so identity tracking starts.
+            record_seen_head(repo_key, full_hash)
+            return False
+    elif committed_at < last_seen[1]:
+        # HEAD changed but the commit predates our last look, so this command cannot
+        # have created it — it moved externally (git pull, the user's own terminal).
+        # Flagging it would prompt an amend of a commit that is not ours to rewrite.
+        record_seen_head(repo_key, full_hash)
+        return False
+    return True
 
 
 def format_amend_prompt(short_hash: str, patterns_removed: list[dict]) -> str:
@@ -458,22 +504,17 @@ def handle_post_tool_use(input_data: dict) -> Optional[dict]:  # noqa: PLR0911 -
     # re-flagged — but wall-clock age cannot decide, because the hook fires after the
     # WHOLE command and `git commit && <slow suite>` ages HEAD past any window.
     repo_key = get_repo_key(input_data.get("cwd"))
-    last_seen = read_last_seen_head(repo_key)
-    if last_seen == full_hash:
-        return None  # no new commit since the last look — failed/no-op re-run
-    record_seen_head(repo_key, full_hash)
-    if last_seen is None and time.time() - committed_at > FRESHNESS_WINDOW_SECONDS:
-        # Bootstrap: with no recorded HEAD for this repo (first contact, or state
-        # unavailable), an old HEAD after a failed re-run is indistinguishable from a
-        # slow compound command's commit — fall back to the wall-clock window rather
-        # than re-flag a stale commit.
+    if not is_uninspected_commit(repo_key, full_hash, committed_at):
         return None
 
     try:
         _cleaned, patterns_removed, categories = commit_filter.clean_message(message)
     except Exception as e:
+        # NOT recorded as seen: a transient filter failure must not permanently
+        # suppress this HEAD — the next commit-shaped command retries it.
         logger.warning(f"Post-commit filter failed: {e}. Skipping (fail-open).")
         return None
+    record_seen_head(repo_key, full_hash)
 
     file_matches = find_file_advertising(input_data.get("cwd"))
     if not patterns_removed and not file_matches:

@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
 
 import post_tool_use
 from post_tool_use import handle_post_tool_use, read_head_commit
+from schlock.integrations.commit_filter import CommitMessageFilter
 
 TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
 FILE_TRAILER = "Generated with Claude Code"
@@ -406,11 +407,22 @@ class TestHeadIdentityFreshness:
     sleeping through a real suite.
     """
 
-    def seed_inspected_head(self, git_repo):
-        """First commit + hook run: records this repo's last-seen HEAD."""
+    def seed_inspected_head(self, git_repo, seen_at_age: int = 7200):
+        """First commit + hook run: records this repo's last-seen HEAD.
+
+        The recorded seen_at is then aged by seen_at_age seconds: the tests below
+        backdate GIT_COMMITTER_DATE to simulate a slow compound command, and a
+        real slow command's commit postdates the previous look — the aged seed
+        reproduces that ordering without sleeping.
+        """
         command = 'git commit -m "seed"'
         assert run_bash(command, git_repo).returncode == 0
         assert handle_post_tool_use(hook_input(command, git_repo)) is None
+        state_path = Path(os.environ["SCHLOCK_POST_COMMIT_STATE"])
+        state = json.loads(state_path.read_text())
+        for entry in state.values():
+            entry["seen_at"] -= seen_at_age
+        state_path.write_text(json.dumps(state))
 
     def test_slow_compound_command_commit_is_inspected(self, git_repo):
         """A `git commit && sleep 31`-shaped command IS inspected (fails on the old
@@ -450,6 +462,42 @@ class TestHeadIdentityFreshness:
         rerun = 'git commit -m "nothing staged"'
         assert run_bash(rerun, git_repo).returncode != 0  # no-op: HEAD unchanged, still fresh
         assert handle_post_tool_use(hook_input(rerun, git_repo)) is None
+
+    def test_externally_created_commit_is_not_flagged_by_failed_rerun(self, git_repo):
+        """A HEAD that changed but predates the detector's last look (git pull, a
+        commit from the user's own terminal) must not be blamed on a later failed
+        `git commit` — the amend prompt would rewrite a commit that is not ours."""
+        command = 'git commit -m "seed"'
+        assert run_bash(command, git_repo).returncode == 0
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+        # Trailer-bearing commit whose committer date PREDATES the look above.
+        (git_repo / "user.txt").write_text("user work\n")
+        subprocess.run(["git", "add", "user.txt"], cwd=git_repo, env=git_env(), check=True)
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        assert run_bash("git commit -F msg.txt", git_repo, env=backdated_env()).returncode == 0
+
+        rerun = 'git commit -m "nothing staged"'
+        assert run_bash(rerun, git_repo).returncode != 0
+        assert handle_post_tool_use(hook_input(rerun, git_repo)) is None
+
+    def test_transient_filter_failure_is_retried_not_suppressed(self, git_repo):
+        """A transient message-scan failure must not record the HEAD as seen —
+        the next commit-shaped command retries and still flags it."""
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+
+        def boom(self, message):
+            raise RuntimeError("transient failure")
+
+        # Scoped patch: the shared function-scoped monkeypatch would also undo the
+        # autouse state-isolation env var.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(CommitMessageFilter, "clean_message", boom)
+            assert handle_post_tool_use(hook_input(command, git_repo)) is None  # fail-open
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None  # retried
 
     def test_state_unavailable_falls_back_to_window(self, git_repo, monkeypatch):
         """Unreadable/unwritable state degrades to the pre-identity window behavior:
