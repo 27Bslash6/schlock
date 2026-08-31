@@ -54,6 +54,24 @@ def run_bash(command: str, cwd: Path, env: Optional[dict] = None) -> subprocess.
     )
 
 
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path_factory, monkeypatch):
+    """Point the last-seen-HEAD state at a fresh per-test file — never the user's real
+    state, and never inside a test repo where `git add -A` would commit it."""
+    state = tmp_path_factory.mktemp("schlock-state") / "post_commit_heads.json"
+    monkeypatch.setenv("SCHLOCK_POST_COMMIT_STATE", str(state))
+    return state
+
+
+def backdated_env(seconds: int = 3600) -> dict:
+    """git env whose committer date predates the freshness window — the on-disk
+    committer timestamp a slow compound command leaves behind by the time the
+    hook finally fires."""
+    env = git_env()
+    env["GIT_COMMITTER_DATE"] = f"{int(time.time()) - seconds} +0000"
+    return env
+
+
 @pytest.fixture
 def git_repo(tmp_path):
     """Fresh git repo with one staged file, ready to commit."""
@@ -379,6 +397,88 @@ class TestFileContentDetection:
         assert "... and 20 more" in context
 
 
+class TestHeadIdentityFreshness:
+    """The freshness gate is HEAD identity, not wall-clock age (LAB-1439).
+
+    The hook fires after the WHOLE Bash command, so `git commit && <slow suite>`
+    presents a HEAD older than any wall-clock window by the time it runs.
+    Backdating GIT_COMMITTER_DATE reproduces exactly that on-disk state without
+    sleeping through a real suite.
+    """
+
+    def seed_inspected_head(self, git_repo):
+        """First commit + hook run: records this repo's last-seen HEAD."""
+        command = 'git commit -m "seed"'
+        assert run_bash(command, git_repo).returncode == 0
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+    def test_slow_compound_command_commit_is_inspected(self, git_repo):
+        """A `git commit && sleep 31`-shaped command IS inspected (fails on the old
+        wall-clock gate: HEAD is already past the window when the hook fires)."""
+        self.seed_inspected_head(git_repo)
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        subprocess.run(["git", "add", "msg.txt"], cwd=git_repo, env=git_env(), check=True)
+        assert run_bash("git commit -F msg.txt", git_repo, env=backdated_env()).returncode == 0
+
+        response = handle_post_tool_use(hook_input("git commit -F msg.txt && sleep 31", git_repo))
+
+        assert response is not None
+        assert "git commit --amend" in response["hookSpecificOutput"]["additionalContext"]
+
+    def test_slow_compound_command_file_content_is_scanned(self, git_repo):
+        """The file-content scan shares the identity gate — a slow compound command
+        must not silently disable it either."""
+        self.seed_inspected_head(git_repo)
+        (git_repo / "vendored.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "vendored.md"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo, env=backdated_env()).returncode == 0
+
+        response = handle_post_tool_use(hook_input(f"{command} && sleep 31", git_repo))
+
+        assert response is not None
+        assert "vendored.md:1" in response["hookSpecificOutput"]["additionalContext"]
+
+    def test_seen_head_is_not_reinspected_even_when_fresh(self, git_repo):
+        """A failed re-run seconds after a flagged commit no longer re-flags it —
+        identity closes the old window's within-30s re-flag hole."""
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+
+        rerun = 'git commit -m "nothing staged"'
+        assert run_bash(rerun, git_repo).returncode != 0  # no-op: HEAD unchanged, still fresh
+        assert handle_post_tool_use(hook_input(rerun, git_repo)) is None
+
+    def test_state_unavailable_falls_back_to_window(self, git_repo, monkeypatch):
+        """Unreadable/unwritable state degrades to the pre-identity window behavior:
+        a fresh commit is still flagged, nothing raises."""
+        monkeypatch.setenv("SCHLOCK_POST_COMMIT_STATE", str(git_repo / "file.txt" / "state.json"))
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+
+    def test_corrupt_state_file_is_ignored_and_rewritten(self, git_repo, isolated_state):
+        isolated_state.write_text("{not json")
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+        assert isinstance(json.loads(isolated_state.read_text()), dict)  # recorded despite corruption
+
+    def test_state_caps_tracked_repos(self, isolated_state):
+        for i in range(post_tool_use.MAX_TRACKED_REPOS + 5):
+            post_tool_use.record_seen_head(f"/repo{i}/.git", "a" * 40)
+        state = json.loads(isolated_state.read_text())
+        assert len(state) == post_tool_use.MAX_TRACKED_REPOS
+        assert "/repo0/.git" not in state  # oldest evicted
+        assert f"/repo{post_tool_use.MAX_TRACKED_REPOS + 4}/.git" in state
+
+
 class TestAmendLoopTerminates:
     def test_clean_amend_produces_silence(self, git_repo):
         (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
@@ -490,9 +590,11 @@ class TestHelpers:
 
     def test_read_head_commit_parses_head(self, git_repo):
         run_bash(f'git commit -m "{CLEAN_MESSAGE}"', git_repo)
-        epoch, short_hash, message = read_head_commit(str(git_repo))
+        epoch, short_hash, full_hash, message = read_head_commit(str(git_repo))
         assert abs(time.time() - epoch) < 60
         assert len(short_hash) >= 7
+        assert len(full_hash) == 40
+        assert full_hash.startswith(short_hash)
         assert message.strip() == CLEAN_MESSAGE
 
     def test_main_emits_json_on_detection_and_exits_zero(self, git_repo, monkeypatch, capsys):
