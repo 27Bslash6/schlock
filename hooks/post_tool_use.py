@@ -157,7 +157,7 @@ def escape_control_chars(text: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
-def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
+def find_file_advertising(cwd: Optional[str]) -> Optional[list[tuple[str, int]]]:
     """Return (path, line_number) locations of the canonical phrase added by HEAD.
 
     `git show HEAD` rather than `git diff HEAD~1 HEAD`: a root commit is still
@@ -170,7 +170,8 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
     `--text` scans paths a .gitattributes `-diff` rule would otherwise hide;
     undecodable bytes in forced-text diffs are replaced, not fatal.
 
-    Fail-open: any git failure returns [] (this is a cosmetic filter).
+    Fail-open: any git failure returns None — distinct from [] (scanned clean) so
+    the caller can leave the HEAD unrecorded and retry the scan next time.
     """
     if is_schlock_checkout(cwd):
         return []
@@ -202,7 +203,8 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
             cwd=cwd or None,
         )
         if result.returncode != 0:
-            return []
+            logger.warning(f"Post-commit file scan failed: git show exited {result.returncode}. Skipping (fail-open).")
+            return None
 
         matches: list[tuple[str, int]] = []
         current_path: Optional[str] = None
@@ -228,8 +230,9 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
                     matches.append((current_path, line_number))
                 line_number += 1
         return matches
-    except (OSError, subprocess.SubprocessError):
-        return []
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning(f"Post-commit file scan failed: {e}. Skipping (fail-open).")
+        return None
 
 
 def read_head_commit(cwd: Optional[str]) -> Optional[tuple[int, str, str, str]]:
@@ -366,9 +369,9 @@ def is_uninspected_commit(repo_key: Optional[str], full_hash: str, committed_at:
     """True when HEAD is a commit this command may have created and the detector
     has not yet inspected.
 
-    Records the HEADs it rules out (they are now "seen"); the caller records an
-    inspected HEAD only after a successful scan, so a transient scan failure is
-    retried rather than permanently suppressed.
+    Records the HEADs it rules out (they are now "seen"); the caller records a HEAD
+    once it is scanned clean or reported, so a transient scan failure on a clean
+    commit is retried rather than permanently suppressed.
     """
     last_seen = read_last_seen(repo_key)
     if last_seen is not None and last_seen[0] == full_hash:
@@ -514,9 +517,14 @@ def handle_post_tool_use(input_data: dict) -> Optional[dict]:  # noqa: PLR0911 -
         # suppress this HEAD — the next commit-shaped command retries it.
         logger.warning(f"Post-commit filter failed: {e}. Skipping (fail-open).")
         return None
-    record_seen_head(repo_key, full_hash)
 
+    # None = scan failed: leave the HEAD unrecorded so the next run retries — unless
+    # message findings report it below (a reported HEAD must not be re-flagged by a
+    # later failed re-run; None is falsy, so the report still fires this run).
     file_matches = find_file_advertising(input_data.get("cwd"))
+    if file_matches is not None or patterns_removed:
+        record_seen_head(repo_key, full_hash)
+
     if not patterns_removed and not file_matches:
         # Clean message — also the amend-loop terminator: a successful amend lands here.
         return None
