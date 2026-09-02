@@ -796,16 +796,15 @@ def _match_original_and_reconstructed(
 
     SECURITY CRITICAL: bashlex resolves escapes and drops quote characters when
     it reconstructs a command from its AST, so `rm\\ -rf\\ /` and `"chmod" 777`
-    only reveal themselves to the regex rules in reconstructed form. Bash treats
-    `"chmod"` and `chmod` identically, so quoting costs an attacker nothing.
+    only reveal themselves to the regex rules in reconstructed form. Both passes
+    always run and the higher risk wins; the reconstructed pass used to be
+    skipped whenever the command held a quoted token, which is what made
+    `"chmod" 777 /etc/shadow` classify SAFE. See
+    BashCommandParser.reconstruct_command_with_suppression_ranges for why
+    rebasing the ranges is what makes always-on affordable.
 
-    The reconstructed pass used to be skipped whenever the command contained any
-    quoted token at all (LAB-1732) - and quoting the command name was itself
-    enough to trip that gate, which is what made `"chmod" 777 /etc/shadow`
-    classify SAFE. It now always runs, with the quoted-literal ranges rebased
-    onto the reconstructed string so the false positives the gate was guarding
-    (`echo "rm -rf /"`, commit messages) stay suppressed on their own merits
-    rather than by switching the whole pass off.
+    Centralising this is deliberate: the multi-segment branch had simply
+    forgotten the reconstructed pass, so one call site is the fix's habitat.
 
     Args:
         engine: Rule engine to match against
@@ -813,8 +812,12 @@ def _match_original_and_reconstructed(
         command: Command (or single segment) to match
         ast_nodes: Parsed AST for `command`; may be empty if parsing failed
         string_literals: Pre-computed literal ranges for `command`; derived here
-                         when omitted
-        heredoc_ranges: Optional heredoc ranges for the original-form pass
+                         when omitted. Omitting is the safe default - an explicit
+                         `[]` switches suppression off, which is the shape of the
+                         bug this function exists to fix.
+        heredoc_ranges: Heredoc ranges for the original-form pass. Segments carry
+                        none: heredoc bodies never reach the reconstruction
+                        either, since _collect_words only walks `.word` parts.
 
     Returns:
         The higher-risk of the two matches.
@@ -828,9 +831,9 @@ def _match_original_and_reconstructed(
         heredoc_ranges=heredoc_ranges,
     )
 
-    reconstructed, recon_literals = parser.reconstruct_command_with_literals(command, ast_nodes)
+    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(command, ast_nodes)
     if reconstructed and reconstructed != command:
-        recon_match = engine.match_command(reconstructed, string_literals=recon_literals)
+        recon_match = engine.match_command(reconstructed, string_literals=suppression_ranges)
         if recon_match.risk_level > match.risk_level:
             return recon_match
 
@@ -1085,7 +1088,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     # Parse segment to get its string literals
                     try:
                         seg_ast = parser.parse(segment)
-                    except (ParseError, ValueError):
+                    except (ParseError, ValueError) as e:
+                        # Without an AST this segment loses literal suppression AND
+                        # the reconstructed pass - say so rather than fail silently.
+                        logger.warning(f"Segment parse failed, matching raw with no AST context: {segment!r}: {e}")
                         seg_ast = []
 
                     seg_match = _match_original_and_reconstructed(engine, parser, segment, seg_ast)

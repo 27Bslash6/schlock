@@ -594,30 +594,24 @@ class BashCommandParser:
 
         return segments
 
-    def _collect_words(self, ast_nodes: list[Any]) -> list[tuple]:
+    def _collect_words(self, ast_nodes: list[Any]) -> list[tuple[str, Optional[tuple]]]:
         """Collect the word parts that make up the reconstructed command.
 
         Returns:
-            List of (word_text, original_span, is_command_name) tuples in
-            reconstruction order. original_span is the node's (start, end)
-            offsets in the source command, or None when the node carries no
-            position. is_command_name marks the word bash will execute - the
-            first non-assignment word of a command node.
+            List of (word_text, original_span) tuples in reconstruction order.
+            original_span is the node's (start, end) offsets in the source
+            command, or None when the node carries no position.
         """
-        words: list[tuple] = []
+        words: list[tuple[str, Optional[tuple]]] = []
 
         def visit(node):
             """Recursively visit AST nodes to extract words."""
             if hasattr(node, "kind"):
                 # Command nodes - extract their word parts
                 if node.kind == "command" and hasattr(node, "parts"):
-                    seen_name = False
                     for part in node.parts:
                         if hasattr(part, "word"):
-                            # Leading VAR=value pairs precede the command name
-                            is_name = not seen_name and getattr(part, "kind", None) != "assignment"
-                            seen_name = seen_name or is_name
-                            words.append((part.word, getattr(part, "pos", None), is_name))
+                            words.append((part.word, getattr(part, "pos", None)))
                     return  # Don't recurse further into this command
 
                 # Recursively visit child nodes for other structures
@@ -638,10 +632,10 @@ class BashCommandParser:
     def reconstruct_command(self, ast_nodes: list[Any]) -> str:
         """Reconstruct command from AST word nodes.
 
-        SECURITY CRITICAL: Bashlex unescapes special characters during parsing.
-        For example, 'rm\\ -rf\\ /' becomes word 'rm -rf /'.
-        This reconstruction enables pattern matching against the ACTUAL command
-        that will be executed, not the escaped input string.
+        No production caller - the live validation pass uses
+        reconstruct_command_with_suppression_ranges, which produces the same
+        string plus the ranges the rule engine needs. Kept for the
+        native-parser differential oracle; harden the other one.
 
         Args:
             ast_nodes: List of bashlex AST nodes from parse()
@@ -655,62 +649,83 @@ class BashCommandParser:
             >>> parser.reconstruct_command(ast)
             'rm -rf /'
         """
-        return " ".join(word for word, _, _ in self._collect_words(ast_nodes))
+        return " ".join(word for word, _ in self._collect_words(ast_nodes))
 
-    def reconstruct_command_with_literals(self, command: str, ast_nodes: list[Any]) -> tuple:
-        """Reconstruct the command AND rebase quoted-literal ranges onto it.
+    def reconstruct_command_with_suppression_ranges(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
+        """Reconstruct the command AND rebase its suppression ranges onto it.
 
         SECURITY CRITICAL (LAB-1732): the reconstructed pass is the only defence
-        that catches a dangerous command whose *name* is quoted - bash runs
+        that catches a dangerous command whose name is quoted - bash runs
         `"chmod" 777 /etc/shadow` exactly as `chmod 777 /etc/shadow`. That pass
-        used to be skipped whenever the command contained any quoted token,
-        because reconstruction strips quote characters and so invalidates the
-        literal offsets computed against the original string. Skipping is the
-        wrong trade for a fail-closed validator: it swaps a false-positive class
-        for an under-block class. Rebasing the ranges keeps both properties -
-        the pass always runs, and matches that live wholly inside quoted *data*
-        stay suppressed (`echo "rm -rf /"`).
+        used to be skipped whenever the command held any quoted token at all,
+        because reconstruction strips quote characters and so invalidates every
+        offset computed against the original string. Skipping traded a
+        false-positive class for an under-block class, the wrong direction for a
+        fail-closed validator. Rebasing keeps both properties: the pass always
+        runs, and matches living wholly inside quoted data stay suppressed.
 
-        Rebasing works because suppression requires a rule match to sit
-        ENTIRELY inside one literal range (see RuleEngine._is_in_string_literal).
-        A quoted command name occupies only its own word in the reconstruction,
-        so a rule pattern spanning `chmod 777` is not contained by it and still
-        fires; a quoted message covers the whole match and still suppresses it.
+        Rebasing works because suppression needs a match to sit ENTIRELY inside
+        one range (RuleEngine._is_in_string_literal). Which words earn a range
+        is decided by _quoting_is_load_bearing - read that first.
 
         Args:
             command: Original command string (needed for quote detection)
             ast_nodes: List of bashlex AST nodes from parse()
 
         Returns:
-            (reconstructed_command, literal_ranges) where literal_ranges are
-            (start, end) offsets INTO reconstructed_command.
+            (reconstructed_command, suppression_ranges).
+
+            NOT the same shape as extract_string_literals, though both feed the
+            same `string_literals=` argument, so passing one where the other
+            belongs misaligns suppression silently. These offsets index the
+            RECONSTRUCTED string, cover the whole word plus its joining space,
+            and are omitted entirely for words whose quotes do no work.
 
         Example:
             >>> parser = BashCommandParser()
             >>> ast = parser.parse('echo "rm -rf /"')
-            >>> parser.reconstruct_command_with_literals('echo "rm -rf /"', ast)
-            ('echo rm -rf /', [(5, 13)])
+            >>> parser.reconstruct_command_with_suppression_ranges('echo "rm -rf /"', ast)
+            ('echo rm -rf /', [(5, 14)])
         """
         words = self._collect_words(ast_nodes)
-        literals = []
+        ranges = []
         offset = 0
-        last_index = len(words) - 1
 
-        for index, (word, span, is_command_name) in enumerate(words):
-            # SECURITY: a quoted command name is still executed - `"mkfs.ext4"`
-            # runs mkfs. Emitting a range for it would suppress rules that match
-            # the bare name (\bmkfs\b), which is the LAB-1732 bypass itself.
-            if word and span is not None and not is_command_name and self._is_quoted_span(command, span):
-                # Include the joining space: in the original string that offset
-                # held the closing quote, a character no rule pattern can cross.
-                # Reconstruction turns it into whitespace, which patterns ending
+        for word, span in words:
+            if span is not None and self._quoting_is_load_bearing(command, word, span):
+                # Absorb the following joining space. In the source that offset
+                # held the closing quote, a character no rule pattern can cross;
+                # reconstruction turns it into whitespace, which patterns ending
                 # in `(\s|$)` will happily consume - without this the match ends
-                # one char past the range and escapes suppression.
-                end = offset + len(word) + (1 if index < last_index else 0)
-                literals.append((offset, end))
+                # one character past the range and escapes suppression. Adding it
+                # unconditionally is safe: for the final word the range then ends
+                # at len(reconstructed) + 1, which no match end can reach.
+                ranges.append((offset, offset + len(word) + 1))
             offset += len(word) + 1  # +1 for the joining space
 
-        return " ".join(word for word, _, _ in words), literals
+        return " ".join(word for word, _ in words), ranges
+
+    def _quoting_is_load_bearing(self, command: str, word: str, span: tuple) -> bool:
+        """Whether a word's quotes do real work, rather than just hiding it.
+
+        SECURITY CRITICAL: this is the whole of LAB-1732. Quotes suppress a rule
+        match only when they are what makes the text a single inert argument -
+        `echo "rm -rf /"` passes one word to echo, and without the quotes it
+        would not. A quoted BARE TOKEN is different: bash runs `"mkfs.ext4"`
+        exactly as `mkfs.ext4`, so the quotes change nothing about execution and
+        exist only to keep the name out of the reconstructed string. Suppressing
+        there is the bypass, because a name-only pattern (`\bmkfs\b`) sits
+        entirely inside that one word and so is swallowed whole.
+
+        Asking "is the quoting load-bearing" rather than "is this the command
+        name" is what covers the exec-wrapper forms - `timeout 5 "mkfs.ext4" …`,
+        `env FOO=1 "mkfs.ext4" …`, `nice/command/nohup/setsid "mkfs.ext4" …` -
+        where bash executes a word that is NOT in command-name position.
+        """
+        if not word or not self._is_quoted_span(command, span):
+            return False
+        # Shell-significant characters are the ones quoting actually protects.
+        return any(char in word for char in " \t\n;|&<>()$`*?[]#~!\\'\"")
 
     @staticmethod
     def _is_quoted_span(command: str, span: tuple) -> bool:
@@ -802,13 +817,11 @@ class BashCommandParser:
             if hasattr(node, "kind"):
                 # Look for word nodes that are quoted strings
                 if node.kind == "word" and hasattr(node, "pos"):
-                    start, end = node.pos
-                    # Check if the position in the original command has quotes
+                    # Record the position INSIDE the quotes (exclude quote chars).
+                    # _is_quoted_span's own `end - start < 2` check rules out the
+                    # empty-quote span that would invert this range.
                     if self._is_quoted_span(command, node.pos):
-                        # Record the position INSIDE the quotes (exclude quote chars)
-                        # Only append valid ranges (empty strings would create invalid ranges)
-                        if start + 1 <= end - 1:
-                            string_literals.append((start + 1, end - 1))
+                        string_literals.append((node.pos[0] + 1, node.pos[1] - 1))
 
                 # Recursively visit child nodes
                 for attr in ["parts", "command", "list", "pipe", "compound"]:

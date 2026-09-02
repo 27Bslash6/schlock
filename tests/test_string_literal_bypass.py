@@ -166,6 +166,9 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
     including the command name itself - switched the pass off for the whole
     command.
 
+    Suppression now turns on whether a word's quotes DO anything, not on where
+    the word sits, which is what covers the exec-wrapper forms below.
+
     ShellCheck is forced unavailable throughout: it independently catches some
     of these, which would mask a regression in schlock's own rule matching.
     """
@@ -231,3 +234,83 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
         assert (result.allowed, result.risk_level) == (expected_allowed, expected_risk), (
             f"FALSE POSITIVE: {command!r} scored {result.risk_level} (allowed={result.allowed}), expected {expected_risk}"
         )
+
+    @pytest.mark.parametrize(
+        "wrapper",
+        [
+            "env FOO=1",
+            "timeout 5",
+            "nice",
+            "command",
+            "nohup",
+            "setsid",
+            "stdbuf",
+        ],
+    )
+    def test_quoted_name_behind_exec_wrapper(self, safety_rules_path, wrapper):
+        """Bash executes a word that is NOT in command-name position here.
+
+        Keying suppression off "is this parts[0]" missed all of these: the
+        payload name is an *argument* of the wrapper, so it got a suppression
+        range and `\\bmkfs\\b` - a pattern that fits entirely inside that one
+        word - was swallowed whole. Found by the LAB-1732 expert panel.
+        """
+        attack = f'{wrapper} "mkfs.ext4" /dev/sda'
+        control = f"{wrapper} mkfs.ext4 /dev/sda"
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            attack_result = validate_command(attack, config_path=safety_rules_path)
+            clear_caches()
+            control_result = validate_command(control, config_path=safety_rules_path)
+
+        assert (control_result.allowed, control_result.risk_level) == (False, RiskLevel.BLOCKED), (
+            f"control drifted for {control!r}: {control_result.risk_level}"
+        )
+        assert (attack_result.allowed, attack_result.risk_level) == (False, RiskLevel.BLOCKED), (
+            f"SECURITY BYPASS: {attack!r} scored {attack_result.risk_level} (allowed={attack_result.allowed})"
+        )
+
+    @pytest.mark.parametrize(
+        "command,span,expected",
+        [
+            ('"abc"', (0, 5), True),
+            ("'abc'", (0, 5), True),
+            # Partial quoting: the outermost chars do not both belong to one quote
+            ('x"y"', (0, 4), False),
+            ('"a"b', (0, 4), False),
+            ("'a'\"b\"", (0, 6), False),
+            # A single quote char is not a quoted span - `end - start < 2`
+            ('"', (0, 1), False),
+            # Out-of-bounds spans must not raise
+            ("abc", (5, 9), False),
+        ],
+    )
+    def test_is_quoted_span_requires_both_ends(self, parser, command, span, expected):
+        """Both ends must belong to the SAME quote pair.
+
+        Pinned because this helper gates suppression on both the original and
+        the reconstructed pass, so widening it (e.g. testing only the first
+        character) silently widens suppression twice over - a mutation the
+        LAB-1732 panel found surviving the whole suite.
+        """
+        assert parser._is_quoted_span(command, span) is expected
+
+    @pytest.mark.parametrize(
+        "word,expected",
+        [
+            # Bare tokens: quotes are pure obfuscation, bash runs them the same
+            ("mkfs.ext4", False),
+            ("rm", False),
+            ("-rf", False),
+            # Quotes do real work: without them this would not be one word
+            ("rm -rf /", True),
+            ("fix: remove rm -rf / from docs", True),
+            ("a;b", True),
+            ("a|b", True),
+            ("$(x)", True),
+        ],
+    )
+    def test_quoting_is_load_bearing(self, parser, word, expected):
+        """A word only earns a suppression range when its quotes do work."""
+        command = f'"{word}"'
+        assert parser._quoting_is_load_bearing(command, word, (0, len(command))) is expected

@@ -183,7 +183,12 @@ rules:
       # base64 -d piped to shell
       - 'base64\s+(-d|--decode)[^;|&]*\|\s*(bash|sh|zsh|eval)'
       - '(bash|sh|zsh).*<<<.*\$\(base64\s+(-d|--decode)'
-      - 'echo\s+[A-Za-z0-9+/=]{20,}[^;|&]*\|\s*base64\s+(-d|--decode)[^;|&]*\|\s*(bash|sh)'
+      # An `echo <base64> | base64 -d | sh` form was listed here too. It was
+      # strictly subsumed by the first pattern above (which needs no echo prefix
+      # and also covers zsh/eval), and its unanchored `{20,}` run followed by
+      # `[^;|&]*` backtracked quadratically on any long echo argument: 43KB of
+      # padding cost 4.9s on a hook that runs before every bash call. Removed,
+      # not bounded - it was detecting nothing the line above does not.
       # Openssl base64 decode to shell
       - 'openssl\s+(base64|enc)[^;|&]*-d[^;|&]*\|\s*(bash|sh)'
       # Python base64 decode to execution
