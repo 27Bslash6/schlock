@@ -121,6 +121,9 @@ whitelist:
 
 - Patterns are regex, matched against the start of the command string (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
+- For a **chained** command (`a; b`, `a && b`, `a | b`), a prefix match is not enough: each
+  segment is validated on its own unless a pattern spans the *entire* command. `^ls\b`
+  allows `ls -la`, but `ls; rm -rf /` is still BLOCKED on the `rm`
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
@@ -143,6 +146,8 @@ whitelist:
 ```
 
 Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
+
+To whitelist a whole multi-command pipeline (e.g. `gh auth token | docker login … --password-stdin`), the pattern must cover the command end to end — anchor it with `$`. A pattern that only matches the first segment will let the pipeline through to per-segment validation instead, where the later segments are judged on their own.
 
 #### Security: User-Level Only
 

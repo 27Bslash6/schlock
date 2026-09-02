@@ -637,6 +637,26 @@ class RuleEngine:
         """
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
+    def is_fully_whitelisted(self, command: str) -> bool:
+        """Check if a whitelist pattern spans the ENTIRE command.
+
+        Whitelist patterns are deliberately prefix matches (issue #66: match(),
+        not fullmatch(), so "^ls\\b" keeps covering "ls -la" when a user adds
+        flags). For a chained command a prefix is not enough — it would let the
+        "ls" in "ls; rm -rf /" vouch for the rm. Only a pattern whose match
+        reaches the end of the command (in practice a "$"-anchored entry such
+        as the gh-auth-token/docker-login pipeline) may whitelist a whole chain.
+
+        Args:
+            command: Command string to check
+
+        Returns:
+            True if a whitelist pattern matches from the start of the command
+            through to its end
+        """
+        end = len(command.rstrip())
+        return any((match := pattern.match(command)) is not None and match.end() >= end for pattern in self.whitelist_patterns)
+
     def match_command(
         self,
         command: str,

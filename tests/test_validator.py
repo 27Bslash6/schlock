@@ -692,3 +692,89 @@ rules:
 
         # BLOCKED rule should survive category disable
         assert any(r.name == "schlock_config_write" for r in engine.rules)
+
+
+class TestMultiSegmentWhitelistBypass:
+    """LAB-2752: a whitelisted PREFIX must not vouch for a whole chained command.
+
+    Before the fix, validate_command() ran the prefix-matching
+    engine.is_whitelisted() over the FULL command before the segment loop, so
+    anything starting with a whitelisted prefix ("ls", "git status", a user's
+    "^npm\\b") returned SAFE and the rest of the chain was never validated.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _hermetic(self, tmp_path, monkeypatch):
+        """No real user config and no ShellCheck: verdicts come from rules alone."""
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        clear_caches()
+        yield
+        clear_caches()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls; rm -rf /",
+            "ls && rm -rf /",
+            "ls | rm -rf /",
+            "ls x ; rm -rf /",
+            "ls && dd if=/dev/zero of=/dev/sda",
+            "ls | mkfs.ext4 /dev/sda",
+            "git status; mkfs.ext4 /dev/sda",
+            # Second unanchored whitelist entry: ^chmod\s+[0-7]{3}\s+/tmp/
+            "chmod 777 /tmp/x; rm -rf /",
+        ],
+    )
+    def test_whitelisted_prefix_does_not_whitelist_the_chain(self, command):
+        """AC-1: dangerous segment after a whitelisted prefix is still BLOCKED."""
+        result = validate_command(command)
+        assert not result.allowed
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_chained_chmod_keeps_its_standalone_risk(self):
+        """AC-1: "ls ; chmod 777 /etc/shadow" scores as the chmod does alone (HIGH)."""
+        chained = validate_command("ls ; chmod 777 /etc/shadow")
+        assert chained.risk_level == RiskLevel.HIGH
+        clear_caches()
+        assert validate_command("chmod 777 /etc/shadow").risk_level == RiskLevel.HIGH
+
+    @pytest.mark.parametrize(
+        "command",
+        ["ls", "ls -la", "git status", "pwd", "ls | grep foo"],
+    )
+    def test_benign_whitelisted_commands_unchanged(self, command):
+        """AC-2: absolute verdicts for the commands the whitelist exists to allow."""
+        result = validate_command(command)
+        assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
+
+    def test_end_anchored_full_command_entry_still_whitelisted(self):
+        """AC-3: the deliberate multi-command carve-out (00_whitelist.yaml) survives.
+
+        This is the entry the is_fully_whitelisted() call site exists for: no
+        per-segment pass can approve it, because "docker login" in isolation is
+        not whitelisted.
+        """
+        result = validate_command("gh auth token | docker login ghcr.io -u someuser --password-stdin")
+        assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.message == "Command is whitelisted"
+
+    def test_user_whitelist_prefix_does_not_whitelist_the_chain(self, tmp_path):
+        """AC-4: a user-config pattern without "$" has the same fence as a built-in."""
+        user_config = tmp_path / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        (user_config / "config.yaml").write_text("""
+whitelist:
+  - ^npm\\b
+""")
+
+        allowed_alone = validate_command("npm run build")
+        assert allowed_alone.allowed
+        assert allowed_alone.risk_level == RiskLevel.SAFE
+
+        clear_caches()
+        chained = validate_command("npm run build; rm -rf /")
+        assert not chained.allowed
+        assert chained.risk_level == RiskLevel.BLOCKED
