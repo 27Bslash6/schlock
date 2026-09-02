@@ -571,50 +571,31 @@ class BashCommandParser:
             visit(node)
         return commands
 
-    def reconstruct_command(self, ast_nodes: list[Any]) -> str:
-        """Reconstruct command from AST word nodes.
-
-        SECURITY CRITICAL: Bashlex unescapes special characters during parsing.
-        For example, 'rm\\ -rf\\ /' becomes word 'rm -rf /'.
-        This reconstruction enables pattern matching against the ACTUAL command
-        that will be executed, not the escaped input string.
-
-        Args:
-            ast_nodes: List of bashlex AST nodes from parse()
-
-        Returns:
-            Reconstructed command string with escapes resolved
-
-        Example:
-            >>> parser = BashCommandParser()
-            >>> ast = parser.parse("rm\\\\ -rf\\\\ /")
-            >>> parser.reconstruct_command(ast)
-            'rm -rf /'
-        """
-        return " ".join(part.word for parts in self._command_words(ast_nodes) for part in parts)
-
     def reconstruct_with_literals(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
-        """Reconstruct the command AND rebase quoted-argument ranges onto the reconstructed text.
+        """Reconstruct the command as the parser's unquoted, unescaped word view, with quoted-data
+        ranges rebased onto that text.
 
-        Reconstruction strips quotes and resolves escapes, so ranges from
-        extract_string_literals() (original-string offsets) do not apply to it. This
-        computes the ranges during the join, in the reconstructed string's coordinates.
+        SECURITY CRITICAL: the parser unescapes and unquotes (``rm\\ -rf\\ /`` and ``"rm" -rf /``
+        both become ``rm -rf /``), so this view is the only one that catches escape- and
+        quote-based evasion. It is a *word* view: redirect targets and heredoc bodies are not
+        part of it. Ranges from extract_string_literals() are original-string offsets and do
+        not apply here; these are computed during the join, so a word that shrinks through
+        unescaping stays aligned.
 
-        SECURITY: the command-name word is never treated as a literal. ``"chmod" 777``
-        executes chmod exactly as ``chmod 777`` does; only quoted *arguments*
-        (``echo "rm -rf /"``) are data that rules must not match inside. Suppressing the
-        name would let ``"mkfs.ext4" /dev/sda`` hide from ``\\bmkfs\\b`` (LAB-1732).
-
-        Args:
-            command: Original command string (needed to see which words were quoted)
-            ast_nodes: List of bashlex AST nodes from parse()
-
-        Each range is widened by one character on each side, onto the separator spaces
-        that stand where the quote characters stood. In the original string a rule's
-        trailing ``(\\s|$)`` cannot cross the closing quote; in the reconstructed string
-        that quote is gone and the separator abuts the content, so the separator has to
-        count as part of the literal or ``echo "prefix rm -rf /" suffix`` becomes a
-        false positive.
+        What counts as data (a range) on this view:
+        - only quoted ARGUMENTS. The command-name word is never data: ``"mkfs.ext4" /dev/sda``
+          executes mkfs, and ``\\bmkfs\\b`` would otherwise be suppressed inside the name's
+          own range (LAB-1732).
+        - only quoted words containing whitespace. A quoted single token (``env "mkswap"``,
+          ``nice "wipefs"``) is the same argv entry bash sees unquoted, and behind an exec
+          wrapper it IS the command; quoted *data* that a rule could match is a command with
+          arguments, i.e. it has whitespace. Cost: ``echo "mkfs"`` now classifies like
+          ``echo mkfs`` -- parity with the unquoted form, the accepted direction here.
+        - each range is widened by one onto the separator spaces that stand where the quote
+          characters stood, clamped to ``[0, len(text)]``. In the original string a rule's
+          trailing ``(\\s|$)`` cannot cross the closing quote; here that quote is gone and the
+          separator abuts the content, so without this ``echo "prefix rm -rf /" suffix`` is a
+          false positive.
 
         Returns:
             (reconstructed_text, [(start, end), ...]) with ranges in reconstructed_text offsets
@@ -634,7 +615,7 @@ class BashCommandParser:
                 is_name = not name_seen and getattr(part, "kind", None) == "word"
                 name_seen = name_seen or is_name
                 pos = getattr(part, "pos", None)
-                if not is_name and part.word and pos and self._is_quoted(command, *pos):
+                if not is_name and pos and any(c.isspace() for c in part.word) and self._is_quoted(command, *pos):
                     spans.append((offset, offset + len(part.word)))
                 words.append(part.word)
                 offset += len(part.word) + 1
@@ -721,9 +702,8 @@ class BashCommandParser:
                 if node.kind == "word" and hasattr(node, "pos"):
                     start, end = node.pos
                     # Check if the position in the original command has quotes
-                    # Record the position INSIDE the quotes (exclude quote chars).
-                    # Only append valid ranges (empty strings would create invalid ranges)
-                    if self._is_quoted(command, start, end) and start + 1 <= end - 1:
+                    # Record the position INSIDE the quotes (exclude quote chars)
+                    if self._is_quoted(command, start, end):
                         string_literals.append((start + 1, end - 1))
 
                 # Recursively visit child nodes

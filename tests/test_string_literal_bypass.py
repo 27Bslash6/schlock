@@ -182,6 +182,10 @@ class TestQuotedCommandNameBypass:
             ('"dd" if=/dev/zero of=/dev/sda', RiskLevel.BLOCKED),
             ('"mkfs.ext4" /dev/sda', RiskLevel.BLOCKED),
             ("'rm' -rf /", RiskLevel.BLOCKED),
+            # behind an exec wrapper the quoted token IS the command (panel finding on this fix)
+            ('env "mkfs.ext4" /dev/sda', RiskLevel.BLOCKED),
+            ('nice "wipefs" -a /dev/sda', RiskLevel.BLOCKED),
+            ('timeout 10 "mkswap" /dev/sda', RiskLevel.BLOCKED),
             # controls
             ("chmod 777 /etc/shadow", RiskLevel.HIGH),
             ("dd if=/dev/zero of=/dev/sda", RiskLevel.BLOCKED),
@@ -215,6 +219,7 @@ class TestQuotedCommandNameBypass:
             ('cat "rm -rf /"', True, RiskLevel.SAFE),
             ("echo 'rm -rf /'", True, RiskLevel.SAFE),
             ('echo "mkfs.ext4 /dev/sda"', True, RiskLevel.SAFE),
+            ('echo "a\\"b" tail', True, RiskLevel.SAFE),
         ],
     )
     def test_quoted_data_keeps_verdict(self, safety_rules_path, command, expected_allowed, expected_risk):
@@ -222,9 +227,26 @@ class TestQuotedCommandNameBypass:
         assert result.allowed is expected_allowed, f"{command!r}: allowed={result.allowed}"
         assert result.risk_level == expected_risk, f"{command!r}: got {result.risk_level}, want {expected_risk}"
 
+    @pytest.mark.parametrize(
+        "quoted,unquoted,expected_risk",
+        [
+            # ACCEPTED false-positive shifts: a quoted single token, or a quoted word a rule reads
+            # past, now classifies exactly like its unquoted form. Pinned so the shift is a
+            # decision, not drift. (pre-fix main: SAFE / SAFE / HIGH / LOW / SAFE)
+            ('echo "mkfs"', "echo mkfs", RiskLevel.BLOCKED),
+            ('echo "mkfs.xfs" /dev/sda', "echo mkfs.xfs /dev/sda", RiskLevel.BLOCKED),
+            ('echo "chmod" 777 x', "echo chmod 777 x", RiskLevel.HIGH),
+            ('git commit -m "wipefs"', "git commit -m wipefs", RiskLevel.BLOCKED),
+            ('echo "rm" "-rf" "/"', "echo rm -rf /", RiskLevel.BLOCKED),
+        ],
+    )
+    def test_quoted_token_has_parity_with_unquoted(self, safety_rules_path, quoted, unquoted, expected_risk):
+        assert validate_command(quoted, config_path=safety_rules_path).risk_level == expected_risk
+        assert validate_command(unquoted, config_path=safety_rules_path).risk_level == expected_risk
+
 
 class TestReconstructWithLiterals:
-    """Literal ranges are rebased onto the reconstructed string; the command name is never data."""
+    """Ranges are rebased onto the reconstructed string; the name and single tokens are never data."""
 
     @pytest.mark.parametrize(
         "command,expected_text,expected_literals",
@@ -235,7 +257,12 @@ class TestReconstructWithLiterals:
             ("echo 'rm -rf /'", "echo rm -rf /", [(4, 13)]),
             ('echo "rm -rf /" tail', "echo rm -rf / tail", [(4, 14)]),
             # escape inside quotes: word text shrinks, range follows the reconstructed text
-            ('echo "a\\"b" tail', 'echo a"b tail', [(4, 9)]),
+            ('echo "a\\" b" tail', 'echo a" b tail', [(4, 10)]),
+            # a quoted single token is not data: unquoted argv is identical, and behind a
+            # wrapper it is the command
+            ('echo "a\\"b" tail', 'echo a"b tail', []),
+            ('env "mkswap" /dev/sda', "env mkswap /dev/sda", []),
+            ('echo "mkfs"', "echo mkfs", []),
             # assignment prefix: the first *word* is the name, not the assignment
             ('FOO=bar "rm" -rf /', "FOO=bar rm -rf /", []),
             # partially quoted word is not a literal
@@ -249,8 +276,6 @@ class TestReconstructWithLiterals:
         text, literals = parser.reconstruct_with_literals(command, ast)
         assert text == expected_text
         assert literals == expected_literals
-        # reconstruct_command stays the text-only view of the same walk
-        assert parser.reconstruct_command(ast) == expected_text
 
     def test_empty_ast(self, parser):
         assert parser.reconstruct_with_literals("", []) == ("", [])

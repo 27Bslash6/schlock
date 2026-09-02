@@ -247,18 +247,6 @@ class TestParserBranchCoverage:
         segments = parser.extract_command_segments("echo test", [])
         assert segments == []
 
-    def test_reconstruct_command_empty_ast(self):
-        """reconstruct_command with empty AST returns empty string."""
-        parser = BashCommandParser()
-        result = parser.reconstruct_command([])
-        assert result == ""
-
-    def test_reconstruct_command_none_ast(self):
-        """reconstruct_command with None AST returns empty string."""
-        parser = BashCommandParser()
-        result = parser.reconstruct_command(None)
-        assert result == ""
-
     def test_has_dangerous_constructs_empty_ast(self):
         """has_dangerous_constructs with empty AST returns empty list."""
         parser = BashCommandParser()

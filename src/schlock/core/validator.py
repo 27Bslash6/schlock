@@ -746,17 +746,19 @@ def _match_with_reconstruction(
     string_literals: list[tuple],
     heredoc_ranges: Optional[list[tuple]] = None,
 ) -> RuleMatch:
-    """Match ``text`` against the rules as written AND as bash will execute it; keep the higher risk.
+    """Match ``text`` as written AND as the parser's unquoted/unescaped word view; keep the higher risk.
 
-    SECURITY: the parser unescapes and unquotes words (``rm\\ -rf\\ /`` and ``"rm" -rf /``
-    both become ``rm -rf /``), so the reconstructed text is the only view that catches
-    escape- and quote-based evasion. Quoted *arguments* are still data on that view:
-    reconstruct_with_literals() rebases their ranges onto the reconstructed string so
-    ``echo "rm -rf /"`` stays a false-positive-free echo. The pass is never skipped
-    wholesale -- gating it on "no literals present" is what let ``"chmod" 777 /etc/shadow``
-    classify SAFE (LAB-1732).
+    SECURITY: ``rm\\ -rf\\ /`` and ``"rm" -rf /`` both reconstruct to ``rm -rf /``, so the word
+    view is the only one that catches escape- and quote-based evasion (redirect targets and
+    heredoc bodies are not part of it). Quoted arguments are still data on that view:
+    reconstruct_with_literals() rebases their ranges so ``echo "rm -rf /"`` stays an echo.
+    The pass is never skipped wholesale -- gating it on "no literals present" is what let
+    ``"chmod" 777 /etc/shadow`` classify SAFE (LAB-1732). It is skipped only when the first
+    pass already hit BLOCKED, since reconstruction can only raise the risk.
     """
     match = engine.match_command(text, string_literals=string_literals, heredoc_ranges=heredoc_ranges)
+    if match.risk_level == RiskLevel.BLOCKED:
+        return match
     reconstructed, recon_literals = parser.reconstruct_with_literals(text, ast)
     if reconstructed and reconstructed != text:
         recon_match = engine.match_command(reconstructed, string_literals=recon_literals)
@@ -940,6 +942,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         seg_ast = parser.parse(segment)
                         seg_literals = parser.extract_string_literals(segment, seg_ast)
                     except (ParseError, ValueError):
+                        # Segment-level parse failure when the whole command parsed: raw-text match only
+                        logger.debug("segment %r failed to re-parse; matching raw text only", segment)
                         seg_ast, seg_literals = [], []
 
                     seg_match = _match_with_reconstruction(engine, parser, segment, seg_ast, seg_literals)
