@@ -728,6 +728,7 @@ class TestHeredocSurroundings:
             ("ls << 'A'\n1\nA\ncat << 'B'\n2\nB\nrm -rf /", "second heredoc opens on a later line"),
             ("cat << 'EOF'\nEOFX\n  EOF\nEOF\nrm -rf /", "body lines that only look like the terminator"),
             ("cat << 'EOF' > out.txt\nfoo\nEOF\nrm -rf /", "heredoc redirected to a file, then rm"),
+            ("cat << 'A' << B\n1\nA\n2\nB\nrm -rf /", "quoted and bare delimiters mixed, then rm"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -797,6 +798,12 @@ class TestHeredocSurroundings:
             ("cat << 'EOF'\n$(rm -rf /)\nEOF", RiskLevel.LOW, "substitution in the body stays literal"),
             ("cat << 'EOF'\n$(rm -rf /)\nEOF\necho ok", RiskLevel.LOW, "literal body plus benign trailer"),
             ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
+            # Delimiter spellings other than single-quoted: getting the
+            # delimiter wrong leaves a rewrite that cannot parse, which would
+            # fail-close ordinary heredoc use rather than let anything through.
+            ('cat << "EOF"\nhello\nEOF', RiskLevel.LOW, "double-quoted delimiter, benign"),
+            ('cat << "EOF"\nx\nEOF\necho done', RiskLevel.LOW, "double-quoted delimiter, benign trailer"),
+            ("cat << 'A' << B\n1\nA\n2\nB", RiskLevel.LOW, "quoted and bare delimiters mixed"),
             ("python3 << 'EOF'\nprint(1)\nEOF", RiskLevel.LOW, "python heredoc"),
             ("ssh host << 'EOF'\nuptime\nEOF", RiskLevel.LOW, "ssh heredoc"),
         ],
@@ -819,3 +826,17 @@ class TestHeredocSurroundings:
     def test_neuter_returns_none_without_a_heredoc(self):
         """No opener means nothing to rewrite, and the caller keeps its verdict."""
         assert val_module._neuter_heredocs("echo hello") is None
+
+    def test_neuter_matches_bash_on_tab_stripped_terminators(self):
+        """`<<-` lets the terminator be indented with tabs, and bash still ends there.
+
+        Pinned directly rather than through validate_command: `_validate_heredoc_command`
+        bails on `<<-` before this runs (its base-command regex does not accept the
+        dash), so no end-to-end command reaches this branch today. Comparing the raw
+        line instead of the tab-stripped one would run the body past its terminator
+        and swallow the trailing command, so the guard is kept and pinned here
+        against the day that regex is widened.
+        """
+        neutered = val_module._neuter_heredocs("ls <<- 'EOF'\n\tx\n\tEOF\nrm -rf /")
+
+        assert neutered == "ls <<-EOF\n\n\tEOF\nrm -rf /"
