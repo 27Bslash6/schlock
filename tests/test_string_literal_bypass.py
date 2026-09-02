@@ -10,7 +10,7 @@ import pytest
 
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
-from schlock.core.validator import validate_command
+from schlock.core.validator import clear_caches, validate_command
 
 
 class TestStringLiteralBypassFix:
@@ -152,3 +152,106 @@ class TestEmptyQuotedStringRangeFix:
             # All ranges must be valid
             for start, end in literals:
                 assert start <= end, f"Invalid range in '{command}': ({start}, {end})"
+
+
+class TestQuotedCommandNameBypass:
+    """LAB-1732: a quoted token anywhere must not disable the quote-stripped rule pass.
+
+    ``"chmod" 777 /etc/shadow`` executes exactly like ``chmod 777 /etc/shadow``; the
+    reconstructed (quote-stripped) pass is the only check that sees it, and it used to be
+    gated off by ``if not string_literals:`` -- so quoting *anything* hid the whole command.
+
+    ShellCheck is forced unavailable so the verdict comes from the rule engine alone, and
+    the expected values are pinned ABSOLUTELY (not "same tier as control") so a mutation
+    that weakens both sides together still fails.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        monkeypatch.setattr("schlock.core.validator.is_shellcheck_available", lambda: False)
+        clear_caches()
+        yield
+        clear_caches()
+
+    @pytest.mark.parametrize(
+        "command,expected_risk",
+        [
+            # AC-1: quoted command name reaches the unquoted control's risk level
+            ('"chmod" 777 /etc/shadow', RiskLevel.HIGH),
+            ("'chmod' 777 /etc/shadow", RiskLevel.HIGH),
+            ('"dd" if=/dev/zero of=/dev/sda', RiskLevel.BLOCKED),
+            ('"mkfs.ext4" /dev/sda', RiskLevel.BLOCKED),
+            ("'rm' -rf /", RiskLevel.BLOCKED),
+            # controls
+            ("chmod 777 /etc/shadow", RiskLevel.HIGH),
+            ("dd if=/dev/zero of=/dev/sda", RiskLevel.BLOCKED),
+            ("mkfs.ext4 /dev/sda", RiskLevel.BLOCKED),
+        ],
+    )
+    def test_quoted_command_name_matches_unquoted_risk(self, safety_rules_path, command, expected_risk):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.risk_level == expected_risk, f"{command!r}: got {result.risk_level}, want {expected_risk}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # AC-2: multi-segment branch reconstructs per segment too
+            'echo "${z:-y}" && "rm" -rf /',
+            'echo "x" | "rm" -rf /',
+            'true; "mkfs.ext4" /dev/sda',
+        ],
+    )
+    def test_quoted_name_in_later_segment_is_denied(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is False, f"{command!r} was allowed"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command,expected_allowed,expected_risk",
+        [
+            # AC-3: quoted DATA keeps its pre-fix verdict (pinned on main @ 1353f73)
+            ('echo "rm -rf /"', True, RiskLevel.SAFE),
+            ('git commit -m "fix: remove rm -rf / from docs"', True, RiskLevel.LOW),
+            ('cat "rm -rf /"', True, RiskLevel.SAFE),
+            ("echo 'rm -rf /'", True, RiskLevel.SAFE),
+            ('echo "mkfs.ext4 /dev/sda"', True, RiskLevel.SAFE),
+        ],
+    )
+    def test_quoted_data_keeps_verdict(self, safety_rules_path, command, expected_allowed, expected_risk):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is expected_allowed, f"{command!r}: allowed={result.allowed}"
+        assert result.risk_level == expected_risk, f"{command!r}: got {result.risk_level}, want {expected_risk}"
+
+
+class TestReconstructWithLiterals:
+    """Literal ranges are rebased onto the reconstructed string; the command name is never data."""
+
+    @pytest.mark.parametrize(
+        "command,expected_text,expected_literals",
+        [
+            ('"chmod" 777 /etc/shadow', "chmod 777 /etc/shadow", []),
+            # ranges are widened onto the separators that replace the quote chars (clamped at the ends)
+            ('echo "rm -rf /"', "echo rm -rf /", [(4, 13)]),
+            ("echo 'rm -rf /'", "echo rm -rf /", [(4, 13)]),
+            ('echo "rm -rf /" tail', "echo rm -rf / tail", [(4, 14)]),
+            # escape inside quotes: word text shrinks, range follows the reconstructed text
+            ('echo "a\\"b" tail', 'echo a"b tail', [(4, 9)]),
+            # assignment prefix: the first *word* is the name, not the assignment
+            ('FOO=bar "rm" -rf /', "FOO=bar rm -rf /", []),
+            # partially quoted word is not a literal
+            ('r"m" -rf /', "rm -rf /", []),
+            ('echo "" tail', "echo  tail", []),
+            ("rm\\ -rf\\ /", "rm -rf /", []),
+        ],
+    )
+    def test_reconstruct_with_literals(self, parser, command, expected_text, expected_literals):
+        ast = parser.parse(command)
+        text, literals = parser.reconstruct_with_literals(command, ast)
+        assert text == expected_text
+        assert literals == expected_literals
+        # reconstruct_command stays the text-only view of the same walk
+        assert parser.reconstruct_command(ast) == expected_text
+
+    def test_empty_ast(self, parser):
+        assert parser.reconstruct_with_literals("", []) == ("", [])
+        assert parser.reconstruct_with_literals("", None) == ("", [])

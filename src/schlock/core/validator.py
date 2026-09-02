@@ -738,6 +738,33 @@ def _validate_heredoc_command(
         return None
 
 
+def _match_with_reconstruction(
+    engine: RuleEngine,
+    parser: BashCommandParser,
+    text: str,
+    ast: list,
+    string_literals: list[tuple],
+    heredoc_ranges: Optional[list[tuple]] = None,
+) -> RuleMatch:
+    """Match ``text`` against the rules as written AND as bash will execute it; keep the higher risk.
+
+    SECURITY: the parser unescapes and unquotes words (``rm\\ -rf\\ /`` and ``"rm" -rf /``
+    both become ``rm -rf /``), so the reconstructed text is the only view that catches
+    escape- and quote-based evasion. Quoted *arguments* are still data on that view:
+    reconstruct_with_literals() rebases their ranges onto the reconstructed string so
+    ``echo "rm -rf /"`` stays a false-positive-free echo. The pass is never skipped
+    wholesale -- gating it on "no literals present" is what let ``"chmod" 777 /etc/shadow``
+    classify SAFE (LAB-1732).
+    """
+    match = engine.match_command(text, string_literals=string_literals, heredoc_ranges=heredoc_ranges)
+    reconstructed, recon_literals = parser.reconstruct_with_literals(text, ast)
+    if reconstructed and reconstructed != text:
+        recon_match = engine.match_command(reconstructed, string_literals=recon_literals)
+        if recon_match.risk_level > match.risk_level:
+            return recon_match
+    return match
+
+
 def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
     command: str,
     config_path: Optional[str] = None,
@@ -913,9 +940,9 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         seg_ast = parser.parse(segment)
                         seg_literals = parser.extract_string_literals(segment, seg_ast)
                     except (ParseError, ValueError):
-                        seg_literals = []
+                        seg_ast, seg_literals = [], []
 
-                    seg_match = engine.match_command(segment, string_literals=seg_literals)
+                    seg_match = _match_with_reconstruction(engine, parser, segment, seg_ast, seg_literals)
 
                     if seg_match.matched and seg_match.rule:
                         all_matched_rules.append(seg_match.rule.name)
@@ -938,28 +965,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     match = engine.match_command(command, string_literals=string_literals)
                     all_matched_rules = []
             else:
-                # Single segment - validate both original and reconstructed command
-                # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')
-                # We must match against both to catch escape-based evasion attempts
-                match = engine.match_command(
-                    command,
-                    string_literals=string_literals,
-                    heredoc_ranges=heredoc_ranges,
-                )
-
-                # Also check reconstructed command (catches escaped characters)
-                # SECURITY: Reconstruction strips quotes, which is useful for detecting
-                # escape sequences like 'rm\ -rf\ /' → 'rm -rf /', but we must NOT
-                # use it if the original match was inside a string literal (would cause false positives)
-                reconstructed = parser.reconstruct_command(ast)
-                if reconstructed and reconstructed != command:
-                    # Only check reconstructed if there are no string literals that would explain the difference
-                    # (i.e., difference is due to escapes, not quotes)
-                    if not string_literals:
-                        recon_match = engine.match_command(reconstructed, string_literals=[])
-                        # Use higher risk match
-                        if recon_match.risk_level > match.risk_level:
-                            match = recon_match
+                match = _match_with_reconstruction(engine, parser, command, ast, string_literals, heredoc_ranges)
         except ConfigurationError as e:
             return ValidationResult(
                 allowed=False,

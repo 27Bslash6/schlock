@@ -541,6 +541,36 @@ class BashCommandParser:
 
         return segments
 
+    @staticmethod
+    def _is_quoted(command: str, start: int, end: int) -> bool:
+        """True when command[start:end] is a whole double- or single-quoted token."""
+        if start >= len(command) or end > len(command) or end - start < 2:
+            return False
+        return (command[start] == '"' and command[end - 1] == '"') or (command[start] == "'" and command[end - 1] == "'")
+
+    def _command_words(self, ast_nodes: list[Any]) -> list[list[Any]]:
+        """Word-bearing parts of each command node, in source order, one list per command."""
+        commands: list[list[Any]] = []
+
+        def visit(node):
+            if not hasattr(node, "kind"):
+                return
+            if node.kind == "command" and hasattr(node, "parts"):
+                commands.append([part for part in node.parts if hasattr(part, "word")])
+                return  # Don't recurse further into this command
+            for attr in ["parts", "command", "list", "pipe", "compound"]:
+                if hasattr(node, attr):
+                    child = getattr(node, attr)
+                    if isinstance(child, list):
+                        for item in child:
+                            visit(item)
+                    elif child:
+                        visit(child)
+
+        for node in ast_nodes or []:
+            visit(node)
+        return commands
+
     def reconstruct_command(self, ast_nodes: list[Any]) -> str:
         """Reconstruct command from AST word nodes.
 
@@ -561,32 +591,55 @@ class BashCommandParser:
             >>> parser.reconstruct_command(ast)
             'rm -rf /'
         """
-        words = []
+        return " ".join(part.word for parts in self._command_words(ast_nodes) for part in parts)
 
-        def visit(node):
-            """Recursively visit AST nodes to extract words."""
-            if hasattr(node, "kind"):
-                # Command nodes - extract their word parts
-                if node.kind == "command" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            words.append(part.word)
-                    return  # Don't recurse further into this command
+    def reconstruct_with_literals(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
+        """Reconstruct the command AND rebase quoted-argument ranges onto the reconstructed text.
 
-                # Recursively visit child nodes for other structures
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
+        Reconstruction strips quotes and resolves escapes, so ranges from
+        extract_string_literals() (original-string offsets) do not apply to it. This
+        computes the ranges during the join, in the reconstructed string's coordinates.
 
-        for node in ast_nodes or []:
-            visit(node)
+        SECURITY: the command-name word is never treated as a literal. ``"chmod" 777``
+        executes chmod exactly as ``chmod 777`` does; only quoted *arguments*
+        (``echo "rm -rf /"``) are data that rules must not match inside. Suppressing the
+        name would let ``"mkfs.ext4" /dev/sda`` hide from ``\\bmkfs\\b`` (LAB-1732).
 
-        return " ".join(words)
+        Args:
+            command: Original command string (needed to see which words were quoted)
+            ast_nodes: List of bashlex AST nodes from parse()
+
+        Each range is widened by one character on each side, onto the separator spaces
+        that stand where the quote characters stood. In the original string a rule's
+        trailing ``(\\s|$)`` cannot cross the closing quote; in the reconstructed string
+        that quote is gone and the separator abuts the content, so the separator has to
+        count as part of the literal or ``echo "prefix rm -rf /" suffix`` becomes a
+        false positive.
+
+        Returns:
+            (reconstructed_text, [(start, end), ...]) with ranges in reconstructed_text offsets
+
+        Example:
+            >>> parser = BashCommandParser()
+            >>> cmd = 'echo "rm -rf /" tail'
+            >>> parser.reconstruct_with_literals(cmd, parser.parse(cmd))
+            ('echo rm -rf / tail', [(4, 14)])
+        """
+        words: list[str] = []
+        spans: list[tuple[int, int]] = []
+        offset = 0
+        for parts in self._command_words(ast_nodes):
+            name_seen = False
+            for part in parts:
+                is_name = not name_seen and getattr(part, "kind", None) == "word"
+                name_seen = name_seen or is_name
+                pos = getattr(part, "pos", None)
+                if not is_name and part.word and pos and self._is_quoted(command, *pos):
+                    spans.append((offset, offset + len(part.word)))
+                words.append(part.word)
+                offset += len(part.word) + 1
+        text = " ".join(words)
+        return text, [(max(start - 1, 0), min(end + 1, len(text))) for start, end in spans]
 
     def extract_heredoc_ranges(self, command: str, ast_nodes: list[Any]) -> list[tuple]:
         """Extract heredoc content ranges that should NOT be pattern matched.
@@ -668,14 +721,10 @@ class BashCommandParser:
                 if node.kind == "word" and hasattr(node, "pos"):
                     start, end = node.pos
                     # Check if the position in the original command has quotes
-                    if start < len(command) and end <= len(command):
-                        if (command[start] == '"' and command[end - 1] == '"') or (
-                            command[start] == "'" and command[end - 1] == "'"
-                        ):
-                            # Record the position INSIDE the quotes (exclude quote chars)
-                            # Only append valid ranges (empty strings would create invalid ranges)
-                            if start + 1 <= end - 1:
-                                string_literals.append((start + 1, end - 1))
+                    # Record the position INSIDE the quotes (exclude quote chars).
+                    # Only append valid ranges (empty strings would create invalid ranges)
+                    if self._is_quoted(command, start, end) and start + 1 <= end - 1:
+                        string_literals.append((start + 1, end - 1))
 
                 # Recursively visit child nodes
                 for attr in ["parts", "command", "list", "pipe", "compound"]:

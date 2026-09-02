@@ -1,0 +1,14 @@
+fix(validator): always run quote-stripped rule pass with rebased literal ranges
+
+The reconstructed (quote-stripped) match was gated on `if not string_literals`,
+so one quoted token anywhere disabled it for the whole command and
+`"chmod" 777 /etc/shadow` classified SAFE while the unquoted form is HIGH.
+The multi-segment branch never reconstructed at all.
+
+Reconstruction now returns the quoted-argument ranges rebased onto the
+reconstructed string (computed during the join, so escapes shrinking a word
+are handled), the command-name word is never treated as data, and each
+range is widened onto the separators that replace the quote characters so
+a rule's trailing `(\s|$)` cannot spill past quoted content. Both the
+single-segment and per-segment paths run the pass unconditionally and keep
+the higher risk.
