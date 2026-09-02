@@ -16,7 +16,7 @@ from schlock.core.validator import (
     load_rules,
     validate_command,
 )
-from schlock.exceptions import ConfigurationError
+from schlock.exceptions import ConfigurationError, ParseError
 
 
 class TestValidator:
@@ -725,10 +725,33 @@ class TestHeredocSurroundings:
             ('ls << "EOF"\nx\nEOF\nrm -rf /', "double-quoted delimiter"),
             ("ls << 'EOF' ; rm -rf /\nx\nEOF", "`;` tail on the opener line, before the body"),
             ("cat << 'A' << 'B'\n1\nA\n2\nB\nrm -rf /", "two heredocs, both bodies consumed in order"),
+            ("cat << 'A' << B\n1\nA\n2\nB\nrm -rf /", "quoted and bare delimiters mixed"),
             ("ls << 'A'\n1\nA\ncat << 'B'\n2\nB\nrm -rf /", "second heredoc opens on a later line"),
             ("cat << 'EOF'\nEOFX\n  EOF\nEOF\nrm -rf /", "body lines that only look like the terminator"),
             ("cat << 'EOF' > out.txt\nfoo\nEOF\nrm -rf /", "heredoc redirected to a file, then rm"),
-            ("cat << 'A' << B\n1\nA\n2\nB\nrm -rf /", "quoted and bare delimiters mixed, then rm"),
+            ("ls <<- 'EOF'\n\tx\n\tEOF\nrm -rf /", "tab-stripped `<<-` heredoc"),
+            ("for f in a b; do cat << 'EOF'\nx\nEOF\ndone\nrm -rf /", "after a compound statement's closer"),
+            # The rewrite has to read the delimiter the way bash does - the whole
+            # word, quotes removed - or the body swallows the payload. Reading
+            # only `\w+` stops at `-`/`.`/space; reading only the first quoted
+            # run turns `"E"OF` into `E`.
+            ("ls <<'EOF-X'\nbody\nEOF-X\nrm -rf /", "delimiter containing a dash"),
+            ("ls <<'E.F'\nbody\nE.F\nrm -rf /", "delimiter containing a dot"),
+            ("ls <<'E F'\nbody\nE F\nrm -rf /", "delimiter containing a space"),
+            ('ls << "E"OF\nEOF\nrm -rf /\nE\nEOF', "delimiter split across a double-quoted run"),
+            ("ls << 'E'OF\nEOF\nrm -rf /\nE\nEOF", "delimiter split across a single-quoted run"),
+            ("ls <<\\EOF\nEOF\nrm -rf /", "backslash-escaped delimiter"),
+            # A `<<` that bash does not read as an opener must not be read as one
+            # here either: a phantom opener's body swallows the real commands.
+            ("ls << 'EOF'\nEOF\necho \"x << y\"\nrm -rf /\ny", "`<<` inside a double-quoted word"),
+            ("ls << 'EOF'\nEOF\necho '<<END'\nrm -rf /\nEND", "`<<` inside a single-quoted word"),
+            ("cat <<'EOF' > s.sh\nhi\nEOF\n# uses << 'END'\nrm -rf /", "`<<` inside a comment"),
+            ("ls <<'EOF'\nx\nEOF\ncat <<<'z'\nrm -rf /", "`<<<` here-string is not a heredoc"),
+            ("cat <<'EOF' > f\nx\nEOF\necho \"a\nb\"\nrm -rf /", "double-quoted string spanning lines"),
+            # A dangerous command is not excused by owning a heredoc of its own,
+            # nor by carrying a literal `<<` argument.
+            ("ls << 'X'\nX\nchmod -R 777 / << 'Y'\nY", "the dangerous command owns the second heredoc"),
+            ("ls << 'X'\nX\nchmod -R 777 / \"<<\"", "a literal `<<` argument does not hide a segment"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -759,14 +782,29 @@ class TestHeredocSurroundings:
 
         assert result.risk_level == RiskLevel.HIGH
         assert result.allowed is True
-        assert "git push --force" not in result.message  # carries the rule, not the command
+        assert result.message == "Alongside heredoc: Force push overwrites remote history"
 
-    def test_unparseable_shell_after_terminator_fails_closed(self, safety_rules_path):
-        """A stray separator is shell we cannot read, so we cannot vouch for it."""
-        result = validate_command("ls << 'EOF'\nx\nEOF\n; rm -rf /", config_path=safety_rules_path)
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ("ls << 'EOF'\nx\nEOF\n; rm -rf /", "a stray separator is shell we cannot read"),
+            ("ls << 'X'\nrm -rf /", "no terminator: the body has no end"),
+            ("ls << 'EOF'\nx\nEOF\necho $((1<<2))", "arithmetic `<<`, already blocked repo-wide"),
+            ("cat << 'EO\nx\nEOF", "unterminated quote in the delimiter"),
+            ("cat << ''\nx\nEOF", "empty delimiter"),
+            ("cat << 'EOF'\nx", "opener with no terminator at all"),
+        ],
+    )
+    def test_unreadable_heredoc_fails_closed(self, safety_rules_path, command, description):
+        """Not knowing where a body ends means not knowing which text is shell.
 
-        assert result.risk_level == RiskLevel.BLOCKED
-        assert result.allowed is False
+        Escalation cannot be skipped in that case: whatever it could not read
+        might be the command that matters, so the verdict is deny.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.allowed is False, description
 
     @pytest.mark.parametrize(
         "command,expected_risk,description",
@@ -786,24 +824,31 @@ class TestHeredocSurroundings:
                 RiskLevel.LOW,
                 "heredoc inside a while loop with a redirect on the closer",
             ),
+            ("greet() {\n  cat << 'EOF'\nhi\nEOF\n}", RiskLevel.LOW, "heredoc inside a function body"),
             # The opener line can continue the heredoc's own command rather than
             # start a new one.
             ("cat << 'EOF' | grep x\nfoo\nEOF", RiskLevel.LOW, "piped into grep"),
             ("cat << 'EOF' > out.txt\nfoo\nEOF", RiskLevel.LOW, "redirected to a file"),
             ("cat << 'EOF' && echo ok\nfoo\nEOF", RiskLevel.LOW, "&& a benign command"),
             # A quoted delimiter means the body is literal text. Rewriting it to
-            # an unquoted delimiter would make bash expand it, so the body must
-            # be discarded rather than re-parsed (heredoc-body substitution is
+            # a bare delimiter would make bash expand it, so the body must be
+            # discarded rather than re-parsed (heredoc-body substitution is
             # LAB-2756's problem, and stays out of scope here).
             ("cat << 'EOF'\n$(rm -rf /)\nEOF", RiskLevel.LOW, "substitution in the body stays literal"),
             ("cat << 'EOF'\n$(rm -rf /)\nEOF\necho ok", RiskLevel.LOW, "literal body plus benign trailer"),
-            ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
-            # Delimiter spellings other than single-quoted: getting the
-            # delimiter wrong leaves a rewrite that cannot parse, which would
-            # fail-close ordinary heredoc use rather than let anything through.
+            ("cat << 'EOF'\nit's \"fine\" << here\nEOF\necho ok", RiskLevel.LOW, "quotes and `<<` in the body"),
+            # Delimiter spellings other than single-quoted, and openers the old
+            # entry regex rejected outright - each was a hard BLOCKED before.
             ('cat << "EOF"\nhello\nEOF', RiskLevel.LOW, "double-quoted delimiter, benign"),
             ('cat << "EOF"\nx\nEOF\necho done', RiskLevel.LOW, "double-quoted delimiter, benign trailer"),
             ("cat << 'A' << B\n1\nA\n2\nB", RiskLevel.LOW, "quoted and bare delimiters mixed"),
+            ("cat << 'A' << 'B'\n1\nA\n2\nB", RiskLevel.LOW, "two quoted delimiters on one line"),
+            ("ls <<- 'EOF'\n\tx\n\tEOF", RiskLevel.SAFE, "tab-stripped `<<-`, whitelisted head"),
+            ("cat <<- 'EOF'\n\tx\n\tEOF\necho ok", RiskLevel.LOW, "tab-stripped `<<-`, benign trailer"),
+            ("cat <<'EOF-X'\nx\nEOF-X\necho ok", RiskLevel.LOW, "delimiter containing a dash, benign"),
+            ("cat << 'EOF'\nx\nEOF\n# just a note", RiskLevel.LOW, "a comment after the terminator"),
+            ("cat <<'EOF' > f\nx\nEOF\necho \"a\nb\"", RiskLevel.LOW, "double-quoted string spanning lines"),
+            ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
             ("python3 << 'EOF'\nprint(1)\nEOF", RiskLevel.LOW, "python heredoc"),
             ("ssh host << 'EOF'\nuptime\nEOF", RiskLevel.LOW, "ssh heredoc"),
         ],
@@ -816,27 +861,52 @@ class TestHeredocSurroundings:
         assert result.allowed is True, f"{description}: {result.message}"
         assert result.exit_code == 0, description
 
-    def test_heredoc_body_size_does_not_drive_cost(self, safety_rules_path):
-        """A 5000-line body is one placeholder line, so the rewrite stays cheap."""
-        body = "\n".join(["x"] * 5000)
-        neutered = val_module._neuter_heredocs(f"cat << 'EOF'\n{body}\nEOF\necho done")
+    def test_rewrite_replaces_the_body_and_the_delimiter(self):
+        """The rewrite keeps structure and discards content, whatever the body's size.
 
-        assert neutered == "cat <<EOF\n\nEOF\necho done"
-
-    def test_neuter_returns_none_without_a_heredoc(self):
-        """No opener means nothing to rewrite, and the caller keeps its verdict."""
-        assert val_module._neuter_heredocs("echo hello") is None
-
-    def test_neuter_matches_bash_on_tab_stripped_terminators(self):
-        """`<<-` lets the terminator be indented with tabs, and bash still ends there.
-
-        Pinned directly rather than through validate_command: `_validate_heredoc_command`
-        bails on `<<-` before this runs (its base-command regex does not accept the
-        dash), so no end-to-end command reaches this branch today. Comparing the raw
-        line instead of the tab-stripped one would run the body past its terminator
-        and swallow the trailing command, so the guard is kept and pinned here
-        against the day that regex is widened.
+        `<<-` is pinned here as well as end-to-end: bash lets the terminator be
+        indented with tabs, and comparing the raw line instead of the
+        tab-stripped one would run the body past its terminator and swallow the
+        trailing command.
         """
-        neutered = val_module._neuter_heredocs("ls <<- 'EOF'\n\tx\n\tEOF\nrm -rf /")
+        body = "\n".join(["x"] * 5000)
+        neutered, base = val_module._neuter_heredocs(f"ls <<- 'EOF'\n\t{body}\n\tEOF\nrm -rf /")
 
-        assert neutered == "ls <<-EOF\n\n\tEOF\nrm -rf /"
+        assert neutered == "ls <<-SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /"
+        assert base == "ls"
+
+    def test_rewrite_denies_a_command_with_no_opener_it_can_see(self):
+        """Reaching the fallback means bashlex blamed a heredoc; finding none means we misread it.
+
+        Returning the base verdict here instead would restore the original
+        fail-open for every opener spelling the lexer cannot follow.
+        """
+        with pytest.raises(ParseError):
+            val_module._neuter_heredocs("echo hello")
+
+    def test_escalation_does_not_revalidate_an_unchanged_command(self, safety_rules_path, monkeypatch):
+        """A rewrite that changed nothing would re-enter this fallback forever.
+
+        Unreachable today - every command that gets here fails to parse, and an
+        unchanged command would fail identically - so it is pinned directly
+        rather than left as an argument in a comment.
+        """
+        monkeypatch.setattr(val_module, "_neuter_heredocs", lambda command: (command, "cat"))
+        seen = []
+        real = val_module.validate_command
+
+        def spy(command, config_path=None):
+            seen.append(command)
+            return real(command, config_path)
+
+        monkeypatch.setattr(val_module, "validate_command", spy)
+        val_module._escalate_past_heredoc(
+            val_module._get_rule_engine(safety_rules_path),
+            "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
+            "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
+            val_module.ValidationResult(allowed=True, risk_level=RiskLevel.LOW, message="base"),
+            safety_rules_path,
+        )
+
+        assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
+        assert seen == ["cat", "echo ok"]
