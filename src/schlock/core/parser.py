@@ -202,6 +202,59 @@ _STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
 _MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
 
 
+# Wrapper commands that pass through execution to subsequent args. Best-effort, NOT an
+# exhaustive enumeration - an unknown wrapper degrades to the pre-LAB-2754 behaviour.
+# SECURITY: 'env exec bash' executes exec despite env being first word
+# Categories for documentation and maintainability:
+# - Privilege: sudo, doas, pkexec (escalate privileges)
+# - Resource: nice, ionice, timeout, nohup, stdbuf, time (control resources)
+# - Execution: env, command, xargs, parallel (modify execution context)
+# - Multicall: busybox, toybox (can invoke any applet)
+# - Namespace: chroot, nsenter, unshare (container/namespace operations)
+WRAPPER_COMMANDS: frozenset[str] = frozenset(
+    {
+        # Privilege escalation
+        "sudo",  # Run as superuser
+        "doas",  # OpenBSD sudo equivalent
+        "pkexec",  # PolicyKit execution
+        # Resource control
+        "nice",  # Adjusts CPU priority
+        "ionice",  # Adjusts I/O priority
+        "timeout",  # Adds time limit
+        "nohup",  # Prevents hangup signals
+        "stdbuf",  # Modifies buffering
+        "time",  # Times execution
+        "chrt",  # Real-time scheduler control
+        "taskset",  # CPU affinity
+        # Execution context
+        "env",  # Modifies environment then executes
+        "command",  # Bypasses shell functions/aliases
+        "xargs",  # Executes command with piped input
+        "parallel",  # GNU parallel execution
+        "setsid",  # New session execution
+        "flock",  # Lock file, then exec
+        "strace",  # Trace, then exec
+        "ltrace",  # Trace library calls, then exec
+        "systemd-run",  # Run as a transient systemd unit
+        "setpriv",  # Drop/alter privileges, then exec
+        "unbuffer",  # expect(1) pty wrapper
+        "su",  # Switch user (also carries its own -c)
+        "runuser",  # su without PAM auth
+        "sg",  # Run under a different group
+        # Multicall binaries
+        "busybox",  # Multi-tool binary (can run any applet)
+        "toybox",  # Lightweight busybox alternative
+        # Namespace/container operations (CRITICAL - escape vectors)
+        "chroot",  # Change root filesystem
+        "nsenter",  # Enter namespaces
+        "unshare",  # Create namespaces
+        "setarch",  # Architecture override
+        "linux32",  # 32-bit mode
+        "linux64",  # 64-bit mode
+    }
+)
+
+
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     """Resolve a multicall binary to its effective applet and that applet's args.
 
@@ -724,46 +777,6 @@ class BashCommandParser:
         pipeline_dangers = self._detect_dangerous_pipelines(ast_nodes)
         dangers.extend(pipeline_dangers)
 
-        # Wrapper commands that pass through execution to subsequent args
-        # SECURITY: 'env exec bash' executes exec despite env being first word
-        # Categories for documentation and maintainability:
-        # - Privilege: sudo, doas, pkexec (escalate privileges)
-        # - Resource: nice, ionice, timeout, nohup, stdbuf, time (control resources)
-        # - Execution: env, command, xargs, parallel (modify execution context)
-        # - Multicall: busybox, toybox (can invoke any applet)
-        # - Namespace: chroot, nsenter, unshare (container/namespace operations)
-        wrapper_commands = {
-            # Privilege escalation
-            "sudo",  # Run as superuser
-            "doas",  # OpenBSD sudo equivalent
-            "pkexec",  # PolicyKit execution
-            # Resource control
-            "nice",  # Adjusts CPU priority
-            "ionice",  # Adjusts I/O priority
-            "timeout",  # Adds time limit
-            "nohup",  # Prevents hangup signals
-            "stdbuf",  # Modifies buffering
-            "time",  # Times execution
-            "chrt",  # Real-time scheduler control
-            "taskset",  # CPU affinity
-            # Execution context
-            "env",  # Modifies environment then executes
-            "command",  # Bypasses shell functions/aliases
-            "xargs",  # Executes command with piped input
-            "parallel",  # GNU parallel execution
-            "setsid",  # New session execution
-            # Multicall binaries
-            "busybox",  # Multi-tool binary (can run any applet)
-            "toybox",  # Lightweight busybox alternative
-            # Namespace/container operations (CRITICAL - escape vectors)
-            "chroot",  # Change root filesystem
-            "nsenter",  # Enter namespaces
-            "unshare",  # Create namespaces
-            "setarch",  # Architecture override
-            "linux32",  # 32-bit mode
-            "linux64",  # 64-bit mode
-        }
-
         def _get_all_words(node) -> list[str]:
             """Get ALL words from a command node, skipping assignments/redirects."""
             words = []
@@ -822,7 +835,7 @@ class BashCommandParser:
                     # Scan all words looking for exec/eval as a command (not as arg to another tool)
                     # Allow: sudo kubectl exec (kubectl handles exec as subcommand)
                     # Block: sudo exec bash (exec IS the command)
-                    elif cmd_name in wrapper_commands:
+                    elif cmd_name in WRAPPER_COMMANDS:
                         words = _get_all_words(node)
                         # Container tools that use "exec" as a subcommand (not shell exec)
                         container_tools = {"kubectl", "docker", "podman", "nerdctl", "crictl", "ctr"}
