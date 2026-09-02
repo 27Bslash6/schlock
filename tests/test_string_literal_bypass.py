@@ -6,11 +6,13 @@ ENTIRE match (both start AND end) falls within a string literal.
 Also tests FIX 2: Empty quoted string range bug fix.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
-from schlock.core.validator import validate_command
+from schlock.core.validator import clear_caches, validate_command
 
 
 class TestStringLiteralBypassFix:
@@ -152,3 +154,80 @@ class TestEmptyQuotedStringRangeFix:
             # All ranges must be valid
             for start, end in literals:
                 assert start <= end, f"Invalid range in '{command}': ({start}, {end})"
+
+
+class TestQuotedTokenDoesNotSuppressReconstructedPass:
+    """LAB-1732: a quoted token must not disable the quote-stripped rule pass.
+
+    The reconstructed-command pass is the only defence that catches a dangerous
+    command whose *name* is quoted (bash treats `"chmod"` and `chmod`
+    identically, so the quoting costs an attacker nothing). It used to be gated
+    behind `if not string_literals:`, so a single quoted token anywhere -
+    including the command name itself - switched the pass off for the whole
+    command.
+
+    ShellCheck is forced unavailable throughout: it independently catches some
+    of these, which would mask a regression in schlock's own rule matching.
+    """
+
+    @pytest.mark.parametrize(
+        "quoted,unquoted,expected_allowed,expected_risk",
+        [
+            ('"chmod" 777 /etc/shadow', "chmod 777 /etc/shadow", True, RiskLevel.HIGH),
+            ('"dd" if=/dev/zero of=/dev/sda', "dd if=/dev/zero of=/dev/sda", False, RiskLevel.BLOCKED),
+            ('"mkfs.ext4" /dev/sda', "mkfs.ext4 /dev/sda", False, RiskLevel.BLOCKED),
+            # Quoted *flag* rather than quoted name - same bypass shape.
+            ('rm "-rf" /', "rm -rf /", False, RiskLevel.BLOCKED),
+        ],
+    )
+    def test_quoted_command_name_matches_unquoted_verdict(
+        self, safety_rules_path, quoted, unquoted, expected_allowed, expected_risk
+    ):
+        """AC-1: quoting a token must not lower the verdict below its plain form."""
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            control = validate_command(unquoted, config_path=safety_rules_path)
+            clear_caches()
+            attack = validate_command(quoted, config_path=safety_rules_path)
+
+        # Absolute values, not just parity: a mutation that flattens both forms
+        # to SAFE must fail here rather than pass on equality.
+        assert (control.allowed, control.risk_level) == (expected_allowed, expected_risk), (
+            f"control drifted for {unquoted!r}: {control.allowed} {control.risk_level}"
+        )
+        assert (attack.allowed, attack.risk_level) == (expected_allowed, expected_risk), (
+            f"SECURITY BYPASS: {quoted!r} scored {attack.risk_level} (allowed={attack.allowed}), "
+            f"but {unquoted!r} scores {expected_risk}"
+        )
+
+    def test_multi_segment_reconstructs_per_segment(self, safety_rules_path):
+        """AC-2: the multi-segment branch must reconstruct each segment too."""
+        command = 'echo "${z:-y}" && "rm" -rf /'
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            result = validate_command(command, config_path=safety_rules_path)
+
+        assert not result.allowed, f"SECURITY BYPASS: {command!r} was allowed (risk={result.risk_level})"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command,expected_allowed,expected_risk",
+        [
+            # These are the false positives the old gate was protecting. The
+            # quoted word covers the ENTIRE rule match in the reconstructed
+            # string, so rebased literal ranges still suppress it.
+            ('echo "rm -rf /"', True, RiskLevel.SAFE),
+            ("echo 'rm -rf /'", True, RiskLevel.SAFE),
+            ('git commit -m "fix: remove rm -rf / from docs"', True, RiskLevel.LOW),
+            ('cat "rm -rf /"', True, RiskLevel.SAFE),
+        ],
+    )
+    def test_quoted_data_verdicts_unchanged(self, safety_rules_path, command, expected_allowed, expected_risk):
+        """AC-3: quoted *data* keeps its pre-fix verdict - no false-positive regression."""
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            result = validate_command(command, config_path=safety_rules_path)
+
+        assert (result.allowed, result.risk_level) == (expected_allowed, expected_risk), (
+            f"FALSE POSITIVE: {command!r} scored {result.risk_level} (allowed={result.allowed}), expected {expected_risk}"
+        )

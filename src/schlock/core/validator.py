@@ -784,6 +784,59 @@ def _check_special_cases(command: str) -> Optional[ValidationResult]:
     return None
 
 
+def _match_original_and_reconstructed(
+    engine: "RuleEngine",
+    parser: "BashCommandParser",
+    command: str,
+    ast_nodes: list,
+    string_literals: Optional[list[tuple]] = None,
+    heredoc_ranges: Optional[list[tuple]] = None,
+) -> RuleMatch:
+    """Match `command` against the rules as written AND quote/escape-stripped.
+
+    SECURITY CRITICAL: bashlex resolves escapes and drops quote characters when
+    it reconstructs a command from its AST, so `rm\\ -rf\\ /` and `"chmod" 777`
+    only reveal themselves to the regex rules in reconstructed form. Bash treats
+    `"chmod"` and `chmod` identically, so quoting costs an attacker nothing.
+
+    The reconstructed pass used to be skipped whenever the command contained any
+    quoted token at all (LAB-1732) - and quoting the command name was itself
+    enough to trip that gate, which is what made `"chmod" 777 /etc/shadow`
+    classify SAFE. It now always runs, with the quoted-literal ranges rebased
+    onto the reconstructed string so the false positives the gate was guarding
+    (`echo "rm -rf /"`, commit messages) stay suppressed on their own merits
+    rather than by switching the whole pass off.
+
+    Args:
+        engine: Rule engine to match against
+        parser: Parser used to reconstruct the command from its AST
+        command: Command (or single segment) to match
+        ast_nodes: Parsed AST for `command`; may be empty if parsing failed
+        string_literals: Pre-computed literal ranges for `command`; derived here
+                         when omitted
+        heredoc_ranges: Optional heredoc ranges for the original-form pass
+
+    Returns:
+        The higher-risk of the two matches.
+    """
+    if string_literals is None:
+        string_literals = parser.extract_string_literals(command, ast_nodes)
+
+    match = engine.match_command(
+        command,
+        string_literals=string_literals,
+        heredoc_ranges=heredoc_ranges,
+    )
+
+    reconstructed, recon_literals = parser.reconstruct_command_with_literals(command, ast_nodes)
+    if reconstructed and reconstructed != command:
+        recon_match = engine.match_command(reconstructed, string_literals=recon_literals)
+        if recon_match.risk_level > match.risk_level:
+            return recon_match
+
+    return match
+
+
 def _validate_heredoc_command(
     command: str,
     config_path: Optional[str] = None,
@@ -1032,11 +1085,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     # Parse segment to get its string literals
                     try:
                         seg_ast = parser.parse(segment)
-                        seg_literals = parser.extract_string_literals(segment, seg_ast)
                     except (ParseError, ValueError):
-                        seg_literals = []
+                        seg_ast = []
 
-                    seg_match = engine.match_command(segment, string_literals=seg_literals)
+                    seg_match = _match_original_and_reconstructed(engine, parser, segment, seg_ast)
 
                     if seg_match.matched and seg_match.rule:
                         all_matched_rules.append(seg_match.rule.name)
@@ -1062,25 +1114,14 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # Single segment - validate both original and reconstructed command
                 # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')
                 # We must match against both to catch escape-based evasion attempts
-                match = engine.match_command(
+                match = _match_original_and_reconstructed(
+                    engine,
+                    parser,
                     command,
+                    ast,
                     string_literals=string_literals,
                     heredoc_ranges=heredoc_ranges,
                 )
-
-                # Also check reconstructed command (catches escaped characters)
-                # SECURITY: Reconstruction strips quotes, which is useful for detecting
-                # escape sequences like 'rm\ -rf\ /' → 'rm -rf /', but we must NOT
-                # use it if the original match was inside a string literal (would cause false positives)
-                reconstructed = parser.reconstruct_command(ast)
-                if reconstructed and reconstructed != command:
-                    # Only check reconstructed if there are no string literals that would explain the difference
-                    # (i.e., difference is due to escapes, not quotes)
-                    if not string_literals:
-                        recon_match = engine.match_command(reconstructed, string_literals=[])
-                        # Use higher risk match
-                        if recon_match.risk_level > match.risk_level:
-                            match = recon_match
         except ConfigurationError as e:
             return ValidationResult(
                 allowed=False,
