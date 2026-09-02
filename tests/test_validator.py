@@ -746,6 +746,9 @@ class TestHeredocSurroundings:
             ("ls << 'EOF'\nEOF\necho \"x << y\"\nrm -rf /\ny", "`<<` inside a double-quoted word"),
             ("ls << 'EOF'\nEOF\necho '<<END'\nrm -rf /\nEND", "`<<` inside a single-quoted word"),
             ("cat <<'EOF' > s.sh\nhi\nEOF\n# uses << 'END'\nrm -rf /", "`<<` inside a comment"),
+            ("(echo hi)#<<Q\nrm -rf /\nQ\ncat <<'E'\nb\nE", "`#` opens a comment after `)` too"),
+            ("cat <<'EOF'\nx\nEOF\necho $'a\\'<<X b'\nrm -rf /\nX", "`\\'` does not close an ANSI-C `$'…'` string"),
+            ('ls <<\'EOF\'\nEOF\necho "a\\" << X b\\" c"\nrm -rf /\nX', '`\\"` does not close a double-quoted word'),
             ("ls <<'EOF'\nx\nEOF\ncat <<<'z'\nrm -rf /", "`<<<` here-string is not a heredoc"),
             ("cat <<'EOF' > f\nx\nEOF\necho \"a\nb\"\nrm -rf /", "double-quoted string spanning lines"),
             # A dangerous command is not excused by owning a heredoc of its own,
@@ -797,6 +800,13 @@ class TestHeredocSurroundings:
             ("cat << ''\nx\nEOF", "Heredoc opener with an empty delimiter"),
             # A stray separator survives the rewrite and fails bashlex there.
             ("ls << 'EOF'\nx\nEOF\n; rm -rf /", "unexpected token ';'"),
+            # An opener on a line that does not end there: bash starts the body
+            # after the line that finishes the command, so consuming from the
+            # next one would delete the commands in between. Denied either way,
+            # which costs a false positive on the benign spelling - the shape is
+            # rare, and reading it wrong drops a payload silently.
+            ("cat <<'EOF' \\\n&& rm -rf /\nhello\nEOF", "line that continues"),
+            ("cat <<'EOF' \\\n&& echo ok\nhello\nEOF", "line that continues"),
         ],
     )
     def test_unreadable_heredoc_fails_closed(self, safety_rules_path, command, expected_error):
@@ -830,6 +840,10 @@ class TestHeredocSurroundings:
             # AC-2: the pre-fix verdict for legitimate heredoc use, unchanged.
             ("cat << 'EOF'\nhello\nEOF", RiskLevel.LOW, "benign body, nothing after"),
             ("ls << 'EOF'\nx\nEOF", RiskLevel.SAFE, "whitelisted head, nothing after"),
+            # The whitelist is consulted on the head word alone. Passing the
+            # whole opener line instead would make `^git\\s+status` match and
+            # report SAFE, quietly widening what a heredoc head can vouch for.
+            ("git status << 'EOF'\nx\nEOF", RiskLevel.LOW, "whitelist is checked on the head word only"),
             ("cat << 'EOF'\nx\nEOF\necho done", RiskLevel.LOW, "benign trailing command"),
             # Compound statements leave a block closer after the terminator.
             # `done` and `fi` are not commands and never parse alone, so a fix
@@ -873,6 +887,17 @@ class TestHeredocSurroundings:
             ("cat << 'EOF'\nx\nEOF\necho 'a << b'", RiskLevel.LOW, "`<<` inside a single-quoted word"),
             ("cat << 'EOF'\nx\nEOF\necho \"a\nb << c\"", RiskLevel.LOW, "`<<` inside a multi-line quoted word"),
             ("cat << 'EOF'\nx\nEOF\ncat <<<'z'", RiskLevel.LOW, "`<<<` here-string after the terminator"),
+            ("cat << 'EOF'\nx\nEOF\necho $'a\\'<<X b'", RiskLevel.LOW, "`<<` inside an ANSI-C `$'…'` string"),
+            ('cat << \'EOF\'\nx\nEOF\necho "a\\" << X b\\" c"', RiskLevel.LOW, '`<<` past an escaped `\\"`'),
+            # Quote context has to reach the rule engine here too, or a commit
+            # message quoting a dangerous command is a hard BLOCK on a routine
+            # commit - and escalation only raises, so nothing could undo it.
+            (
+                "git commit -m \"never rm -rf / here\" <<'EOF'\nx\nEOF",
+                RiskLevel.LOW,
+                "a dangerous-looking quoted argument on the opener line",
+            ),
+            ("cat <<'EOF' | <<'X'\nx\nEOF\ny\nX", RiskLevel.LOW, "a segment that is only a redirection"),
             # Delimiter spellings whose quote removal has to happen across the
             # whole word: reading only the first quoted run gives `E`, and the
             # body then runs to a line reading `E` instead of `EOF`.

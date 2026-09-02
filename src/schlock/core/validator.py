@@ -678,8 +678,10 @@ _HEREDOC_REDIRECT_RE = re.compile(rf"\s*<<-?{re.escape(_HEREDOC_PLACEHOLDER)}")
 # Bash ends an unquoted word at a blank or an operator character.
 _WORD_END = frozenset(" \t;&|<>()")
 
-# `#` opens a comment only at the start of a word.
-_WORD_START_AFTER = frozenset(" \t;&|(<>")
+# `#` opens a comment only at the start of a word, which is anywhere a bash
+# metacharacter just ended one. Omitting `)` made `(echo hi)#<<Q` read as an
+# opener that bash - and bashlex - both read as a comment.
+_WORD_START_AFTER = frozenset(" \t;&|()<>")
 
 
 def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
@@ -724,7 +726,9 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     return "".join(delimiter), pos
 
 
-def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, int]], str]:
+def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting it hides the state machine
+    line: str, quote: str
+) -> tuple[str, list[tuple[str, bool, int]], str]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted* `<<` opens a heredoc. Bash reads `echo "x << y"` and
@@ -743,21 +747,31 @@ def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, 
     """
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
+    continued = False
     pos = 0
 
     while pos < len(line):
         char = line[pos]
 
         if quote:
-            if char == quote:
+            # `quote` holds the opening sequence, so `$'` and `'` stay distinct:
+            # a backslash escapes inside `"…"` and `$'…'` but not inside `'…'`.
+            if char == quote[-1]:
                 quote = ""
-            elif char == "\\" and quote == '"' and pos + 1 < len(line):
+            elif char == "\\" and quote != "'" and pos + 1 < len(line):
                 out.append(char)
                 pos += 1
                 char = line[pos]
             out.append(char)
             pos += 1
         elif char == "\\":
+            continued = pos + 1 >= len(line)
+            out.append(line[pos : pos + 2])
+            pos += 2
+        elif char == "$" and pos + 1 < len(line) and line[pos + 1] in "'\"":
+            # $'…' is ANSI-C quoting, $"…" is locale translation; both escape
+            # with a backslash, and $" is otherwise an ordinary double quote.
+            quote = "$'" if line[pos + 1] == "'" else '"'
             out.append(line[pos : pos + 2])
             pos += 2
         elif char in "'\"":
@@ -783,6 +797,12 @@ def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, 
         else:
             out.append(char)
             pos += 1
+
+    if openers and (quote or continued):
+        # A trailing `\` or an unclosed quote means this line does not finish
+        # the command, so bash starts the body after a later line. Consuming
+        # from the next one would delete the commands in between.
+        raise ParseError("Heredoc opener on a line that continues; the body's start is unknown")
 
     return "".join(out), openers, quote
 
@@ -912,8 +932,15 @@ def _heredoc_base_result(engine: "RuleEngine", base_command: str) -> ValidationR
             matched_rules=[],
         )
 
-    # Check if base command matches any dangerous patterns
-    match = engine.match_command(base_command)
+    # Check if base command matches any dangerous patterns. Quote context
+    # matters as much here as anywhere: without it a commit message mentioning
+    # `rm -rf /` is a hard BLOCK on a command that is LOW without the heredoc.
+    parser = _get_parser()
+    try:
+        literals = parser.extract_string_literals(base_command, parser.parse(base_command))
+    except (ParseError, ValueError):
+        literals = None  # a compound head like `for f in a b; do cat` need not parse alone
+    match = engine.match_command(base_command, string_literals=literals)
     if match.matched and match.rule:  # rule is guaranteed by __post_init__ but helps type checker
         return ValidationResult(
             allowed=match.risk_level not in (RiskLevel.BLOCKED,),
