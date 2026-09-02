@@ -10,9 +10,13 @@ whitelist:
   - ^pwd$
 
   # Safe directory cleanup operations (common developer workflows)
-  # Path tail excludes whitespace and shell metacharacters: a greedy ".*" before the "$"
-  # would let "rm -rf node_modules/x; rm -rf /" match end-to-end and whitelist the chain.
-  - '^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/[^\s;&|<>()$`]*)?$'
+  # Only "rm -rf <dir>" and literal descendants: each segment is [A-Za-z0-9._@+-]+ that is
+  # not "." and does not start with ".." (".cache" yes; "." / ".." / globs / braces / "~" no).
+  # The whitelist sees the raw string before expansion, so "node_modules/../.git" would
+  # otherwise walk out of <dir>. One terminal bare "*" is allowed: unlike ".*" it never
+  # expands to "." or "..". No trailing slash: GNU rm follows a trailing-slash symlink and
+  # empties its target, so "rm -rf node_modules/" on a symlinked node_modules is not safe.
+  - '^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*)*(/\*)?$'
   - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)
 
   # Safe /tmp operations (testing/temporary files)
@@ -22,9 +26,11 @@ whitelist:
   # Safe container registry authentication via gh CLI
   # Token is piped directly to docker's credential store, never exposed to stdout/logs.
   # GitHub's official docs recommend this pattern for ghcr.io authentication.
-  # Registry and user are spelled out rather than "\S+": "\S+" accepts ";" and "${IFS}",
-  # smuggling a whole command into the middle of an otherwise end-anchored pattern.
-  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+[A-Za-z0-9._:/-]+\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
+  # Registry is literally ghcr.io: a GitHub token is only meaningful there, and any other
+  # registry would just receive the caller's token. The user slot is spelled out rather
+  # than "\S+", which accepts ";" and "${IFS}" and smuggles a command into the middle of
+  # an otherwise end-anchored pattern.
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
 
 # Note: This file has no rules section, only whitelist patterns
 rules: []

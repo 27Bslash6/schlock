@@ -152,6 +152,8 @@ whitelist:
 
 `$` alone does not make a pattern safe for chained commands. A pattern that must span a whole command has to spell out the characters it accepts (e.g. `[\w./:-]+`) rather than use `.*` or `\S+`, which match `;`, `&`, `|` and `${IFS}` happily.
 
+Spelling out separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..` and `host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf` and `gh auth token` entries in `00_whitelist.yaml` show the shape.
+
 Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
 
 #### Security: User-Level Only
