@@ -673,7 +673,7 @@ _HEREDOC_PLACEHOLDER = "SCHLOCK_HEREDOC"
 
 # Strips the rewritten redirection back off a segment. Exact rather than a
 # guess, because the rewrite chose this delimiter itself.
-_HEREDOC_REDIRECT_RE = re.compile(rf"\s*<<-?{_HEREDOC_PLACEHOLDER}")
+_HEREDOC_REDIRECT_RE = re.compile(rf"\s*<<-?{re.escape(_HEREDOC_PLACEHOLDER)}")
 
 # Bash ends an unquoted word at a blank or an operator character.
 _WORD_END = frozenset(" \t;&|<>()")
@@ -690,12 +690,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     line reading exactly `EOF`. Reading only the first quoted run instead yields
     `E`, and the body then swallows every command after the real terminator.
 
-    Args:
-        text: Line being lexed
-        pos: Offset of the first delimiter character
-
-    Returns:
-        ``(delimiter, offset just past the word)``
+    Returns ``(delimiter, offset just past the word)``.
 
     Raises:
         ParseError: on an unterminated quote or an empty delimiter. A delimiter
@@ -739,19 +734,12 @@ def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, 
     lexical context over: enumerate the tokenization deltas before trusting a
     rewrite, and deny when the reading is uncertain.
 
-    Args:
-        line: One line of the command
-        quote: Quote character left open by the previous line, or "" - a string
-            spanning lines means the next line is not shell to be scanned
-
-    Returns:
-        ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener order, open quote)``
-        where ``offset`` is where the `<<` sits in ``line`` - the only honest source
-        for "what command owns this heredoc", since a second regex looking for the
-        first `<<` would find the quoted ones this skipped
-
-    Raises:
-        ParseError: propagated from :func:`_read_delimiter`
+    ``quote`` carries the quote character left open by the previous line, since a
+    string spanning lines means the next line is not shell to be scanned. Returns
+    ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener order, open
+    quote)``; each ``offset`` is where its `<<` sits, which is the only honest
+    source for "what command owns this heredoc" - a second regex looking for the
+    first `<<` would find the quoted ones this deliberately skipped.
     """
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
@@ -817,11 +805,7 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
     cost flat: writing a 5000-line file through a heredoc is an everyday
     operation, and its body is not shell that needs validating.
 
-    Args:
-        command: Full command string containing at least one heredoc
-
-    Returns:
-        ``(rewritten command, text before the first heredoc opener)``
+    Returns ``(rewritten command, text before the first heredoc opener)``.
 
     Raises:
         ParseError: when the reading is uncertain - a delimiter that cannot be
@@ -973,23 +957,23 @@ def _escalate_past_heredoc(
     the whole-command pass before the per-segment loop it relies on (LAB-2752).
     Neither pass subsumes the other: the whole-command pass is the only one that
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
-    whitelist cannot silence. Cost of the extra passes, measured with ShellCheck
-    installed: ~12ms for a heredoc followed by two commands, and 538ms for a
-    pathological 2000-command chain - against 409ms for that same chain with no
-    heredoc in front of it, so this path stays within reach of the ordinary one.
+    whitelist cannot silence.
+
+    The extra passes cost real time, and the reason they are worth it is that
+    this is the exceptional path - only a quoted heredoc delimiter arrives here.
+    Measured: `cat <<'EOF' > s.sh … EOF` plus two commands is 21ms against 7ms
+    for the same work without a heredoc (ShellCheck installed, one subprocess
+    per pass); a pathological 2000-command chain is 538ms against 409ms for that
+    chain with no heredoc in front of it. Gating the per-segment pass on
+    "was the whole-command pass whitelisted" would recover most of that, and is
+    deliberately not done: it would make this control's correctness depend on a
+    predicate about another function's short-circuit, which is a fail-open
+    coupling traded for milliseconds on a path that is already the slow one.
 
     Escalation only ever raises risk. That is what keeps a legitimate heredoc's
     existing verdict intact, and it bounds a misread rewrite to a false positive.
 
-    Args:
-        engine: Rule engine, already loaded
-        command: Full command string with heredoc
-        neutered: Rewrite of ``command`` from :func:`_neuter_heredocs`
-        result: Verdict for the heredoc's own command
-        config_path: Optional rules config path
-
-    Returns:
-        ``result``, or the worst verdict among the commands around the heredoc
+    Returns ``result``, or the worst verdict among the commands around it.
     """
     parser = _get_parser()
     segments = parser.extract_command_segments(neutered, parser.parse(neutered))

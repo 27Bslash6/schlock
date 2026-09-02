@@ -785,26 +785,44 @@ class TestHeredocSurroundings:
         assert result.message == "Alongside heredoc: Force push overwrites remote history"
 
     @pytest.mark.parametrize(
-        "command,description",
+        "command,expected_error",
         [
-            ("ls << 'EOF'\nx\nEOF\n; rm -rf /", "a stray separator is shell we cannot read"),
-            ("ls << 'X'\nrm -rf /", "no terminator: the body has no end"),
-            ("ls << 'EOF'\nx\nEOF\necho $((1<<2))", "arithmetic `<<`, already blocked repo-wide"),
-            ("cat << 'EO\nx\nEOF", "unterminated quote in the delimiter"),
-            ("cat << ''\nx\nEOF", "empty delimiter"),
-            ("cat << 'EOF'\nx", "opener with no terminator at all"),
+            ("ls << 'X'\nrm -rf /", "Heredoc 'X' has no terminator; its body has no end"),
+            ("cat << 'EOF'\nx", "Heredoc 'EOF' has no terminator; its body has no end"),
+            # Arithmetic `<<` reads as an opener whose body never terminates.
+            # Bare `echo $((1+1))` is already blocked repo-wide, so this aligns
+            # the fallback with the rest of the validator rather than adding a
+            # new cliff.
+            ("ls << 'EOF'\nx\nEOF\necho $((1<<2))", "Heredoc '2' has no terminator; its body has no end"),
+            ("cat << ''\nx\nEOF", "Heredoc opener with an empty delimiter"),
+            # A stray separator survives the rewrite and fails bashlex there.
+            ("ls << 'EOF'\nx\nEOF\n; rm -rf /", "unexpected token ';'"),
         ],
     )
-    def test_unreadable_heredoc_fails_closed(self, safety_rules_path, command, description):
+    def test_unreadable_heredoc_fails_closed(self, safety_rules_path, command, expected_error):
         """Not knowing where a body ends means not knowing which text is shell.
 
-        Escalation cannot be skipped in that case: whatever it could not read
-        might be the command that matters, so the verdict is deny.
+        The reason is asserted, not just the verdict. A mis-lexed opener denies
+        too - by inventing a heredoc that never terminates - so `BLOCKED` alone
+        would pass with the lexer's context tracking removed (LAB-1584).
         """
         result = validate_command(command, config_path=safety_rules_path)
 
-        assert result.risk_level == RiskLevel.BLOCKED, description
-        assert result.allowed is False, description
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert expected_error in (result.error or "")
+        assert result.message.startswith("BLOCKED: Cannot determine what this heredoc runs")
+
+    def test_unterminated_quote_in_a_delimiter_is_rejected(self):
+        """A delimiter whose quote never closes has no readable end.
+
+        Pinned directly: bashlex blames the unmatched quote rather than the
+        here-document, so `validate_command` denies before the fallback runs and
+        cannot reach this branch. Without it the reader would run to end of line
+        and hand back a delimiter bash never had.
+        """
+        with pytest.raises(ParseError, match="Unterminated"):
+            val_module._read_delimiter("'EOF", 0)
 
     @pytest.mark.parametrize(
         "command,expected_risk,description",
@@ -847,6 +865,20 @@ class TestHeredocSurroundings:
             ("cat <<- 'EOF'\n\tx\n\tEOF\necho ok", RiskLevel.LOW, "tab-stripped `<<-`, benign trailer"),
             ("cat <<'EOF-X'\nx\nEOF-X\necho ok", RiskLevel.LOW, "delimiter containing a dash, benign"),
             ("cat << 'EOF'\nx\nEOF\n# just a note", RiskLevel.LOW, "a comment after the terminator"),
+            # A `<<` bash does not read as an opener must not be read as one
+            # here either. Reading these as openers denies all four, because the
+            # phantom body then has no terminator.
+            ("cat << 'EOF'\nx\nEOF\n# see << 'END' below", RiskLevel.LOW, "`<<` inside a comment"),
+            ("cat << 'EOF'\nx\nEOF\necho \"a << b\"", RiskLevel.LOW, "`<<` inside a double-quoted word"),
+            ("cat << 'EOF'\nx\nEOF\necho 'a << b'", RiskLevel.LOW, "`<<` inside a single-quoted word"),
+            ("cat << 'EOF'\nx\nEOF\necho \"a\nb << c\"", RiskLevel.LOW, "`<<` inside a multi-line quoted word"),
+            ("cat << 'EOF'\nx\nEOF\ncat <<<'z'", RiskLevel.LOW, "`<<<` here-string after the terminator"),
+            # Delimiter spellings whose quote removal has to happen across the
+            # whole word: reading only the first quoted run gives `E`, and the
+            # body then runs to a line reading `E` instead of `EOF`.
+            ('cat << "E"OF\nx\nEOF\necho ok', RiskLevel.LOW, "delimiter split across a double-quoted run"),
+            ("cat << 'E'OF\nx\nEOF\necho ok", RiskLevel.LOW, "delimiter split across a single-quoted run"),
+            ("cat <<\\EOF\nx\nEOF\necho ok", RiskLevel.LOW, "backslash-escaped delimiter"),
             ("cat <<'EOF' > f\nx\nEOF\necho \"a\nb\"", RiskLevel.LOW, "double-quoted string spanning lines"),
             ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
             ("python3 << 'EOF'\nprint(1)\nEOF", RiskLevel.LOW, "python heredoc"),
