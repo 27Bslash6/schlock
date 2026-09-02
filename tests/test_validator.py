@@ -712,6 +712,10 @@ class TestHeredocSurroundings:
         """Pin verdicts to the rules, not to whether ShellCheck is installed."""
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
         val_module._global_cache.clear()
+        yield
+        # Verdicts computed with ShellCheck off must not leak into later tests
+        # that validate the same string with it on.
+        val_module._global_cache.clear()
 
     @pytest.mark.parametrize(
         "command,description",
