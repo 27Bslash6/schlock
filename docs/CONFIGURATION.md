@@ -143,11 +143,16 @@ whitelist:
 # BAD: Too broad — matches ALL gcloud commands including dangerous ones
 whitelist:
   - ^gcloud
+
+# BAD: anchored but greedy — ".*" swallows "; rm -rf /", so the pattern spans
+# "npm run build; rm -rf /" end to end and whitelists the whole chain
+whitelist:
+  - ^npm\s+run\s+.*$
 ```
 
-Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
+`$` alone does not make a pattern safe for chained commands. A pattern that must span a whole command has to spell out the characters it accepts (e.g. `[\w./:-]+`) rather than use `.*` or `\S+`, which match `;`, `&`, `|` and `${IFS}` happily.
 
-To whitelist a whole multi-command pipeline (e.g. `gh auth token | docker login … --password-stdin`), the pattern must cover the command end to end — anchor it with `$`. A pattern that only matches the first segment will let the pipeline through to per-segment validation instead, where the later segments are judged on their own.
+Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
 
 #### Security: User-Level Only
 

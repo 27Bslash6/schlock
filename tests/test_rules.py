@@ -133,6 +133,20 @@ rules:
         assert engine.is_whitelisted("git status --short")
         assert engine.is_whitelisted("git status; rm -rf /")
 
+    def test_is_fully_whitelisted_allows_pattern_to_overshoot_rstrip(self, tmp_path):
+        """The ">=" is load-bearing: a "\\s*" tail spans whitespace rstrip() discounted."""
+        rules = tmp_path / "trailing.yaml"
+        rules.write_text("whitelist:\n  - ^git\\s+status\\s*$\nrules: []\n")
+        engine = RuleEngine(rules)
+        assert engine.is_fully_whitelisted("git status  ")
+
+    def test_match_command_can_skip_the_whitelist(self, test_rules_file):
+        """use_whitelist=False lets the multi-segment fallback re-check a command whose
+        prefix is whitelisted (LAB-2752) without the prefix vouching for the rest."""
+        engine = RuleEngine(test_rules_file)
+        assert not engine.match_command("git status; rm -rf /").matched
+        assert engine.match_command("git status; rm -rf /", use_whitelist=False).matched
+
     def test_no_match_returns_safe(self, test_rules_file):
         """Unknown commands are safe."""
         engine = RuleEngine(test_rules_file)
