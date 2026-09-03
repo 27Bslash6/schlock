@@ -35,19 +35,19 @@ DEFAULT_BIN_ROOT = Path(__file__).parent.parent.parent.parent / ".claude-plugin"
 # Size guards (spec §5, LAB-528). Both fail-closed: a trip raises
 # NativeBridgeError and the caller falls back to bashlex.
 #
-# Input guard, checked on the UTF-8 byte length BEFORE spawning. Shared with
-# integrations/commit_filter.py, whose own check stays fail-open — that module
-# filters commit messages, it does not decide whether a command runs.
+# Input guard, checked on the UTF-8 byte length BEFORE spawning (the CLI reads
+# bytes). Shared with integrations/commit_filter.py, which counts code points
+# and fails toward skip-extraction rather than raising — see its docstring.
 MAX_COMMAND_SIZE = 64 * 1024
 
-# Anti-OOM output bound on the incremental stdout read. Its job is to bound this
-# process's memory against a runaway or tampered binary, so it must sit ABOVE the
-# largest AST a legitimate max-size input can produce. The spec's original 12 MB
-# came from an `echo a;` shape (~125× amplification); the densest shape mvdan
-# emits is a bare pipeline chain (`a|b|c|…;` → ~410× measured on v3.13.1, 25.6 MiB
-# for 64 KiB). 512× keeps the two constants coherent with headroom; the
-# `TestOutputBoundServesLegitimateInput` cases are the tripwire if mvdan's JSON grows.
-MAX_AST_JSON_SIZE = 512 * MAX_COMMAND_SIZE
+# Anti-OOM output bound on the incremental stdout read: a memory budget against a
+# runaway or tampered binary (decoded JSON costs ~40 B of Python heap per byte).
+# It clears the sparse `echo a;` shape at 64 KiB (~7.9 MiB) but NOT dense ones —
+# `a;`, `x=1;` and bare pipeline chains reach ~410× amplification (25.6 MiB on
+# mvdan v3.13.1) and trip it → bashlex. Deliberate: those shapes also blow the
+# §6 250 ms timeout, so native never serves them anyway, and a bound that admitted
+# them would let one 64 KiB command cost the hook ~1 GiB.
+MAX_AST_JSON_SIZE = 12 * 1024 * 1024
 
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_STDERR_BYTES = 8 * 1024
@@ -155,9 +155,15 @@ class NativeBridge:
                 output overflow, stdin/stdout error (exit 3/4), crash, or
                 undecodable output.
         """
-        payload_in = command.encode("utf-8")
-        if len(payload_in) > MAX_COMMAND_SIZE:
-            raise NativeBridgeError(f"command exceeds native parser input bound ({len(payload_in)} > {MAX_COMMAND_SIZE} bytes)")
+        try:
+            command_bytes = command.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            # A lone surrogate arrives via a `\ud800` escape in the hook's JSON stdin.
+            raise NativeBridgeError(f"command is not UTF-8 encodable: {exc}")
+        if len(command_bytes) > MAX_COMMAND_SIZE:
+            raise NativeBridgeError(
+                f"command exceeds native parser input bound ({len(command_bytes)} > {MAX_COMMAND_SIZE} bytes)"
+            )
         binary = self._binary()
         try:
             proc = subprocess.Popen(
@@ -172,7 +178,7 @@ class NativeBridge:
         # Popen as a context manager closes the three pipes and reaps the child
         # even on the raising paths below.
         with proc:
-            payload, stderr, returncode = self._exchange(proc, payload_in, binary)
+            payload, stderr, returncode = self._exchange(proc, command_bytes, binary)
 
         if returncode == EXIT_OK:
             try:
@@ -187,14 +193,14 @@ class NativeBridge:
         # whatever landed on stdout is a prefix, so it is dropped, not returned.
         raise NativeBridgeError(f"native parser exited {returncode}: {detail}")
 
-    def _exchange(self, proc: subprocess.Popen, command: bytes, binary: Path) -> "tuple[bytes, bytes, int]":
+    def _exchange(self, proc: subprocess.Popen, command_bytes: bytes, binary: Path) -> "tuple[bytes, bytes, int]":
         """Feed stdin, read stdout under the bound, and collect the exit code."""
         if proc.stdin is None or proc.stdout is None or proc.stderr is None:
             _kill_and_reap(proc)
             raise NativeBridgeError("native parser pipes unavailable")
 
         try:
-            proc.stdin.write(command)
+            proc.stdin.write(command_bytes)
             proc.stdin.close()
         except OSError as exc:
             # Child exited before consuming stdin, so it only ever saw a prefix.

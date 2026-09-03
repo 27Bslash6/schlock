@@ -111,9 +111,6 @@ class TestCorpusParseability:
         with pytest.raises(ParseError):
             NativeBridge().parse_json("if; then")
 
-    def test_default_output_bound_is_the_spec_value(self):
-        assert MAX_AST_JSON_SIZE == 32 * 1024 * 1024
-
 
 class TestExitContract:
     """Exit 3/4 and crashes must never be reported as a (partial) success."""
@@ -194,54 +191,54 @@ class TestSpawnDiscipline:
         assert calls[0]["stdout"] is subprocess.PIPE
 
 
-class TestInputGuard:
-    """Input guard (spec §5.1): oversized input never reaches the subprocess — fail-closed."""
+class TestSizeGuards:
+    """Spec §5: both guards fail-closed — a trip raises NativeBridgeError before any partial work."""
 
-    def test_default_input_bound_is_the_spec_value(self):
+    def test_default_bounds_are_the_spec_values(self):
         assert MAX_COMMAND_SIZE == 64 * 1024
+        assert MAX_AST_JSON_SIZE == 12 * 1024 * 1024
 
-    def test_oversized_input_never_spawns(self, tmp_path, monkeypatch):
-        binary = _fake_binary(tmp_path, "sys.stdout.write('{}')\n")
-        spawns = []
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: spawns.append(a))
-
+    @pytest.mark.parametrize(
+        "command",
+        ["a" * (MAX_COMMAND_SIZE + 1), "é" * (MAX_COMMAND_SIZE // 2 + 1)],
+        ids=["ascii", "multibyte-under-the-char-count"],
+    )
+    def test_oversized_input_never_spawns(self, monkeypatch, command):
+        # Bytes, not code points: the CLI reads bytes, so a len(str) check would under-guard.
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("spawned"))
         with pytest.raises(NativeBridgeError, match="exceeds"):
-            NativeBridge(binary_path=binary).parse_json("a" * (MAX_COMMAND_SIZE + 1))
-        assert spawns == []
+            NativeBridge().parse_json(command)
 
     def test_input_at_the_bound_is_accepted(self, tmp_path):
         binary = _fake_binary(tmp_path, "sys.stdout.write(str(len(sys.stdin.buffer.read())))\n")
         assert NativeBridge(binary_path=binary).parse_json("a" * MAX_COMMAND_SIZE) == str(MAX_COMMAND_SIZE)
 
-    def test_bound_is_measured_in_utf8_bytes_not_code_points(self, tmp_path, monkeypatch):
-        # The CLI reads bytes; a 64 KB *character* count of multibyte input is
-        # far larger on the wire, so guarding on len(str) would under-guard.
-        binary = _fake_binary(tmp_path, "sys.stdout.write('{}')\n")
+    def test_unencodable_input_routes_to_fallback(self, monkeypatch):
+        # A lone surrogate reaches the hook via a `\ud800` escape in its JSON stdin.
         monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("spawned"))
-        with pytest.raises(NativeBridgeError, match="exceeds"):
-            NativeBridge(binary_path=binary).parse_json("é" * (MAX_COMMAND_SIZE // 2 + 1))
+        with pytest.raises(NativeBridgeError, match="not UTF-8"):
+            NativeBridge().parse_json("echo \ud800")
+
+    def test_deeply_nested_json_routes_to_fallback(self, tmp_path):
+        # json.loads overflows the C scanner on deep nesting; a bare RecursionError skips T5's routing.
+        binary = _fake_binary(tmp_path, "sys.stdout.write('[' * 100000 + ']' * 100000)\n")
+        with pytest.raises(NativeBridgeError, match="malformed"):
+            NativeBridge(binary_path=binary).parse("echo hi")
 
     def test_commit_filter_shares_the_core_constant(self):
-        # Relocated, not duplicated. commit_filter's own fail-open behaviour on a
-        # trip is pinned by tests/test_commit_filter.py (test_size_limit_prevents_dos,
-        # test_oversized_command_skips_bashlex_parse).
         assert commit_filter.MAX_COMMAND_SIZE == MAX_COMMAND_SIZE
 
 
 @needs_binary
-class TestOutputBoundServesLegitimateInput:
-    """Output guard (spec §5.2) must trip only on subprocess pathology, never on a legitimate
-    max-size command. `a|b|…;` is the densest node-per-byte shape mvdan produces (~400× JSON
-    amplification measured, LAB-528); `echo a;` is the ~125× shape the original eval used."""
+class TestOutputBoundAtMaxInput:
+    """The bound clears the spec's legitimate 64 KiB worst case and trips CLEANLY on the dense
+    shapes it is sized to reject (memory budget — see MAX_AST_JSON_SIZE)."""
 
-    @pytest.mark.parametrize("unit", ["a|b|c|d|e|f|g|h;", "a|b;", "a;", "x=1;", "echo a;"])
-    def test_max_size_input_parses_on_the_native_tier(self, unit):
-        command = (unit * (MAX_COMMAND_SIZE // len(unit))).ljust(MAX_COMMAND_SIZE)
-        assert len(command.encode("utf-8")) == MAX_COMMAND_SIZE
-        payload = NativeBridge().parse_json(command)
-        assert json.loads(payload)["Type"] == "File"
+    def test_sparse_max_size_input_parses_on_the_native_tier(self):
+        command = ("echo a;" * (MAX_COMMAND_SIZE // 7)).ljust(MAX_COMMAND_SIZE)
+        assert json.loads(NativeBridge().parse_json(command))["Type"] == "File"
 
-    def test_output_bound_derives_from_the_input_bound(self):
-        # 512× the input cap: above the ~400× measured legitimate ceiling, so a
-        # bump to either constant keeps them coherent instead of silently re-opening MAJ #7.
-        assert MAX_AST_JSON_SIZE == 512 * MAX_COMMAND_SIZE
+    def test_dense_max_size_input_trips_the_bound_and_falls_back(self):
+        command = "a|b|c|d|e|f|g|h;" * (MAX_COMMAND_SIZE // 16)
+        with pytest.raises(NativeBridgeError, match="exceeded"):
+            NativeBridge().parse_json(command)

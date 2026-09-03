@@ -39,8 +39,8 @@ from typing import Any, Optional
 import bashlex
 import bashlex.errors
 
-# Shared with the core parser's pre-spawn input guard (spec §5). Core is fail-closed on a
-# trip; every check in THIS module stays fail-open — see the module docstring.
+# Shared with core's fail-closed pre-spawn guard (spec §5). This module counts code points
+# (bashlex cost) and fails toward skip-extraction, never a raise — see the module docstring.
 from schlock.core.native_bridge import MAX_COMMAND_SIZE
 
 logger = logging.getLogger(__name__)
@@ -335,7 +335,7 @@ class CommitMessageFilter:
         # Size limit check (DoS prevention per Security Specialist)
         if len(command) > MAX_COMMAND_SIZE:
             logger.warning(
-                f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} bytes). Skipping extraction (fail-open)."
+                f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars). Skipping extraction (fail-open)."
             )
             return None
 
