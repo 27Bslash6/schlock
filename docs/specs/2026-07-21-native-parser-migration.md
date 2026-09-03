@@ -97,7 +97,7 @@ The bridge: (1) input size-guard (§5); (2) `subprocess.Popen`, write command to
 ## 5. Size guards (both fail-closed → fallback)
 
 1. **Input guard** — before spawn. Relocate `MAX_COMMAND_SIZE = 64*1024` from `commit_filter.py` to a shared `core` constant (update the 4 refs `:254/:291/:470/:569`; **preserve commit_filter's fail-open** local behavior while core is **fail-closed**). Input > 64 KB → skip native → §6 fallback.
-2. **Output guard (anti-OOM)** — a bounded incremental stdout read (§3.2), not a post-hoc `len()`. `MAX_AST_JSON_SIZE = 12 * 1024 * 1024` (12 MB) — deliberately **above** the eval's ~8.8 MB legit worst-case output for a 64 KB input, so it trips only on genuine subprocess pathology (a misbehaving/backdoored binary streaming garbage), never on legitimate max-size input. Overflow → kill+wait → §6 fallback. Its job is bounding the hook's memory against a runaway subprocess, not a second input-derived guard.
+2. **Output guard (anti-OOM)** — a bounded incremental stdout read (§3.2), not a post-hoc `len()`. `MAX_AST_JSON_SIZE = 512 * MAX_COMMAND_SIZE` (32 MiB) — deliberately **above** the legit worst-case output for a 64 KB input, so it trips only on genuine subprocess pathology (a misbehaving/backdoored binary streaming garbage), never on legitimate max-size input. Overflow → kill+wait → §6 fallback. Its job is bounding the hook's memory against a runaway subprocess, not a second input-derived guard. *T4 correction (LAB-528):* the eval's ~8.8 MB figure measured an `echo a;` shape (~125× amplification); the densest legitimate shape is a bare pipeline chain `a|b|c|…;` at ~410× (25.6 MiB for 64 KiB, mvdan v3.13.1), and `a;`/`x=1;`/`a|b;` all exceed 12 MB. 512× is the measured ceiling with headroom; `tests/test_native_bridge.py::TestOutputBoundServesLegitimateInput` pins it.
 
 ---
 
@@ -115,7 +115,7 @@ Tier order is fixed: **native → in-process bashlex → deny.** Every bridge ex
 | stdin read error (exit 3) / span < input length | returncode / span check | → bashlex |
 | Native parse error (exit 2) | returncode == 2 | → bashlex |
 | Timeout (`T = 250 ms`, ~100× typical) | `TimeoutExpired` | kill+wait → bashlex |
-| Input > 64 KB / output > 12 MB | §5 guards | → bashlex |
+| Input > 64 KB / output > 32 MiB | §5 guards | → bashlex |
 | JSON malformed / **unmapped node or WordPart** | decode error / adapter raise | → bashlex |
 | **bashlex fallback also raises** | `bashlex.errors.ParsingError` | **raise `ParseError` → BLOCKED** (unchanged production behavior) |
 
@@ -171,7 +171,7 @@ Promote as sub-issues of **LAB-409** after this gate. Stage-2 = foundational bui
 | T1 | Build & vendor `schlock-parse` Go CLI + `MANIFEST.json` (stdin-err→exit 3, comments-off, reproducible `-trimpath`) | s | 2 | — |
 | T2 | `NativeBridge` + `AstView`: mvdan→bashlex **kind-mapping table** (both walker families, 12 kinds; unmapped→raise); **parse-once, derive segments** from parent AST; `Popen`+bounded read | l | 2 | T1 |
 | T3 | Arg-unescape `.word` + **byte→char offsets for all 3 `.pos` consumers** + **superset differential oracle** (all detection outputs + full verdict + dangerous variants, ShellCheck-disabled) | l | 2 | T2, T5 |
-| T4 | Size guards — input 64 KB (relocate `MAX_COMMAND_SIZE`, keep commit_filter fail-open) + output 12 MB anti-OOM bounded read | s | 2 | T2 |
+| T4 | Size guards — input 64 KB (relocate `MAX_COMMAND_SIZE`, keep commit_filter fail-open) + output 32 MiB anti-OOM bounded read | s | 2 | T2 |
 | T5 | Fail-closed state machine + `SCHLOCK_PARSER` (user/global-scope-only, allowlisted, `native`=native-only) | m | 2 | T2, T4 |
 | T6 | Binary integrity: `bin/`+`vendor/` in self-protection paths + rules; runtime SHA-256 vs MANIFEST → mismatch fallback | m | 2 | T1 |
 | T7 | Re-baseline `test_performance.py:121,137`; assert parse-once (no per-segment spawn) | s | 3 | T2 |

@@ -3,8 +3,7 @@
 Slice T2a of the native-parser migration (spec §3.1/§3.2): resolve the binary
 for this platform, hand it a command on stdin, and read its typed-JSON AST back
 under a hard output bound. Turning that JSON into an `AstView` the existing
-walkers can read is T2b; the final size constants are T4; the tier/fallback
-state machine is T5.
+walkers can read is T2b; the tier/fallback state machine is T5.
 
 Two invariants carry the security weight here:
 
@@ -33,10 +32,22 @@ BINARY_NAME = "schlock-parse"
 # validator.py's project_root.
 DEFAULT_BIN_ROOT = Path(__file__).parent.parent.parent.parent / ".claude-plugin" / "bin"
 
-# Anti-OOM output bound (spec §5). Deliberately above the ~8.8 MB legitimate
-# worst case for a 64 KB input, so it trips only on subprocess pathology.
-# T4 owns the final constants, including the pre-spawn 64 KB input guard.
-MAX_AST_JSON_SIZE = 12 * 1024 * 1024
+# Size guards (spec §5, LAB-528). Both fail-closed: a trip raises
+# NativeBridgeError and the caller falls back to bashlex.
+#
+# Input guard, checked on the UTF-8 byte length BEFORE spawning. Shared with
+# integrations/commit_filter.py, whose own check stays fail-open — that module
+# filters commit messages, it does not decide whether a command runs.
+MAX_COMMAND_SIZE = 64 * 1024
+
+# Anti-OOM output bound on the incremental stdout read. Its job is to bound this
+# process's memory against a runaway or tampered binary, so it must sit ABOVE the
+# largest AST a legitimate max-size input can produce. The spec's original 12 MB
+# came from an `echo a;` shape (~125× amplification); the densest shape mvdan
+# emits is a bare pipeline chain (`a|b|c|…;` → ~410× measured on v3.13.1, 25.6 MiB
+# for 64 KiB). 512× keeps the two constants coherent with headroom; the
+# `TestOutputBoundServesLegitimateInput` cases are the tripwire if mvdan's JSON grows.
+MAX_AST_JSON_SIZE = 512 * MAX_COMMAND_SIZE
 
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_STDERR_BYTES = 8 * 1024
@@ -140,9 +151,13 @@ class NativeBridge:
 
         Raises:
             ParseError: the binary rejected the command as unparseable (exit 2).
-            NativeBridgeError: any other failure — spawn error, output overflow,
-                stdin/stdout error (exit 3/4), crash, or undecodable output.
+            NativeBridgeError: any other failure — oversized input, spawn error,
+                output overflow, stdin/stdout error (exit 3/4), crash, or
+                undecodable output.
         """
+        payload_in = command.encode("utf-8")
+        if len(payload_in) > MAX_COMMAND_SIZE:
+            raise NativeBridgeError(f"command exceeds native parser input bound ({len(payload_in)} > {MAX_COMMAND_SIZE} bytes)")
         binary = self._binary()
         try:
             proc = subprocess.Popen(
@@ -157,7 +172,7 @@ class NativeBridge:
         # Popen as a context manager closes the three pipes and reaps the child
         # even on the raising paths below.
         with proc:
-            payload, stderr, returncode = self._exchange(proc, command, binary)
+            payload, stderr, returncode = self._exchange(proc, payload_in, binary)
 
         if returncode == EXIT_OK:
             try:
@@ -172,14 +187,14 @@ class NativeBridge:
         # whatever landed on stdout is a prefix, so it is dropped, not returned.
         raise NativeBridgeError(f"native parser exited {returncode}: {detail}")
 
-    def _exchange(self, proc: subprocess.Popen, command: str, binary: Path) -> "tuple[bytes, bytes, int]":
+    def _exchange(self, proc: subprocess.Popen, command: bytes, binary: Path) -> "tuple[bytes, bytes, int]":
         """Feed stdin, read stdout under the bound, and collect the exit code."""
         if proc.stdin is None or proc.stdout is None or proc.stderr is None:
             _kill_and_reap(proc)
             raise NativeBridgeError("native parser pipes unavailable")
 
         try:
-            proc.stdin.write(command.encode("utf-8"))
+            proc.stdin.write(command)
             proc.stdin.close()
         except OSError as exc:
             # Child exited before consuming stdin, so it only ever saw a prefix.
