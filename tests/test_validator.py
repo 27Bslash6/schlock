@@ -794,9 +794,8 @@ class TestMultiSegmentWhitelistBypass:
             "rm -rf node_modules",
             "rm -rf .next/static",
             "rm -rf node_modules/.cache",
-            "rm -rf node_modules/@scope/pkg",
-            "rm -rf node_modules/.pnpm/@babel+core@7.24.0",
-            "rm -rf dist/*",
+            "rm -rf node_modules/@scope",  # one literal segment is removed, not traversed
+            "rm -rf dist/*",  # bare glob directly on <dir>: rm gets child names, not targets
         ],
     )
     def test_tightened_whitelist_entries_still_allow_their_real_use(self, command):
@@ -819,6 +818,16 @@ class TestMultiSegmentWhitelistBypass:
             # GNU rm follows a trailing-slash symlink and empties its target.
             "rm -rf node_modules/",
             "rm -rf node_modules/x/",
+            # CWE-22 (CodeRabbit #146): a path deeper than one component traverses THROUGH an
+            # intermediate segment. If a malicious package planted "node_modules/link -> /",
+            # these walk out of <dir> — and a pre-expansion regex cannot tell a real dir from
+            # a symlink, so the only defence is to not whitelist any traversed path.
+            "rm -rf node_modules/link/victim",
+            "rm -rf node_modules/link/*",
+            # pnpm's node_modules is a symlink farm, so these deep paths are the MOST likely
+            # to traverse a symlink — not a benign convenience. They drop to the ask tier.
+            "rm -rf node_modules/@scope/pkg",
+            "rm -rf node_modules/.pnpm/@babel+core@7.24.0",
         ],
     )
     def test_artifact_dir_whitelist_only_covers_literal_descendants(self, command):

@@ -9,14 +9,21 @@ whitelist:
   - ^ls\b
   - ^pwd$
 
-  # Safe directory cleanup operations (common developer workflows)
-  # Only "rm -rf <dir>" and literal descendants: each segment is [A-Za-z0-9._@+-]+ that is
-  # not "." and does not start with ".." (".cache" yes; "." / ".." / globs / braces / "~" no).
-  # The whitelist sees the raw string before expansion, so "node_modules/../.git" would
-  # otherwise walk out of <dir>. One terminal bare "*" is allowed: unlike ".*" it never
-  # expands to "." or "..". No trailing slash: GNU rm follows a trailing-slash symlink and
-  # empties its target, so "rm -rf node_modules/" on a symlinked node_modules is not safe.
-  - '^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*)*(/\*)?$'
+  # Safe directory cleanup operations (common developer workflows).
+  # "rm -rf <dir>" and AT MOST ONE component below it: either a single literal segment
+  # ("node_modules/.cache") or a bare glob directly on <dir> ("dist/*"). Never a deeper
+  # path.  The whitelist matches the raw string before the shell touches the filesystem,
+  # so it cannot tell a real directory from a symlink; a deeper path such as
+  # "node_modules/link/victim" (or "node_modules/link/*") traverses THROUGH "link", and if
+  # a malicious package planted "node_modules/link -> /" that walks out of <dir> (CWE-22,
+  # CodeRabbit #146). One component can only be removed or globbed, never traversed, so it
+  # is safe; anything deeper drops to the ordinary recursive-delete tier (HIGH → prompt).
+  # A single segment is [A-Za-z0-9._@+-]+ that is not "." and does not start with ".."
+  # (".cache" yes; "." / ".." / "./x" / braces / "~" / dot-globs no). No trailing slash:
+  # GNU rm follows a trailing-slash symlink and empties its target. A bare terminal "*" is
+  # allowed only directly on <dir> (glob on <dir> yields child NAMES, which rm removes
+  # without following); unlike ".*" it never expands to "." or "..".
+  - '^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*|/\*)?$'
   - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)
 
   # Safe /tmp operations (testing/temporary files)
