@@ -828,6 +828,13 @@ class TestMultiSegmentWhitelistBypass:
             # to traverse a symlink — not a benign convenience. They drop to the ask tier.
             "rm -rf node_modules/@scope/pkg",
             "rm -rf node_modules/.pnpm/@babel+core@7.24.0",
+            # CWE-22 on the sibling ".git/(hooks|objects/pack|refs)" entry: it was an
+            # unanchored prefix match with no depth cap, so literal "../" walked out of the
+            # repo with no symlink at all, and "hooksXYZ" matched via the "hooks" prefix.
+            "rm -rf .git/refs/../../../../tmp/pwned",
+            "rm -rf .git/hooksXYZ/../etc",
+            "rm -rf .git/objects/pack/../../../home",
+            "rm -rf .git/refs/heads",
         ],
     )
     def test_artifact_dir_whitelist_only_covers_literal_descendants(self, command):
@@ -839,6 +846,16 @@ class TestMultiSegmentWhitelistBypass:
         result = validate_command(command)
         assert result.message != "Command is whitelisted"
         assert result.risk_level == RiskLevel.HIGH
+
+    @pytest.mark.parametrize(
+        "command",
+        ["rm -rf .git/hooks", "rm -rf .git/objects/pack", "rm -rf .git/refs"],
+    )
+    def test_git_leaf_dir_whitelist_still_allows_the_three_fixed_paths(self, command):
+        """Anchoring the .git entry must not cost its three legitimate targets."""
+        result = validate_command(command)
+        assert result.allowed
+        assert result.risk_level == RiskLevel.SAFE
 
     @pytest.mark.parametrize(
         "command",

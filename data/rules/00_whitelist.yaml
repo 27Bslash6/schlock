@@ -24,7 +24,12 @@ whitelist:
   # allowed only directly on <dir> (glob on <dir> yields child NAMES, which rm removes
   # without following); unlike ".*" it never expands to "." or "..".
   - '^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*|/\*)?$'
-  - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)
+  # Exactly these three fixed leaf dirs, "$"-anchored. Without the anchor this was a bare
+  # prefix match with no depth cap — strictly worse than the artifact-dir entry above:
+  # "rm -rf .git/refs/../../../../tmp/x" needed no symlink at all, just literal "../", and
+  # "rm -rf .git/hooksXYZ/../etc" matched via the "hooks" prefix. No descendant is ever
+  # needed here, so anything below these three drops to the recursive-delete tier (HIGH).
+  - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)$
 
   # Safe /tmp operations (testing/temporary files)
   - ^chmod\s+[0-7]{3}\s+/tmp/
