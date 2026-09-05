@@ -637,11 +637,34 @@ class RuleEngine:
         """
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
+    def is_fully_whitelisted(self, command: str) -> bool:
+        """Check if a whitelist pattern spans the ENTIRE command.
+
+        Whitelist patterns are deliberately prefix matches (issue #66: match(),
+        not fullmatch(), so "^ls\\b" keeps covering "ls -la" when a user adds
+        flags). For a chained command a prefix is not enough — it would let the
+        "ls" in "ls; rm -rf /" vouch for the rm. Only a pattern whose match
+        reaches the end of the command (in practice a "$"-anchored entry such
+        as the gh-auth-token/docker-login pipeline) may whitelist a whole chain.
+
+        Args:
+            command: Command string to check
+
+        Returns:
+            True if a whitelist pattern matches from the start of the command
+            through to its end
+        """
+        # >= not ==: a pattern ending in \s* consumes trailing whitespace that rstrip()
+        # already discounted, so a legitimate span can overshoot.
+        end = len(command.rstrip())
+        return any(m.end() >= end for p in self.whitelist_patterns if (m := p.match(command)))
+
     def match_command(
         self,
         command: str,
         string_literals: Optional[list[tuple]] = None,
         heredoc_ranges: Optional[list[tuple]] = None,
+        use_whitelist: bool = True,
     ) -> RuleMatch:
         """Match command against all rules, return highest risk.
 
@@ -658,6 +681,10 @@ class RuleEngine:
                            from AST analysis. Matches inside these ranges are ignored.
             heredoc_ranges: Optional list of (start, end, is_shell) tuples for heredocs.
                           Matches inside non-shell heredocs are ignored (just text).
+            use_whitelist: Consult the whitelist before matching rules. Pass False when
+                          the caller has already settled the whitelist question — the
+                          multi-segment path does, with the full-span
+                          is_fully_whitelisted() where this check is prefix-based.
 
         Returns:
             RuleMatch with highest risk level from all matching rules
@@ -673,7 +700,7 @@ class RuleEngine:
             >>> # Pattern match at position 11-18 is inside string literal, ignored
         """
         # Whitelist override
-        if self.is_whitelisted(command):
+        if use_whitelist and self.is_whitelisted(command):
             return RuleMatch(
                 matched=False,
                 rule=None,
