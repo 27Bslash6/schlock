@@ -999,13 +999,15 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # SECURITY CRITICAL: Extract and validate each command segment independently
             # This prevents bypass via piping/chaining dangerous commands after whitelisted ones
             # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
-            segments = parser.extract_command_segments(command, ast)
+            # Literal ranges come from the SAME parse — see the method's docstring
+            # for why the per-segment re-parse had to go (spec §3.2 parse-once).
+            segments_with_literals = parser.extract_command_segments_with_literals(command, ast)
 
             # Track all matched rules for audit logging (used when multiple segments)
             all_matched_rules = []
 
             # If we have multiple segments, validate each one
-            if len(segments) > 1:
+            if len(segments_with_literals) > 1:
                 # Full-command whitelist check before segment validation.
                 # Per-segment validation cannot detect safe multi-command patterns
                 # (e.g., "gh auth token | docker login ... --password-stdin") because
@@ -1028,14 +1030,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 highest_risk = RiskLevel.SAFE
                 highest_match = None
 
-                for segment in segments:
-                    # Parse segment to get its string literals
-                    try:
-                        seg_ast = parser.parse(segment)
-                        seg_literals = parser.extract_string_literals(segment, seg_ast)
-                    except (ParseError, ValueError):
-                        seg_literals = []
-
+                for segment, seg_literals in segments_with_literals:
                     seg_match = engine.match_command(segment, string_literals=seg_literals)
 
                     if seg_match.matched and seg_match.rule:
