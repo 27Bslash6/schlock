@@ -444,7 +444,9 @@ def build_ast_view(command: str, typed_json: "Union[str, bytes, dict]") -> "list
     if isinstance(typed_json, (str, bytes)):
         try:
             typed_json = json.loads(typed_json)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: the C scanner overflows on deep nesting (`$(`×20000 is
+            # ~10 MiB, inside the output bound). Bare, it would skip T5's routing.
             raise NativeBridgeError(f"native parser emitted malformed JSON: {exc}")
     if not isinstance(typed_json, dict) or typed_json.get("Type") != "File":
         got = f"Type={typed_json.get('Type')!r}" if isinstance(typed_json, dict) else type(typed_json).__name__
