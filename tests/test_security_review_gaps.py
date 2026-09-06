@@ -11,7 +11,9 @@ which causes the validator to load from data/rules/ directory (the organized
 rule files including 11_dynamic_linker.yaml and 12_cloud_security.yaml).
 """
 
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -269,6 +271,14 @@ class TestBase64ShellExecution:
             ("base64 -d payload.b64 | sh", "Decode file to sh"),
             ("bash<<<$(base64 -d<<<Y2F0IC9ldGMvcGFzc3dk)", "Inline base64 to bash"),
             ("openssl base64 -d -in payload | bash", "OpenSSL base64 to bash"),
+            # LAB-1732: an `echo <base64>|base64 -d|sh` pattern used to carry
+            # these on its own. It was deleted - strictly subsumed by the
+            # `base64 -d…|sh` pattern, and its unanchored {20,} run backtracked
+            # quadratically (43KB of echo padding = 4.9s on a per-bash-call
+            # hook). These rows are the proof the survivor still covers it.
+            ("echo cm0gLXJmIC8KZWNob28= | base64 --decode | sh", "Long base64 to sh, --decode"),
+            ("echo QUJDQUJDQUJDQUJDQUJDQUJDQUJD|base64 -d|bash", "Long base64 to bash, unspaced pipes"),
+            ("echo QUJDQUJDQUJDQUJDQUJDQUJDQUJD -n | base64 -d -i | sh", "Long base64 with flags on both sides"),
         ],
     )
     def test_base64_shell_blocked(self, command, description):
@@ -276,6 +286,22 @@ class TestBase64ShellExecution:
         result = validate_command(command)
         assert not result.allowed, f"CRITICAL: {description} was NOT blocked! Command: {command}"
         assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("length", [4000, 20000])
+    def test_long_echo_argument_does_not_stall_the_hook(self, length):
+        """A long echo argument must not backtrack quadratically.
+
+        This hook runs before every bash call, and padding is free for whoever
+        writes the command. Both the quoted and bare forms are checked: the
+        quoted one used to take a fast path that masked the pathological
+        pattern, so removing that gate (LAB-1732) is what exposed it.
+        """
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            for command in (f'echo "{"a" * length}"', f"echo {'a' * length}"):
+                start = time.perf_counter()
+                validate_command(command)
+                elapsed = time.perf_counter() - start
+                assert elapsed < 1.0, f"validation took {elapsed:.2f}s for a {length}-char echo argument: {command[:30]}..."
 
     def test_safe_base64_allowed(self):
         """Safe base64 usage should be allowed."""

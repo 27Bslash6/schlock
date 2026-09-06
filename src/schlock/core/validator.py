@@ -784,6 +784,62 @@ def _check_special_cases(command: str) -> Optional[ValidationResult]:
     return None
 
 
+def _match_original_and_reconstructed(
+    engine: "RuleEngine",
+    parser: "BashCommandParser",
+    command: str,
+    ast_nodes: list,
+    string_literals: Optional[list[tuple]] = None,
+    heredoc_ranges: Optional[list[tuple]] = None,
+) -> RuleMatch:
+    """Match `command` against the rules as written AND quote/escape-stripped.
+
+    SECURITY CRITICAL: bashlex resolves escapes and drops quote characters when
+    it reconstructs a command from its AST, so `rm\\ -rf\\ /` and `"chmod" 777`
+    only reveal themselves to the regex rules in reconstructed form. Both passes
+    always run and the higher risk wins; the reconstructed pass used to be
+    skipped whenever the command held a quoted token, which is what made
+    `"chmod" 777 /etc/shadow` classify SAFE. See
+    BashCommandParser.reconstruct_command_with_suppression_ranges for why
+    rebasing the ranges is what makes always-on affordable.
+
+    Centralising this is deliberate: the multi-segment branch had simply
+    forgotten the reconstructed pass, so one call site is the fix's habitat.
+
+    Args:
+        engine: Rule engine to match against
+        parser: Parser used to reconstruct the command from its AST
+        command: Command (or single segment) to match
+        ast_nodes: Parsed AST for `command`
+        string_literals: Pre-computed literal ranges for `command`; derived here
+                         when omitted. Omitting is the safe default - an explicit
+                         `[]` switches suppression off, which is the shape of the
+                         bug this function exists to fix.
+        heredoc_ranges: Heredoc ranges for the original-form pass only: heredoc
+                        bodies never reach the reconstruction, since
+                        _collect_words walks `.word` parts alone.
+
+    Returns:
+        The higher-risk of the two matches.
+    """
+    if string_literals is None:
+        string_literals = parser.extract_string_literals(command, ast_nodes)
+
+    match = engine.match_command(
+        command,
+        string_literals=string_literals,
+        heredoc_ranges=heredoc_ranges,
+    )
+
+    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(command, ast_nodes)
+    if reconstructed and reconstructed != command:
+        recon_match = engine.match_command(reconstructed, string_literals=suppression_ranges)
+        if recon_match.risk_level > match.risk_level:
+            return recon_match
+
+    return match
+
+
 def _validate_heredoc_command(
     command: str,
     config_path: Optional[str] = None,
@@ -1029,14 +1085,30 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 highest_match = None
 
                 for segment in segments:
-                    # Parse segment to get its string literals
+                    # Re-parse the segment for its own literal ranges and reconstruction.
                     try:
                         seg_ast = parser.parse(segment)
-                        seg_literals = parser.extract_string_literals(segment, seg_ast)
-                    except (ParseError, ValueError):
-                        seg_literals = []
+                    except (ParseError, ValueError) as e:
+                        # No AST means no literal suppression and no reconstructed pass -
+                        # the gap that let `"chmod" 777` hide behind a heredoc. Fail
+                        # closed, as the whole-command parse above does once its
+                        # heredoc fallback is exhausted.
+                        return ValidationResult(
+                            allowed=False,
+                            risk_level=RiskLevel.BLOCKED,
+                            message=f"Parse error in segment: {e}",
+                            alternatives=[],
+                            exit_code=1,
+                            error=str(e),
+                        )
 
-                    seg_match = engine.match_command(segment, string_literals=seg_literals)
+                    seg_match = _match_original_and_reconstructed(
+                        engine,
+                        parser,
+                        segment,
+                        seg_ast,
+                        heredoc_ranges=parser.extract_heredoc_ranges(segment, seg_ast),
+                    )
 
                     if seg_match.matched and seg_match.rule:
                         all_matched_rules.append(seg_match.rule.name)
@@ -1062,25 +1134,14 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # Single segment - validate both original and reconstructed command
                 # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')
                 # We must match against both to catch escape-based evasion attempts
-                match = engine.match_command(
+                match = _match_original_and_reconstructed(
+                    engine,
+                    parser,
                     command,
+                    ast,
                     string_literals=string_literals,
                     heredoc_ranges=heredoc_ranges,
                 )
-
-                # Also check reconstructed command (catches escaped characters)
-                # SECURITY: Reconstruction strips quotes, which is useful for detecting
-                # escape sequences like 'rm\ -rf\ /' → 'rm -rf /', but we must NOT
-                # use it if the original match was inside a string literal (would cause false positives)
-                reconstructed = parser.reconstruct_command(ast)
-                if reconstructed and reconstructed != command:
-                    # Only check reconstructed if there are no string literals that would explain the difference
-                    # (i.e., difference is due to escapes, not quotes)
-                    if not string_literals:
-                        recon_match = engine.match_command(reconstructed, string_literals=[])
-                        # Use higher risk match
-                        if recon_match.risk_level > match.risk_level:
-                            match = recon_match
         except ConfigurationError as e:
             return ValidationResult(
                 allowed=False,
