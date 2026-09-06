@@ -973,6 +973,14 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             if dangerous_check is not None:
                 return dangerous_check
 
+            # LAB-2768: here-strings (`bash <<< PROG`) execute PROG the same way `bash -c PROG`
+            # does, but the payload rides a redirect node the extractor above skips. Surface it
+            # here; only SHELL here-strings are re-validated as bash (a python/perl here-string is
+            # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
+            herestring_payloads = [
+                prog for name, prog in parser.extract_stdin_program_redirects(ast) if name in _SHELL_COMMANDS and prog.strip()
+            ]
+
         except (ParseError, ValueError) as e:
             # Check if this is a heredoc parse failure (bashlex doesn't support quoted delimiters)
             # e.g., python3 << 'EOF' ... EOF
@@ -1126,7 +1134,12 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
-        payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
+        # `-c`/wrapper/`watch` payloads plus here-string (`<<<`) payloads (LAB-2768); a here-string
+        # re-enters validation identically to a `-c` payload, so `bash <<< "$CMD"` matches
+        # `bash -c "$CMD"` rather than fail-closing one spelling of the same delegation.
+        payloads = (
+            _shell_delegated_payloads(commands_with_args) + herestring_payloads if match.risk_level < RiskLevel.BLOCKED else []
+        )
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
