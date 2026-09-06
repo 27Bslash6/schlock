@@ -23,7 +23,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import BashCommandParser
+from .parser import WRAPPER_COMMANDS, BashCommandParser
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidator
 
@@ -396,6 +396,124 @@ def _check_dangerous_command_flags(
     return None
 
 
+# LAB-2754: commands whose *argument* is a program, not data.
+#
+# `bash -c "rm -rf /"` hands the quoted word to bash as source code. The AST is right to
+# report it as one argument word, but every check downstream of that - the regex rules
+# (which match raw source text, where quoting `-c` breaks `\s+-c\s+`) and the string-literal
+# suppression - then treats it as an inert string. So `bash "-c" "rm -rf /"` came back SAFE
+# while the bare payload was BLOCKED. The fix re-enters validation on the payload.
+#
+# Shells: `-c PROG` runs PROG, and a LEADING operand is the script to run, which ends option
+# parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
+_SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "rbash"})
+
+# Not shells, but their `-c` argument is a command string they hand to one. Their leading
+# operand is a user/group/file rather than a script, so it must NOT end option parsing
+# (`sg root -c PROG`, `su postgres -c PROG`).
+_DASH_C_RUNNERS: frozenset[str] = frozenset({"su", "runuser", "sg", "script"})
+
+_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
+
+# Depth cap for re-entering validation on a payload. Reachable in practice only by chaining
+# `watch` (shell quoting collapses before `bash -c` can nest this far), so it is a backstop,
+# not a hot path. Exceeding it fails closed. Pinned by test_depth_cap_fails_closed.
+MAX_SHELL_DELEGATION_DEPTH = 4
+
+# `watch`'s own options. Only these consume a following word; everything after the option run
+# belongs to the command. Getting this wrong over-approximates (an option value is prepended to
+# the program), which is the safe direction.
+_WATCH_VALUE_OPTIONS: frozenset[str] = frozenset({"-n", "--interval"})
+
+
+def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> Optional[str]:
+    """Return the program a `-c` hands to a shell, given the words following the command name.
+
+    The shell's own getopt is the specification, and it says the program is always the NEXT
+    word: `bash -cecho` is "option requires an argument", not inline code, and `bash -ce PROG`
+    runs PROG (both verified against bash/dash/zsh). So a clustered `c` never consumes the
+    rest of its own cluster - reading `-ce PROG` as the program "e" was a hole, not a shortcut.
+
+    A `--` between `-c` and the program is skipped, because the shell skips it too
+    (`bash -c -- 'echo hi'` prints hi). A `--` *before* any `-c` ends option parsing, so
+    there is no inline program at all.
+    """
+    for i, word in enumerate(words):
+        if word == "--":
+            return None  # end of options: a later -c is an argument, not a flag
+        if not word.startswith("-"):
+            # For a shell, a leading operand is the script to run, so no -c can follow it. For
+            # `su`/`sg`/`runuser` it is a user or group and options continue after it. Once an
+            # option has been seen a bare token is that option's value either way - keep
+            # scanning. Same reading as parser._reads_stdin_as_program.
+            if i == 0 and operand_ends_options:
+                return None
+            continue
+        if word.startswith("--") or "c" not in word[1:]:
+            continue
+        rest = words[i + 1 :]
+        while rest and rest[0] == "--":
+            rest = rest[1:]
+        return rest[0] if rest else None
+    return None
+
+
+def _watch_payload(args: list[str]) -> Optional[str]:
+    """Return the command `watch` will run, verbatim.
+
+    `watch` execs its command through `sh -c`, so the flags belong to the *program* and must
+    survive: dropping every dashed word turned `watch -n 5 rm -rf /` into `rm /` and
+    `watch -- git -c core.pager=/bin/sh log` into a form that no longer trips the git check.
+    """
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "--":
+            i += 1
+            break
+        if args[i] in _WATCH_VALUE_OPTIONS:
+            i += 1
+        i += 1
+    return " ".join(args[i:]) or None
+
+
+def _shell_delegated_payloads(
+    commands_with_args: list[tuple[str, list[str]]],
+) -> list[str]:
+    """Extract every argument the command will hand to a shell as source code.
+
+    Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
+    `env FOO=1`, `busybox`, `flock ...`), and `watch PROG`.
+
+    Deliberately NOT covered, each tracked separately: remote delegation (`ssh host "..."`,
+    a different trust domain); non-shell interpreters (`python3 -c`, `perl -e`) whose payload
+    is not bash and would be nonsense to re-validate as bash; `find -exec bash -c`; and
+    here-strings (`bash <<< "..."`), which the AST hides on a redirect node. WRAPPER_COMMANDS
+    is best-effort, not an exhaustive enumeration of every exec-passthrough binary.
+
+    A first word that is neither a delegator nor a wrapper is never scanned, so
+    `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
+    """
+    payloads = []
+    for cmd_name, args in commands_with_args:
+        base = cmd_name.rsplit("/", 1)[-1]
+        found = []
+
+        if base == "watch":
+            found.append(_watch_payload(args))
+        else:
+            if base in _DASH_C_PROGRAM_COMMANDS:
+                found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
+            if base in WRAPPER_COMMANDS:
+                # `sudo bash -c ...`, `timeout 5 bash -c ...`: find the delegator it wraps.
+                words = [a.rsplit("/", 1)[-1] for a in args]
+                at = next((i for i, w in enumerate(words) if w in _DASH_C_PROGRAM_COMMANDS), None)
+                if at is not None:
+                    found.append(_dash_c_payload(args[at + 1 :]))
+
+        payloads.extend(p for p in found if p and p.strip())
+    return payloads
+
+
 def _check_contextual_high_risk(
     commands_with_args: list[tuple[str, list[str]]],
 ) -> Optional[tuple[str, str]]:
@@ -741,6 +859,8 @@ def _validate_heredoc_command(
 def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
     command: str,
     config_path: Optional[str] = None,
+    *,
+    _depth: int = 0,
 ) -> ValidationResult:
     """Validate command for safety.
 
@@ -762,6 +882,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
     Args:
         command: Bash command string to validate
         config_path: Optional path to rules file (for testing)
+        _depth: Internal, keyword-only. Shell-delegation recursion depth; callers leave it at 0.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -997,6 +1118,46 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     alternatives=ctx_alternatives,
                 )
 
+        # Step 5c: shell-delegated payloads (LAB-2754).
+        # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
+        # higher verdict, so no spelling of the wrapper scores below the bare payload.
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a
+        # whitelisted prefix still short-circuits it (LAB-2759). Deliberately NOT routed through
+        # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
+        # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
+        # BLOCKED.
+        payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
+        for payload in payloads:
+            if _depth >= MAX_SHELL_DELEGATION_DEPTH:
+                # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
+                # shell quoting collapses before the payload can nest this far.
+                inner = ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"Shell delegation nested deeper than {MAX_SHELL_DELEGATION_DEPTH} levels",
+                    alternatives=["Run the command directly instead of nesting shell -c"],
+                    exit_code=1,
+                    error=None,
+                )
+            else:
+                inner = validate_command(payload, config_path, _depth=_depth + 1)
+            if inner.risk_level > match.risk_level:
+                match = RuleMatch(
+                    matched=True,
+                    rule=SecurityRule(
+                        name="shell_delegated_payload",
+                        description="Argument executed as shell code by the invoking command",
+                        risk_level=inner.risk_level,
+                        patterns=[],
+                        alternatives=inner.alternatives,
+                    ),
+                    risk_level=inner.risk_level,
+                    message=f"Shell-delegated payload {payload!r}: {inner.message}",
+                    alternatives=inner.alternatives,
+                )
+            if match.risk_level == RiskLevel.BLOCKED:
+                break
+
         # Step 6: ShellCheck integration (if available)
         # ShellCheck can catch issues our regex patterns miss, like $'' expansions
         # SC2114: "Warning: deletes a system directory" catches rm -r$''f /
@@ -1045,8 +1206,13 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             matched_rules=matched_rules,
         )
 
-        # Step 7: Cache successful validation
-        _global_cache.set(command, result)
+        # Step 7: Cache successful validation.
+        # Never at depth > 0: the shell-delegation depth cap makes a verdict depend on nesting
+        # level, and the cache is keyed on the command string alone. Caching a capped inner
+        # verdict flipped `watch watch watch watch ls` from SAFE to BLOCKED for the rest of the
+        # process once a deeper chain had been seen.
+        if _depth == 0:
+            _global_cache.set(command, result)
 
         # Step 8: Return
         return result

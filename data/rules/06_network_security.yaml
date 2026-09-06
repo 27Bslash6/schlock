@@ -25,7 +25,9 @@ rules:
     description: Shell -c flag can execute arbitrary commands including blocked ones
     risk_level: BLOCKED
     patterns:
-      # bash/sh -c with dangerous commands inside
+      # bash/sh -c with dangerous commands inside. The literal quote requirement means every
+      # spelling that quotes the flag (`bash "-c" ...`) evades this rule; the AST-level
+      # payload recursion in validator.py Step 5c is what actually covers those (LAB-2754).
       - '\b(bash|sh|zsh|ksh|dash)\s+-c\s+[''"].*\b(nc|ncat|netcat|socat)\s+.*-e'
       - '\b(bash|sh|zsh|ksh|dash)\s+-c\s+[''"].*\brm\s+-rf\s+/'
       - '\b(bash|sh|zsh|ksh|dash)\s+-c\s+[''"].*\bchmod\s+[47][0-7]{2}'
