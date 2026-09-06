@@ -810,14 +810,14 @@ def _match_original_and_reconstructed(
         engine: Rule engine to match against
         parser: Parser used to reconstruct the command from its AST
         command: Command (or single segment) to match
-        ast_nodes: Parsed AST for `command`; may be empty if parsing failed
+        ast_nodes: Parsed AST for `command`
         string_literals: Pre-computed literal ranges for `command`; derived here
                          when omitted. Omitting is the safe default - an explicit
                          `[]` switches suppression off, which is the shape of the
                          bug this function exists to fix.
-        heredoc_ranges: Heredoc ranges for the original-form pass. Segments carry
-                        none: heredoc bodies never reach the reconstruction
-                        either, since _collect_words only walks `.word` parts.
+        heredoc_ranges: Heredoc ranges for the original-form pass only: heredoc
+                        bodies never reach the reconstruction, since
+                        _collect_words walks `.word` parts alone.
 
     Returns:
         The higher-risk of the two matches.
@@ -1085,16 +1085,30 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 highest_match = None
 
                 for segment in segments:
-                    # Parse segment to get its string literals
+                    # Re-parse the segment for its own literal ranges and reconstruction.
                     try:
                         seg_ast = parser.parse(segment)
                     except (ParseError, ValueError) as e:
-                        # Without an AST this segment loses literal suppression AND
-                        # the reconstructed pass - say so rather than fail silently.
-                        logger.warning(f"Segment parse failed, matching raw with no AST context: {segment!r}: {e}")
-                        seg_ast = []
+                        # No AST means no literal suppression and no reconstructed pass -
+                        # the gap that let `"chmod" 777` hide behind a heredoc. Fail
+                        # closed, as the whole-command parse above does once its
+                        # heredoc fallback is exhausted.
+                        return ValidationResult(
+                            allowed=False,
+                            risk_level=RiskLevel.BLOCKED,
+                            message=f"Parse error in segment: {e}",
+                            alternatives=[],
+                            exit_code=1,
+                            error=str(e),
+                        )
 
-                    seg_match = _match_original_and_reconstructed(engine, parser, segment, seg_ast)
+                    seg_match = _match_original_and_reconstructed(
+                        engine,
+                        parser,
+                        segment,
+                        seg_ast,
+                        heredoc_ranges=parser.extract_heredoc_ranges(segment, seg_ast),
+                    )
 
                     if seg_match.matched and seg_match.rule:
                         all_matched_rules.append(seg_match.rule.name)

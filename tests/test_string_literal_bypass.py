@@ -13,6 +13,7 @@ import pytest
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import clear_caches, validate_command
+from schlock.exceptions import ParseError
 
 
 class TestStringLiteralBypassFix:
@@ -212,6 +213,67 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
 
         assert not result.allowed, f"SECURITY BYPASS: {command!r} was allowed (risk={result.risk_level})"
         assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_heredoc_segment_still_reconstructs(self, safety_rules_path):
+        """AC-2 via heredoc: the body sits past the command's span, so the bare
+        segment slice did not re-parse and the reconstructed pass was skipped -
+        the original bug back through a side door. Found by CodeRabbit on #145.
+        """
+        quoted = 'echo hi && "chmod" 777 /etc/shadow <<EOF\nfoo\nEOF'
+        unquoted = "echo hi && chmod 777 /etc/shadow <<EOF\nfoo\nEOF"
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            control = validate_command(unquoted, config_path=safety_rules_path)
+            clear_caches()
+            attack = validate_command(quoted, config_path=safety_rules_path)
+
+        assert (control.allowed, control.risk_level) == (True, RiskLevel.HIGH), f"control drifted: {control.risk_level}"
+        assert (attack.allowed, attack.risk_level) == (True, RiskLevel.HIGH), (
+            f"SECURITY BYPASS: {quoted!r} scored {attack.risk_level} (allowed={attack.allowed})"
+        )
+
+    @pytest.mark.parametrize(
+        "command,expected_allowed,expected_risk",
+        [
+            # Everyday heredoc pipe: must not trip the fail-closed segment branch.
+            ("cat <<EOF | grep x\nhello\nEOF", True, RiskLevel.SAFE),
+            # Body now travels with the segment, so it needs the same non-shell
+            # heredoc suppression a standalone command gets: pre-fix verdict kept.
+            ("cat <<EOF | grep x && chmod 777 f\nrm -rf /\nEOF", True, RiskLevel.HIGH),
+            # A shell's heredoc body is code. Was HIGH (body never reached the
+            # segment); now matches the single-segment `bash <<EOF` verdict.
+            ("bash <<EOF | tee log\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
+        ],
+    )
+    def test_heredoc_segment_verdicts(self, safety_rules_path, command, expected_allowed, expected_risk):
+        """Segments carry their heredoc bodies and get per-segment heredoc suppression."""
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            result = validate_command(command, config_path=safety_rules_path)
+
+        assert (result.allowed, result.risk_level) == (expected_allowed, expected_risk), (
+            f"{command!r} scored {result.risk_level} (allowed={result.allowed}), expected {expected_risk}"
+        )
+
+    def test_segment_that_will_not_reparse_is_blocked(self, safety_rules_path, monkeypatch):
+        """A segment with no AST gets neither literal suppression nor the
+        reconstructed pass, so it fails closed like a whole-command parse error.
+        No known input reaches this branch any more; force it.
+        """
+        real_parse = BashCommandParser.parse
+
+        def parse_all_but_one(self, command):
+            if command == "echo two":
+                raise ParseError("forced segment parse failure")
+            return real_parse(self, command)
+
+        monkeypatch.setattr(BashCommandParser, "parse", parse_all_but_one)
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            result = validate_command("echo one && echo two", config_path=safety_rules_path)
+
+        assert (result.allowed, result.risk_level) == (False, RiskLevel.BLOCKED)
+        assert "Parse error in segment" in result.message
 
     @pytest.mark.parametrize(
         "command,expected_allowed,expected_risk",

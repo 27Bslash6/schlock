@@ -13,6 +13,7 @@ rule files including 11_dynamic_linker.yaml and 12_cloud_security.yaml).
 
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -295,11 +296,12 @@ class TestBase64ShellExecution:
         quoted one used to take a fast path that masked the pathological
         pattern, so removing that gate (LAB-1732) is what exposed it.
         """
-        for command in (f'echo "{"a" * length}"', f"echo {'a' * length}"):
-            start = time.perf_counter()
-            validate_command(command)
-            elapsed = time.perf_counter() - start
-            assert elapsed < 1.0, f"validation took {elapsed:.2f}s for a {length}-char echo argument: {command[:30]}..."
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            for command in (f'echo "{"a" * length}"', f"echo {'a' * length}"):
+                start = time.perf_counter()
+                validate_command(command)
+                elapsed = time.perf_counter() - start
+                assert elapsed < 1.0, f"validation took {elapsed:.2f}s for a {length}-char echo argument: {command[:30]}..."
 
     def test_safe_base64_allowed(self):
         """Safe base64 usage should be allowed."""

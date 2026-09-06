@@ -556,7 +556,11 @@ class BashCommandParser:
                     if start < len(command) and end <= len(command):
                         segment = command[start:end].strip()
                         if segment:
-                            segments.append(segment)
+                            # bashlex hangs a heredoc body off the redirect, past the
+                            # command's span, so the bare slice would not re-parse.
+                            # Carry the body: a segment must be the command as bash sees it.
+                            bodies = [p.heredoc.value for p in node.parts if getattr(p, "heredoc", None)]
+                            segments.append("\n".join([segment, *bodies]))
                     return  # Don't recurse into command parts
 
                 # Pipeline nodes - visit each command in the pipeline
