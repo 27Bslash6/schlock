@@ -425,6 +425,47 @@ MAX_SHELL_DELEGATION_DEPTH = 4
 # the program), which is the safe direction.
 _WATCH_VALUE_OPTIONS: frozenset[str] = frozenset({"-n", "--interval"})
 
+# `find`'s clauses that run an external command. Everything up to the terminating `;`/`+` is
+# that command, and the shell inside it is a delegator find never names as a command itself.
+_FIND_EXEC_FLAGS: frozenset[str] = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+# find's own getopt: `-exec CMD ;` runs CMD once per file, `-exec CMD +` once with all files.
+# A bare `;` is a bash separator (never reaches find's args); an escaped `\;` or quoted `';'`
+# survives as this literal word, as does `+`. All three end the clause.
+_FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
+
+
+def _find_exec_clauses(args: list[str]) -> list[list[str]]:
+    """Return each `find -exec/-execdir/-ok/-okdir` clause's sub-command words.
+
+    `find`'s exec clause is opaque `args` to find, so the shell it launches (`-exec bash -c
+    PROG`) is invisible to the delegator scan. Each returned word list is a synthetic command
+    (`[cmd, *args]`) the caller re-enters through the same extraction.
+
+    Only the properly-terminated clause is collected here (`-exec CMD \\;` / `-exec CMD +`,
+    where the terminator reaches find as a real `;`/`+` word, and the `;`-per-file default).
+    A bare *unescaped* `;` is a bash separator, so a later `-exec ... ;` clause splits off as
+    its own command that argv[0]=`-exec` makes `command not found` - it never runs the payload,
+    so it is deliberately not chased. A dangerous *first* clause still reaches find's own args
+    and is caught here.
+
+    `{}` is a filename find substitutes at run time, not code; it is passed through verbatim
+    and only matters if it feeds a delegator, which it never does on its own.
+    """
+    clauses: list[list[str]] = []
+    i = 0
+    while i < len(args):
+        if args[i] not in _FIND_EXEC_FLAGS:
+            i += 1
+            continue
+        i += 1  # step past the exec flag onto the sub-command
+        clause: list[str] = []
+        while i < len(args) and args[i] not in _FIND_EXEC_TERMINATORS:
+            clause.append(args[i])
+            i += 1
+        if clause:
+            clauses.append(clause)
+    return clauses
+
 
 def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> Optional[str]:
     """Return the program a `-c` hands to a shell, given the words following the command name.
@@ -482,16 +523,22 @@ def _shell_delegated_payloads(
     """Extract every argument the command will hand to a shell as source code.
 
     Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
-    `env FOO=1`, `busybox`, `flock ...`), and `watch PROG`.
+    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
+    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
 
     Deliberately NOT covered, each tracked separately: remote delegation (`ssh host "..."`,
     a different trust domain); non-shell interpreters (`python3 -c`, `perl -e`) whose payload
-    is not bash and would be nonsense to re-validate as bash; `find -exec bash -c`; and
-    here-strings (`bash <<< "..."`), which the AST hides on a redirect node. WRAPPER_COMMANDS
-    is best-effort, not an exhaustive enumeration of every exec-passthrough binary.
+    is not bash and would be nonsense to re-validate as bash; and here-strings
+    (`bash <<< "..."`), which the AST hides on a redirect node. WRAPPER_COMMANDS is
+    best-effort, not an exhaustive enumeration of every exec-passthrough binary.
 
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
+
+    KNOWN GAP (LAB-3004): the wrapper branch below re-implements a partial scan rather than
+    recursing, so a wrapper in front of a dash-c *runner* (`timeout 5 sg root -c PROG`) or
+    `watch` (`timeout 5 watch PROG`) loses the payload and scores below the bare form. The
+    `find` branch already recurses correctly; unifying the two is LAB-3004's fix.
     """
     payloads = []
     for cmd_name, args in commands_with_args:
@@ -500,6 +547,11 @@ def _shell_delegated_payloads(
 
         if base == "watch":
             found.append(_watch_payload(args))
+        elif base == "find":
+            # Each exec clause is a command in its own right; re-run the FULL extractor on it,
+            # so a wrapped or nested delegator inside `-exec` is caught for free.
+            for clause in _find_exec_clauses(args):
+                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])]))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
