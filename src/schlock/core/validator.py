@@ -433,11 +433,13 @@ _FIND_EXEC_FLAGS: frozenset[str] = frozenset({"-exec", "-execdir", "-ok", "-okdi
 # survives as this literal word, as does `+`. All three end the clause.
 _FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
 
-# Every base name the extractor itself knows how to unwrap. A wrapper skips its own
-# options/operands to the first of these and re-enters the extractor on it, so runner operand
-# semantics, `watch`, `find -exec`, and nested wrappers thread identically to the bare spelling
-# instead of being re-implemented in the wrapper branch (LAB-3004). su/sg/runuser sit in both
-# _DASH_C_PROGRAM_COMMANDS and WRAPPER_COMMANDS; the union keeps `sudo su -c PROG` locatable.
+# Every base name the extractor itself knows how to unwrap. The wrapper branch re-enters the
+# extractor on each arg that names one of these (LAB-3004), so runner operand semantics,
+# `watch`, `find -exec`, and nested wrappers thread identically to the bare spelling instead of
+# being re-implemented in the wrapper branch. The union of all four recognized-command sets is
+# deliberate: WRAPPER_COMMANDS lets a nested wrapper be skipped past, the program/watch/find
+# members let the wrapped target be found; a member matched sooner only recurses earlier, it
+# can never make the scan miss. su/sg/runuser happen to sit in both unioned sets.
 _DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find"})
 
 
@@ -558,14 +560,21 @@ def _shell_delegated_payloads(
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
-                # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: skip the
-                # wrapper's own options/operands to the first command the extractor recognizes,
-                # then re-enter the FULL extractor on it so operand semantics, `watch`, `find`,
-                # and nested wrappers all thread for free (LAB-3004) — same shape as `find` above.
+                # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
+                # the FULL extractor on every arg position that names a recognized command, so
+                # operand semantics, `watch`, `find`, and nested wrappers all thread for free
+                # (LAB-3004) — same `(head, tail)` re-entry the `find` branch above uses.
+                #
+                # EVERY match, not just the first: a wrapper's own operand or option value whose
+                # basename collides with a delegator (`flock ./find sh -c PROG`, the lock file
+                # basenames to `find`; `strace -o bash sg root -c PROG`, the trace file to `bash`)
+                # would otherwise be picked as a decoy that ends the scan and drops the real
+                # payload behind it. Re-validating a benign decoy is harmless over-approximation;
+                # missing a payload is a bypass. Terminates: each re-entry passes `args[i+1:]`.
                 words = [a.rsplit("/", 1)[-1] for a in args]
-                at = next((i for i, w in enumerate(words) if w in _DELEGATOR_COMMANDS), None)
-                if at is not None:
-                    found.extend(_shell_delegated_payloads([(args[at], args[at + 1 :])]))
+                for i, word in enumerate(words):
+                    if word in _DELEGATOR_COMMANDS:
+                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])]))
 
         payloads.extend(p for p in found if p and p.strip())
     return payloads

@@ -153,13 +153,31 @@ class TestShellDelegatedPayloadExtraction:
         assert self._p(("env", ["FOO=1", "watch", "-n", "5", "rm", "-rf", "/"])) == ["rm -rf /"]
 
     def test_nested_wrappers_thread(self):
-        # A wrapper wrapping a wrapper resolves to the innermost delegator for free.
-        assert self._p(("timeout", ["5", "sudo", "bash", "-c", "rm -rf /"])) == ["rm -rf /"]
-        assert self._p(("sudo", ["timeout", "5", "sg", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
+        # A wrapper wrapping a wrapper resolves to the innermost delegator for free. The
+        # every-position scan may re-reach the same payload via more than one delegator token
+        # (here both `sudo` and `bash`), so the invariant is "exactly this payload, no spurious
+        # extra" — pinned on the deduplicated set, dups are harmless over-approximation.
+        assert set(self._p(("timeout", ["5", "sudo", "bash", "-c", "rm -rf /"]))) == {"rm -rf /"}
+        assert set(self._p(("sudo", ["timeout", "5", "sg", "root", "-c", "rm -rf /"]))) == {"rm -rf /"}
 
     def test_wrapper_before_bare_shell_has_no_payload(self):
         # No `-c`, no payload — the recursion must not invent one.
         assert self._p(("timeout", ["5", "bash", "script.sh"])) == []
+
+    def test_decoy_operand_does_not_end_the_scan(self):
+        # Panel (LAB-3004): a wrapper OPERAND whose basename collides with a delegator name is a
+        # decoy. Scanning only the FIRST match let the decoy end the scan and drop the real
+        # payload behind it. Every delegator position is re-entered, so the decoy over-approximates
+        # (or yields nothing) while the true payload is still found.
+        # `flock ./find sh -c PROG`: lock-file operand basenames to `find`; `find` has no -exec, so
+        # only re-entry on the later `sh` recovers the payload.
+        assert "mkswap /dev/sda" in self._p(("flock", ["find", "sh", "-c", "mkswap /dev/sda"]))
+        assert "mkswap /dev/sda" in self._p(("flock", ["/var/lock/find", "sh", "-c", "mkswap /dev/sda"]))
+        # `flock ./sh sg root -c PROG`: operand basenames to shell `sh`; the true runner `sg`
+        # sits behind it and must still resolve with runner operand semantics.
+        assert "rm -rf /" in self._p(("flock", ["./sh", "sg", "root", "-c", "rm -rf /"]))
+        # `strace -o bash sg root -c PROG`: the `-o FILE` value basenames to `bash`.
+        assert "rm -rf /" in self._p(("strace", ["-o", "bash", "sg", "root", "-c", "rm -rf /"]))
 
 
 class TestFindExecPayloadExtraction:
@@ -420,6 +438,37 @@ class TestWrappedRunnerAndWatchDelegation:
         # A wrapper wrapping a wrapper threads to the innermost delegator. Pre-fix: SAFE.
         assert validate_command('timeout 5 sudo watch "mkswap /dev/sda"').risk_level == RiskLevel.BLOCKED
         assert validate_command('sudo timeout 5 sg root -c "mkswap /dev/sda"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Panel (LAB-3004): a wrapper operand / option value whose basename collides with a
+            # delegator name is a decoy that, under a first-match scan, ended the scan and dropped
+            # the real payload — the exact wrapped-runner/watch bypass this ticket closes, reopened
+            # one layer down. Each of these was SAFE / allowed=True against the first-match cut of
+            # the fix; the bare `sg root -c ...` / `sh -c ...` control is BLOCKED.
+            'flock find sh -c "mkswap /dev/sda"',  # lock-file operand basenames to `find`
+            'flock /tmp/sh sg root -c "mkswap /dev/sda"',  # operand basenames to shell `sh`
+            'flock /tmp/bash watch "mkswap /dev/sda"',  # decoy + wrapped watch
+            'strace -o bash sg root -c "mkswap /dev/sda"',  # `-o FILE` value basenames to `bash`
+            'ltrace -o sh sg root -c "mkswap /dev/sda"',
+            'nsenter --root=/tmp/bash sg root -c "mkswap /dev/sda"',
+            'env A=1 flock /tmp/sh sg root -c "mkswap /dev/sda"',
+        ],
+    )
+    def test_decoy_token_before_delegator_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_wrapped_multiclause_find_all_clauses_scanned(self):
+        # Panel (LAB-3004): with `find` in the scan set, a WRAPPED multi-clause find routes through
+        # the find branch so EVERY -exec clause is inspected, not just the first. Escaped `\;` keeps
+        # both clauses under one find; the dangerous second clause must not slip. Pre-fix: SAFE.
+        assert (
+            validate_command(r'timeout 5 find . -exec sh -c ls \; -exec sh -c "mkswap /dev/sda" \;').risk_level
+            == RiskLevel.BLOCKED
+        )
 
     @pytest.mark.parametrize(
         "command",
