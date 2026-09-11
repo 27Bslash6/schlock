@@ -138,6 +138,29 @@ class TestShellDelegatedPayloadExtraction:
     def test_empty_payload_is_ignored(self):
         assert self._p(("bash", ["-c", "   "])) == []
 
+    def test_wrapper_before_runner_keeps_operand_semantics(self):
+        # LAB-3004: a wrapper in front of a dash-c RUNNER re-enters the extractor, so the
+        # runner's leading user/group operand does not end option parsing. Pre-fix the wrapper
+        # branch called `_dash_c_payload` with the default `operand_ends_options=True`, so the
+        # operand stopped the scan and this returned [].
+        assert self._p(("timeout", ["5", "sg", "root", "-c", "mkswap /dev/sda"])) == ["mkswap /dev/sda"]
+        assert self._p(("nice", ["su", "postgres", "-c", "rm -rf /"])) == ["rm -rf /"]
+
+    def test_wrapper_before_watch(self):
+        # LAB-3004: `watch` was absent from the wrapper branch's search set entirely, so a
+        # wrapped `watch` returned []. It now re-enters through the same extractor.
+        assert self._p(("timeout", ["5", "watch", "mkswap /dev/sda"])) == ["mkswap /dev/sda"]
+        assert self._p(("env", ["FOO=1", "watch", "-n", "5", "rm", "-rf", "/"])) == ["rm -rf /"]
+
+    def test_nested_wrappers_thread(self):
+        # A wrapper wrapping a wrapper resolves to the innermost delegator for free.
+        assert self._p(("timeout", ["5", "sudo", "bash", "-c", "rm -rf /"])) == ["rm -rf /"]
+        assert self._p(("sudo", ["timeout", "5", "sg", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
+
+    def test_wrapper_before_bare_shell_has_no_payload(self):
+        # No `-c`, no payload — the recursion must not invent one.
+        assert self._p(("timeout", ["5", "bash", "script.sh"])) == []
+
 
 class TestFindExecPayloadExtraction:
     """LAB-2767: a shell inside `find -exec ... ;` is a command in its own right.
@@ -344,6 +367,74 @@ class TestFindExecDelegation:
         # the second `-exec` is `command not found`, so the payload never runs. schlock leaves it
         # at the pre-existing HIGH (find_exec_dangerous) rather than block a non-executable form.
         assert validate_command('find . -exec echo hi ; -exec sh -c "mkswap /dev/sda" ;').risk_level == RiskLevel.HIGH
+
+
+class TestWrappedRunnerAndWatchDelegation:
+    """LAB-3004: a wrapper in front of a dash-c runner or `watch` gets the bare payload's verdict.
+
+    Pre-fix (`main` @ `a508274`, ShellCheck unavailable) the wrapper branch only searched for a
+    dash-c *program command* and called `_dash_c_payload` with the default
+    `operand_ends_options=True`, so a wrapped runner's operand ended option parsing and `watch`
+    was never looked for at all. Every wrapped form below returned **SAFE / allowed=True** while
+    its bare spelling is BLOCKED.
+    """
+
+    # WRAPPER_COMMANDS is the source of truth; AC-2 asks specifically that "every wrapper entry"
+    # works, so parametrize over a representative spread of them rather than pinning one.
+    _WRAPPERS = ["timeout 5", "sudo", "nice", "nohup", "env FOO=1", "flock /tmp/l", "busybox"]
+
+    @pytest.mark.parametrize("wrapper", _WRAPPERS)
+    def test_wrapped_runner_is_blocked(self, wrapper):
+        # Pre-fix: SAFE / allowed=True.
+        result = validate_command(f'{wrapper} sg root -c "mkswap /dev/sda"')
+        assert result.risk_level == RiskLevel.BLOCKED, f"{wrapper} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("wrapper", _WRAPPERS)
+    def test_wrapped_watch_is_blocked(self, wrapper):
+        # Pre-fix: SAFE / allowed=True.
+        result = validate_command(f'{wrapper} watch "mkswap /dev/sda"')
+        assert result.risk_level == RiskLevel.BLOCKED, f"{wrapper} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_ac1_repro_lines(self):
+        # The two exact repro lines from the ticket. Pre-fix: SAFE / allowed=True.
+        for command in ('timeout 5 sg root -c "mkswap /dev/sda"', 'timeout 5 watch "mkswap /dev/sda"'):
+            result = validate_command(command)
+            assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+            assert result.allowed is False
+
+    def test_dual_membership_forms_still_resolve(self):
+        # su/sg/runuser are both runners and wrappers; both the bare runner and the wrapped
+        # runner must resolve. Pre-fix the wrapped `sudo su -c` was already BLOCKED (su is a
+        # dash-c command found by the old search set) — pinned so the recursion keeps it.
+        for command in (
+            'su -c "mkswap /dev/sda"',
+            'sudo su -c "mkswap /dev/sda"',
+            'sudo bash -c "mkswap /dev/sda"',
+            'busybox sh -c "mkswap /dev/sda"',
+        ):
+            assert validate_command(command).risk_level == RiskLevel.BLOCKED, command
+
+    def test_nested_wrapper_is_blocked(self):
+        # A wrapper wrapping a wrapper threads to the innermost delegator. Pre-fix: SAFE.
+        assert validate_command('timeout 5 sudo watch "mkswap /dev/sda"').risk_level == RiskLevel.BLOCKED
+        assert validate_command('sudo timeout 5 sg root -c "mkswap /dev/sda"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # AC-2: benign wrapped forms must NOT be over-blocked by the recursion.
+            'timeout 5 sg root -c "ls -la"',
+            "timeout 5 watch date",
+            "nice watch -n 5 date",
+            "timeout 5 bash script.sh",
+        ],
+    )
+    def test_benign_wrapped_forms_stay_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
 
 
 class TestFindExecUnchanged:

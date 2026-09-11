@@ -433,6 +433,13 @@ _FIND_EXEC_FLAGS: frozenset[str] = frozenset({"-exec", "-execdir", "-ok", "-okdi
 # survives as this literal word, as does `+`. All three end the clause.
 _FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
 
+# Every base name the extractor itself knows how to unwrap. A wrapper skips its own
+# options/operands to the first of these and re-enters the extractor on it, so runner operand
+# semantics, `watch`, `find -exec`, and nested wrappers thread identically to the bare spelling
+# instead of being re-implemented in the wrapper branch (LAB-3004). su/sg/runuser sit in both
+# _DASH_C_PROGRAM_COMMANDS and WRAPPER_COMMANDS; the union keeps `sudo su -c PROG` locatable.
+_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find"})
+
 
 def _find_exec_clauses(args: list[str]) -> list[list[str]]:
     """Return each `find -exec/-execdir/-ok/-okdir` clause's sub-command words.
@@ -534,11 +541,6 @@ def _shell_delegated_payloads(
 
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
-
-    KNOWN GAP (LAB-3004): the wrapper branch below re-implements a partial scan rather than
-    recursing, so a wrapper in front of a dash-c *runner* (`timeout 5 sg root -c PROG`) or
-    `watch` (`timeout 5 watch PROG`) loses the payload and scores below the bare form. The
-    `find` branch already recurses correctly; unifying the two is LAB-3004's fix.
     """
     payloads = []
     for cmd_name, args in commands_with_args:
@@ -556,11 +558,14 @@ def _shell_delegated_payloads(
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
-                # `sudo bash -c ...`, `timeout 5 bash -c ...`: find the delegator it wraps.
+                # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: skip the
+                # wrapper's own options/operands to the first command the extractor recognizes,
+                # then re-enter the FULL extractor on it so operand semantics, `watch`, `find`,
+                # and nested wrappers all thread for free (LAB-3004) — same shape as `find` above.
                 words = [a.rsplit("/", 1)[-1] for a in args]
-                at = next((i for i, w in enumerate(words) if w in _DASH_C_PROGRAM_COMMANDS), None)
+                at = next((i for i, w in enumerate(words) if w in _DELEGATOR_COMMANDS), None)
                 if at is not None:
-                    found.append(_dash_c_payload(args[at + 1 :]))
+                    found.extend(_shell_delegated_payloads([(args[at], args[at + 1 :])]))
 
         payloads.extend(p for p in found if p and p.strip())
     return payloads
