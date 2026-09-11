@@ -122,6 +122,16 @@ class TestBashCommandParser:
         dangers = parser.has_dangerous_constructs(ast)
         assert dangers == []  # No blanket blocking
 
+    def test_extract_command_segments_carries_heredoc_body(self, parser):
+        """The heredoc body lives past the command's span; the segment must
+        include it so the slice re-parses as the command bash actually runs.
+        """
+        command = "cat <<EOF | grep foo\nhello\nEOF"
+        assert parser.extract_command_segments(command, parser.parse(command)) == [
+            "cat <<EOF\nhello\nEOF",
+            "grep foo",
+        ]
+
 
 class TestDangerousPipelineDetection:
     """Test suite for _detect_dangerous_pipelines AST analysis."""
