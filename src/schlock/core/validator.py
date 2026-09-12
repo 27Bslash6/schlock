@@ -420,6 +420,16 @@ _DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
 # not a hot path. Exceeding it fails closed. Pinned by test_depth_cap_fails_closed.
 MAX_SHELL_DELEGATION_DEPTH = 4
 
+# Ceiling on distinct (command, tail) suffixes one top-level extraction may visit. Legitimate
+# commands need a few dozen at most. Past it the command is adversarial and extraction fails
+# CLOSED: the extractor raises, validate_command's catch-all returns BLOCKED, the hook denies.
+# Needed because the per-call memo bounds ONE wrapper chain, not k independent chains with
+# distinct tails, so total work still grew with command size - and a PreToolUse hook that
+# outlives its timeout fails OPEN. Pinned by test_sibling_chains_past_the_ceiling_fail_closed.
+# ponytail: each suffix costs O(len) for the `args[i+1:]` slice + tuple key, so the worst case
+# under this ceiling is ~0.2 s (measured); index-based re-entry would make it O(1) if needed.
+MAX_DELEGATOR_TOKENS = 256
+
 # `watch`'s own options. Only these consume a following word; everything after the option run
 # belongs to the command. Getting this wrong over-approximates (an option value is prepended to
 # the program), which is the safe direction.
@@ -528,6 +538,8 @@ def _watch_payload(args: list[str]) -> Optional[str]:
 
 def _shell_delegated_payloads(
     commands_with_args: list[tuple[str, list[str]]],
+    *,
+    _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
 ) -> list[str]:
     """Extract every argument the command will hand to a shell as source code.
 
@@ -543,9 +555,25 @@ def _shell_delegated_payloads(
 
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
+
+    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there).
     """
+    # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
+    # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
+    # so without this a chain of n wrappers (`sudo sudo ... bash -c PROG`) visited every subset
+    # of positions: 2^n calls, 2^(n-1) copies of PROG, each then re-validated. A visited suffix
+    # has already handed its payloads up through the call that first reached it, so skipping it
+    # drops nothing: n distinct suffixes each scanned once, O(n^2) calls in total (the rest are
+    # O(1) skips). Pinned by test_repeated_wrappers_extract_each_suffix_once.
+    seen = set() if _seen is None else _seen
     payloads = []
     for cmd_name, args in commands_with_args:
+        key = (cmd_name, tuple(args))
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(seen) > MAX_DELEGATOR_TOKENS:
+            raise ValueError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} delegator tokens")
         base = cmd_name.rsplit("/", 1)[-1]
         found = []
 
@@ -555,7 +583,7 @@ def _shell_delegated_payloads(
             # Each exec clause is a command in its own right; re-run the FULL extractor on it,
             # so a wrapped or nested delegator inside `-exec` is caught for free.
             for clause in _find_exec_clauses(args):
-                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])]))
+                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
@@ -574,10 +602,12 @@ def _shell_delegated_payloads(
                 words = [a.rsplit("/", 1)[-1] for a in args]
                 for i, word in enumerate(words):
                     if word in _DELEGATOR_COMMANDS:
-                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])]))
+                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])], _seen=seen))
 
         payloads.extend(p for p in found if p and p.strip())
-    return payloads
+    # The same program can still surface from more than one delegator (`su su bash -c PROG`:
+    # each `su` owns a -c AND wraps the next). Validating it once is enough.
+    return list(dict.fromkeys(payloads))
 
 
 def _check_contextual_high_risk(

@@ -17,6 +17,7 @@ import pytest
 from schlock.core import validator
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
+    MAX_DELEGATOR_TOKENS,
     MAX_SHELL_DELEGATION_DEPTH,
     _dash_c_payload,
     _shell_delegated_payloads,
@@ -153,12 +154,10 @@ class TestShellDelegatedPayloadExtraction:
         assert self._p(("env", ["FOO=1", "watch", "-n", "5", "rm", "-rf", "/"])) == ["rm -rf /"]
 
     def test_nested_wrappers_thread(self):
-        # A wrapper wrapping a wrapper resolves to the innermost delegator for free. The
-        # every-position scan may re-reach the same payload via more than one delegator token
-        # (here both `sudo` and `bash`), so the invariant is "exactly this payload, no spurious
-        # extra" — pinned on the deduplicated set, dups are harmless over-approximation.
-        assert set(self._p(("timeout", ["5", "sudo", "bash", "-c", "rm -rf /"]))) == {"rm -rf /"}
-        assert set(self._p(("sudo", ["timeout", "5", "sg", "root", "-c", "rm -rf /"]))) == {"rm -rf /"}
+        # A wrapper wrapping a wrapper resolves to the innermost delegator; a suffix re-reached
+        # through a second delegator token is skipped, so exactly one payload, no duplicate.
+        assert self._p(("timeout", ["5", "sudo", "bash", "-c", "rm -rf /"])) == ["rm -rf /"]
+        assert self._p(("sudo", ["timeout", "5", "sg", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
 
     def test_wrapper_before_bare_shell_has_no_payload(self):
         # No `-c`, no payload — the recursion must not invent one.
@@ -178,6 +177,46 @@ class TestShellDelegatedPayloadExtraction:
         assert "rm -rf /" in self._p(("flock", ["./sh", "sg", "root", "-c", "rm -rf /"]))
         # `strace -o bash sg root -c PROG`: the `-o FILE` value basenames to `bash`.
         assert "rm -rf /" in self._p(("strace", ["-o", "bash", "sg", "root", "-c", "rm -rf /"]))
+
+    @pytest.mark.parametrize("wrapper", ["sudo", "su"])
+    def test_repeated_wrappers_extract_each_suffix_once(self, wrapper, monkeypatch):
+        # CodeRabbit on #153 (CWE-400): `sudo sudo ... bash -c PROG` visited every subset of
+        # wrapper positions - pre-fix 2^n extractor calls and 2^(n-1) copies of PROG (n=18:
+        # 131072 payloads, 0.4 s before the first inner validation). Now quadratic calls, one
+        # PROG. `su` is the dual-membership case (owns a -c AND wraps): it still finds PROG once
+        # per `su` node, so it pins the payload dedup that `sudo` alone would let rot. Counted,
+        # not timed: the recursion resolves the module global, so wrapping it observes every
+        # re-entry - the floor proves the wrapper actually saw the recursion.
+        calls = 0
+        real = validator._shell_delegated_payloads
+
+        def counting(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(validator, "_shell_delegated_payloads", counting)
+        n = 12
+        payloads = counting([(wrapper, [wrapper] * (n - 1) + ["bash", "-c", "mkswap /dev/sda"])])
+        assert payloads == ["mkswap /dev/sda"]
+        assert calls >= n, f"{calls} extractor calls: the monkeypatch did not observe the recursion"
+        assert calls <= (n + 1) ** 2, f"{calls} extractor calls for {n} wrappers: not polynomial"
+
+    def test_sibling_chains_past_the_ceiling_fail_closed(self):
+        # Panel on #153: the per-call memo bounds ONE chain, not k independent chains with
+        # distinct tails, so total extraction work still grew with command size - and a
+        # PreToolUse hook that outlives its timeout fails OPEN. Past MAX_DELEGATOR_TOKENS
+        # distinct suffixes the extractor raises; validate_command's catch-all turns that into
+        # BLOCKED with the reason in `error`, which the hook denies on.
+        half = MAX_DELEGATOR_TOKENS // 2 + 1  # two chains of `half` nice tokens + bash > ceiling
+        progs = ("echo a", "echo b")
+        with pytest.raises(ValueError, match="delegator tokens"):
+            self._p(*(("nice", ["nice"] * (half - 1) + ["bash", "-c", prog]) for prog in progs))
+        command = "; ".join(" ".join(["nice"] * half + ["bash", "-c", prog]) for prog in progs)
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert "delegator tokens" in (result.error or "")
 
 
 class TestFindExecPayloadExtraction:
