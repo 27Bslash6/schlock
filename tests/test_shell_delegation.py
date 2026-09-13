@@ -411,7 +411,7 @@ class TestHereStringPayloadExtraction:
         assert self._extract('env FOO=1 bash <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('stdbuf -o0 bash <<< "rm -rf /"') == [("bash", "rm -rf /")]
 
-    def test_compound_here_string_finds_the_first_command_sink(self):
+    def test_compound_here_string_single_command_sink(self):
         # A `<<<` on a subshell/brace group feeds the group's stdin; a command inside runs it.
         # bashlex hangs the redirect on the compound node, not the inner command (panel CRIT).
         assert self._extract('( bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
@@ -427,6 +427,52 @@ class TestHereStringPayloadExtraction:
         assert self._extract('while :; do bash; done <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('if true; then bash; fi <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('for i in 1; do bash; done <<< "rm -rf /"') == [("bash", "rm -rf /")]
+
+    def test_function_call_resolves_to_its_body(self):
+        # CodeRabbit CWE-78 Critical (#151, round 2): a shell function inherits the caller's stdin, so
+        # `f <<< X` hands X to whatever the body runs. `_classify_sink` saw an unknown command `f`,
+        # surfaced nothing, and the body's bash ran the here-string unvalidated (HIGH / allowed).
+        # Every shape below executes the payload in real bash.
+        assert self._extract('f() { bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('function f { bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('f() { true; bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('f() { timeout 5 bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        # Transitive: f -> g -> bash.
+        assert self._extract('f() { g; }; g() { bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        # Call site inside a group; definition outside it.
+        assert self._extract('f() { bash; }; { f; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        # A definition inside a branch, or nested inside another function's body, is still a binding.
+        assert self._extract('if true; then f() { bash; }; fi; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('f() { g() { bash; }; }; f; g <<< "rm -rf /"') == [("bash", "rm -rf /")]
+
+    def test_non_shell_candidate_does_not_shadow_a_shell_sink(self):
+        # Panel CRIT: first-match returned ('python3', X) - which the validator drops as not-bash - and
+        # never reached the shell behind it. `python3 --version` reads no stdin; bash runs X for real.
+        # Every candidate is surfaced and the validator keeps the shell ones. The bare group has been
+        # HIGH since the compound walk landed; the function shapes were HIGH under first-match resolution.
+        assert ("bash", "rm -rf /") in self._extract('f() { python3 --version; bash; }; f <<< "rm -rf /"')
+        assert ("bash", "rm -rf /") in self._extract('f() { python3 --version; }; { f; bash; } <<< "rm -rf /"')
+        assert ("bash", "rm -rf /") in self._extract('{ python3 --version; bash; } <<< "rm -rf /"')
+
+    def test_function_without_an_interpreter_surfaces_nothing(self):
+        # `cat` consumes the here-string but never executes it - same rule as the bare `cat <<< X`.
+        assert self._extract('f() { cat; }; f <<< "some text"') == []
+
+    def test_recursive_and_diamond_call_graphs_terminate(self):
+        # Mutual recursion: `seen` breaks the cycle; no body executes stdin, so nothing surfaces.
+        assert self._extract('f() { g; }; g() { f; }; f <<< "rm -rf /"') == []
+        # Panel CRIT: a per-path guard re-walked this call DAG 2^N times (N=18 took 2.5s; N~27 outran
+        # the 600s hook timeout, which fails OPEN). One visited set per here-string keeps it linear -
+        # this case is unmissable in CI if that regresses.
+        dag = " ".join(f"f{i}() {{ f{i + 1}; f{i + 1}; }};" for i in range(24)) + " f24() { true; }; f0 <<< x"
+        assert self._extract(dag) == []
+
+    def test_function_redefinition_over_approximates(self):
+        # DECISION: bindings are a union over the whole parse, not an ordered scope model. Only the
+        # first `f` (true) is live at the call, so real bash executes nothing here - the here-string
+        # is surfaced anyway and re-validated, failing closed on a dangerous payload. Over-blocking a
+        # redefinition decoy is the safe direction ("reject the redirect when resolution is ambiguous").
+        assert self._extract('f() { true; }; f <<< "rm -rf /"; f() { bash; }') == [("bash", "rm -rf /")]
 
     def test_compound_without_an_interpreter_surfaces_nothing(self):
         # Only a stdin-executing interpreter is a sink; `cat`/`read` consume stdin but never run it.
@@ -486,6 +532,14 @@ class TestHereStringDelegationEvasion:
             'if true; then bash; fi <<< "rm -rf /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
+            # Shell functions inherit the caller's stdin - CodeRabbit CWE-78 Critical on #151, round 2
+            # (pre-fix: HIGH / allowed; `f` was an unknown command, so the body's bash was never seen).
+            'f() { bash; }; f <<< "rm -rf /"',
+            'f() { g; }; g() { bash; }; f <<< "rm -rf /"',
+            # A non-shell candidate must not shadow the shell behind it (panel CRIT; pre-fix HIGH / allowed).
+            'f() { python3 --version; bash; }; f <<< "rm -rf /"',
+            'f() { python3 --version; }; { f; bash; } <<< "rm -rf /"',
+            '{ python3 --version; bash; } <<< "rm -rf /"',
         ],
     )
     def test_here_string_payload_is_blocked(self, command):
@@ -510,6 +564,8 @@ class TestHereStringBenignUnchanged:
             # Compound surfacing re-validates the payload, so a benign one still passes.
             '{ true; bash; } <<< "echo hi"',
             '{ true; cat; } <<< "some text"',
+            # Function resolution surfaces the payload; a benign one re-validates to SAFE.
+            'f() { bash; }; f <<< "echo hi"',
         ],
     )
     def test_benign_here_string_stays_safe(self, command):

@@ -271,31 +271,59 @@ def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     return cmd_name, args
 
 
-def _command_nodes(node: Any) -> "list[Any]":
-    """Every `command`-kind node reachable from `node`, in source order.
+def _children(node: Any) -> "list[Any]":
+    """Direct AST children of `node` via the bashlex child attrs, in source order."""
+    children: list[Any] = []
+    for attr in ("list", "parts", "command"):
+        child = getattr(node, attr, None)
+        if isinstance(child, list):
+            children.extend(child)
+        elif child is not None:
+            children.append(child)
+    return children
 
-    Returns ALL commands in a group so a stdin consumer that is not the first command
-    (`{ true; bash; }`, a while/for/if body) is still seen. Stops at each command without
-    descending into its own parts (word-level substitutions are not group stdin consumers).
+
+def _nodes_of_kind(node: Any, kind: str) -> "list[Any]":
+    """Every `kind` node reachable from `node`, in source order, without entering a `command` node's
+    own parts (word-level substitutions are validated separately).
+
+    The ONE walk skeleton behind every security-critical traversal here - group stdin consumers
+    (`_command_nodes`), function bindings (`_function_bodies`) and, via `_children`, the `<<<`
+    visitor - so a bashlex child-attr change cannot leave one of them silently under-scanning (panel MAJ).
     """
     found: list[Any] = []
 
     def walk(n: Any) -> None:
         if not hasattr(n, "kind"):
             return
-        if n.kind == "command":
+        if n.kind == kind:
             found.append(n)
+        if n.kind == "command":
             return
-        for attr in ("list", "parts", "command"):
-            child = getattr(n, attr, None)
-            if isinstance(child, list):
-                for item in child:
-                    walk(item)
-            elif child is not None:
-                walk(child)
+        for child in _children(n):
+            walk(child)
 
     walk(node)
     return found
+
+
+def _command_nodes(node: Any) -> "list[Any]":
+    """Every command in a group, so a stdin consumer that is not the first (`{ true; bash; }`) is seen."""
+    return _nodes_of_kind(node, "command")
+
+
+def _function_bodies(ast_nodes: "list[Any]") -> "dict[str, list[Any]]":
+    """Map each shell-function name to the commands of EVERY body bound to it anywhere in the parse.
+
+    A union, not a scope model: `f() { true; }; f <<< X; f() { bash; }` binds both bodies although
+    only the first is live at the call. Modelling definition order, branches and nesting would be a
+    second bash interpreter; the union resolves that ambiguity the fail-closed way (`_classify_sink`).
+    """
+    table: dict[str, list[Any]] = {}
+    for node in ast_nodes or []:
+        for fn in _nodes_of_kind(node, "function"):
+            table.setdefault(fn.name.word, []).extend(_command_nodes(fn.body))
+    return table
 
 
 def _first_command_node(node: Any) -> Optional[Any]:
@@ -305,9 +333,6 @@ def _first_command_node(node: Any) -> Optional[Any]:
     on the FIRST command inside the group (its stdin sink). Inner *pipelines* within the group are
     handled separately by the recursive walk, so first-command is the right target here (#97) -
     unlike a here-string's shared fd, which any command in the group may read (`_command_nodes`).
-
-    Expressed via `_command_nodes` so the two security-critical traversals share ONE walk skeleton:
-    a future bashlex child-attr change cannot leave one of them silently under-scanning (panel MAJ).
     """
     return next(iter(_command_nodes(node)), None)
 
@@ -371,38 +396,54 @@ def _command_words(node: Any) -> "list[str]":
     return words
 
 
-def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
-    """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
+def _classify_sink(sink: Any, here_string: str, functions: "dict[str, list[Any]]", seen: set[str]) -> list[tuple[str, str]]:
+    """Every (interpreter, here_string) pair for which command node `sink` runs its stdin as a program.
 
-    Two shapes, mirroring the `-c` path:
-    - direct: the sink is a stdin-executing interpreter reading stdin as a program. `bash -c X <<< Y`
-      runs X (Y is inert data), `bash script.sh <<< Y` runs the script, `cat`/`grep` read stdin but
-      never execute it - all correctly excluded by `_reads_stdin_as_program`.
-    - wrapped: `timeout 5 bash <<< Y`, `env FOO=1 bash <<< Y`. The wrapper execs a shell that
-      inherits the wrapper's stdin (verified against timeout/env/stdbuf/nice). Mirrors the wrapper
-      scan in `_shell_delegated_payloads`: find the first interpreter it hands off to.
+    Three shapes, ACCUMULATED rather than first-match: a non-shell candidate must not shadow the shell
+    behind it - `{ python3 --version; bash; } <<< X` surfaces both, the validator drops `python3` and
+    keeps `bash` (panel CRIT: first-match returned only python3, and bash ran X unvalidated).
+    - direct: a stdin-executing interpreter with no inline program. `bash -c X <<< Y` runs X (Y is
+      inert), `bash script.sh <<< Y` runs the script, `cat`/`grep` read stdin but never execute it -
+      all excluded by `_reads_stdin_as_program`. Mirrors the `-c` path.
+    - wrapped: `timeout 5 bash <<< Y`, `env FOO=1 bash <<< Y` - the wrapper execs a shell that
+      inherits its stdin (verified against timeout/env/stdbuf/nice). Mirrors `_shell_delegated_payloads`.
+    - shell function: `f() { bash; }; f <<< Y` - the body inherits the caller's stdin, so every command
+      in it is a candidate sink (CodeRabbit CWE-78 Critical on #151, round 2: `f` was an unknown command
+      and the nested bash ran Y unvalidated). Resolved through `functions` (`_function_bodies`),
+      recursing for `f() { g; }; g() { bash; }`.
+
+    `seen` is ONE visited set per here-string, not a per-path guard: per-path only breaks cycles and
+    re-walks a call DAG (`f1() { f2; f2; }; f2() { f3; f3; }; ...`) 2^N times - ~27 functions outran
+    the hook timeout, which fails OPEN (panel CRIT). The union in `functions` makes each name's answer
+    path-independent, so plain reachability is exact.
 
     `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
     caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
     """
     words = _command_words(sink)
     if not words:
-        return None
+        return []
 
     name, args = _resolve_multicall(words[0].split("/")[-1], words[1:])
+    found: list[tuple[str, str]] = []
     if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args):
-        return (name, here_string)
+        found.append((name, here_string))
 
     if name in WRAPPER_COMMANDS:
         arg_bases = [a.split("/")[-1] for a in args]
         at = next((i for i, w in enumerate(arg_bases) if w in STDIN_EXEC_INTERPRETERS), None)
         if at is not None and _reads_stdin_as_program(arg_bases[at], args[at + 1 :]):
-            return (arg_bases[at], here_string)
-    return None
+            found.append((arg_bases[at], here_string))
+
+    if name in functions and name not in seen:
+        seen.add(name)
+        for cmd in functions[name]:
+            found.extend(_classify_sink(cmd, here_string, functions, seen))
+    return found
 
 
-def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
-    """Return (interpreter, here-string) if `node` runs its `<<<` here-string as a program.
+def _here_string_program(node: Any, functions: "dict[str, list[Any]]") -> list[tuple[str, str]]:
+    """Every (interpreter, here-string) pair for which `node` runs its `<<<` here-string as a program.
 
     A `<<<` redirect feeds its word to a command's stdin; a bare interpreter runs that stdin as a
     program. The redirect attaches in two places:
@@ -418,25 +459,20 @@ def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
       here-string still passes, only a dangerous one blocks. (A rare over-block, e.g. `{ cat; bash;
       } <<< X` where `cat` actually consumes the here-string, is acceptable and fails closed.)
 
-    `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
-    caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
+    Either sink may be a shell function call, resolved by `_classify_sink` through `functions`.
     """
     kind = getattr(node, "kind", None)
     if kind == "command":
         here_string = _last_here_string(getattr(node, "parts", []))
-        if here_string is None:
-            return None
-        return _classify_sink(node, here_string)
-
-    if kind == "compound":
+    elif kind == "compound":
         here_string = _last_here_string(getattr(node, "redirects", []))
-        if here_string is None:
-            return None
-        for sink in _command_nodes(node):
-            found = _classify_sink(sink, here_string)
-            if found is not None:
-                return found
-    return None
+    else:
+        return []
+    if here_string is None:
+        return []
+    sinks = [node] if kind == "command" else _command_nodes(node)
+    seen: set[str] = set()
+    return [found for sink in sinks for found in _classify_sink(sink, here_string, functions, seen)]
 
 
 class BashCommandParser:
@@ -658,28 +694,22 @@ class BashCommandParser:
         (`python3 <<< "import os"`) is real stdin-as-program but nonsense to re-check as bash.
         """
         results: list[tuple[str, str]] = []
+        functions = _function_bodies(ast_nodes)
 
         def visit(node):
             if not hasattr(node, "kind"):
                 return
             # `<<<` rides a command node's `.parts` (`bash <<< X`) or a compound node's `.redirects`
-            # (`( bash ) <<< X`); _here_string_program handles both and finds the stdin sink.
+            # (`( bash ) <<< X`); _here_string_program handles both and finds the stdin sinks.
             if node.kind in ("command", "compound"):
-                found = _here_string_program(node)
-                if found is not None:
-                    results.append(found)
-            for attr in ["parts", "command", "list", "pipe", "compound"]:
-                child = getattr(node, attr, None)
-                if isinstance(child, list):
-                    for item in child:
-                        visit(item)
-                elif child:
-                    visit(child)
+                results.extend(_here_string_program(node, functions))
+            for child in _children(node):
+                visit(child)
 
         for node in ast_nodes or []:
             visit(node)
 
-        return results
+        return list(dict.fromkeys(results))
 
     def extract_command_segments(self, command: str, ast_nodes: list[Any]) -> list[str]:
         """Extract full command segments from pipelines and command lists.
