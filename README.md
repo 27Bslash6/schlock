@@ -1,5 +1,7 @@
 # schlock
 
+[![Skillselion Top 25](https://skillselion.com/badge/marketplace/27Bslash6/schlock.svg?award=1)](https://skillselion.com/marketplace/27Bslash6/schlock)
+
 **A safety net for Claude Code** — Intercepts dangerous bash commands before they execute.
 
 
