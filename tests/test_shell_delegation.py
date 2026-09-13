@@ -412,10 +412,26 @@ class TestHereStringPayloadExtraction:
         assert self._extract('stdbuf -o0 bash <<< "rm -rf /"') == [("bash", "rm -rf /")]
 
     def test_compound_here_string_finds_the_first_command_sink(self):
-        # A `<<<` on a subshell/brace group feeds the group's stdin; the first command inside runs
-        # it. bashlex hangs the redirect on the compound node, not the inner command (panel CRIT).
+        # A `<<<` on a subshell/brace group feeds the group's stdin; a command inside runs it.
+        # bashlex hangs the redirect on the compound node, not the inner command (panel CRIT).
         assert self._extract('( bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('{ bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
+
+    def test_compound_here_string_finds_a_later_command_sink(self):
+        # CodeRabbit CWE-78 (Critical, #151): the stdin consumer need not be the FIRST command -
+        # an earlier command that does not read stdin (`true`, `echo`) leaves the here-string for
+        # the next. Checking only _first_command_node missed all of these. Verified in real bash.
+        assert self._extract('{ true; bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('( true; bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('{ echo pre; bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('while :; do bash; done <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('if true; then bash; fi <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('for i in 1; do bash; done <<< "rm -rf /"') == [("bash", "rm -rf /")]
+
+    def test_compound_without_an_interpreter_surfaces_nothing(self):
+        # Only a stdin-executing interpreter is a sink; `cat`/`read` consume stdin but never run it.
+        assert self._extract('{ true; cat; } <<< "some text"') == []
+        assert self._extract('{ read a; read b; } <<< "$data"') == []
 
     def test_compound_wrapper_here_string(self):
         assert self._extract('( timeout 5 bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
@@ -461,6 +477,13 @@ class TestHereStringDelegationEvasion:
             '( bash ) <<< "rm -rf /"',
             '{ bash; } <<< "rm -rf /"',
             '( timeout 5 bash ) <<< "rm -rf /"',
+            # Later-command consumers - CodeRabbit CWE-78 Critical on #151 (a benign first command
+            # decoys _first_command_node while a later shell runs the here-string).
+            '{ true; bash; } <<< "rm -rf /"',
+            '( true; bash ) <<< "rm -rf /"',
+            '{ echo pre; bash; } <<< "rm -rf /"',
+            'while :; do bash; done <<< "rm -rf /"',
+            'if true; then bash; fi <<< "rm -rf /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
         ],
@@ -484,6 +507,9 @@ class TestHereStringBenignUnchanged:
             'bash <<< "echo hi"',
             'cat <<< "some text"',
             'grep foo <<< "$line"',
+            # Compound surfacing re-validates the payload, so a benign one still passes.
+            '{ true; bash; } <<< "echo hi"',
+            '{ true; cat; } <<< "some text"',
         ],
     )
     def test_benign_here_string_stays_safe(self, command):
