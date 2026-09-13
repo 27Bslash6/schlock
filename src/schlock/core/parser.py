@@ -132,6 +132,7 @@ STDIN_EXEC_INTERPRETERS = frozenset(
         "ksh",
         "ash",
         "fish",
+        "rbash",  # restricted bash still execs its stdin; `rbash -c` is already in _SHELL_COMMANDS
         "python",
         "python2",
         "python3",
@@ -171,6 +172,7 @@ _INLINE_CODE_FLAGS = {
     "ksh": frozenset({"-c"}),
     "ash": frozenset({"-c"}),
     "fish": frozenset({"-c"}),
+    "rbash": frozenset({"-c"}),
     "python": frozenset({"-c", "-m"}),
     "python2": frozenset({"-c", "-m"}),
     "python3": frozenset({"-c", "-m"}),
@@ -269,29 +271,45 @@ def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     return cmd_name, args
 
 
+def _command_nodes(node: Any) -> "list[Any]":
+    """Every `command`-kind node reachable from `node`, in source order.
+
+    Returns ALL commands in a group so a stdin consumer that is not the first command
+    (`{ true; bash; }`, a while/for/if body) is still seen. Stops at each command without
+    descending into its own parts (word-level substitutions are not group stdin consumers).
+    """
+    found: list[Any] = []
+
+    def walk(n: Any) -> None:
+        if not hasattr(n, "kind"):
+            return
+        if n.kind == "command":
+            found.append(n)
+            return
+        for attr in ("list", "parts", "command"):
+            child = getattr(n, attr, None)
+            if isinstance(child, list):
+                for item in child:
+                    walk(item)
+            elif child is not None:
+                walk(child)
+
+    walk(node)
+    return found
+
+
 def _first_command_node(node: Any) -> Optional[Any]:
     """Return the first `command`-kind node reachable from `node`, in source order, else None.
 
     Used to classify a subshell/group pipeline stage (`(bash)`, `{ bash; }`): the piped data lands
     on the FIRST command inside the group (its stdin sink). Inner *pipelines* within the group are
-    handled separately by the recursive walk, so first-command is the right target here. See #97.
+    handled separately by the recursive walk, so first-command is the right target here (#97) -
+    unlike a here-string's shared fd, which any command in the group may read (`_command_nodes`).
+
+    Expressed via `_command_nodes` so the two security-critical traversals share ONE walk skeleton:
+    a future bashlex child-attr change cannot leave one of them silently under-scanning (panel MAJ).
     """
-    if not hasattr(node, "kind"):
-        return None
-    if node.kind == "command":
-        return node
-    for attr in ("list", "parts", "command"):
-        child = getattr(node, attr, None)
-        if isinstance(child, list):
-            for item in child:
-                found = _first_command_node(item)
-                if found is not None:
-                    return found
-        elif child is not None:
-            found = _first_command_node(child)
-            if found is not None:
-                return found
-    return None
+    return next(iter(_command_nodes(node)), None)
 
 
 def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
@@ -323,6 +341,102 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
             continue
         saw_option = True
     return True
+
+
+def _last_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
+    """Content of the last `<<<` here-string in a redirect-bearing list, else None.
+
+    The here-string content is the redirect's target word (`.output`); a fd-duplication redirect
+    (`>&2`) carries an int there instead, so guard on `.word`. The last `<<<` wins, matching bash's
+    last-stdin-redirect-wins rule.
+    """
+    here_string = None
+    for part in redirect_nodes:
+        if getattr(part, "kind", None) != "redirect" or getattr(part, "type", None) != "<<<":
+            continue
+        target = getattr(part, "output", None)
+        if target is not None and hasattr(target, "word"):
+            here_string = target.word
+    return here_string
+
+
+def _command_words(node: Any) -> "list[str]":
+    """Word tokens (command name + args) of a command node, skipping assignment/redirect prefixes."""
+    words: list[str] = []
+    for part in getattr(node, "parts", []):
+        if getattr(part, "kind", None) in ("assignment", "redirect"):
+            continue
+        if hasattr(part, "word"):
+            words.append(part.word)
+    return words
+
+
+def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
+    """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
+
+    Two shapes, mirroring the `-c` path:
+    - direct: the sink is a stdin-executing interpreter reading stdin as a program. `bash -c X <<< Y`
+      runs X (Y is inert data), `bash script.sh <<< Y` runs the script, `cat`/`grep` read stdin but
+      never execute it - all correctly excluded by `_reads_stdin_as_program`.
+    - wrapped: `timeout 5 bash <<< Y`, `env FOO=1 bash <<< Y`. The wrapper execs a shell that
+      inherits the wrapper's stdin (verified against timeout/env/stdbuf/nice). Mirrors the wrapper
+      scan in `_shell_delegated_payloads`: find the first interpreter it hands off to.
+
+    `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
+    caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
+    """
+    words = _command_words(sink)
+    if not words:
+        return None
+
+    name, args = _resolve_multicall(words[0].split("/")[-1], words[1:])
+    if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args):
+        return (name, here_string)
+
+    if name in WRAPPER_COMMANDS:
+        arg_bases = [a.split("/")[-1] for a in args]
+        at = next((i for i, w in enumerate(arg_bases) if w in STDIN_EXEC_INTERPRETERS), None)
+        if at is not None and _reads_stdin_as_program(arg_bases[at], args[at + 1 :]):
+            return (arg_bases[at], here_string)
+    return None
+
+
+def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
+    """Return (interpreter, here-string) if `node` runs its `<<<` here-string as a program.
+
+    A `<<<` redirect feeds its word to a command's stdin; a bare interpreter runs that stdin as a
+    program. The redirect attaches in two places:
+
+    - on a command node (`bash <<< "rm -rf /"`): the command IS the stdin sink.
+    - on a compound/group/loop node (`( bash ) <<< X`, `{ true; bash; } <<< X`, `while :; do bash;
+      done <<< X`): the here-string feeds the GROUP's stdin, which bashlex hangs on `.redirects`.
+      ANY bare interpreter in the group can consume it - an earlier command that does not read stdin
+      (`true`, `echo`) simply leaves it for the next command (all verified against real bash). So we
+      must check every command in the group, not just the first: checking only `_first_command_node`
+      missed `{ true; bash; } <<< "rm -rf /"` (CodeRabbit CWE-78 Critical on #151). Over-approximate
+      to every command - the safe direction, since surfacing re-validates the payload: a benign
+      here-string still passes, only a dangerous one blocks. (A rare over-block, e.g. `{ cat; bash;
+      } <<< X` where `cat` actually consumes the here-string, is acceptable and fails closed.)
+
+    `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
+    caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
+    """
+    kind = getattr(node, "kind", None)
+    if kind == "command":
+        here_string = _last_here_string(getattr(node, "parts", []))
+        if here_string is None:
+            return None
+        return _classify_sink(node, here_string)
+
+    if kind == "compound":
+        here_string = _last_here_string(getattr(node, "redirects", []))
+        if here_string is None:
+            return None
+        for sink in _command_nodes(node):
+            found = _classify_sink(sink, here_string)
+            if found is not None:
+                return found
+    return None
 
 
 class BashCommandParser:
@@ -519,6 +633,48 @@ class BashCommandParser:
                                 visit(item)
                         elif child:
                             visit(child)
+
+        for node in ast_nodes or []:
+            visit(node)
+
+        return results
+
+    def extract_stdin_program_redirects(self, ast_nodes: list[Any]) -> list[tuple[str, str]]:
+        """Extract here-string (`<<<`) contents a command executes as a program.
+
+        SECURITY CRITICAL (LAB-2768): `bash <<< "rm -rf /"` feeds the here-string to bash's
+        stdin, and a bare shell runs its stdin as a program - the same "argument is code, not
+        data" sink as `bash -c PROG`, but the here-string hangs off a *redirect* node that
+        `extract_commands_with_args` skips. So `_shell_delegated_payloads` sees `('bash', [])`,
+        no payload, no recursion, and the delegated `rm -rf /` degrades to HIGH (allowed by the
+        permissive preset).
+
+        Returns (command_basename, here_string_text) for each command whose stdin - supplied by
+        a `<<<` redirect - it executes as a program. Gated by `_reads_stdin_as_program` (the same
+        predicate that makes pipe-to-shell dangerous), so a here-string that is NOT the program is
+        never surfaced: `bash -c X <<< Y` (bash runs X; Y is inert stdin data), `bash script.sh
+        <<< Y` (the script is the program), and `cat <<< text` (cat is not an interpreter). The
+        caller decides which interpreters' payloads are re-validated as bash - a Python here-string
+        (`python3 <<< "import os"`) is real stdin-as-program but nonsense to re-check as bash.
+        """
+        results: list[tuple[str, str]] = []
+
+        def visit(node):
+            if not hasattr(node, "kind"):
+                return
+            # `<<<` rides a command node's `.parts` (`bash <<< X`) or a compound node's `.redirects`
+            # (`( bash ) <<< X`); _here_string_program handles both and finds the stdin sink.
+            if node.kind in ("command", "compound"):
+                found = _here_string_program(node)
+                if found is not None:
+                    results.append(found)
+            for attr in ["parts", "command", "list", "pipe", "compound"]:
+                child = getattr(node, attr, None)
+                if isinstance(child, list):
+                    for item in child:
+                        visit(item)
+                elif child:
+                    visit(child)
 
         for node in ast_nodes or []:
             visit(node)
