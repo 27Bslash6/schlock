@@ -202,6 +202,18 @@ class TestShellDelegatedPayloadExtraction:
         assert calls >= n, f"{calls} extractor calls: the monkeypatch did not observe the recursion"
         assert calls <= (n + 1) ** 2, f"{calls} extractor calls for {n} wrappers: not polynomial"
 
+    def test_ceiling_admits_exactly_max_delegator_tokens(self):
+        # CodeRabbit on #153: the sibling test below pins only the reject side, so a `>` -> `>=`
+        # slip would start blocking commands that fit the ceiling exactly. n `nice` tokens ahead of
+        # `bash -c PROG` is n + 1 distinct suffixes: n = MAX - 1 sits on the ceiling, n = MAX is
+        # one past it.
+        def chain(n):
+            return ("nice", ["nice"] * (n - 1) + ["bash", "-c", "echo ok"])
+
+        assert self._p(chain(MAX_DELEGATOR_TOKENS - 1)) == ["echo ok"]
+        with pytest.raises(ValueError, match="delegator tokens"):
+            self._p(chain(MAX_DELEGATOR_TOKENS))
+
     def test_sibling_chains_past_the_ceiling_fail_closed(self):
         # Panel on #153: the per-call memo bounds ONE chain, not k independent chains with
         # distinct tails, so total extraction work still grew with command size - and a
