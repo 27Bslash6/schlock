@@ -5,6 +5,14 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2](https://github.com/27Bslash6/schlock/compare/schlock-v0.9.1...schlock-v0.9.2) (2026-09-05)
+
+
+### Bug Fixes
+
+* **hooks:** scan committed file content for advertising ([#136](https://github.com/27Bslash6/schlock/issues/136)) ([1353f73](https://github.com/27Bslash6/schlock/commit/1353f734749ea13346e29215092eb751caedb8fb))
+* **validator:** validate shell -c payloads as code, not data (LAB-2754) ([#147](https://github.com/27Bslash6/schlock/issues/147)) ([1de8e4c](https://github.com/27Bslash6/schlock/commit/1de8e4c072ae263d82866460f384e86d335ea0f6))
+
 ## [0.9.1](https://github.com/27Bslash6/schlock/compare/schlock-v0.9.0...schlock-v0.9.1) (2026-07-24)
 
 
