@@ -308,9 +308,13 @@ terminating the loop.
 
 Guard rails:
 
-- **Freshness gate**: the Bash tool "succeeds" even when `git commit` was a no-op, so only a
-  HEAD committed within the last 30 seconds is inspected — a failed re-run cannot re-flag an
-  old commit.
+- **Freshness gate (HEAD identity)**: the Bash tool "succeeds" even when `git commit` was a
+  no-op, so only a HEAD the detector has not already seen is inspected — a failed re-run
+  cannot re-flag an old commit, while a commit made early in a slow compound command
+  (`git commit && <long test suite>`) is still inspected however long the rest of the
+  command runs. The last-seen HEAD per repository lives in a small state file next to the
+  audit log (override with `SCHLOCK_POST_COMMIT_STATE`); on first contact with a repository
+  a 30-second wall-clock window decides instead.
 - **Fail-open + cheap-gated**: errors and non-repo directories are silent; the hook does no
   real work unless the command looks like a commit. Disabling the commit filter
   (`enabled: false`) disables this detector too.
