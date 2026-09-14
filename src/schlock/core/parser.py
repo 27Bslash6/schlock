@@ -7,12 +7,17 @@ The parser is security-critical and REQUIRES bashlex for proper AST parsing.
 Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
+import json
 import logging
+import os
+from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any, Optional
 
 import bashlex
 import bashlex.errors
 
+from schlock.core.native_bridge import NativeBridge, NativeBridgeError, NativeUnavailableError
 from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
@@ -118,6 +123,165 @@ def _apply_andor_substitution_correction() -> None:
 
 
 _apply_andor_substitution_correction()
+
+
+def parse_bashlex(command: str) -> list[Any]:
+    """The in-process bashlex tier: parse or raise `ParseError` (never returns a partial AST).
+
+    Runs with the AND-OR substitution correction above applied. This is also the LAST tier
+    of `TieredParser`: when it raises, nothing rescues the command and validator.py blocks.
+    """
+    try:
+        return bashlex.parse(command)
+    except bashlex.errors.ParsingError as e:
+        # Preserve original bashlex error for debugging
+        raise ParseError(
+            f"Failed to parse bash command: {command!r}",
+            original_error=e,
+        )
+    except Exception as e:
+        # Catch any other unexpected bashlex errors
+        logger.error(f"Unexpected error parsing command: {e}")
+        raise ParseError(
+            f"Unexpected parsing error for command: {command!r}",
+            original_error=e,
+        )
+
+
+# --- Parser tiers: `SCHLOCK_PARSER` switch + fail-closed state machine (spec §6, LAB-409 T5) ---
+
+PARSER_TIER_ENV = "SCHLOCK_PARSER"
+PARSER_TIERS = frozenset({"auto", "native", "bashlex"})
+DEFAULT_PARSER_TIER = "auto"
+
+# Claude Code applies the `env` block of these files to every session, hooks included, and a
+# repository ships them. A value they set is therefore PROJECT scope: a hostile checkout pinning
+# the parser that reads its own commands is the same privilege escalation as a project-scope
+# whitelist (validator._extract_whitelist_patterns) and is refused the same way.
+_PROJECT_SETTINGS_FILES = ("settings.json", "settings.local.json")
+
+
+def _project_settings_pinning(name: str, project_dirs: Iterable[Path]) -> Optional[Path]:
+    """Return the project-scope Claude settings file whose `env` block sets `name`, if any.
+
+    A file that exists but cannot be read or parsed counts too: we cannot prove the value did
+    NOT come from project scope, so the caller falls back to the default tier.
+    """
+    for root in project_dirs:
+        for filename in _PROJECT_SETTINGS_FILES:
+            path = root / ".claude" / filename
+            try:
+                if not path.is_file():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:  # noqa: BLE001 - any read/parse failure means "cannot rule it out"
+                logger.warning(f"Cannot read {path} to verify the scope of {name} ({exc}); treating it as project scope")
+                return path
+            env_block = data.get("env") if isinstance(data, dict) else None
+            if isinstance(env_block, dict) and name in env_block:
+                return path
+    return None
+
+
+def _default_project_dirs(environ: Mapping[str, str]) -> list[Path]:
+    dirs: list[Path] = []
+    project_dir = environ.get("CLAUDE_PROJECT_DIR")  # Claude Code sets it for hooks: the project root
+    if project_dir:
+        dirs.append(Path(project_dir))
+    dirs.append(Path.cwd())  # raises FileNotFoundError when cwd was deleted; caller handles it
+    return dirs
+
+
+def resolve_parser_tier(
+    environ: Optional[Mapping[str, str]] = None,
+    project_dirs: Optional[Iterable[Path]] = None,
+) -> str:
+    """Resolve the forced parser tier from `SCHLOCK_PARSER` (spec §6).
+
+    `auto` (default) runs the fail-closed chain native → bashlex → deny. `bashlex` skips the
+    native tier entirely (the kill-switch: never spawns). `native` is native-ONLY: every native
+    failure denies with no bashlex rescue, so CI can prove the native path on its own and a
+    native under-block cannot pass green on a bashlex save.
+
+    Honored from user/global scope only. Any value outside the allowlist, and any value a
+    project-scope Claude settings file sets, resolves to `auto` with a warning. Never raises.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(PARSER_TIER_ENV)
+    if raw is None:
+        return DEFAULT_PARSER_TIER
+    tier = raw.strip().lower()
+    if tier not in PARSER_TIERS:
+        logger.warning(f"Ignoring {PARSER_TIER_ENV}={raw!r} (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}")
+        return DEFAULT_PARSER_TIER
+    if tier == DEFAULT_PARSER_TIER:
+        return tier  # nothing to protect: the scope probe would only ever land here anyway
+    try:
+        dirs = list(project_dirs) if project_dirs is not None else _default_project_dirs(env)
+        pinned_by = _project_settings_pinning(PARSER_TIER_ENV, dirs)
+    except Exception as exc:  # noqa: BLE001 - cannot establish the scope → safest tier
+        logger.warning(f"Cannot determine the scope of {PARSER_TIER_ENV} ({exc}); using {DEFAULT_PARSER_TIER}")
+        return DEFAULT_PARSER_TIER
+    if pinned_by is not None:
+        logger.warning(
+            f"Ignoring {PARSER_TIER_ENV} set in project-scope {pinned_by} "
+            f"(only user/global scope may pin the parser tier); using {DEFAULT_PARSER_TIER}"
+        )
+        return DEFAULT_PARSER_TIER
+    return tier
+
+
+class TieredParser:
+    """Spec §6 state machine: native → in-process bashlex → deny.
+
+    Every `parse` exit returns a mapped AST or raises `ParseError`, which validator.py turns
+    into BLOCKED. The deny tier is terminal in every mode; no path allows on failure.
+
+    Args:
+        tier: one of PARSER_TIERS; defaults to `resolve_parser_tier()`.
+        bridge: the native tier (tests inject scripted binaries and short timeouts).
+    """
+
+    def __init__(self, tier: Optional[str] = None, bridge: Optional[NativeBridge] = None):
+        self.tier = resolve_parser_tier() if tier is None else tier
+        if self.tier not in PARSER_TIERS:
+            raise ValueError(f"unknown parser tier {self.tier!r}; expected one of {sorted(PARSER_TIERS)}")
+        self._bridge = NativeBridge() if bridge is None else bridge
+        self._warned_unavailable = False
+
+    def parse(self, command: str) -> list[Any]:
+        if self.tier == "bashlex":
+            return parse_bashlex(command)
+        try:
+            return self._bridge.parse(command)
+        except Exception as exc:  # noqa: BLE001 - spec §6: ANY native failure moves to the next tier
+            self._note_native_failure(exc)
+            if self.tier == "native":
+                # Native-only: no rescue. A native parse error is already a ParseError; wrap the rest.
+                if isinstance(exc, ParseError):
+                    raise
+                raise ParseError(
+                    f"native parser failed and {PARSER_TIER_ENV}=native forbids the bashlex fallback: {exc}",
+                    original_error=exc,
+                ) from exc
+        return parse_bashlex(command)  # raises ParseError itself when bashlex also fails → deny
+
+    def _note_native_failure(self, exc: Exception) -> None:
+        if isinstance(exc, NativeUnavailableError):
+            # Once per process (the hook is one process per command) — not once per parse.
+            if not self._warned_unavailable:
+                self._warned_unavailable = True
+                logger.warning(f"native parser unavailable, using bashlex: {exc}")
+        elif isinstance(exc, (NativeBridgeError, ParseError)):
+            logger.debug(f"native parser tier failed: {exc}")
+        else:
+            # Outside the bridge's exception contract: still fail toward bashlex, but loudly —
+            # this is a bridge bug, not one of the designed §6 rows.
+            logger.warning(
+                f"native parser raised outside its contract ({type(exc).__name__}: {exc}); using bashlex",
+                exc_info=True,
+            )
+
 
 # Interpreters that EXECUTE their standard input as a program when given no program source.
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
@@ -407,21 +571,7 @@ class BashCommandParser:
         if not command.strip():
             raise ValueError("Command cannot be whitespace-only")
 
-        try:
-            return bashlex.parse(command)
-        except bashlex.errors.ParsingError as e:
-            # Preserve original bashlex error for debugging
-            raise ParseError(
-                f"Failed to parse bash command: {command!r}",
-                original_error=e,
-            )
-        except Exception as e:
-            # Catch any other unexpected bashlex errors
-            logger.error(f"Unexpected error parsing command: {e}")
-            raise ParseError(
-                f"Unexpected parsing error for command: {command!r}",
-                original_error=e,
-            )
+        return parse_bashlex(command)
 
     def extract_commands(self, ast_nodes: list[Any]) -> list[str]:
         """Extract all command names from AST.

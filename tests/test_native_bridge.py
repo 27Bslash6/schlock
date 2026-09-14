@@ -8,13 +8,16 @@ shape of the typed-JSON beyond "it decodes" — mapping it to an AstView is T2b.
 import json
 import platform
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
+from schlock.core import native_bridge
 from schlock.core.native_bridge import (
     MAX_AST_JSON_SIZE,
     MAX_COMMAND_SIZE,
+    NATIVE_TIMEOUT,
     NativeBridge,
     NativeBridgeError,
     platform_dir,
@@ -48,14 +51,6 @@ needs_binary = pytest.mark.skipif(
     not _binary_available(),
     reason="no vendored schlock-parse binary for this platform",
 )
-
-
-def _fake_binary(tmp_path, body):
-    """Write an executable stand-in for schlock-parse that runs `body`."""
-    script = tmp_path / "fake-schlock-parse"
-    script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
-    script.chmod(0o755)
-    return script
 
 
 class TestBinaryResolution:
@@ -116,35 +111,33 @@ class TestExitContract:
     """Exit 3/4 and crashes must never be reported as a (partial) success."""
 
     @pytest.mark.parametrize("code", [3, 4])
-    def test_partial_output_then_error_exit_is_not_swallowed(self, tmp_path, code):
-        binary = _fake_binary(
-            tmp_path,
+    def test_partial_output_then_error_exit_is_not_swallowed(self, fake_binary, code):
+        binary = fake_binary(
             f'sys.stdout.write(\'{{"Type":"File"\')\nsys.stdout.flush()\nsys.exit({code})\n',
         )
         with pytest.raises(NativeBridgeError, match=f"exited {code}"):
             NativeBridge(binary_path=binary).parse_json("echo hi")
 
-    def test_unexpected_exit_code_raises(self, tmp_path):
-        binary = _fake_binary(tmp_path, "sys.exit(9)\n")
+    def test_unexpected_exit_code_raises(self, fake_binary):
+        binary = fake_binary("sys.exit(9)\n")
         with pytest.raises(NativeBridgeError, match="exited 9"):
             NativeBridge(binary_path=binary).parse_json("echo hi")
 
-    def test_parse_error_exit_2_carries_stderr_detail(self, tmp_path):
-        binary = _fake_binary(tmp_path, 'sys.stderr.write("1:1: bad syntax")\nsys.exit(2)\n')
+    def test_parse_error_exit_2_carries_stderr_detail(self, fake_binary):
+        binary = fake_binary('sys.stderr.write("1:1: bad syntax")\nsys.exit(2)\n')
         with pytest.raises(ParseError, match="bad syntax"):
             NativeBridge(binary_path=binary).parse_json("if; then")
 
-    def test_command_reaches_the_binary_on_stdin(self, tmp_path):
-        binary = _fake_binary(tmp_path, "sys.stdout.write(sys.stdin.read())\n")
+    def test_command_reaches_the_binary_on_stdin(self, fake_binary):
+        binary = fake_binary("sys.stdout.write(sys.stdin.read())\n")
         assert NativeBridge(binary_path=binary).parse_json("echo unique-marker") == "echo unique-marker"
 
 
 class TestBoundedRead:
     """Output guard: bound the stream, kill the process, and reap it."""
 
-    def test_overflow_kills_and_reaps_the_process(self, tmp_path, monkeypatch):
-        binary = _fake_binary(
-            tmp_path,
+    def test_overflow_kills_and_reaps_the_process(self, fake_binary, monkeypatch):
+        binary = fake_binary(
             "while True:\n    sys.stdout.write('x' * 4096)\n    sys.stdout.flush()\n",
         )
         spawned = []
@@ -165,17 +158,62 @@ class TestBoundedRead:
         # returncode set => wait() ran => no zombie left behind.
         assert spawned[0].returncode is not None
 
-    def test_output_at_the_bound_is_accepted(self, tmp_path):
-        binary = _fake_binary(tmp_path, "sys.stdout.write('y' * 4096)\n")
+    def test_output_at_the_bound_is_accepted(self, fake_binary):
+        binary = fake_binary("sys.stdout.write('y' * 4096)\n")
         payload = NativeBridge(binary_path=binary, max_ast_json_size=4096).parse_json("echo hi")
         assert len(payload) == 4096
+
+
+class TestTimeout:
+    """Spec §6: a hung or slow binary is killed and reaped (kill+wait), never awaited."""
+
+    def test_default_timeout_is_the_spec_value(self):
+        assert NATIVE_TIMEOUT == 0.25
+
+    def test_hung_binary_is_killed_reaped_and_reported_as_timeout(self, fake_binary, monkeypatch):
+        binary = fake_binary("import time\nsys.stdin.read()\ntime.sleep(30)\n")
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def recording_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", recording_popen)
+
+        started = time.perf_counter()
+        with pytest.raises(NativeBridgeError, match="timed out"):
+            NativeBridge(binary_path=binary, timeout=0.1).parse_json("echo hi")
+
+        assert time.perf_counter() - started < 5  # did not sit out the 30 s sleep
+        assert len(spawned) == 1
+        assert spawned[0].returncode is not None  # reaped: no zombie
+        assert spawned[0].returncode != 0
+
+    def test_timer_firing_after_a_clean_exit_is_not_a_timeout(self, fake_binary, monkeypatch):
+        """Race: the child exits 0 and the timer fires before cancel() wins. returncode is truth."""
+
+        class FiresOnCancel:
+            def __init__(self, interval, function):
+                self._function = function
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self._function()
+
+        monkeypatch.setattr(native_bridge.threading, "Timer", FiresOnCancel)
+        binary = fake_binary("sys.stdout.write('{}')\n")
+        assert NativeBridge(binary_path=binary).parse_json("echo hi") == "{}"
 
 
 class TestSpawnDiscipline:
     """Parse-once: exactly one Popen per call, and no unbounded capture."""
 
-    def test_single_spawn_and_no_capture_output(self, tmp_path, monkeypatch):
-        binary = _fake_binary(tmp_path, "sys.stdout.write('{}')\n")
+    def test_single_spawn_and_no_capture_output(self, fake_binary, monkeypatch):
+        binary = fake_binary("sys.stdout.write('{}')\n")
         calls = []
         real_popen = subprocess.Popen
 
@@ -209,8 +247,8 @@ class TestSizeGuards:
         with pytest.raises(NativeBridgeError, match="exceeds"):
             NativeBridge().parse_json(command)
 
-    def test_input_at_the_bound_is_accepted(self, tmp_path):
-        binary = _fake_binary(tmp_path, "sys.stdout.write(str(len(sys.stdin.buffer.read())))\n")
+    def test_input_at_the_bound_is_accepted(self, fake_binary):
+        binary = fake_binary("sys.stdout.write(str(len(sys.stdin.buffer.read())))\n")
         assert NativeBridge(binary_path=binary).parse_json("a" * MAX_COMMAND_SIZE) == str(MAX_COMMAND_SIZE)
 
     def test_unencodable_input_routes_to_fallback(self, monkeypatch):
@@ -219,9 +257,9 @@ class TestSizeGuards:
         with pytest.raises(NativeBridgeError, match="not UTF-8"):
             NativeBridge().parse_json("echo \ud800")
 
-    def test_deeply_nested_json_routes_to_fallback(self, tmp_path):
+    def test_deeply_nested_json_routes_to_fallback(self, fake_binary):
         # json.loads overflows the C scanner on deep nesting; a bare RecursionError skips T5's routing.
-        binary = _fake_binary(tmp_path, "sys.stdout.write('[' * 100000 + ']' * 100000)\n")
+        binary = fake_binary("sys.stdout.write('[' * 100000 + ']' * 100000)\n")
         with pytest.raises(NativeBridgeError, match="malformed"):
             NativeBridge(binary_path=binary).parse("echo hi")
 
@@ -232,13 +270,17 @@ class TestSizeGuards:
 @needs_binary
 class TestOutputBoundAtMaxInput:
     """The bound clears the spec's legitimate 64 KiB worst case and trips CLEANLY on the dense
-    shapes it is sized to reject (memory budget — see MAX_AST_JSON_SIZE)."""
+    shapes it is sized to reject (memory budget — see MAX_AST_JSON_SIZE).
+
+    The deadline is lifted here on purpose: every 64 KiB shape takes the Go side longer than
+    NATIVE_TIMEOUT, so with the default the timer wins and these would measure the timeout
+    (TestTimeout's job), not the bound."""
 
     def test_sparse_max_size_input_parses_on_the_native_tier(self):
         command = ("echo a;" * (MAX_COMMAND_SIZE // 7)).ljust(MAX_COMMAND_SIZE)
-        assert json.loads(NativeBridge().parse_json(command))["Type"] == "File"
+        assert json.loads(NativeBridge(timeout=30).parse_json(command))["Type"] == "File"
 
     def test_dense_max_size_input_trips_the_bound_and_falls_back(self):
         command = "a|b|c|d|e|f|g|h;" * (MAX_COMMAND_SIZE // 16)
         with pytest.raises(NativeBridgeError, match="exceeded"):
-            NativeBridge().parse_json(command)
+            NativeBridge(timeout=30).parse_json(command)

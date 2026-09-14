@@ -2,8 +2,10 @@
 
 Slice T2a of the native-parser migration (spec §3.1/§3.2): resolve the binary
 for this platform, hand it a command on stdin, and read its typed-JSON AST back
-under a hard output bound. Turning that JSON into an `AstView` the existing
-walkers can read is T2b; the tier/fallback state machine is T5.
+under a hard output bound and a hard deadline. Turning that JSON into an
+`AstView` the existing walkers can read is `ast_view.py`; the tier/fallback state
+machine that decides what happens when this bridge raises is
+`parser.TieredParser` (spec §6).
 
 Two invariants carry the security weight here:
 
@@ -21,6 +23,7 @@ Two invariants carry the security weight here:
 import os
 import platform
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +64,11 @@ _GOARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "ar
 EXIT_OK = 0
 EXIT_PARSE_ERROR = 2
 
+# Spec §6 deadline, ~100x a typical parse. Trips on the dense 64 KiB shapes (0.4-1 s on the
+# Go side) and on a hung or tampered binary; the child is killed and reaped, then the caller
+# falls back to bashlex.
+NATIVE_TIMEOUT = 0.25
+
 
 class NativeBridgeError(Exception):
     """The native tier could not produce a trustworthy AST (spec §6 → fallback).
@@ -72,6 +80,13 @@ class NativeBridgeError(Exception):
     """
 
 
+class NativeUnavailableError(NativeBridgeError):
+    """No usable binary for this platform (missing, not executable, unsupported GOOS/GOARCH,
+    or the spawn itself failed). Spec §6 row 1: the tier state machine warns ONCE for this
+    class and stays on bashlex, instead of logging on every command.
+    """
+
+
 def platform_dir() -> str:
     """Return the `<goos>-<goarch>` directory name for the running platform."""
     system = platform.system().lower()
@@ -79,7 +94,7 @@ def platform_dir() -> str:
     goos = _GOOS.get(system)
     goarch = _GOARCH.get(machine)
     if goos is None or goarch is None:
-        raise NativeBridgeError(f"unsupported platform for native parser: {system}/{machine}")
+        raise NativeUnavailableError(f"unsupported platform for native parser: {system}/{machine}")
     return f"{goos}-{goarch}"
 
 
@@ -87,7 +102,7 @@ def resolve_binary(bin_root: Optional[Path] = None) -> Path:
     """Locate the vendored `schlock-parse` for this platform.
 
     Raises:
-        NativeBridgeError: platform unsupported, binary absent, or not executable.
+        NativeUnavailableError: platform unsupported, binary absent, or not executable.
             Never returns None — a missing parser must surface as a failure the
             fallback chain can see, not as a silent allow.
     """
@@ -95,9 +110,9 @@ def resolve_binary(bin_root: Optional[Path] = None) -> Path:
     suffix = ".exe" if platform.system().lower() == "windows" else ""
     path = root / platform_dir() / f"{BINARY_NAME}{suffix}"
     if not path.is_file():
-        raise NativeBridgeError(f"native parser binary not found: {path}")
+        raise NativeUnavailableError(f"native parser binary not found: {path}")
     if not os.access(path, os.X_OK):
-        raise NativeBridgeError(f"native parser binary not executable: {path}")
+        raise NativeUnavailableError(f"native parser binary not executable: {path}")
     return path
 
 
@@ -114,15 +129,18 @@ class NativeBridge:
         binary_path: explicit binary, bypassing platform resolution (tests, and
             T5's forced-tier switch).
         max_ast_json_size: output bound in bytes; overflow kills the child.
+        timeout: seconds the exchange may take before the child is killed (spec §6).
     """
 
     def __init__(
         self,
         binary_path: Optional[Path] = None,
         max_ast_json_size: int = MAX_AST_JSON_SIZE,
+        timeout: float = NATIVE_TIMEOUT,
     ):
         self._binary_path = binary_path
         self._max_ast_json_size = max_ast_json_size
+        self._timeout = timeout
 
     def _binary(self) -> Path:
         # Resolved lazily and cached on success only, so a machine without a
@@ -151,7 +169,8 @@ class NativeBridge:
 
         Raises:
             ParseError: the binary rejected the command as unparseable (exit 2).
-            NativeBridgeError: any other failure — oversized input, spawn error,
+            NativeUnavailableError: no binary to run (spawn error included).
+            NativeBridgeError: any other failure — oversized input, timeout,
                 output overflow, stdin/stdout error (exit 3/4), crash, or
                 undecodable output.
         """
@@ -173,18 +192,36 @@ class NativeBridge:
                 stderr=subprocess.PIPE,
             )
         except OSError as exc:
-            raise NativeBridgeError(f"failed to spawn native parser {binary}: {exc}")
+            raise NativeUnavailableError(f"failed to spawn native parser {binary}: {exc}")
 
-        # Popen as a context manager closes the three pipes and reaps the child
-        # even on the raising paths below.
-        with proc:
-            payload, stderr, returncode = self._exchange(proc, command_bytes, binary)
+        # Spec §6 deadline: the timer kills the child, the wait below reaps it (kill+wait, no
+        # zombie). Popen.kill() polls first, so a timer that fires after a clean exit is a
+        # no-op — and returncode, not the timer, decides success: a late fire must never turn
+        # a valid AST into a false timeout.
+        timed_out = threading.Event()
+
+        def _on_timeout() -> None:
+            timed_out.set()
+            proc.kill()
+
+        timer = threading.Timer(self._timeout, _on_timeout)
+        try:
+            # Popen as a context manager closes the three pipes and reaps the child
+            # even on the raising paths below — including a timer thread that fails to start.
+            with proc:
+                timer.start()
+                payload, stderr, returncode = self._exchange(proc, command_bytes, binary)
+        finally:
+            timer.cancel()
 
         if returncode == EXIT_OK:
             try:
                 return payload.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise NativeBridgeError(f"native parser emitted undecodable output: {exc}")
+        if timed_out.is_set():
+            # Whatever reached stdout is a prefix of a parse that never finished.
+            raise NativeBridgeError(f"native parser timed out after {self._timeout * 1000:.0f} ms; killed {binary}")
 
         detail = stderr.decode("utf-8", errors="replace").strip()
         if returncode == EXIT_PARSE_ERROR:
@@ -209,8 +246,8 @@ class NativeBridge:
 
         # ponytail: write-then-read is deadlock-free only because the CLI does
         # io.ReadAll(stdin) before writing a byte of stdout. A tampered binary
-        # that floods stdout first could block the write above; T5's 250 ms
-        # timeout (spec §6) is what closes that window.
+        # that floods stdout first could block the write above; the NATIVE_TIMEOUT
+        # timer in parse_json kills the child and closes that window.
         chunks: list[bytes] = []
         total = 0
         while True:

@@ -64,3 +64,21 @@ def mock_result():
         return MockResult(value)
 
     return _create
+
+
+@pytest.fixture
+def fake_binary(tmp_path):
+    """Factory: write an executable stand-in for `schlock-parse` that runs `body` (Python source).
+
+    Shared by the bridge tests and the tier state-machine tests so each spec §6
+    failure row can be scripted (exit codes, hangs, garbage output) without
+    the real vendored binary.
+    """
+
+    def _make(body: str) -> Path:
+        script = tmp_path / "fake-schlock-parse"
+        script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    return _make
