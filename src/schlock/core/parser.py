@@ -9,15 +9,14 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import json
 import logging
-import os
-from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Optional
 
 import bashlex
 import bashlex.errors
 
-from schlock.core.native_bridge import NativeBridge, NativeBridgeError, NativeUnavailableError
+from schlock.core.ast_view import UnmappedNodeError
+from schlock.core.native_bridge import NativeBridge, NativeBridgeError
 from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
@@ -154,48 +153,12 @@ PARSER_TIER_ENV = "SCHLOCK_PARSER"
 PARSER_TIERS = frozenset({"auto", "native", "bashlex"})
 DEFAULT_PARSER_TIER = "auto"
 
-# Claude Code applies the `env` block of these files to every session, hooks included, and a
-# repository ships them. A value they set is therefore PROJECT scope: a hostile checkout pinning
-# the parser that reads its own commands is the same privilege escalation as a project-scope
-# whitelist (validator._extract_whitelist_patterns) and is refused the same way.
-_PROJECT_SETTINGS_FILES = ("settings.json", "settings.local.json")
+
+def _user_settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
 
 
-def _project_settings_pinning(name: str, project_dirs: Iterable[Path]) -> Optional[Path]:
-    """Return the project-scope Claude settings file whose `env` block sets `name`, if any.
-
-    A file that exists but cannot be read or parsed counts too: we cannot prove the value did
-    NOT come from project scope, so the caller falls back to the default tier.
-    """
-    for root in project_dirs:
-        for filename in _PROJECT_SETTINGS_FILES:
-            path = root / ".claude" / filename
-            try:
-                if not path.is_file():
-                    continue
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as exc:  # noqa: BLE001 - any read/parse failure means "cannot rule it out"
-                logger.warning(f"Cannot read {path} to verify the scope of {name} ({exc}); treating it as project scope")
-                return path
-            env_block = data.get("env") if isinstance(data, dict) else None
-            if isinstance(env_block, dict) and name in env_block:
-                return path
-    return None
-
-
-def _default_project_dirs(environ: Mapping[str, str]) -> list[Path]:
-    dirs: list[Path] = []
-    project_dir = environ.get("CLAUDE_PROJECT_DIR")  # Claude Code sets it for hooks: the project root
-    if project_dir:
-        dirs.append(Path(project_dir))
-    dirs.append(Path.cwd())  # raises FileNotFoundError when cwd was deleted; caller handles it
-    return dirs
-
-
-def resolve_parser_tier(
-    environ: Optional[Mapping[str, str]] = None,
-    project_dirs: Optional[Iterable[Path]] = None,
-) -> str:
+def resolve_parser_tier(user_settings: Optional[Path] = None) -> str:
     """Resolve the forced parser tier from `SCHLOCK_PARSER` (spec §6).
 
     `auto` (default) runs the fail-closed chain native → bashlex → deny. `bashlex` skips the
@@ -203,29 +166,35 @@ def resolve_parser_tier(
     failure denies with no bashlex rescue, so CI can prove the native path on its own and a
     native under-block cannot pass green on a bashlex save.
 
-    Honored from user/global scope only. Any value outside the allowlist, and any value a
-    project-scope Claude settings file sets, resolves to `auto` with a warning. Never raises.
+    The value is read from the `env` block of the USER-scope Claude Code settings file
+    (`~/.claude/settings.json`) and from nothing else. The process environment is deliberately
+    NOT consulted: Claude Code applies every settings file's `env` block to the session and its
+    subprocesses, project over user, so an environment variable carries no provenance — a
+    hostile checkout's `.claude/settings.json` can override or junk the user's value, and
+    refusing "project-looking" values would still leave the user's kill-switch defeated. The
+    one file a checkout cannot write is the user's own; that is the same trust line as the
+    project-scope whitelist ban. CI pins a tier by writing that file. Anything unreadable or
+    outside the allowlist resolves to `auto` with one warning. Never raises.
     """
-    env = os.environ if environ is None else environ
-    raw = env.get(PARSER_TIER_ENV)
+    try:
+        path = _user_settings_path() if user_settings is None else user_settings
+        if not path.is_file():
+            return DEFAULT_PARSER_TIER
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - HOME unresolvable, unreadable or malformed: the switch is unknowable
+        logger.warning(f"Cannot read {PARSER_TIER_ENV} from user settings ({exc}); using {DEFAULT_PARSER_TIER}")
+        return DEFAULT_PARSER_TIER
+    env_block = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env_block, dict):
+        return DEFAULT_PARSER_TIER
+    # Case-insensitive key: Windows environments are, and a user's own typo is not a threat.
+    raw = next((v for k, v in env_block.items() if str(k).upper() == PARSER_TIER_ENV), None)
     if raw is None:
         return DEFAULT_PARSER_TIER
-    tier = raw.strip().lower()
+    tier = str(raw).strip().lower()
     if tier not in PARSER_TIERS:
-        logger.warning(f"Ignoring {PARSER_TIER_ENV}={raw!r} (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}")
-        return DEFAULT_PARSER_TIER
-    if tier == DEFAULT_PARSER_TIER:
-        return tier  # nothing to protect: the scope probe would only ever land here anyway
-    try:
-        dirs = list(project_dirs) if project_dirs is not None else _default_project_dirs(env)
-        pinned_by = _project_settings_pinning(PARSER_TIER_ENV, dirs)
-    except Exception as exc:  # noqa: BLE001 - cannot establish the scope → safest tier
-        logger.warning(f"Cannot determine the scope of {PARSER_TIER_ENV} ({exc}); using {DEFAULT_PARSER_TIER}")
-        return DEFAULT_PARSER_TIER
-    if pinned_by is not None:
         logger.warning(
-            f"Ignoring {PARSER_TIER_ENV} set in project-scope {pinned_by} "
-            f"(only user/global scope may pin the parser tier); using {DEFAULT_PARSER_TIER}"
+            f"Ignoring {PARSER_TIER_ENV}={raw!r} in {path} (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}"
         )
         return DEFAULT_PARSER_TIER
     return tier
@@ -234,12 +203,18 @@ def resolve_parser_tier(
 class TieredParser:
     """Spec §6 state machine: native → in-process bashlex → deny.
 
-    Every `parse` exit returns a mapped AST or raises `ParseError`, which validator.py turns
-    into BLOCKED. The deny tier is terminal in every mode; no path allows on failure.
+    Every `parse` exit returns a mapped AST or raises `ParseError`; validator.py's parse-failure
+    path then BLOCKS (or, for a heredoc parse failure, re-validates the command before the
+    heredoc — that special case keys off bashlex's own message, which is why the bashlex tier's
+    `ParseError` is the one that propagates). The deny tier is terminal in every mode; no path
+    allows on failure.
 
     Args:
         tier: one of PARSER_TIERS; defaults to `resolve_parser_tier()`.
         bridge: the native tier (tests inject scripted binaries and short timeouts).
+
+    T8 must hold ONE instance per process (inside the cached `BashCommandParser`): the
+    once-per-process warning below is per instance.
     """
 
     def __init__(self, tier: Optional[str] = None, bridge: Optional[NativeBridge] = None):
@@ -247,7 +222,7 @@ class TieredParser:
         if self.tier not in PARSER_TIERS:
             raise ValueError(f"unknown parser tier {self.tier!r}; expected one of {sorted(PARSER_TIERS)}")
         self._bridge = NativeBridge() if bridge is None else bridge
-        self._warned_unavailable = False
+        self._warned = False
 
     def parse(self, command: str) -> list[Any]:
         if self.tier == "bashlex":
@@ -267,20 +242,21 @@ class TieredParser:
         return parse_bashlex(command)  # raises ParseError itself when bashlex also fails → deny
 
     def _note_native_failure(self, exc: Exception) -> None:
-        if isinstance(exc, NativeUnavailableError):
-            # Once per process (the hook is one process per command) — not once per parse.
-            if not self._warned_unavailable:
-                self._warned_unavailable = True
-                logger.warning(f"native parser unavailable, using bashlex: {exc}")
-        elif isinstance(exc, (NativeBridgeError, ParseError)):
-            logger.debug(f"native parser tier failed: {exc}")
-        else:
-            # Outside the bridge's exception contract: still fail toward bashlex, but loudly —
-            # this is a bridge bug, not one of the designed §6 rows.
-            logger.warning(
-                f"native parser raised outside its contract ({type(exc).__name__}: {exc}); using bashlex",
-                exc_info=True,
-            )
+        if isinstance(exc, (ParseError, UnmappedNodeError)):
+            # Designed, per-command outcomes (exit 2; a construct T3 has not mapped yet): debug only.
+            logger.debug(f"native parser tier declined the command: {exc}")
+            return
+        # Everything else — no binary, crash, timeout, guard trip, malformed output — says the
+        # native tier is broken on this machine, and a silent permanent degrade to bashlex would
+        # hide it. One warning per process is the noise budget (the hook is one process per
+        # command; the hook's root logger sits at INFO, so debug never reaches stderr).
+        if self._warned:
+            return
+        self._warned = True
+        action = f"denying ({PARSER_TIER_ENV}=native)" if self.tier == "native" else "using bashlex"
+        in_contract = isinstance(exc, NativeBridgeError)
+        contract = "" if in_contract else f" ({type(exc).__name__} is outside the bridge's exception contract)"
+        logger.warning(f"native parser tier failed{contract}: {exc}; {action}", exc_info=not in_contract)
 
 
 # Interpreters that EXECUTE their standard input as a program when given no program source.

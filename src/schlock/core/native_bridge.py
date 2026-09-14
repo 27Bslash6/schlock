@@ -20,8 +20,10 @@ Two invariants carry the security weight here:
    and the accumulated output is discarded (spec §3.1, §11 finding 10).
 """
 
+import contextlib
 import os
 import platform
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -64,9 +66,11 @@ _GOARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "ar
 EXIT_OK = 0
 EXIT_PARSE_ERROR = 2
 
-# Spec §6 deadline, ~100x a typical parse. Trips on the dense 64 KiB shapes (0.4-1 s on the
-# Go side) and on a hung or tampered binary; the child is killed and reaped, then the caller
-# falls back to bashlex.
+# Spec §6 deadline, ~50-100x a typical parse (~5 ms measured). Bounds the whole exchange —
+# not just the child's lifetime: a hung binary, a dense 64 KiB shape (0.4-1.2 s on the Go
+# side) or a forked grandchild holding stdout open all end here, with the process group
+# killed and the child reaped, and the caller falls back to bashlex. A hook blocked past its
+# own timeout is fail-OPEN (Claude Code proceeds), so this is load-bearing.
 NATIVE_TIMEOUT = 0.25
 
 
@@ -80,13 +84,6 @@ class NativeBridgeError(Exception):
     """
 
 
-class NativeUnavailableError(NativeBridgeError):
-    """No usable binary for this platform (missing, not executable, unsupported GOOS/GOARCH,
-    or the spawn itself failed). Spec §6 row 1: the tier state machine warns ONCE for this
-    class and stays on bashlex, instead of logging on every command.
-    """
-
-
 def platform_dir() -> str:
     """Return the `<goos>-<goarch>` directory name for the running platform."""
     system = platform.system().lower()
@@ -94,7 +91,7 @@ def platform_dir() -> str:
     goos = _GOOS.get(system)
     goarch = _GOARCH.get(machine)
     if goos is None or goarch is None:
-        raise NativeUnavailableError(f"unsupported platform for native parser: {system}/{machine}")
+        raise NativeBridgeError(f"unsupported platform for native parser: {system}/{machine}")
     return f"{goos}-{goarch}"
 
 
@@ -102,7 +99,7 @@ def resolve_binary(bin_root: Optional[Path] = None) -> Path:
     """Locate the vendored `schlock-parse` for this platform.
 
     Raises:
-        NativeUnavailableError: platform unsupported, binary absent, or not executable.
+        NativeBridgeError: platform unsupported, binary absent, or not executable.
             Never returns None — a missing parser must surface as a failure the
             fallback chain can see, not as a silent allow.
     """
@@ -110,15 +107,24 @@ def resolve_binary(bin_root: Optional[Path] = None) -> Path:
     suffix = ".exe" if platform.system().lower() == "windows" else ""
     path = root / platform_dir() / f"{BINARY_NAME}{suffix}"
     if not path.is_file():
-        raise NativeUnavailableError(f"native parser binary not found: {path}")
+        raise NativeBridgeError(f"native parser binary not found: {path}")
     if not os.access(path, os.X_OK):
-        raise NativeUnavailableError(f"native parser binary not executable: {path}")
+        raise NativeBridgeError(f"native parser binary not executable: {path}")
     return path
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the child and anything it forked (same session, see start_new_session) — no-op if gone."""
+    if hasattr(os, "killpg"):
+        # ProcessLookupError once reaped, PermissionError never in practice; proc.kill() covers the parent.
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    proc.kill()  # polls first: a no-op on an exited child
 
 
 def _kill_and_reap(proc: subprocess.Popen) -> None:
     """Kill the child and collect it — `kill()` alone leaves a zombie."""
-    proc.kill()
+    _kill_tree(proc)
     proc.wait()
 
 
@@ -145,6 +151,9 @@ class NativeBridge:
     def _binary(self) -> Path:
         # Resolved lazily and cached on success only, so a machine without a
         # vendored binary keeps raising (→ fallback) instead of caching a lie.
+        # T6 (binary integrity) inserts the MANIFEST SHA-256 check here, before the
+        # path is cached: a mismatch raises NativeBridgeError → bashlex with a
+        # warning (spec §6 row 2). The tier machine already routes and logs it.
         if self._binary_path is None:
             self._binary_path = resolve_binary()
         return self._binary_path
@@ -169,8 +178,7 @@ class NativeBridge:
 
         Raises:
             ParseError: the binary rejected the command as unparseable (exit 2).
-            NativeUnavailableError: no binary to run (spawn error included).
-            NativeBridgeError: any other failure — oversized input, timeout,
+            NativeBridgeError: any other failure — no binary, oversized input, timeout,
                 output overflow, stdin/stdout error (exit 3/4), crash, or
                 undecodable output.
         """
@@ -190,38 +198,18 @@ class NativeBridge:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,  # own process group, so _kill_tree reaches forked children
             )
         except OSError as exc:
-            raise NativeUnavailableError(f"failed to spawn native parser {binary}: {exc}")
+            raise NativeBridgeError(f"failed to spawn native parser {binary}: {exc}")
 
-        # Spec §6 deadline: the timer kills the child, the wait below reaps it (kill+wait, no
-        # zombie). Popen.kill() polls first, so a timer that fires after a clean exit is a
-        # no-op — and returncode, not the timer, decides success: a late fire must never turn
-        # a valid AST into a false timeout.
-        timed_out = threading.Event()
-
-        def _on_timeout() -> None:
-            timed_out.set()
-            proc.kill()
-
-        timer = threading.Timer(self._timeout, _on_timeout)
-        try:
-            # Popen as a context manager closes the three pipes and reaps the child
-            # even on the raising paths below — including a timer thread that fails to start.
-            with proc:
-                timer.start()
-                payload, stderr, returncode = self._exchange(proc, command_bytes, binary)
-        finally:
-            timer.cancel()
+        payload, stderr, returncode = self._exchange_within_deadline(proc, command_bytes, binary)
 
         if returncode == EXIT_OK:
             try:
                 return payload.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise NativeBridgeError(f"native parser emitted undecodable output: {exc}")
-        if timed_out.is_set():
-            # Whatever reached stdout is a prefix of a parse that never finished.
-            raise NativeBridgeError(f"native parser timed out after {self._timeout * 1000:.0f} ms; killed {binary}")
 
         detail = stderr.decode("utf-8", errors="replace").strip()
         if returncode == EXIT_PARSE_ERROR:
@@ -229,6 +217,40 @@ class NativeBridge:
         # Exit 3 (stdin read), 4 (stdout write), signals and anything else:
         # whatever landed on stdout is a prefix, so it is dropped, not returned.
         raise NativeBridgeError(f"native parser exited {returncode}: {detail}")
+
+    def _exchange_within_deadline(
+        self, proc: subprocess.Popen, command_bytes: bytes, binary: Path
+    ) -> "tuple[bytes, bytes, int]":
+        """Run `_exchange` on a worker thread and wait at most `timeout` for it (spec §6).
+
+        The deadline bounds the CALLER, not the child: a blocking `read()` cannot be
+        interrupted, and killing the child does not end it when a forked grandchild still
+        holds the stdout pipe open. So the exchange runs on a daemon thread; if it has not
+        finished at the deadline the process group is killed, the child reaped, and the
+        caller raises — whatever the pipe is doing. A worker that finishes first wins
+        outright: returncode, not the clock, decides success.
+        """
+        outcome: dict = {}
+
+        def run() -> None:
+            try:
+                outcome["result"] = self._exchange(proc, command_bytes, binary)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, name="schlock-parse-exchange", daemon=True)
+        # Popen as a context manager closes the three pipes and reaps the child even on the
+        # raising paths — including a worker thread that fails to start.
+        with proc:
+            worker.start()
+            worker.join(self._timeout)
+            if worker.is_alive():
+                _kill_and_reap(proc)
+                # Whatever reached stdout is a prefix of a parse that never finished.
+                raise NativeBridgeError(f"native parser timed out after {self._timeout * 1000:.0f} ms; killed {binary}")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
 
     def _exchange(self, proc: subprocess.Popen, command_bytes: bytes, binary: Path) -> "tuple[bytes, bytes, int]":
         """Feed stdin, read stdout under the bound, and collect the exit code."""
@@ -247,7 +269,7 @@ class NativeBridge:
         # ponytail: write-then-read is deadlock-free only because the CLI does
         # io.ReadAll(stdin) before writing a byte of stdout. A tampered binary
         # that floods stdout first could block the write above; the NATIVE_TIMEOUT
-        # timer in parse_json kills the child and closes that window.
+        # deadline in _exchange_within_deadline closes that window.
         chunks: list[bytes] = []
         total = 0
         while True:

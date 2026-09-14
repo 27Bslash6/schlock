@@ -6,6 +6,7 @@ shape of the typed-JSON beyond "it decodes" — mapping it to an AstView is T2b.
 """
 
 import json
+import os
 import platform
 import subprocess
 import time
@@ -13,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from schlock.core import native_bridge
 from schlock.core.native_bridge import (
     MAX_AST_JSON_SIZE,
     MAX_COMMAND_SIZE,
@@ -136,20 +136,10 @@ class TestExitContract:
 class TestBoundedRead:
     """Output guard: bound the stream, kill the process, and reap it."""
 
-    def test_overflow_kills_and_reaps_the_process(self, fake_binary, monkeypatch):
+    def test_overflow_kills_and_reaps_the_process(self, fake_binary, spawned):
         binary = fake_binary(
             "while True:\n    sys.stdout.write('x' * 4096)\n    sys.stdout.flush()\n",
         )
-        spawned = []
-        real_popen = subprocess.Popen
-
-        def recording_popen(*args, **kwargs):
-            proc = real_popen(*args, **kwargs)
-            spawned.append(proc)
-            return proc
-
-        monkeypatch.setattr(subprocess, "Popen", recording_popen)
-
         bridge = NativeBridge(binary_path=binary, max_ast_json_size=8192)
         with pytest.raises(NativeBridgeError, match="exceeded"):
             bridge.parse_json("echo hi")
@@ -165,22 +155,14 @@ class TestBoundedRead:
 
 
 class TestTimeout:
-    """Spec §6: a hung or slow binary is killed and reaped (kill+wait), never awaited."""
+    """Spec §6: the deadline bounds the CALLER. A hung or pipe-holding child is killed and reaped
+    (kill+wait, no zombie), never awaited."""
 
     def test_default_timeout_is_the_spec_value(self):
         assert NATIVE_TIMEOUT == 0.25
 
-    def test_hung_binary_is_killed_reaped_and_reported_as_timeout(self, fake_binary, monkeypatch):
+    def test_hung_binary_is_killed_reaped_and_reported_as_timeout(self, fake_binary, spawned):
         binary = fake_binary("import time\nsys.stdin.read()\ntime.sleep(30)\n")
-        spawned = []
-        real_popen = subprocess.Popen
-
-        def recording_popen(*args, **kwargs):
-            proc = real_popen(*args, **kwargs)
-            spawned.append(proc)
-            return proc
-
-        monkeypatch.setattr(subprocess, "Popen", recording_popen)
 
         started = time.perf_counter()
         with pytest.raises(NativeBridgeError, match="timed out"):
@@ -191,22 +173,22 @@ class TestTimeout:
         assert spawned[0].returncode is not None  # reaped: no zombie
         assert spawned[0].returncode != 0
 
-    def test_timer_firing_after_a_clean_exit_is_not_a_timeout(self, fake_binary, monkeypatch):
-        """Race: the child exits 0 and the timer fires before cancel() wins. returncode is truth."""
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork-based stand-in")
+    def test_forked_child_holding_stdout_cannot_outlive_the_deadline(self, fake_binary, spawned):
+        # A tampered binary forks a child that keeps the stdout pipe open, then exits 0 itself.
+        # Killing the (already dead) parent changes nothing and read() never sees EOF, so the
+        # deadline has to bound the caller — a hook blocked past its own timeout is fail-open.
+        binary = fake_binary("import os, time\nsys.stdin.read()\nif os.fork() == 0:\n    time.sleep(30)\nsys.exit(0)\n")
 
-        class FiresOnCancel:
-            def __init__(self, interval, function):
-                self._function = function
+        started = time.perf_counter()
+        with pytest.raises(NativeBridgeError, match="timed out"):
+            NativeBridge(binary_path=binary, timeout=0.2).parse_json("echo hi")
 
-            def start(self):
-                pass
+        assert time.perf_counter() - started < 5
+        assert spawned[0].returncode is not None
 
-            def cancel(self):
-                self._function()
-
-        monkeypatch.setattr(native_bridge.threading, "Timer", FiresOnCancel)
-        binary = fake_binary("sys.stdout.write('{}')\n")
-        assert NativeBridge(binary_path=binary).parse_json("echo hi") == "{}"
+    def test_fast_binary_is_not_reported_as_timeout(self, fake_binary):
+        assert NativeBridge(binary_path=fake_binary("sys.stdout.write('{}')\n"), timeout=5).parse_json("echo hi") == "{}"
 
 
 class TestSpawnDiscipline:

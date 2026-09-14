@@ -18,7 +18,7 @@ import pytest
 from schlock.core import native_bridge
 from schlock.core import parser as parser_mod
 from schlock.core.ast_view import AstView
-from schlock.core.native_bridge import MAX_COMMAND_SIZE, NativeBridge, NativeBridgeError, resolve_binary
+from schlock.core.native_bridge import MAX_COMMAND_SIZE, NativeBridge, NativeBridgeError
 from schlock.core.parser import PARSER_TIERS, TieredParser, resolve_parser_tier
 from schlock.exceptions import ParseError
 
@@ -51,19 +51,6 @@ def _call_expr_file(command: str, end: "int | None" = None) -> dict:
 
 def _emit(payload) -> str:
     return f"sys.stdout.write({json.dumps(payload)!r})\n"
-
-
-def _recording_popen(monkeypatch) -> list:
-    spawned = []
-    real_popen = subprocess.Popen
-
-    def recording(*args, **kwargs):
-        proc = real_popen(*args, **kwargs)
-        spawned.append(proc)
-        return proc
-
-    monkeypatch.setattr(subprocess, "Popen", recording)
-    return spawned
 
 
 def _auto(binary, **bridge_kwargs) -> TieredParser:
@@ -110,16 +97,12 @@ class TestFailureTableLandsOnBashlex:
         binary = fake_binary(_emit(_call_expr_file("echo hi", end=7)))
         assert _is_bashlex(_auto(binary).parse("echo hi; rm x"))
 
-    def test_timeout_kills_reaps_and_falls_back(self, fake_binary, monkeypatch):
+    def test_timeout_falls_back(self, fake_binary):
+        # kill+reap is the bridge's contract (test_native_bridge.TestTimeout); this row is "→ bashlex".
         binary = fake_binary("import time\nsys.stdin.read()\ntime.sleep(30)\n")
-        spawned = _recording_popen(monkeypatch)
-
         started = time.perf_counter()
         assert _is_bashlex(_auto(binary, timeout=0.1).parse("echo hi"))
-
         assert time.perf_counter() - started < 5
-        assert len(spawned) == 1
-        assert spawned[0].returncode is not None  # kill+wait: no zombie
 
     def test_input_guard_trip_falls_back_without_spawning(self, monkeypatch):
         monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("spawned"))
@@ -137,6 +120,17 @@ class TestFailureTableLandsOnBashlex:
         payload["Stmts"][0]["Cmd"]["Type"] = "FrobExpr"
         assert _is_bashlex(_auto(fake_binary(_emit(payload))).parse("echo hi"))
 
+    def test_integrity_failure_at_the_binary_site_falls_back_and_warns(self, monkeypatch, caplog):
+        # Spec §6 row 2. T6 raises at NativeBridge._binary() (MANIFEST SHA-256 mismatch); the
+        # router needs no new code for it — this pins that the site is already routed and logged.
+        def tampered(self):
+            raise NativeBridgeError("MANIFEST SHA-256 mismatch for schlock-parse")
+
+        monkeypatch.setattr(NativeBridge, "_binary", tampered)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            assert _is_bashlex(TieredParser(tier="auto").parse("echo hi"))
+        assert any("mismatch" in r.getMessage() for r in caplog.records)
+
     def test_bashlex_also_failing_raises_parse_error(self, fake_binary):
         # Terminal row: no tier left, so ParseError → validator.py → BLOCKED. The message is
         # bashlex's own — validator's heredoc special-case matches on that text.
@@ -152,13 +146,6 @@ class TestNativeSuccess:
         assert _is_native(nodes)
         assert nodes[0].kind == "command"
 
-    def test_vendored_binary_serves_the_native_tier(self):
-        try:
-            resolve_binary()
-        except NativeBridgeError as exc:
-            pytest.skip(str(exc))
-        assert _is_native(TieredParser(tier="auto").parse("echo hello"))
-
 
 class TestForcedTiers:
     """`native` isolates the native path (parse-error → deny, no rescue); `bashlex` never spawns."""
@@ -169,12 +156,14 @@ class TestForcedTiers:
         with pytest.raises(ParseError):
             TieredParser(tier="native", bridge=NativeBridge(binary_path=binary)).parse("echo hi")
 
-    def test_native_mode_bridge_failure_denies(self, tmp_path, monkeypatch):
+    def test_native_mode_bridge_failure_denies_and_says_so(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setattr(parser_mod, "parse_bashlex", lambda *a, **k: pytest.fail("bashlex rescued"))
         tiers = TieredParser(tier="native", bridge=NativeBridge(binary_path=tmp_path / "absent"))
-        with pytest.raises(ParseError) as info:
+        with caplog.at_level(logging.WARNING, logger=LOGGER), pytest.raises(ParseError) as info:
             tiers.parse("echo hi")
         assert isinstance(info.value.original_error, NativeBridgeError)
+        # The diagnostic must describe what happened; "using bashlex" here would be a lie.
+        assert any("denying" in r.getMessage() and "bashlex" not in r.getMessage().split(";")[-1] for r in caplog.records)
 
     def test_bashlex_mode_never_spawns(self, monkeypatch):
         monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("spawned"))
@@ -185,74 +174,66 @@ class TestForcedTiers:
             TieredParser(tier="regex")
 
 
-def _pin(root, filename, value="bashlex"):
-    settings = root / ".claude" / filename
+def _user_settings(root, value="bashlex", key="SCHLOCK_PARSER"):
+    settings = root / ".claude" / "settings.json"
     settings.parent.mkdir(exist_ok=True)
-    settings.write_text(json.dumps({"env": {"SCHLOCK_PARSER": value}}), encoding="utf-8")
+    settings.write_text(json.dumps({"env": {key: value}, "permissions": {}}), encoding="utf-8")
     return settings
 
 
 class TestSchlockParserSwitch:
-    """Spec §6: allowlisted, `auto` default, honored from user/global scope only."""
+    """Spec §6: allowlisted, `auto` default, read from the user's own settings file and nowhere else."""
 
     def test_allowlist_is_the_spec_set(self):
         assert frozenset({"auto", "native", "bashlex"}) == PARSER_TIERS
 
-    def test_unset_is_auto(self, tmp_path):
-        assert resolve_parser_tier(environ={}, project_dirs=[tmp_path]) == "auto"
+    def test_no_user_settings_is_auto(self, tmp_path):
+        assert resolve_parser_tier(user_settings=tmp_path / "settings.json") == "auto"
 
     @pytest.mark.parametrize(
-        "raw, tier", [("native", "native"), ("bashlex", "bashlex"), ("auto", "auto"), (" Native ", "native")]
+        "raw, key, tier",
+        [
+            ("native", "SCHLOCK_PARSER", "native"),
+            ("bashlex", "SCHLOCK_PARSER", "bashlex"),
+            ("auto", "SCHLOCK_PARSER", "auto"),
+            (" Native ", "schlock_parser", "native"),
+        ],
     )
-    def test_user_scope_value_is_honored(self, tmp_path, raw, tier):
-        assert resolve_parser_tier(environ={"SCHLOCK_PARSER": raw}, project_dirs=[tmp_path]) == tier
+    def test_user_scope_value_is_honored(self, tmp_path, raw, key, tier):
+        assert resolve_parser_tier(user_settings=_user_settings(tmp_path, raw, key)) == tier
+
+    def test_settings_without_the_key_are_auto(self, tmp_path):
+        assert resolve_parser_tier(user_settings=_user_settings(tmp_path, "1", key="OTHER")) == "auto"
 
     def test_junk_value_is_auto_with_warning(self, tmp_path, caplog):
         with caplog.at_level(logging.WARNING, logger=LOGGER):
-            assert resolve_parser_tier(environ={"SCHLOCK_PARSER": "regex"}, project_dirs=[tmp_path]) == "auto"
+            assert resolve_parser_tier(user_settings=_user_settings(tmp_path, "regex")) == "auto"
         assert any("regex" in r.getMessage() for r in caplog.records)
 
-    @pytest.mark.parametrize("filename", ["settings.json", "settings.local.json"])
-    def test_project_scope_pin_is_ignored_with_warning(self, tmp_path, caplog, filename):
-        settings = _pin(tmp_path, filename)
-        with caplog.at_level(logging.WARNING, logger=LOGGER):
-            assert resolve_parser_tier(environ={"SCHLOCK_PARSER": "bashlex"}, project_dirs=[tmp_path]) == "auto"
-        assert any(str(settings) in r.getMessage() for r in caplog.records)
-
-    def test_project_settings_without_the_key_do_not_taint(self, tmp_path):
-        settings = tmp_path / ".claude" / "settings.json"
-        settings.parent.mkdir()
-        settings.write_text(json.dumps({"env": {"OTHER": "1"}, "permissions": {}}), encoding="utf-8")
-        assert resolve_parser_tier(environ={"SCHLOCK_PARSER": "native"}, project_dirs=[tmp_path]) == "native"
-
-    def test_unreadable_project_settings_fail_toward_auto(self, tmp_path, caplog):
-        settings = tmp_path / ".claude" / "settings.json"
-        settings.parent.mkdir()
+    def test_malformed_user_settings_fail_toward_auto_with_one_warning(self, tmp_path, caplog):
+        settings = tmp_path / "settings.json"
         settings.write_text("{not json", encoding="utf-8")
         with caplog.at_level(logging.WARNING, logger=LOGGER):
-            assert resolve_parser_tier(environ={"SCHLOCK_PARSER": "native"}, project_dirs=[tmp_path]) == "auto"
-        assert any(str(settings) in r.getMessage() for r in caplog.records)
+            assert resolve_parser_tier(user_settings=settings) == "auto"
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
-    def test_default_project_dirs_cover_claude_project_dir_and_cwd(self, tmp_path, monkeypatch):
-        project, elsewhere = tmp_path / "project", tmp_path / "elsewhere"
-        project.mkdir()
-        elsewhere.mkdir()
-        _pin(project, "settings.json")
+    def test_process_environment_is_never_consulted(self, tmp_path, monkeypatch):
+        # Claude Code applies a project .claude/settings.json `env` block to the hook's environment,
+        # project over user, so an env var has no provenance. Panel CRIT: honouring it — or falling
+        # to `auto` when it looks project-scoped — lets a hostile checkout defeat the user's
+        # bashlex kill-switch. The only trustworthy channel is the user's own file.
+        monkeypatch.setenv("SCHLOCK_PARSER", "native")
+        assert resolve_parser_tier(user_settings=tmp_path / "absent.json") == "auto"
+        assert resolve_parser_tier(user_settings=_user_settings(tmp_path, "bashlex")) == "bashlex"
 
-        monkeypatch.chdir(elsewhere)
-        env = {"SCHLOCK_PARSER": "bashlex", "CLAUDE_PROJECT_DIR": str(project)}
-        assert resolve_parser_tier(environ=env) == "auto"
-
-        monkeypatch.chdir(project)
-        assert resolve_parser_tier(environ={"SCHLOCK_PARSER": "bashlex"}) == "auto"
-
-        monkeypatch.chdir(elsewhere)
-        assert resolve_parser_tier(environ={"SCHLOCK_PARSER": "bashlex"}) == "bashlex"
+    def test_default_path_is_the_users_claude_settings(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        _user_settings(tmp_path, "bashlex")
+        assert resolve_parser_tier() == "bashlex"
 
     def test_tiered_parser_reads_the_switch_by_default(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
-        monkeypatch.setenv("SCHLOCK_PARSER", "bashlex")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        _user_settings(tmp_path, "bashlex")
         monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("spawned"))
         tiers = TieredParser()
         assert tiers.tier == "bashlex"

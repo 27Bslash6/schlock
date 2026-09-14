@@ -1,5 +1,6 @@
 """Pytest configuration and shared fixtures."""
 
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,3 +83,22 @@ def fake_binary(tmp_path):
         return script
 
     return _make
+
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Record every `subprocess.Popen` the code under test creates.
+
+    Lets a test assert spawn count and that a killed child was reaped
+    (`returncode is not None`) without re-implementing the shim.
+    """
+    procs = []
+    real_popen = subprocess.Popen
+
+    def recording(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    return procs
