@@ -523,8 +523,12 @@ def build_ast_view(command: str, typed_json: "Union[str, bytes, dict]") -> "list
         try:
             typed_json = json.loads(typed_json)
         except (ValueError, RecursionError) as exc:
-            # RecursionError: the C scanner overflows on deep nesting (`$(`×20000 is
-            # ~10 MiB, inside the output bound). Bare, it would skip T5's routing.
+            # RecursionError on deep nesting. WHERE it lands is interpreter-dependent:
+            # through 3.13 the C scanner counts frames against the recursion limit and
+            # overflows here; 3.14+ guards C recursion by machine-stack headroom, so the
+            # scanner survives depths the recursive converter below cannot, and the same
+            # input overflows in the walk instead. Both sites re-raise as NativeBridgeError
+            # because a bare RecursionError is outside the contract T5 routes on.
             raise NativeBridgeError(f"native parser emitted malformed JSON: {exc}")
     if not isinstance(typed_json, dict) or typed_json.get("Type") != "File":
         got = f"Type={typed_json.get('Type')!r}" if isinstance(typed_json, dict) else type(typed_json).__name__
@@ -547,9 +551,9 @@ def build_ast_view(command: str, typed_json: "Union[str, bytes, dict]") -> "list
         return _Converter(command).stmts_to_nodes(stmts)
     except NativeBridgeError:
         raise
-    except (KeyError, TypeError, AttributeError, IndexError, UnicodeDecodeError) as exc:
+    except (KeyError, TypeError, AttributeError, IndexError, UnicodeDecodeError, RecursionError) as exc:
         # Structural drift in the typed-JSON (a field the binary stopped
         # emitting) must reach T5's router as a NativeBridgeError → bashlex
         # tier, not escape as a bare KeyError that hard-DENIES with no
-        # context (panel MAJ, LAB-911 review).
+        # context (panel MAJ, LAB-911 review). RecursionError: see json.loads above.
         raise NativeBridgeError(f"malformed typed-JSON structure: {exc!r}") from exc

@@ -290,7 +290,7 @@ class TestRedirects:
 
 @needs_binary
 class TestPanelFindings:
-    """Regressions from the LAB-911 expert-panel review (all under-block class)."""
+    """Regressions from the LAB-911 and LAB-528 expert-panel reviews."""
 
     def test_command_span_includes_trailing_redirect(self):
         # Panel CRIT: mvdan hangs Redirs off the Stmt, so a command node pos
@@ -377,6 +377,12 @@ class TestPanelFindings:
         }
         with pytest.raises(NativeBridgeError, match="malformed"):
             build_ast_view("a && b", no_op_binary)
+
+    def test_deep_nesting_routes_to_fallback_not_bare_recursion_error(self):
+        # Long timeout so a slow runner cannot pass this via T5's timeout path; both
+        # real overflow sites (json.loads through 3.13, the converter on 3.14+) say "malformed".
+        with pytest.raises(NativeBridgeError, match="malformed"):
+            NativeBridge(timeout=30).parse("$(" * 2000 + "a" + ")" * 2000)
 
     def test_missing_pos_raises_bridge_error(self):
         with pytest.raises(NativeBridgeError):
@@ -528,6 +534,48 @@ class TestParserWalkerIntegration:
     def test_extract_commands_with_args(self):
         extracted = BashCommandParser().extract_commands_with_args(view("X=1 nc -e /bin/bash host"))
         assert extracted == [("nc", ["-e", "/bin/bash", "host"])]
+
+
+def _nested_cmdsubst(depth: int) -> "tuple[str, dict]":
+    """`$(`×depth + `a` + `)`×depth and its typed-JSON, built iteratively with exact spans."""
+    command = "$(" * depth + "a" + ")" * depth
+    n = len(command)
+
+    def span(k):
+        return {"Pos": {"Offset": 2 * k}, "End": {"Offset": n - k}}
+
+    stmt = None
+    for k in range(depth, -1, -1):
+        if stmt is None:
+            part = {"Type": "Lit", "Pos": {"Offset": 2 * k}, "End": {"Offset": 2 * k + 1}, "Value": "a"}
+        else:
+            part = {"Type": "CmdSubst", **span(k), "Stmts": [stmt]}
+        word = {**span(k), "Parts": [part]}
+        stmt = {**span(k), "Cmd": {"Type": "CallExpr", **span(k), "Args": [word]}}
+    return command, {"Type": "File", **span(0), "Stmts": [stmt]}
+
+
+class TestRecursionRouting:
+    """Both RecursionError sites in build_ast_view re-raise as NativeBridgeError (see the
+    json.loads clause for why the site is interpreter-dependent). Neither test needs the binary."""
+
+    def test_json_scanner_overflow_routes_to_fallback(self, monkeypatch):
+        # The overflow depth depends on interpreter and stack size, so the trigger is faked.
+        def overflow(_text):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(json, "loads", overflow)
+        with pytest.raises(NativeBridgeError, match="malformed"):
+            build_ast_view("echo hi", "{}")
+
+    def test_converter_overflow_routes_to_fallback(self):
+        # Pre-decoded dict: bypasses json.loads, so only the recursive converter can trip
+        # (~6 frames per level against the 1000-frame limit). The cause pin rejects a
+        # KeyError from a mis-built fixture masquerading as the same "malformed" message.
+        command, typed_json = _nested_cmdsubst(500)
+        with pytest.raises(NativeBridgeError, match="malformed") as excinfo:
+            build_ast_view(command, typed_json)
+        assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
 class TestJsonEntryPoint:

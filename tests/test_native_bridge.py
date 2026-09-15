@@ -239,12 +239,6 @@ class TestSizeGuards:
         with pytest.raises(NativeBridgeError, match="not UTF-8"):
             NativeBridge().parse_json("echo \ud800")
 
-    def test_deeply_nested_json_routes_to_fallback(self, fake_binary):
-        # json.loads overflows the C scanner on deep nesting; a bare RecursionError skips T5's routing.
-        binary = fake_binary("sys.stdout.write('[' * 100000 + ']' * 100000)\n")
-        with pytest.raises(NativeBridgeError, match="malformed"):
-            NativeBridge(binary_path=binary).parse("echo hi")
-
     def test_commit_filter_shares_the_core_constant(self):
         assert commit_filter.MAX_COMMAND_SIZE == MAX_COMMAND_SIZE
 
