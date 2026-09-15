@@ -102,7 +102,7 @@ def _harvest_commands() -> "list[str]":
     return sorted(commands)
 
 
-_CORPUS = sorted(set(_harvest_commands()) | set(_ANCHORS))
+_CORPUS = sorted({*_harvest_commands(), *_ANCHORS})
 
 
 def _native_nodes(command: str) -> "list | None":
@@ -127,13 +127,18 @@ def _sub_denied(parser: BashCommandParser, nodes: "list") -> bool:
 
 
 def _covered(needle: str, haystack: "list[str]") -> bool:
-    """A bashlex segment is covered if native reproduces it exactly or contains it.
+    """A bashlex segment is covered when native reproduces it — exactly, or as a
+    heredoc-extended prefix.
 
-    Containment is required only for heredocs: native's segment carries the body
-    text, bashlex's stops at `cat << EOF`, so native's strictly contains bashlex's
-    (LAB-1584 oracle-input note). Equality covers everything else.
+    Containment is allowed ONLY for a heredoc-introducing segment (`<<` present):
+    native's segment carries the body, bashlex's stops at `cat << EOF`, and both
+    slice the SAME source from the SAME start, so native's is bashlex's plus the
+    body — a `startswith`, not an arbitrary substring (LAB-1584 oracle-input
+    note). A blanket `needle in h` would let a bashlex segment be "covered" by a
+    coincidental substring of an UNRELATED native segment, masking a dropped
+    segment — the exact under-block this oracle exists to catch (craftsman finding).
     """
-    return any(needle == h or needle in h for h in haystack)
+    return any(needle == h or ("<<" in needle and h.startswith(needle)) for h in haystack)
 
 
 @needs_binary
@@ -141,11 +146,10 @@ class TestCorpusSanity:
     """A green oracle over an empty corpus is the classic false pass — guard it."""
 
     def test_corpus_is_substantial(self):
+        # _ANCHORS are unioned into _CORPUS by construction, so asserting their
+        # membership is tautological — TestT3Anchors exercises each anchor's
+        # decode directly, which is the assertion that can actually fail.
         assert len(_CORPUS) >= 100, f"corpus collapsed to {len(_CORPUS)} commands — harvest is broken"
-
-    def test_corpus_contains_the_anchors(self):
-        for anchor in _ANCHORS:
-            assert anchor in _CORPUS
 
     def test_native_tier_actually_parses_some_corpus(self):
         # If every command routed to fallback, the oracle would be vacuously green.
@@ -157,15 +161,15 @@ class TestCorpusSanity:
 class TestT3Anchors:
     """The specific decodes T3 fixes, asserted directly (not just via the sweep)."""
 
-    def test_escaped_spaces_block_on_native(self):
+    def test_escaped_spaces_block_on_native(self, isolate_parser):
         # :268 — the true `.word`/segment anchor. Native must decode `rm -rf /`.
-        result = _validate_forced("rm\\ -rf\\ /", "native")
+        result = isolate_parser("rm\\ -rf\\ /", "native")
         assert not result.allowed
         assert result.risk_level == RiskLevel.BLOCKED
 
-    def test_multibyte_segment_blocks_on_native(self):
+    def test_multibyte_segment_blocks_on_native(self, isolate_parser):
         # A multibyte word before `rm -rf /` must not shift the segment offsets.
-        assert not _validate_forced("echo café; rm -rf /", "native").allowed
+        assert not isolate_parser("echo café; rm -rf /", "native").allowed
 
     @pytest.mark.parametrize(
         "command",
@@ -175,10 +179,10 @@ class TestT3Anchors:
             "echo $(( $(rm -rf /) ))",  # nested $(cmd) inside arithmetic
         ],
     )
-    def test_dangerous_variant_of_parseable_construct_blocks(self, command):
+    def test_dangerous_variant_of_parseable_construct_blocks(self, isolate_parser, command):
         # Parseability is necessary-not-sufficient: whether native maps the
         # construct or raises on it, the dangerous payload must never ALLOW.
-        assert not _validate_forced(command, "native").allowed
+        assert not isolate_parser(command, "native").allowed
 
 
 @needs_binary
@@ -205,13 +209,26 @@ class TestSupersetVerdict:
     """Full validate_command verdict superset, ShellCheck disabled (parser isolated)."""
 
     def test_verdict_superset_over_corpus(self, isolate_parser):
+        # Compare on risk_level SEVERITY, not just `.allowed`. `.allowed` is
+        # `risk_level != BLOCKED` and preset-independent, so an `.allowed`-only
+        # oracle is blind to a HIGH→MEDIUM downgrade — which is a real deny→allow
+        # under the paranoid preset (HIGH→deny). Superset means native is at least
+        # as severe as bashlex on every command (security-panel note).
         violations: list[str] = []
+        elevated = 0  # commands bashlex rates above SAFE — the ones with teeth
         for command in _CORPUS:
             bashlex_result = isolate_parser(command, "bashlex")
             native_result = isolate_parser(command, "native")
-            # Superset: whenever bashlex blocks, native must block too.
-            if not bashlex_result.allowed and native_result.allowed:
-                violations.append(f"  {command!r}: bashlex BLOCKED, native ALLOWED")
+            if bashlex_result.risk_level != RiskLevel.SAFE:
+                elevated += 1
+            if native_result.risk_level.value < bashlex_result.risk_level.value:
+                violations.append(
+                    f"  {command!r}: bashlex {bashlex_result.risk_level.name}, native {native_result.risk_level.name}"
+                )
+        # Guard against a vacuous pass: if a bashlex-side regression rated the
+        # whole corpus SAFE, `native >= bashlex` would hold trivially (craftsman
+        # finding). The corpus is adversarial — many commands MUST be elevated.
+        assert elevated >= 50, f"only {elevated} corpus commands elevated on bashlex — verdict oracle near-vacuous"
         assert not violations, "native tier under-blocks at the verdict level:\n" + "\n".join(violations[:40])
 
 
@@ -252,6 +269,16 @@ def _surface_violations(parser: BashCommandParser, command: str, native: "list",
     if not native_lits <= bashlex_lits:
         out.append(f"  {command!r}: native-only suppression ranges {native_lits - bashlex_lits}")
 
+    # extract_heredoc_ranges: also a SUPPRESSION output (spec §4 lists it) — a
+    # non-shell heredoc range silences rule matches inside it, so a native `Hdoc`
+    # End that bled past the terminator would over-suppress. Same reversed
+    # direction as string literals: native-only heredoc ranges are the failure
+    # (security-panel note).
+    native_hd = set(parser.extract_heredoc_ranges(command, native))
+    bashlex_hd = set(parser.extract_heredoc_ranges(command, bashlex))
+    if not native_hd <= bashlex_hd:
+        out.append(f"  {command!r}: native-only heredoc suppression ranges {native_hd - bashlex_hd}")
+
     # SubstitutionValidator verdict (boolean, never setdiff): bashlex-denied ⇒ native-denied.
     if _sub_denied(parser, bashlex) and not _sub_denied(parser, native):
         out.append(f"  {command!r}: substitution denied on bashlex, allowed on native")
@@ -259,34 +286,18 @@ def _surface_violations(parser: BashCommandParser, command: str, native: "list",
     return out
 
 
-def _validate_forced(command: str, tier: str):
-    """Validate `command` with the parser forced to `tier`, ShellCheck off, fresh cache.
-
-    Standalone (not the fixture) so the anchor tests can call it directly. Restores
-    the patched globals in a finally, since it mutates module state.
-    """
-    original_parse = BashCommandParser.parse
-    original_available = validator_mod.is_shellcheck_available
-    tiered = TieredParser(tier=tier)
-    try:
-        BashCommandParser.parse = lambda self, c: tiered.parse(c)  # type: ignore[assignment]
-        validator_mod.is_shellcheck_available = lambda: False
-        validator_mod._global_cache.clear()
-        return validator_mod.validate_command(command)
-    finally:
-        BashCommandParser.parse = original_parse  # type: ignore[assignment]
-        validator_mod.is_shellcheck_available = original_available
-        validator_mod._global_cache.clear()
-
-
 @pytest.fixture
 def isolate_parser(monkeypatch):
     """Force the validator onto one parser tier with ShellCheck disabled.
 
-    ShellCheck off isolates the PARSER (spec §4). The class-method patch routes
-    every `parser.parse` — including the per-segment re-parse and the substitution
-    validator's parser — through the chosen tier. The cache is cleared each call so
-    a verdict computed on one tier never leaks to the other.
+    The single tier-forcing helper for this module — both the anchor tests and
+    the corpus verdict oracle request it. ShellCheck off isolates the PARSER
+    (spec §4). The class-method patch routes every `parser.parse` — including the
+    per-segment re-parse and the substitution validator's parser — through the
+    chosen tier. `monkeypatch` restores `BashCommandParser.parse` and
+    `is_shellcheck_available` at teardown; the cache is cleared before each call
+    so a verdict computed on one tier never leaks to the other, and once more at
+    teardown so no forced-tier verdict leaks into another test's cache.
     """
     monkeypatch.setattr(validator_mod, "is_shellcheck_available", lambda: False)
 
@@ -296,4 +307,5 @@ def isolate_parser(monkeypatch):
         validator_mod._global_cache.clear()
         return validator_mod.validate_command(command)
 
-    return run
+    yield run
+    validator_mod._global_cache.clear()
