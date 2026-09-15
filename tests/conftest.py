@@ -1,5 +1,6 @@
 """Pytest configuration and shared fixtures."""
 
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,3 +65,40 @@ def mock_result():
         return MockResult(value)
 
     return _create
+
+
+@pytest.fixture
+def fake_binary(tmp_path):
+    """Factory: write an executable stand-in for `schlock-parse` that runs `body` (Python source).
+
+    Shared by the bridge tests and the tier state-machine tests so each spec §6
+    failure row can be scripted (exit codes, hangs, garbage output) without
+    the real vendored binary.
+    """
+
+    def _make(body: str) -> Path:
+        script = tmp_path / "fake-schlock-parse"
+        script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    return _make
+
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Record every `subprocess.Popen` the code under test creates.
+
+    Lets a test assert spawn count and that a killed child was reaped
+    (`returncode is not None`) without re-implementing the shim.
+    """
+    procs = []
+    real_popen = subprocess.Popen
+
+    def recording(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    return procs
