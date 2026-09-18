@@ -443,87 +443,320 @@ class CommitMessageFilter:
         return False
 
     @staticmethod
-    def _short_cluster_has_file_flag(token: str) -> bool:
-        """True if a single-dash short-flag cluster uses -F (commit message from a file/stdin).
-
-        Walks the cluster letters: -m/-C/-c also take arguments, so reaching one of THOSE first
-        means the remainder is that flag's value (e.g. -mFix is message "Fix", not a file flag).
-        Reaching 'F' first means file delivery (handles -F, -Fpath, -aF, -aFpath).
+    def _short_cluster_f_index(token: str) -> Optional[int]:
+        """Index within a single-dash short-flag cluster (``-F``, ``-aF``, ``-aFpath``) of its
+        ``F`` letter, or ``None`` if an argument-taking flag (m/C/c) is reached first and
+        swallows the remainder as that flag's value instead (e.g. ``-mFix`` is message "Fix",
+        not a file flag). Shared primitive behind ``_short_cluster_has_file_flag`` (does this
+        cluster use -F at all) and ``_short_cluster_stdin_attached`` (what's attached after it).
         """
-        for ch in token[1:]:
+        for i, ch in enumerate(token[1:], start=1):
             if ch == "F":
-                return True
-            if ch in "mCc":  # argument-taking flag; the rest of the token is its value, not flags
-                return False
-        return False
+                return i
+            if ch in "mCc":
+                return None
+        return None
 
-    @staticmethod
-    def _arg_targets_stdin(args: list[str]) -> bool:
-        """True if a -F/--file flag in these post-``commit`` args reads the message from STDIN
-        (target ``-`` or ``/dev/stdin``) rather than a real file — i.e. a heredoc-feedable
-        delivery. Walks short-flag clusters like _short_cluster_has_file_flag: an argument-taking
-        flag (m/C/c) reached before F means the remainder is that flag's value, not a file flag.
+    @classmethod
+    def _short_cluster_has_file_flag(cls, token: str) -> bool:
+        """True if a single-dash short-flag cluster uses -F (commit message from a file/stdin)."""
+        return cls._short_cluster_f_index(token) is not None
+
+    # Target values that mark a -F/--file flag as stdin-fed (heredoc-feedable) rather than a
+    # real on-disk file.
+    _STDIN_TARGETS = ("-", "/dev/stdin")
+
+    @classmethod
+    def _short_cluster_stdin_attached(cls, word: str) -> Optional[str]:
+        """For a single-dash short-flag cluster, the text attached after its ``F`` letter
+        (``''`` if ``F`` is the last letter), or ``None`` if the cluster never reaches ``F``.
+        Handles ``-F``, ``-F-``, ``-Fpath``, ``-aF``, ``-aF-`` alike.
         """
-        stdin_targets = ("-", "/dev/stdin")
+        idx = cls._short_cluster_f_index(word)
+        return None if idx is None else word[idx + 1 :]
+
+    @classmethod
+    def _stdin_flag_value_indices(cls, words: list[str]):
+        """Yield the index within ``words`` of each -F/--file token whose value targets stdin.
+
+        Shared by ``_arg_targets_stdin`` (boolean gate: does ANY such flag exist) and
+        ``_first_stdin_flag_end`` (WHERE, in raw text, is the first one — needed to bind the
+        commit to its heredoc). For an attached value (``-F-``, ``--file=-``) the yielded index
+        IS the flag token itself (value and flag share one word); for a separate value
+        (``-F -``, ``--file -``) it is the following token.
+        """
         i = 0
-        while i < len(args):
-            word = args[i]
+        while i < len(words):
+            word = words[i]
             if word == "--":
                 break  # pathspec terminator
             if word == "--file":
-                return i + 1 < len(args) and args[i + 1] in stdin_targets
-            if word.startswith("--file="):
-                return word[len("--file=") :] in stdin_targets
-            if word.startswith("-") and not word.startswith("--"):
-                rest = word[1:]
-                for j, ch in enumerate(rest):
-                    if ch in "mCc":
-                        break  # argument-taking flag swallows the remainder as its value
-                    if ch == "F":
-                        attached = rest[j + 1 :]
-                        if attached:
-                            return attached in stdin_targets  # -F-, -F/dev/stdin, -aF-
-                        return i + 1 < len(args) and args[i + 1] in stdin_targets  # -F -
+                if i + 1 < len(words) and words[i + 1] in cls._STDIN_TARGETS:
+                    yield i + 1
+            elif word.startswith("--file="):
+                if word[len("--file=") :] in cls._STDIN_TARGETS:
+                    yield i
+            elif word.startswith("-") and not word.startswith("--"):
+                attached = cls._short_cluster_stdin_attached(word)
+                if attached:
+                    if attached in cls._STDIN_TARGETS:  # -F-, -F/dev/stdin, -aF-
+                        yield i
+                elif attached is not None and i + 1 < len(words) and words[i + 1] in cls._STDIN_TARGETS:  # -F -
+                    yield i + 1
             i += 1
-        return False
 
-    # Cheap, LINEAR (non-backtracking) heredoc-opener counter. Used to bail out of the more
-    # expensive O(n^2)-prone body regex unless there is EXACTLY one heredoc — see
-    # _extract_heredoc_stdin_message. Matches <<EOF / <<'EOF' / <<"EOF" / <<-EOF / << EOF.
-    _HEREDOC_OPENER_RE = re.compile(r"<<-?[ \t]*['\"]?\w+")
+    @classmethod
+    def _arg_targets_stdin(cls, args: list[str]) -> bool:
+        """True if a -F/--file flag in these post-``commit`` args reads the message from STDIN
+        (target ``-`` or ``/dev/stdin``) rather than a real file — i.e. a heredoc-feedable
+        delivery.
+        """
+        return any(True for _ in cls._stdin_flag_value_indices(args))
 
-    # Heredoc body feeding `git commit -F-` / `--file -`. Matches <<EOF, <<'EOF', <<"EOF",
-    # <<-EOF, << EOF and arbitrary \w+ delimiter names; captures the body up to a line that is
-    # the (optionally tab-indented) delimiter alone. DOTALL so the body spans lines.
-    _HEREDOC_BODY_RE = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n[ \t]*\2(?:\n|$)", re.DOTALL)
+    # Raw-text tokenizer for _first_stdin_flag_end — equivalent to str.split() but with
+    # positions, so a flag's raw-text offset can be found without re-parsing.
+    _TOKEN_RE = re.compile(r"\S+")
+
+    def _first_stdin_flag_end(self, scan_text: str) -> Optional[int]:
+        """End offset of THE -F/--file token that targets stdin, found by naive whitespace
+        tokenization (same shape ``_git_commit_arg_lists`` falls back to) of ``scan_text``.
+
+        ``scan_text`` must be the SANITIZED text from ``_scan_heredocs`` (heredoc bodies and
+        quoted spans blanked to same-length spaces), not the raw command — otherwise decoy text
+        like ``echo "see -F - flag docs"`` fabricates a flag position that doesn't correspond to
+        any real git-commit invocation.
+
+        Returns ``None`` when zero OR MORE THAN ONE such flag is found: a second stdin-fed
+        commit segment in the same command (``git commit -F- <<A ...; git commit -F- <<B ...``)
+        makes "the" extracted message ambiguous — refuse to guess and bind only the first,
+        potentially missing content in the other, same ambiguity-refusal posture as the
+        heredoc-opener cap in ``_scan_heredocs``.
+        """
+        tokens = list(self._TOKEN_RE.finditer(scan_text))
+        words = [t.group() for t in tokens]
+        positions = [tokens[idx].end() for idx in self._stdin_flag_value_indices(words)]
+        return positions[0] if len(positions) == 1 else None
+
+    # Heredoc opener: <<EOF, <<'EOF', <<"EOF", <<-EOF, << EOF. Group 1 is the `-` of `<<-`
+    # (tab-stripping form), group 2 the delimiter name.
+    _HEREDOC_OPENER_RE = re.compile(r"<<(-?)[ \t]*(['\"]?)(\w+)\2")
+
+    # ReDoS / adversarial-input bound: past this many heredoc openers in one command, refuse to
+    # bind and stay unscannable rather than scan an unbounded number of bodies. A real commit +
+    # PR-body + a couple of incidental heredocs never approaches this; it only bites contrived
+    # many-heredoc input.
+    _MAX_HEREDOC_OPENERS = 8
+
+    @staticmethod
+    def _quoted_ranges_in_line(line: str) -> list[tuple[int, int]]:
+        """Character ranges within a single command LINE (no embedded newlines — heredoc bodies
+        are never passed here, see ``_scan_heredocs``) that lie inside a single- or
+        double-quoted string. Used to mask decoy `<<opener`/`-F -`-shaped text that appears only
+        as quoted prose (``echo "see <<EOF for docs"``), not as real shell syntax that could
+        feed a commit's stdin. Naive but bounded: no backslash-escaping inside single quotes
+        (matches shell), backslash-escaping honored inside double quotes; an unterminated quote
+        masks to end of line (safer to under-scan than trust unbalanced text).
+        """
+        ranges: list[tuple[int, int]] = []
+        i = 0
+        n = len(line)
+        while i < n:
+            ch = line[i]
+            if ch not in ("'", '"'):
+                i += 1
+                continue
+            quote = ch
+            start = i
+            i += 1
+            while i < n:
+                if quote == '"' and line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            ranges.append((start, i))
+        return ranges
+
+    def _scan_heredocs(self, command: str) -> Optional[tuple[list[tuple[int, str, int, int]], str]]:
+        """Bind every heredoc body to its ``<<`` opener, single pass, left to right, and produce
+        the sanitized text ``_first_stdin_flag_end`` should search for the commit's flag.
+
+        Bash's own rule: when N openers appear before a line's newline, the N bodies that follow
+        are consumed in that SAME order (the k-th body belongs to the k-th opener) — so this
+        walks line by line, collecting REAL (non-quoted-decoy) openers on the current command
+        line via ``_quoted_ranges_in_line``, then reads their bodies off in order before moving
+        to the next line. Returns ``(bindings, scan_text)`` where ``bindings`` is
+        ``[(opener_start_pos, body, fd, line_key), ...]`` in source order — ``fd`` from
+        ``_heredoc_target_fd`` (0 unless explicitly numbered, e.g. ``3<<B``) and ``line_key`` the
+        starting position of the physical line the opener came from, letting the caller re-apply
+        bash's own "later redirect to the same fd on the same command's line wins" rule instead
+        of always trusting the first opener found — and ``scan_text`` is ``command`` with every
+        heredoc body AND every quoted span on a command line blanked to same-length spaces (so
+        offsets still line up with ``command``) — the only text safe to scan for a real
+        ``-F``/``--file`` flag, since neither a heredoc body nor quoted prose is shell syntax.
+        Returns ``None`` on an unterminated heredoc or past ``_MAX_HEREDOC_OPENERS``.
+        """
+        results: list[tuple[int, str, int, int]] = []  # (opener_pos, body, fd, line_key)
+        scan_chars = list(command)
+        pos = 0
+        n = len(command)
+        while pos < n:
+            newline_idx = command.find("\n", pos)
+            line_end = newline_idx if newline_idx != -1 else n
+            quoted = self._quoted_ranges_in_line(command[pos:line_end])
+            for qstart, qend in quoted:
+                for k in range(pos + qstart, pos + qend):
+                    scan_chars[k] = " "
+            line_openers = [
+                m
+                for m in self._HEREDOC_OPENER_RE.finditer(command, pos, line_end)
+                if not any(qs <= m.start() - pos < qe for qs, qe in quoted)
+            ]
+            if newline_idx == -1:
+                return None if line_openers else (results, "".join(scan_chars))
+            if len(results) + len(line_openers) > self._MAX_HEREDOC_OPENERS:
+                return None
+            cursor = newline_idx + 1
+            for m in line_openers:
+                strip_tabs = bool(m.group(1))
+                delim = m.group(3)
+                body_lines: list[str] = []
+                body_start = cursor
+                while True:
+                    next_nl = command.find("\n", cursor)
+                    body_line_end = next_nl if next_nl != -1 else n
+                    body_line = command[cursor:body_line_end]
+                    test_line = body_line.lstrip("\t") if strip_tabs else body_line
+                    if test_line == delim:
+                        cursor = body_line_end + 1 if next_nl != -1 else body_line_end
+                        break
+                    if next_nl == -1:
+                        return None  # unterminated heredoc
+                    body_lines.append(body_line)
+                    cursor = next_nl + 1
+                for k in range(body_start, cursor):
+                    scan_chars[k] = " "
+                fd = self._heredoc_target_fd(command, m.start())
+                results.append((m.start(), "\n".join(body_lines), fd, pos))
+            pos = cursor
+        return results, "".join(scan_chars)
+
+    @staticmethod
+    def _heredoc_target_fd(command: str, opener_start: int) -> int:
+        """The fd a `<<`/`<<-` heredoc opener at ``opener_start`` targets — the digit run
+        immediately preceding it with no separating whitespace (bash's ``[n]<<word`` syntax,
+        e.g. ``3<<B``), or 0 (stdin, the default unnumbered form) if there is none.
+        """
+        j = opener_start
+        while j > 0 and command[j - 1].isdigit():
+            j -= 1
+        return int(command[j:opener_start]) if j < opener_start else 0
+
+    @staticmethod
+    def _strip_heredoc_terminator(value: str, delim: str) -> str:
+        """bashlex's ``HeredocNode.value`` includes the closing delimiter line (and, for
+        ``<<-``, already has each line's leading tabs stripped) — trim just that trailing
+        ``"\\n" + delim`` (or the whole value, for an empty body) to get the real message.
+        """
+        if value == delim:
+            return ""
+        suffix = "\n" + delim
+        return value[: -len(suffix)] if value.endswith(suffix) else value
+
+    def _heredoc_body_via_ast(self, command: str) -> Optional[str]:
+        """Commit's stdin-fed heredoc body via bashlex's own AST — correct by construction: real
+        quote parsing (a multi-line quoted argument or a quoted flag value is never mistaken for
+        heredoc syntax), real fd binding (``RedirectNode.input is None`` is the command's actual
+        stdin, so a same-line ``3<<other`` on a different fd is never confused with it), and
+        real ``<<-`` tab-stripping. Used whenever bashlex can parse the whole command.
+
+        RAISES if bashlex cannot parse (only a quoted heredoc delimiter, ``<<'EOF'``, does this —
+        see module docstring) — the caller falls back to ``_scan_heredocs``'s naive line scanner,
+        which exists solely for that case. Returns ``None`` (not raise) when parsing succeeds but
+        no single stdin-fed commit heredoc is found — including when MORE THAN ONE command node
+        matches, since which one is "the" message is then ambiguous and guessing risks binding to
+        the wrong one (same refusal posture as ``_scan_heredocs``'s opener cap).
+
+        Within a SINGLE node, bash lets multiple heredocs all implicitly target fd 0
+        (``cmd <<A <<B``) — redirects apply left to right, so a LATER one silently overrides an
+        earlier one for the same fd (verified: ``bash -c 'cat <<A <<B\\n...A\\n...B'`` prints B's
+        body, not A's). That is unambiguous, not ammunition for the ambiguity refusal above, so
+        this walk keeps overwriting rather than stopping at the first match.
+        """
+        parts = self._parse(command)
+        matches: list[str] = []
+
+        def visit(node: Any) -> None:
+            if getattr(node, "kind", None) == "command":
+                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                idx = self._commit_subcommand_index(words)
+                if idx != -1 and self._arg_targets_stdin(words[idx + 1 :]):
+                    winner = None
+                    for p in getattr(node, "parts", []):
+                        heredoc = getattr(p, "heredoc", None)
+                        is_stdin_heredoc = getattr(p, "kind", None) == "redirect" and p.type in ("<<", "<<-") and p.input is None
+                        if is_stdin_heredoc and heredoc is not None:
+                            winner = p  # later redirect to the same (implicit) fd 0 wins
+                    if winner is not None:
+                        delim = getattr(winner.output, "word", "")
+                        matches.append(self._strip_heredoc_terminator(winner.heredoc.value, delim))
+            for attr in ("parts", "list", "command"):
+                child = getattr(node, attr, None)
+                if child is None:
+                    continue
+                for item in child if isinstance(child, list) else [child]:
+                    visit(item)
+
+        for part in parts:
+            visit(part)
+        return matches[0] if len(matches) == 1 else None
 
     def _extract_heredoc_stdin_message(self, command: str) -> Optional[str]:
         """Commit message of a ``git commit -F-`` / ``--file -`` fed by an in-command heredoc.
 
-        Returns the heredoc body when (a) some ``git … commit`` segment reads its message from
-        stdin (``-F -`` / ``--file -`` / ``/dev/stdin``) AND (b) a heredoc body is present in the
-        command string; otherwise ``None``. This reclassifies the stdin-heredoc form from
-        ``unscannable`` to ``scannable`` (issue #87) — its bytes ARE in argv, unlike ``-F file``
-        (on disk) or ``cat f | git commit -F-`` (in a prior pipe segment), both of which return
-        ``None`` here and stay unscannable. Fail-open: any uncertainty → ``None``.
+        Returns the heredoc body bound to the stdin-fed commit segment when (a) some
+        ``git … commit`` segment reads its message from stdin (``-F -`` / ``--file -`` /
+        ``/dev/stdin``) AND (b) a heredoc body for it is present in the command string;
+        otherwise ``None``. This reclassifies the stdin-heredoc form from ``unscannable`` to
+        ``scannable`` (issue #87) — its bytes ARE in argv, unlike ``-F file`` (on disk) or
+        ``cat f | git commit -F-`` (in a prior pipe segment), both of which return ``None`` here
+        and stay unscannable. Fail-open: any uncertainty → ``None``.
 
-        bashlex raises on quoted-delimiter heredocs (``<<'EOF'``), so the STDIN gate reuses the
-        tolerant ``_git_commit_arg_lists`` infra while the BODY is taken by regex (uniform across
-        quoted and unquoted forms).
+        Prefers ``_heredoc_body_via_ast`` (bashlex's real parse — correct on quoting, fd binding,
+        and multiple heredocs sharing a Bash call). Only a quoted heredoc delimiter defeats
+        bashlex entirely; that shape falls back to ``_scan_heredocs``'s naive ordinal line
+        scanner: among the fd-0 (real stdin) openers on the flag's own command line, the LAST
+        wins (bash's own same-fd-redirect precedence), regardless of how many OTHER heredocs —
+        different fd, or a wholly separate command — share the call.
         """
-        if len(command) > MAX_COMMAND_SIZE:
-            return None  # DoS guard: never run the DOTALL body regex on an oversized command
-        if not any(self._arg_targets_stdin(args) for args in self._git_commit_arg_lists(command)):
+        if (
+            len(command) > MAX_COMMAND_SIZE  # DoS guard: never scan an oversized command
+            or not any(self._arg_targets_stdin(args) for args in self._git_commit_arg_lists(command))
+        ):
             return None
-        # Only the UNAMBIGUOUS single-heredoc case can be bound to the stdin-fed commit segment.
-        # With 0 or 2+ heredocs, binding by position would guess wrong — leaking an ad behind a
-        # clean leading heredoc, or false-blocking a clean commit whose sibling heredoc contains
-        # the token — so fail open to unscannable instead. The linear opener count also starves
-        # the O(n^2) DOTALL body search of any multi-`<<` adversarial input within MAX_COMMAND_SIZE.
-        if len(self._HEREDOC_OPENER_RE.findall(command)) != 1:
+        try:
+            return self._heredoc_body_via_ast(command)
+        except Exception:  # noqa: BLE001, S110 - bashlex raises various types; fall back to the scanner
+            pass
+        scanned = self._scan_heredocs(command)  # None: unterminated heredoc or past the cap
+        if not scanned:
             return None
-        match = self._HEREDOC_BODY_RE.search(command)
-        return match.group(3) if match else None
+        heredocs, scan_text = scanned
+        target_pos = self._first_stdin_flag_end(scan_text)
+        if target_pos is None:
+            return None
+        # Real stdin (fd 0, i.e. no explicit `N<<` number) only — a same-line `3<<other` targets
+        # a different fd and never feeds this command's message. Among fd-0 candidates on the
+        # SAME line as the first one at/after the flag, the LAST one wins (bash applies same-fd
+        # redirects left to right, so a later `<<A <<B` silently overrides the earlier for fd 0).
+        candidates = [h for h in heredocs if h[2] == 0 and h[0] >= target_pos]
+        if not candidates:
+            return None
+        winner_line = candidates[0][3]
+        same_line = [h for h in candidates if h[3] == winner_line]
+        return same_line[-1][1]
 
     # Explanation surfaced when an unscannable commit is warned/blocked. Unscannable always
     # means file/stdin delivery (-F/--file), so a single static message suffices.
