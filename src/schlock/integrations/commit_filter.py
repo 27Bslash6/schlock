@@ -537,91 +537,177 @@ class CommitMessageFilter:
         positions = [tokens[idx].end() for idx in self._stdin_flag_value_indices(words)]
         return positions[0] if len(positions) == 1 else None
 
-    # Heredoc opener: <<EOF, <<'EOF', <<"EOF", <<-EOF, << EOF. Group 1 is the `-` of `<<-`
-    # (tab-stripping form), group 2 the delimiter name.
-    _HEREDOC_OPENER_RE = re.compile(r"<<(-?)[ \t]*(['\"]?)(\w+)\2")
+    # Heredoc opener: `<<` (or `<<-`, tab-stripping form) plus optional blanks; the delimiter WORD
+    # that follows is read by _heredoc_delimiter, not by this regex — bash quote-removes the whole
+    # word (`<<"E"OF` is EOF, `<<\EOF` is EOF, `<<'END-MSG'` is END-MSG), and a `\w+` class here
+    # truncated or rejected all three. The lookbehind keeps a here-string's tail (`<<<X` contains
+    # `<<X`) from reading as an opener.
+    _HEREDOC_OPENER_RE = re.compile(r"(?<!<)<<(-?)[ \t]*")
+
+    # Characters that END a heredoc delimiter word: blanks and shell metacharacters.
+    _WORD_BREAK = frozenset(" \t\n;|&<>()")
 
     # ReDoS / adversarial-input bound: past this many heredoc openers in one command, refuse to
     # bind and stay unscannable rather than scan an unbounded number of bodies. A real commit +
     # PR-body + a couple of incidental heredocs never approaches this; it only bites contrived
-    # many-heredoc input.
+    # many-heredoc input. Enforced DURING opener collection (not after), so a MAX_COMMAND_SIZE
+    # line packed with openers costs nine regex matches, not sixteen thousand.
     _MAX_HEREDOC_OPENERS = 8
 
-    @staticmethod
-    def _quoted_ranges_in_line(line: str) -> list[tuple[int, int]]:
-        """Character ranges within a single command LINE (no embedded newlines — heredoc bodies
-        are never passed here, see ``_scan_heredocs``) that lie inside a single- or
-        double-quoted string. Used to mask decoy `<<opener`/`-F -`-shaped text that appears only
-        as quoted prose (``echo "see <<EOF for docs"``), not as real shell syntax that could
-        feed a commit's stdin. Naive but bounded: no backslash-escaping inside single quotes
-        (matches shell), backslash-escaping honored inside double quotes; an unterminated quote
-        masks to end of line (safer to under-scan than trust unbalanced text).
-        """
-        ranges: list[tuple[int, int]] = []
-        i = 0
-        n = len(line)
-        while i < n:
-            ch = line[i]
-            if ch not in ("'", '"'):
-                i += 1
-                continue
-            quote = ch
-            start = i
-            i += 1
-            while i < n:
-                if quote == '"' and line[i] == "\\":
-                    i += 2
-                    continue
-                if line[i] == quote:
-                    i += 1
-                    break
-                i += 1
-            ranges.append((start, i))
-        return ranges
+    # Characters that can end a logical command line or open a span the opener regex must not
+    # see: quote openers, a backslash (escapes the next char, newline included), a comment, a
+    # newline.
+    _LINE_SPECIAL_RE = re.compile(r"""['"\\\n#]""")
+    # Inside a double-quoted (`"…"`) or ANSI-C (`$'…'`) string only the closer and `\` matter.
+    _DQ_SPECIAL_RE = re.compile(r'["\\]')
+    _ANSI_SPECIAL_RE = re.compile(r"['\\]")
+    # A `#` opens a comment only at the start of a word.
+    _COMMENT_LEAD = frozenset(" \t;|&(")
+    # Command / process substitution on the opener's line: an inner heredoc binds INSIDE the
+    # substitution and its newlines are not the command's newline token — beyond what a line
+    # scanner can model, so refuse to bind (unscannable) rather than guess a body.
+    _SUBSTITUTION_RE = re.compile(r"\$\(|`|[<>]\(")
 
-    def _scan_heredocs(self, command: str) -> Optional[tuple[list[tuple[int, str, int, int]], str]]:
+    @classmethod
+    def _heredoc_delimiter(cls, command: str, start: int) -> str:
+        """The heredoc delimiter word starting at ``start``, quote-removed as bash does: ``EOF``,
+        ``'EOF'``, ``"E"OF`` and ``\\EOF`` all read ``EOF``; ``END-MSG`` keeps its hyphen. The
+        word ends at a blank or shell metacharacter. Empty when no word starts there.
+        """
+        parts: list[str] = []
+        i = start
+        n = len(command)
+        while i < n:
+            ch = command[i]
+            if ch in cls._WORD_BREAK:
+                break
+            if ch == "'":
+                close = command.find("'", i + 1)
+                close = n if close == -1 else close
+                parts.append(command[i + 1 : close])
+                i = close + 1
+            elif ch == '"':
+                i += 1
+                while i < n and command[i] != '"':
+                    if command[i] == "\\" and i + 1 < n:
+                        i += 1
+                    parts.append(command[i])
+                    i += 1
+                i += 1
+            elif ch == "\\":
+                if i + 1 < n:
+                    parts.append(command[i + 1])
+                i += 2
+            else:
+                parts.append(ch)
+                i += 1
+        return "".join(parts)
+
+    @staticmethod
+    def _close_escaped_quote(command: str, i: int, special: re.Pattern) -> int:
+        """Index just past the closer of a backslash-escaping quoted span (``"…"`` or ``$'…'``)
+        whose opener sits at ``i - 1``; ``len(command)`` if unterminated.
+        """
+        n = len(command)
+        while True:
+            m = special.search(command, i)
+            if m is None:
+                return n
+            if command[m.start()] != "\\":
+                return m.start() + 1
+            i = min(m.start() + 2, n)  # skip the backslash and the escaped char
+
+    @classmethod
+    def _consume_command_line(cls, command: str, pos: int, scan_chars: list[str]) -> int:
+        """Advance from ``pos`` over ONE logical command line, blanking every quoted span,
+        backslash-escaped character and comment in ``scan_chars`` to same-length spaces, and
+        return the index of the newline that ends it (``len(command)`` when there is none).
+
+        Logical, not physical: bash lets a quoted string span physical lines, and a heredoc body
+        begins only after the newline TOKEN that ends the command — a newline inside quotes or
+        after a backslash is not a token, so it must not end the line here either (one scan with
+        quote state carried across newlines, rather than a fresh scan per physical line that a
+        multi-line quoted argument could decoy). Quote forms as bash reads them: ``'…'`` takes no
+        escapes; ``"…"`` and ``$'…'`` let ``\\`` escape the next char (so ``$'it\\'s'`` does not
+        close at ``\\'``); a bare ``\\`` escapes the next char, so ``\\"`` opens no quote and a
+        ``\\``-newline is a continuation. An unquoted ``#`` at the start of a word comments out
+        the rest of the line. An unterminated quote runs to the end of the command (under-scan
+        rather than trust unbalanced text). Linear: the scan jumps between special characters.
+        """
+        n = len(command)
+        i = pos
+        while i < n:
+            m = cls._LINE_SPECIAL_RE.search(command, i)
+            if m is None:
+                return n
+            i = m.start()
+            ch = command[i]
+            if ch == "\n":
+                return i
+            if ch == "#":
+                if i > pos and command[i - 1] not in cls._COMMENT_LEAD:
+                    i += 1  # mid-word `#` (`a#b`, `$#`) is literal
+                    continue
+                newline = command.find("\n", i)
+                end = n if newline == -1 else newline
+                scan_chars[i:end] = " " * (end - i)
+                return end
+            if ch == "\\":
+                end = min(i + 2, n)  # the backslash and the char it escapes (possibly a newline)
+                scan_chars[i:end] = " " * (end - i)
+                i = end
+                continue
+            start = i
+            if ch == '"':
+                i = cls._close_escaped_quote(command, i + 1, cls._DQ_SPECIAL_RE)
+            elif i > 0 and command[i - 1] == "$":
+                i = cls._close_escaped_quote(command, i + 1, cls._ANSI_SPECIAL_RE)
+            else:
+                close = command.find("'", i + 1)
+                i = n if close == -1 else close + 1
+            scan_chars[start:i] = " " * (i - start)
+        return n
+
+    def _scan_heredocs(self, command: str) -> Optional[tuple[list[tuple[int, str, int]], str]]:
         """Bind every heredoc body to its ``<<`` opener, single pass, left to right, and produce
         the sanitized text ``_first_stdin_flag_end`` should search for the commit's flag.
 
-        Bash's own rule: when N openers appear before a line's newline, the N bodies that follow
-        are consumed in that SAME order (the k-th body belongs to the k-th opener) — so this
-        walks line by line, collecting REAL (non-quoted-decoy) openers on the current command
-        line via ``_quoted_ranges_in_line``, then reads their bodies off in order before moving
-        to the next line. Returns ``(bindings, scan_text)`` where ``bindings`` is
-        ``[(opener_start_pos, body, fd, line_key), ...]`` in source order — ``fd`` from
-        ``_heredoc_target_fd`` (0 unless explicitly numbered, e.g. ``3<<B``) and ``line_key`` the
-        starting position of the physical line the opener came from, letting the caller re-apply
-        bash's own "later redirect to the same fd on the same command's line wins" rule instead
-        of always trusting the first opener found — and ``scan_text`` is ``command`` with every
-        heredoc body AND every quoted span on a command line blanked to same-length spaces (so
-        offsets still line up with ``command``) — the only text safe to scan for a real
-        ``-F``/``--file`` flag, since neither a heredoc body nor quoted prose is shell syntax.
-        Returns ``None`` on an unterminated heredoc or past ``_MAX_HEREDOC_OPENERS``.
+        Bash's own rule: when N openers appear before a command line's newline token, the N
+        bodies that follow are consumed in that SAME order (the k-th body belongs to the k-th
+        opener) — so this walks LOGICAL line by logical line (``_consume_command_line``: quote
+        state carried across physical newlines), collecting the REAL openers on the line, then
+        reads their bodies off in order before moving on. An opener is real iff its ``<`` is still
+        unblanked in ``scan_chars`` after the quote pass — an O(1) test, so a line packed with
+        quoted decoys costs one regex pass, not openers × quoted-spans. Returns
+        ``(bindings, scan_text)`` where ``bindings`` is ``[(opener_start_pos, body, fd), ...]`` in
+        source order — ``fd`` from ``_heredoc_target_fd`` (0 unless explicitly numbered, e.g.
+        ``3<<B``) — and ``scan_text`` is ``command`` with every heredoc body, quoted span,
+        escaped char and comment blanked to same-length spaces (offsets still line up with
+        ``command``): the only text safe to scan for a real ``-F``/``--file`` flag, and in which
+        every surviving newline is a real newline token. Returns ``None`` on an unterminated
+        heredoc, past ``_MAX_HEREDOC_OPENERS``, or when an opener shares its line with a command
+        or process substitution.
         """
-        results: list[tuple[int, str, int, int]] = []  # (opener_pos, body, fd, line_key)
+        results: list[tuple[int, str, int]] = []  # (opener_pos, body, fd)
         scan_chars = list(command)
         pos = 0
         n = len(command)
         while pos < n:
-            newline_idx = command.find("\n", pos)
-            line_end = newline_idx if newline_idx != -1 else n
-            quoted = self._quoted_ranges_in_line(command[pos:line_end])
-            for qstart, qend in quoted:
-                for k in range(pos + qstart, pos + qend):
-                    scan_chars[k] = " "
-            line_openers = [
-                m
-                for m in self._HEREDOC_OPENER_RE.finditer(command, pos, line_end)
-                if not any(qs <= m.start() - pos < qe for qs, qe in quoted)
-            ]
-            if newline_idx == -1:
-                return None if line_openers else (results, "".join(scan_chars))
-            if len(results) + len(line_openers) > self._MAX_HEREDOC_OPENERS:
+            line_end = self._consume_command_line(command, pos, scan_chars)
+            line_openers: list[tuple[int, bool, str]] = []  # (opener_pos, strip_tabs, delimiter)
+            for m in self._HEREDOC_OPENER_RE.finditer(command, pos, line_end):
+                if scan_chars[m.start()] != "<":
+                    continue  # quoted prose, escaped text or a comment, not redirect syntax
+                delim = self._heredoc_delimiter(command, m.end())
+                if not delim:
+                    continue  # `<<` with no word after it (a here-string's `<<<` tail)
+                line_openers.append((m.start(), bool(m.group(1)), delim))
+                if len(results) + len(line_openers) > self._MAX_HEREDOC_OPENERS:
+                    return None
+            if line_openers and (line_end == n or self._SUBSTITUTION_RE.search("".join(scan_chars[pos:line_end]))):
                 return None
-            cursor = newline_idx + 1
-            for m in line_openers:
-                strip_tabs = bool(m.group(1))
-                delim = m.group(3)
+            cursor = line_end + 1
+            for opener_pos, strip_tabs, delim in line_openers:
                 body_lines: list[str] = []
                 body_start = cursor
                 while True:
@@ -636,10 +722,8 @@ class CommitMessageFilter:
                         return None  # unterminated heredoc
                     body_lines.append(body_line)
                     cursor = next_nl + 1
-                for k in range(body_start, cursor):
-                    scan_chars[k] = " "
-                fd = self._heredoc_target_fd(command, m.start())
-                results.append((m.start(), "\n".join(body_lines), fd, pos))
+                scan_chars[body_start:cursor] = " " * (cursor - body_start)
+                results.append((opener_pos, "\n".join(body_lines), self._heredoc_target_fd(command, opener_pos)))
             pos = cursor
         return results, "".join(scan_chars)
 
@@ -668,7 +752,8 @@ class CommitMessageFilter:
     def _heredoc_body_via_ast(self, command: str) -> Optional[str]:
         """Commit's stdin-fed heredoc body via bashlex's own AST — correct by construction: real
         quote parsing (a multi-line quoted argument or a quoted flag value is never mistaken for
-        heredoc syntax), real fd binding (``RedirectNode.input is None`` is the command's actual
+        heredoc syntax), real fd binding (``RedirectNode.input`` is ``None`` for the implicit
+        stdin of ``<<EOF`` and ``0`` for an explicit ``0<<EOF``; either is the command's actual
         stdin, so a same-line ``3<<other`` on a different fd is never confused with it), and
         real ``<<-`` tab-stripping. Used whenever bashlex can parse the whole command.
 
@@ -696,7 +781,10 @@ class CommitMessageFilter:
                     winner = None
                     for p in getattr(node, "parts", []):
                         heredoc = getattr(p, "heredoc", None)
-                        is_stdin_heredoc = getattr(p, "kind", None) == "redirect" and p.type in ("<<", "<<-") and p.input is None
+                        # bashlex: implicit stdin is input None; an explicit `0<<EOF` is input 0.
+                        is_stdin_heredoc = (
+                            getattr(p, "kind", None) == "redirect" and p.type in ("<<", "<<-") and p.input in (None, 0)
+                        )
                         if is_stdin_heredoc and heredoc is not None:
                             winner = p  # later redirect to the same (implicit) fd 0 wins
                     if winner is not None:
@@ -712,6 +800,12 @@ class CommitMessageFilter:
         for part in parts:
             visit(part)
         return matches[0] if len(matches) == 1 else None
+
+    # Command separators in SANITIZED scan text (quotes, bodies, escapes and comments already
+    # blanked, so every surviving newline is a real newline token): newline, `;`, `|` (also `||`,
+    # `|&`), `&&`, and a background `&` — but not the `&` of an fd dup (`2>&1`, `<&0`) or of
+    # `&>file`, which are redirects on the same command.
+    _COMMAND_SEPARATOR_RE = re.compile(r"[;|\n]|(?<![<>])&(?!>)")
 
     def _extract_heredoc_stdin_message(self, command: str) -> Optional[str]:
         """Commit message of a ``git commit -F-`` / ``--file -`` fed by an in-command heredoc.
@@ -747,16 +841,17 @@ class CommitMessageFilter:
         target_pos = self._first_stdin_flag_end(scan_text)
         if target_pos is None:
             return None
-        # Real stdin (fd 0, i.e. no explicit `N<<` number) only — a same-line `3<<other` targets
-        # a different fd and never feeds this command's message. Among fd-0 candidates on the
-        # SAME line as the first one at/after the flag, the LAST one wins (bash applies same-fd
-        # redirects left to right, so a later `<<A <<B` silently overrides the earlier for fd 0).
-        candidates = [h for h in heredocs if h[2] == 0 and h[0] >= target_pos]
-        if not candidates:
-            return None
-        winner_line = candidates[0][3]
-        same_line = [h for h in candidates if h[3] == winner_line]
-        return same_line[-1][1]
+        # The commit's OWN heredoc: real stdin (fd 0 — a same-line `3<<other` feeds a different
+        # fd), at/after the flag with no command separator between them in the sanitized text, so
+        # a sibling command's or a later line's heredoc is never reported as the message while the
+        # commit's real stdin goes unscanned. Among own candidates the LAST wins (bash applies
+        # same-fd redirects left to right: `<<A <<B` feeds B).
+        own = [
+            h
+            for h in heredocs
+            if h[2] == 0 and target_pos <= h[0] and not self._COMMAND_SEPARATOR_RE.search(scan_text, target_pos, h[0])
+        ]
+        return own[-1][1] if own else None
 
     # Explanation surfaced when an unscannable commit is warned/blocked. Unscannable always
     # means file/stdin delivery (-F/--file), so a single static message suffices.

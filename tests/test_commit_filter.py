@@ -1659,21 +1659,142 @@ class TestHeredocStdinExtraction:
         assert result.message_delivery == "scannable"
         assert result.patterns_removed
 
+    def test_multiline_quoted_argument_does_not_mask_real_heredoc(self):
+        # Review finding (PR #154): bash lets a quoted string span PHYSICAL lines, and the heredoc
+        # body starts only after the newline TOKEN that ends the command — a newline inside quotes
+        # is not one. A per-physical-line quote scan saw `<<DECOY` on its "own" line, bound its
+        # empty body, then masked the real `<<'REAL'` when the quote closed: the filter reported an
+        # EMPTY scannable message while bash fed the ad. Quote state now persists across lines.
+        cmd = "git commit -F- 2>'prefix\n<<DECOY\nDECOY\nsuffix' <<'REAL'\nGenerated with Claude Code\nREAL\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_escaped_quote_does_not_open_quote_context(self):
+        # Once quote state spans lines, an unhandled `\"` would open a phantom quote that swallows
+        # the REST OF THE COMMAND (not just the line), hiding the commit's real heredoc. bash treats
+        # `\"` as a literal character with no quote context; so does the scanner.
+        cmd = "echo \\\"x && git commit -F- <<'EOF'\nGenerated with Claude Code\nEOF\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_backslash_newline_continuation_is_same_logical_line(self):
+        # Guards the ownership rule (no separator between flag and opener) from rejecting a
+        # `\`-newline continuation as a later line: bash's lexer removes it, so the opener on the
+        # continued line is the commit's own and its body follows that line's newline token.
+        cmd = "git commit -F- \\\n<<'EOF'\nGenerated with Claude Code\nEOF\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_here_string_tail_is_not_a_heredoc_opener(self):
+        # `<<<X` contains `<<X`; reading that tail as an opener would consume the following lines
+        # (including the commit's real heredoc) as a never-terminated "body" and fail open.
+        cmd = "cat <<<X\ngit commit -F- <<'EOF'\nGenerated with Claude Code\nEOF\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_explicit_fd0_heredoc_is_scannable(self):
+        # Review finding (PR #154): bashlex reports `0<<EOF` as RedirectNode.input == 0, not None.
+        # Rejecting it left a bash-equivalent spelling of the commit's stdin heredoc unscannable
+        # (parse succeeds, so the fallback scanner never ran either). Both tiers: AST (unquoted)
+        # and naive scanner (quoted delimiter).
+        for opener in ("0<<EOF", "0<<'EOF'"):
+            cmd = f"git commit -F- {opener}\nGenerated with Claude Code\nEOF\n"
+            result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+            assert result.message_delivery == "scannable", opener
+            assert result.patterns_removed, opener
+
+    def test_later_line_heredoc_not_bound_to_piped_commit(self):
+        # Review finding (PR #154): the commit's message arrives by PIPE (unscannable), and an
+        # unrelated quoted-delimiter heredoc on the NEXT line forces the fallback scanner. Binding
+        # that heredoc to the commit reported a clean unrelated body as "the message" while the
+        # real piped stdin went unscanned — turning a deny (unscannable_message_action=block)
+        # into an allow. The opener must sit on the flag's own logical line.
+        cmd = "printf 'Generated with Claude Code' | git commit -F-\ncat <<'X'\nclean unrelated\nX\n"
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).message_delivery == "unscannable"
+
+    def test_same_line_sibling_command_heredoc_not_bound(self):
+        # Same class, one line: the heredoc after `;` feeds `cat`, not the commit.
+        cmd = "git commit -F- ; cat <<'X'\nclean unrelated\nX\n"
+        assert self._filter(self._ad_rules()).filter_commit_message(cmd).message_delivery == "unscannable"
+
+    def test_redirects_and_chains_around_own_opener_still_bind(self):
+        # Guards for the separator rule above: an fd dup between flag and opener is NOT a command
+        # separator, and a chain operator AFTER the opener is irrelevant to ownership.
+        for cmd in (
+            "git commit -F- 2>&1 <<'X'\nGenerated with Claude Code\nX\n",
+            "git commit -F- <<'X' && echo ok\nGenerated with Claude Code\nX\n",
+        ):
+            result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+            assert result.message_delivery == "scannable", cmd
+            assert result.patterns_removed, cmd
+
+    def test_comment_opener_is_not_bound(self):
+        # Review finding (PR #154 follow-up): bash comments out everything after an
+        # unquoted word-initial `#`, so `<<DECOY` in a trailing comment is prose. The scanner saw
+        # a real fd-0 opener whose (empty) body then won as the LAST one on the line — an EMPTY
+        # scannable message while bash fed the ad.
+        cmd = "git commit -F- <<'EOF' # <<DECOY\nGenerated with Claude Code\nEOF\nDECOY\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_delimiter_word_is_quote_removed_whole(self):
+        # Review finding (PR #154 follow-up): bash quote-removes the WHOLE delimiter word.
+        # A `\w+` class read `<<"E"OF` as `E` (body terminated early at the `E` line → a WRONG,
+        # clean body reported while bash fed the ad), and rejected `<<'END-MSG'` and `<<\EOF`
+        # outright (no opener → unscannable). All three must bind and block.
+        for opener, terminator in (('<<"E"OF', "EOF"), ("<<'END-MSG'", "END-MSG"), ("<<\\EOF", "EOF")):
+            cmd = f"git commit -F- {opener}\nclean\nE\nGenerated with Claude Code\n{terminator}\n"
+            result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+            assert result.message_delivery == "scannable", opener
+            assert result.patterns_removed, opener
+
+    def test_substitution_on_opener_line_refuses_to_bind(self):
+        # Review finding (PR #154 follow-up): a heredoc INSIDE `$(…)` binds inside the
+        # substitution, and the substitution's newlines are not the command's newline token — a
+        # line scanner cannot model that. It bound D's empty body as the message while bash fed
+        # REAL's ad. Refuse (unscannable) rather than guess.
+        cmd = "git commit -F- $(echo <<D\nD\n) <<'REAL'\nGenerated with Claude Code\nREAL\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "unscannable"
+
+    def test_ansi_c_quote_does_not_swallow_command(self):
+        # Review finding (PR #154 follow-up): `$'…'` is its own quote form — `\'` does
+        # NOT close it. Read as a plain single quote, the stray `'` opened an unterminated quote
+        # that blanked the commit's flag and opener → unscannable while bash fed the ad.
+        cmd = "echo $'it\\'s' && git commit -F- <<'X'\nGenerated with Claude Code\nX\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_heredoc_opener_cap_boundary(self):
+        # Pins the cap's arithmetic (`>` not `>=`): exactly _MAX_HEREDOC_OPENERS terminated heredocs
+        # bind; one more (on a newline-less final line) is refused. The DURING-collection
+        # short-circuit itself is observable only as time — see the slow test below.
+        filt = self._filter()
+        cap = filt._MAX_HEREDOC_OPENERS
+        assert filt._scan_heredocs("<<X " * (cap + 1)) is None
+        assert filt._scan_heredocs("x " + "<<X " * cap + "\n" + "X\n" * cap) is not None
+
     @pytest.mark.slow
     def test_heredoc_opener_cap_check_bounded_time(self):
-        # MAX_COMMAND_SIZE-sized input of bare `<<` openers, no newlines: _scan_heredocs (the
-        # actual production ReDoS bound, including its per-line quote scan) must reject this
-        # well within the existing perf budget rather than attempt to bind any body.
-        # bashlex.parse's own cost for a command this dense with heredoc tokens is a separate,
-        # pre-existing characteristic of _git_commit_arg_lists shared by the original
-        # implementation, not part of this fix.
+        # Review finding (PR #154, CWE-400): a MAX_COMMAND_SIZE line interleaving quoted decoys
+        # and `<<` openers hit an openers × quoted-spans check — 5.9 s in the scanner before the
+        # fix, on the synchronous PreToolUse path. Now ~10 ms: the quote pass blanks a mask and
+        # each opener is one O(1) lookup, and the cap short-circuits during collection. Budget
+        # follows test_redos_fix's posture (wide margin over the measured cost, so scheduler
+        # noise cannot fail it, while a quadratic regression — seconds — still does).
         filt = self._filter()
-        cmd = ("<<X " * 20000)[:MAX_COMMAND_SIZE]
-        start = time.time()
+        cmd = ("'q' <<X " * 20000)[:MAX_COMMAND_SIZE]
+        start = time.perf_counter()
         result = filt._scan_heredocs(cmd)
-        duration = time.time() - start
+        duration = time.perf_counter() - start
         assert result is None
-        assert duration < 0.02
+        assert duration < 0.5, f"_scan_heredocs took {duration:.3f}s on adversarial input"
 
     @pytest.mark.slow
     def test_heredoc_scan_bounded_time_under_cap(self):
@@ -1682,14 +1803,14 @@ class TestHeredocStdinExtraction:
         filt = self._filter()
         body = "x" * 7000
         cmd = "".join(f"cat <<H{i}\n{body}\nH{i}\n" for i in range(filt._MAX_HEREDOC_OPENERS))
-        start = time.time()
+        start = time.perf_counter()
         result = filt._scan_heredocs(cmd)
-        duration = time.time() - start
+        duration = time.perf_counter() - start
         assert result is not None
         bindings, scan_text = result
         assert len(bindings) == filt._MAX_HEREDOC_OPENERS
         assert len(scan_text) == len(cmd)
-        assert duration < 0.02
+        assert duration < 0.5, f"_scan_heredocs took {duration:.3f}s on large legitimate input"
 
 
 class TestPatternCaseWhitespace:
