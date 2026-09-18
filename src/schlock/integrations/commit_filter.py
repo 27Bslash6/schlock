@@ -44,6 +44,21 @@ logger = logging.getLogger(__name__)
 # Size limit to prevent DoS via huge commands (64KB is generous for commit messages)
 MAX_COMMAND_SIZE = 64 * 1024
 
+_GIT_WORD_RE = re.compile(r"\bgit\b")
+_COMMIT_WORD_RE = re.compile(r"\bcommit\b")
+
+
+def _git_then_commit(command: str) -> bool:
+    """Tolerant recognizer fallback: a ``git`` word with a ``commit`` word somewhere after it.
+
+    One positional pass. The equivalent ``\\bgit\\b.*?\\bcommit\\b`` re-scans the tail once per
+    ``git`` token, so ``commit git git …`` at 80 KB took ~8 s; if the FIRST ``git`` has no
+    ``commit`` after it, no later one does either.
+    """
+    m = _GIT_WORD_RE.search(command)
+    return bool(m and _COMMIT_WORD_RE.search(command, m.end()))
+
+
 # git GLOBAL options that consume the FOLLOWING word as a value, in separate-word form (issue
 # #82). When one precedes the subcommand (e.g. `git -C <path> commit`), the next token is its
 # value, NOT the subcommand — so _commit_subcommand_index skips both. Everything else dashed is
@@ -248,18 +263,18 @@ class CommitMessageFilter:
         """
         # Fast reject: a git commit needs both "git" and a standalone "commit" token. Skips
         # parsing the overwhelming majority of commands (which contain neither).
-        if "git" not in command or not re.search(r"\bcommit\b", command):
+        if "git" not in command or not _COMMIT_WORD_RE.search(command):
             return False
         # Oversized: skip bashlex (DoS guard) and use a tolerant regex.
         if len(command) > MAX_COMMAND_SIZE:
-            return bool(re.search(r"\bgit\b.*?\bcommit\b", command, re.DOTALL))
+            return _git_then_commit(command)
         # Precise: bashlex AST, tolerant of global options. AST detection also avoids the old
         # `\bgit\s+commit\b` false positive on strings like `echo "git commit"`. A parse failure
         # must not silently disable detection, so fall back to a tolerant regex (over-detect-safe).
         try:
             return bool(self._commit_arg_word_lists(command))
         except Exception:  # noqa: BLE001 - bashlex raises various types; fail-open to regex
-            return bool(re.search(r"\bgit\b.*?\bcommit\b", command, re.DOTALL))
+            return _git_then_commit(command)
 
     # Git global options that redirect which repository a commit lands in. A `git log` run in
     # the process working directory says nothing about such a commit, so the post-commit

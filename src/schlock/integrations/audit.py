@@ -13,7 +13,8 @@ Log Format (JSONL):
     Each line is a JSON object with:
     - timestamp: ISO 8601 UTC timestamp
     - event_type: "validation" | "block" | "allow" | "warn"
-    - command: The bash command that was validated (secrets redacted)
+    - command: The bash command that was validated (secrets redacted, size-capped)
+    - command_truncated: true when the cap cut the command (false = logged in full)
     - risk_level: Risk level (SAFE, LOW, MEDIUM, HIGH, BLOCKED)
     - violations: List of rule violations (if any)
     - decision: "allow" | "block" | "warn"
@@ -48,6 +49,14 @@ from typing import Any, Optional
 
 from platformdirs import user_data_dir
 
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
+
+# Per-entry size cap on the logged command. Entries the commit filter judged keep the whole
+# command up to the filter's own bound (MAX_COMMAND_SIZE, 64 KiB) so the log shows what the
+# filter saw - a `git commit -F - <<'EOF'` body lives past byte 500 and is the very part that
+# after-the-fact analysis needs. Everything else keeps this short cap.
+COMMAND_LOG_LIMIT = 500
+
 
 def get_null_device() -> str:
     """Get platform-specific null device.
@@ -80,6 +89,7 @@ class AuditEvent:
     decision: str  # "allow", "block", "warn"
     context: dict[str, Any]
     execution_time_ms: Optional[float] = None
+    command_truncated: bool = False
 
     def to_json(self) -> str:
         """Serialize to JSON string."""
@@ -210,16 +220,20 @@ class AuditLogger:
         decision: str,
         execution_time_ms: Optional[float] = None,
         context: Optional[AuditContext] = None,
+        *,
+        is_git_commit: bool = False,
     ):
         """Log a command validation event.
 
         Args:
-            command: The bash command that was validated (will be scrubbed)
+            command: The bash command that was validated (will be capped, then scrubbed)
             risk_level: Risk level (SAFE, LOW, MEDIUM, HIGH, BLOCKED)
             violations: List of rule violations
             decision: "allow", "block", or "warn"
             execution_time_ms: Validation duration in milliseconds
             context: Optional context metadata
+            is_git_commit: True when the commit filter recognized a `git commit`; selects the
+                MAX_COMMAND_SIZE cap instead of COMMAND_LOG_LIMIT.
         """
         if context is None:
             context = AuditContext()
@@ -228,8 +242,11 @@ class AuditLogger:
         event_type_map = {"allow": "allow", "block": "block", "warn": "warn"}
         event_type = event_type_map.get(decision, "validation")
 
-        # Scrub secrets before logging
-        scrubbed_command = self._scrub_secrets(command)
+        # Cap first (bounds the scrub regexes too), then scrub. A secret split by the cut either
+        # still matches `token=\S+` on what remains or has lost its value entirely.
+        cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
+        command_truncated = len(command) > cap
+        scrubbed_command = self._scrub_secrets(command[:cap])
 
         event = AuditEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -245,6 +262,7 @@ class AuditLogger:
                 "environment": context.environment,
             },
             execution_time_ms=execution_time_ms,
+            command_truncated=command_truncated,
         )
 
         self.log_event(event)

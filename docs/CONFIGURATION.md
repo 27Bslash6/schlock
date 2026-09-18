@@ -370,7 +370,8 @@ Audit logging provides a persistent security trail of all command validations.
 
 Every command validation creates an audit entry with:
 - **Timestamp**: ISO 8601 UTC timestamp
-- **Command**: The bash command that was validated (truncated to 500 chars)
+- **Command**: The bash command that was validated, secrets redacted. Capped at 500 chars, except entries for a recognized `git commit` keep the whole command up to the commit filter's own 64 KiB bound so the log shows what the filter saw
+- **Command Truncated**: `true` when the cap cut the command; `false` means it is logged in full
 - **Risk Level**: SAFE, LOW, MEDIUM, HIGH, or BLOCKED
 - **Violations**: List of matched security rules
 - **Decision**: allow, block, or warn
@@ -411,7 +412,8 @@ Each line is a complete JSON object:
     "git_branch": "main",
     "environment": "development"
   },
-  "execution_time_ms": 12.45
+  "execution_time_ms": 12.45,
+  "command_truncated": false
 }
 ```
 

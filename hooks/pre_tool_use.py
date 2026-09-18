@@ -398,6 +398,7 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
     # ultimately fires. Initialized before the try so the except handlers can read them safely.
     unscannable_warning = None
     unscannable_audit_violation = None
+    is_git_commit = False
 
     try:
         # 1. Extract command from stdin JSON
@@ -431,6 +432,7 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         filter_instance = get_filter()
         if filter_instance:
             filter_result = filter_instance.filter_commit_message(command)
+            is_git_commit = filter_instance.is_git_commit_command(command)  # selects the audit log's command cap
 
             # DENY if advertising patterns were matched (not just whitespace changes)
             if filter_result.patterns_removed:
@@ -460,12 +462,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                 execution_time_ms = (time.perf_counter() - start_time) * 1000
                 violations = [f"Advertising: {cat}" for cat in filter_result.categories_matched]
                 audit_logger.log_validation(
-                    command=command[:500],  # Truncate for log size
+                    command=command,
                     risk_level="BLOCKED",
                     violations=violations,
                     decision="block",
                     execution_time_ms=execution_time_ms,
                     context=context,
+                    is_git_commit=is_git_commit,
                 )
 
                 return {
@@ -484,12 +487,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                 logger.warning("[commit-filter] BLOCKED unscannable commit message (content not in argv)")
                 execution_time_ms = (time.perf_counter() - start_time) * 1000
                 audit_logger.log_validation(
-                    command=command[:500],
+                    command=command,
                     risk_level="BLOCKED",
                     violations=["commit_filter: unscannable commit message (block)"],
                     decision="block",
                     execution_time_ms=execution_time_ms,
                     context=context,
+                    is_git_commit=is_git_commit,
                 )
                 return {
                     "hookSpecificOutput": {
@@ -518,12 +522,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
             if unscannable_audit_violation:
                 error_violations.append(unscannable_audit_violation)
             audit_logger.log_validation(
-                command=command[:500],
+                command=command,
                 risk_level="BLOCKED",
                 violations=error_violations,
                 decision="block",
                 execution_time_ms=execution_time_ms,
                 context=context,
+                is_git_commit=is_git_commit,
             )
             return {
                 "hookSpecificOutput": {
@@ -566,12 +571,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         if decision == "allow":
             logger.info(f"Command allowed (risk: {result.risk_level.name})")
             audit_logger.log_validation(
-                command=command[:500],
+                command=command,
                 risk_level=result.risk_level.name,
                 violations=violations,
                 decision="allow",
                 execution_time_ms=execution_time_ms,
                 context=context,
+                is_git_commit=is_git_commit,
             )
             allow_output = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
             if unscannable_warning:
@@ -586,12 +592,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
                 message = f"{message}\n\n{shellcheck_message}"
             logger.info(f"Command requires approval (risk: {result.risk_level.name})")
             audit_logger.log_validation(
-                command=command[:500],
+                command=command,
                 risk_level=result.risk_level.name,
                 violations=violations,
                 decision="ask",
                 execution_time_ms=execution_time_ms,
                 context=context,
+                is_git_commit=is_git_commit,
             )
             ask_output = {
                 "hookEventName": "PreToolUse",
@@ -606,12 +613,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         message = format_message(result, decision="deny")
         logger.warning(f"Command blocked (risk: {result.risk_level.name})")
         audit_logger.log_validation(
-            command=command[:500],
+            command=command,
             risk_level=result.risk_level.name,
             violations=violations if violations else [result.message],
             decision="block",
             execution_time_ms=execution_time_ms,
             context=context,
+            is_git_commit=is_git_commit,
         )
         return {
             "hookSpecificOutput": {
@@ -629,12 +637,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         if unscannable_audit_violation:
             rt_violations.append(unscannable_audit_violation)
         audit_logger.log_validation(
-            command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
+            command=input_data.get("tool_input", {}).get("command", "<unknown>"),
             risk_level="BLOCKED",
             violations=rt_violations,
             decision="block",
             execution_time_ms=execution_time_ms,
             context=context,
+            is_git_commit=is_git_commit,
         )
         return {
             "hookSpecificOutput": {
@@ -652,12 +661,13 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         if unscannable_audit_violation:
             unexpected_violations.append(unscannable_audit_violation)
         audit_logger.log_validation(
-            command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
+            command=input_data.get("tool_input", {}).get("command", "<unknown>"),
             risk_level="BLOCKED",
             violations=unexpected_violations,
             decision="block",
             execution_time_ms=execution_time_ms,
             context=context,
+            is_git_commit=is_git_commit,
         )
         return {
             "hookSpecificOutput": {

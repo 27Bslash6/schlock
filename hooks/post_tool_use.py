@@ -301,12 +301,13 @@ def audit_detection(command: str, categories: list[str], cwd: Optional[str], sta
         from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: PLC0415 - lazy, post-gate
 
         get_audit_logger().log_validation(
-            command=command[:500],
+            command=command,
             risk_level="LOW",
             violations=[f"commit_filter: post-commit advertising detected ({cat})" for cat in categories],
             decision="warn",
             execution_time_ms=(time.perf_counter() - start_time) * 1000,
             context=AuditContext(project_root=cwd or "", current_dir=cwd or "", environment="development"),
+            is_git_commit=True,  # audit_detection runs only after is_git_commit_command gated True
         )
     except Exception as e:
         logger.warning(f"Audit logging failed: {e}")

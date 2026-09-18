@@ -16,6 +16,7 @@ from schlock.integrations.audit import (
     get_audit_logger,
     get_null_device,
 )
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 class TestAuditContext:
@@ -423,3 +424,31 @@ class TestAuditLoggerThreadSafety:
                 parsed = json.loads(line)
                 assert "command" in parsed
                 assert parsed["command"].startswith("echo thread")
+
+
+class TestCommandLength:
+    """The logged command is capped per entry: a short cap by default, the commit filter's own
+    bound for entries the filter judged, and every cut is marked. A flat 500-char cap dropped the
+    heredoc body of a `git commit -F -` that a root-cause later needed."""
+
+    @staticmethod
+    def _log_and_read(log_file: Path, command: str, violations=None, **kwargs) -> dict:
+        AuditLogger(log_file=log_file).log_validation(
+            command=command, risk_level="LOW", violations=violations or [], decision="allow", **kwargs
+        )
+        return json.loads(log_file.read_text().splitlines()[-1])
+
+    def test_commit_command_is_bounded_by_filter_size_limit(self, tmp_path):
+        """The full-length path is still bounded: past MAX_COMMAND_SIZE the entry is cut and marked."""
+        command = "git commit -m '" + "x" * (MAX_COMMAND_SIZE + 1000) + "'"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
+        assert len(entry["command"]) == MAX_COMMAND_SIZE
+        assert entry["command_truncated"] is True
+
+    def test_secret_past_short_cap_is_redacted_in_full_commit_entry(self, tmp_path):
+        """Redaction runs over the whole kept command, not just its first 500 chars."""
+        command = "git commit -m '" + "x" * 600 + "' && curl 'https://x/?token=sk-live-abc123'"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
+        assert "***REDACTED***" in entry["command"]
+        assert "sk-live-abc123" not in entry["command"]
+        assert entry["command_truncated"] is False
