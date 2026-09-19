@@ -811,6 +811,13 @@ class TestHeredocSurroundings:
                 "cat <<'EOF' x\\\n\\\n#c \\\n; rm -rf /\nbody\nEOF",
                 "`#` glued across an empty continuation line",
             ),
+            # `<` ending the opener line and `<<` starting the continuation is a
+            # `<<<` here-string once bash deletes the backslash-newline - ONE
+            # heredoc, not two. Reading the physical lines separately invents a
+            # second opener whose phantom body swallows the payload; bash really
+            # runs it (sentinel-confirmed). This is the same class as the `#`
+            # row above, which is why the lexer is handed the assembled line.
+            ("cat <<'A' q <\\\n<<'B' r\na\nA\nrm -rf /\nB", "`<` + `<<` join into a `<<<` here-string"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):

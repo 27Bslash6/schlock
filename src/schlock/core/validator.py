@@ -896,7 +896,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     return "".join(delimiter), pos
 
 
-def _rewrite_openers(line: str, quote: str, prev: str = "") -> tuple[str, list[tuple[str, bool, int]], str, bool]:
+def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, int]], str, bool]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted* `<<` opens a heredoc. Bash reads `echo "x << y"` and
@@ -907,14 +907,15 @@ def _rewrite_openers(line: str, quote: str, prev: str = "") -> tuple[str, list[t
     rewrite, and deny when the reading is uncertain.
 
     ``quote`` carries the quote character left open by the previous line, since a
-    string spanning lines means the next line is not shell to be scanned. ``prev``
-    carries the character the caller will glue to the front of this line when it
-    joins a backslash continuation - empty when this line really does start one.
-    Without it position 0 looks like the start of a word even mid-word, and a
-    `#` there reads as a comment bash never had: ``cat <<'EOF' x\\`` then
-    ``#c \\`` then `; rm -rf /` is ONE logical line whose `x#c` is a single
-    word, and ending the line at that phantom comment swallows the payload as
-    heredoc body (LAB-2781). Returns
+    string spanning lines means the next line is not shell to be scanned.
+
+    ``line`` must be a COMPLETE logical line - the caller deletes backslash-
+    newlines before calling, so this lexes the exact byte sequence bash lexes.
+    Handing it physical lines instead makes every construct that straddles the
+    join read two ways: `x` + `#c` is the single word `x#c` to bash but a
+    comment here, and `<` + `<<` is a `<<<` here-string to bash but two openers
+    here. Both deleted the commands after them from the rewrite (LAB-2781).
+    Returns
     ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener order, open
     quote, line continues)``; each ``offset`` is where its `<<` sits, which is
     the only honest source for "what command owns this heredoc" - a second regex
@@ -962,7 +963,7 @@ def _rewrite_openers(line: str, quote: str, prev: str = "") -> tuple[str, list[t
             quote = char
             out.append(char)
             pos += 1
-        elif char == "#" and ((line[pos - 1] if pos else prev) or " ") in _WORD_START_AFTER:
+        elif char == "#" and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
@@ -1019,74 +1020,67 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
     index = 0
 
     while index < len(lines):
-        # A body starts after the newline that ENDS THE COMMAND, not after the
-        # physical line its opener sits on. Bash removes a backslash-newline, so
-        # that newline is not the newline *token* that triggers body collection:
-        # the logical line, and the body's start with it, runs on. Consuming from
-        # the next physical line instead deleted the continuation from the
-        # rewrite, which is how `cat <<'EOF' \` + `&& rm -rf /` came back
-        # allowed (LAB-2765).
+        # Assemble the whole LOGICAL line, then lex that - never the physical
+        # lines it is made of. A body starts after the newline that ENDS THE
+        # COMMAND, and bash deletes a backslash-newline, so that newline is not
+        # the newline *token* that triggers body collection: the command, and
+        # the body's start with it, runs on.
         #
-        # A trailing `|` or `&&` does NOT continue a line here: bash emits a
-        # newline token and starts the body on the very next line even though
-        # the command carries on.
-        pending: list[tuple[str, bool, int]] = []
-        parts: list[str] = []
+        # Joining before lexing is what keeps this honest, not just tidy. Every
+        # construct that straddles the join reads one way per physical line and
+        # another way joined - `x` + `#c` is the single word `x#c` to bash but a
+        # comment to a per-line scan, and `<` + `<<` is a `<<<` here-string to
+        # bash but two openers to a per-line scan. Both end the logical line
+        # early and swallow the commands after it as heredoc body, which is the
+        # hole this whole area exists to close (LAB-2765, LAB-2781). Lexing the
+        # assembled line means schlock reads the exact bytes bash reads, so the
+        # class cannot recur one construct over.
+        #
+        # A trailing `|` or `&&` does NOT continue a line: bash emits a newline
+        # token and starts the body on the very next line even though the
+        # command carries on.
+        quote_in = quote
+        logical = lines[index]
+        index += 1
         while True:
-            raw = lines[index]
-            # The whole joined prefix, not `parts[-1]`: a physical line that
-            # is only a backslash contributes an empty part, and the glued
-            # character is then further back than the last one.
-            line, openers, quote, ends_with_backslash = _rewrite_openers(raw, quote, "".join(parts)[-1:])
+            # Re-lexed from the same starting quote each time, so a string
+            # opened on one physical line and closed on the next is read whole.
+            line, openers, quote, ends_with_backslash = _rewrite_openers(logical, quote_in)
+            if not ends_with_backslash:
+                break
+            if index >= len(lines):
+                # No line left to continue onto. Bash runs the command anyway -
+                # `bash -c 'echo hi \\'` prints `hi \\` - so dropping the
+                # trailing escape and re-reading is what keeps a benign command
+                # out of a parse error. It can only ever expose more text to the
+                # rules: `rm -rf / \\` becomes `rm -rf /`, never less. Any
+                # opener still pending then falls through to the body loop,
+                # which finds no terminator and says so.
+                logical = logical[:-1]
+                continue
+            logical = logical[:-1] + lines[index]
             index += 1
 
-            if base_command is None and openers:
-                # The command owning this heredoc starts where the LOGICAL line
-                # does. Taking only `raw` denied `cat \` + `<<'EOF'` outright
-                # ("no command in front of it") - a false positive on exactly
-                # the shape this reads - and undercounted the head everywhere
-                # else, so the two spellings of one command disagreed.
-                base_command = ("".join(parts) + raw[: openers[0][2]]).strip()
-            pending.extend(openers)
+        if openers and quote:
+            # The other way a line runs on. Joining it would be correct about
+            # bash and wrong about this validator: a newline inside a
+            # double-quoted substitution hides its payload from the rule engine
+            # even with no heredoc in sight - `echo "$(echo a` + `rm -rf /)"`
+            # is SAFE today (LAB-4114). Joining here would turn that standing
+            # hole into a heredoc bypass, so this arm keeps failing closed until
+            # the engine reads multi-line substitutions.
+            raise ParseError(f"Heredoc opener on a line that ends inside a quote (line {index}); the body's start is unknown")
 
-            if pending and quote:
-                # The other way a line runs on. Joining it would be correct
-                # about bash and wrong about this validator: a newline inside a
-                # double-quoted substitution hides its payload from the rule
-                # engine even with no heredoc in sight - `echo "$(echo a` +
-                # `rm -rf /)"` is SAFE today (LAB-4114). Joining here would turn
-                # that standing hole into a heredoc bypass, so this arm keeps
-                # failing closed until the engine reads multi-line substitutions.
-                raise ParseError(
-                    f"Heredoc opener on a line that ends inside a quote (line {index}); the body's start is unknown"
-                )
-            if not ends_with_backslash:
-                parts.append(line)
-                break
-
-            # Emit the logical line as ONE line rather than keeping the
-            # physical breaks: bash deletes a backslash-newline outright. Keeping
-            # the break hands `_escalate_past_heredoc` a segment with a
-            # continuation inside, and stripping the placeholder redirection back
-            # off that leaves a dangling `\` which parses nowhere.
-            #
-            # `ends_with_backslash` is set only where that backslash is the
-            # line's last character, and nothing is emitted after it, so the
-            # slice drops the escape and nothing else.
-            parts.append(line[:-1])
-
-            if index >= len(lines):
-                # The command never ends, so the body never starts. Breaking
-                # here is what makes that a clean denial rather than an
-                # IndexError: any pending opener falls through to the body loop
-                # below, which finds no terminator and says so.
-                break
-        rewritten.append("".join(parts))
+        rewritten.append(line)
+        if base_command is None and openers:
+            # Offsets index the assembled line, so this is the head of the whole
+            # command, not of whichever physical line the opener landed on.
+            base_command = logical[: openers[0][2]].strip()
 
         # Bodies are consumed in opener order. `<<-` strips leading tabs from the
         # terminator line as well as the body, so the comparison has to match
         # bash's or a body line would be mistaken for the terminator.
-        for delimiter, strips_tabs, _ in pending:
+        for delimiter, strips_tabs, _ in openers:
             # One placeholder line stands in for the entire body. It cannot be
             # dropped altogether: bashlex rejects an empty heredoc inside a
             # compound statement, which would deny every `for … do
