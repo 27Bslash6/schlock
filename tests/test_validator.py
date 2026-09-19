@@ -1095,6 +1095,18 @@ class TestHeredocSurroundings:
             # identical either way and no risk-level row can tell the two
             # readings apart. Pinning the rewrite is the only thing that can.
             ("cat <<'EOF' \\\\\nhello\nEOF", "cat <<SCHLOCK_HEREDOC \\\\\n\nSCHLOCK_HEREDOC"),
+            # Same boundary, one character over: only a backslash that is the
+            # line's LAST character escapes the newline. A backslash before a
+            # space or a tab escapes THAT, and the line ends - verified against
+            # bash 5.3, where `echo a\` + `echo b` prints `aecho b` (one
+            # command) but `echo a\ ` + `echo b` prints `a ` then `b` (two).
+            # The row above does not cover this: it catches a predicate that
+            # forgets escape parity, but not one that keeps parity and merely
+            # ignores trailing whitespace. `pos + 1 >= len(line.rstrip())`
+            # passes every other row here and fails only these two, joining the
+            # next line into the command and moving the body boundary with it.
+            ("cat <<'EOF' \\ \nhello\nEOF", "cat <<SCHLOCK_HEREDOC \\ \n\nSCHLOCK_HEREDOC"),
+            ("cat <<'EOF' \\\t\nhello\nEOF", "cat <<SCHLOCK_HEREDOC \\\t\n\nSCHLOCK_HEREDOC"),
             (
                 "cat <<'EOF' &&\nhello\nEOF\necho ok",
                 "cat <<SCHLOCK_HEREDOC &&\n\nSCHLOCK_HEREDOC\necho ok",
@@ -1102,7 +1114,7 @@ class TestHeredocSurroundings:
         ],
     )
     def test_a_line_that_ends_is_not_joined(self, command, expected):
-        """Only a backslash-newline is deleted; a `\\` or a `&&` ends the line."""
+        """Only a backslash-newline is deleted; `\\`, `\\ ` and `&&` end the line."""
         assert val_module._neuter_heredocs(command)[0] == expected
 
     @pytest.mark.parametrize(
