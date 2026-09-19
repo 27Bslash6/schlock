@@ -1034,6 +1034,9 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
         parts: list[str] = []
         while True:
             raw = lines[index]
+            # The whole joined prefix, not `parts[-1]`: a physical line that
+            # is only a backslash contributes an empty part, and the glued
+            # character is then further back than the last one.
             line, openers, quote, ends_with_backslash = _rewrite_openers(raw, quote, "".join(parts)[-1:])
             index += 1
 

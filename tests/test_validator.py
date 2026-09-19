@@ -803,6 +803,14 @@ class TestHeredocSurroundings:
                 "cat <<'EOF' >out\\\n#c \\\n; rm -rf /\nbody\nEOF",
                 "same, with a redirect on the opener",
             ),
+            # A physical line that is only a backslash contributes nothing to
+            # the joined text, so the character the `#` is glued to sits further
+            # back than the last piece. Looking only at the previous piece reads
+            # this as a line start, and the payload goes back to being body.
+            (
+                "cat <<'EOF' x\\\n\\\n#c \\\n; rm -rf /\nbody\nEOF",
+                "`#` glued across an empty continuation line",
+            ),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -998,6 +1006,11 @@ class TestHeredocSurroundings:
                 "`#` after a `;` IS a comment; the payload is body text",
             ),
             ("cat <<'EOF' x\\\n#c \\\n; echo ok\nbody\nEOF", RiskLevel.LOW, "glued `#`, benign continuation"),
+            (
+                "cat <<'EOF' x \\\n\\\n#c \\\n; rm -rf /\nbody\nEOF",
+                RiskLevel.LOW,
+                "empty continuation line keeps the space before `#`, so it stays a comment",
+            ),
             # A trailing `|`/`&&` starts the body on the next line, so the
             # payload below is inert body text that bash never runs. These rows,
             # not their BLOCKED twins, are what fail if the rule is loosened to
