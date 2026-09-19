@@ -896,9 +896,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     return "".join(delimiter), pos
 
 
-def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting it hides the state machine
-    line: str, quote: str
-) -> tuple[str, list[tuple[str, bool, int]], str, bool]:
+def _rewrite_openers(line: str, quote: str, prev: str = "") -> tuple[str, list[tuple[str, bool, int]], str, bool]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted* `<<` opens a heredoc. Bash reads `echo "x << y"` and
@@ -909,7 +907,14 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
     rewrite, and deny when the reading is uncertain.
 
     ``quote`` carries the quote character left open by the previous line, since a
-    string spanning lines means the next line is not shell to be scanned. Returns
+    string spanning lines means the next line is not shell to be scanned. ``prev``
+    carries the character the caller will glue to the front of this line when it
+    joins a backslash continuation - empty when this line really does start one.
+    Without it position 0 looks like the start of a word even mid-word, and a
+    `#` there reads as a comment bash never had: ``cat <<'EOF' x\\`` then
+    ``#c \\`` then `; rm -rf /` is ONE logical line whose `x#c` is a single
+    word, and ending the line at that phantom comment swallows the payload as
+    heredoc body (LAB-2781). Returns
     ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener order, open
     quote, line continues)``; each ``offset`` is where its `<<` sits, which is
     the only honest source for "what command owns this heredoc" - a second regex
@@ -957,7 +962,7 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
             quote = char
             out.append(char)
             pos += 1
-        elif char == "#" and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+        elif char == "#" and ((line[pos - 1] if pos else prev) or " ") in _WORD_START_AFTER:
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
@@ -1021,18 +1026,17 @@ def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines ne
         # that newline is not the newline *token* that triggers body collection:
         # the logical line, and the body's start with it, runs on. Consuming from
         # the next physical line instead deleted the continuation from the
-        # rewrite, which is how `cat <<'EOF' \` + `&& rm -rf /` came back allowed
-        # (LAB-2765); denying the whole shape was that hole's first, blunter
-        # patch, and this reads it instead (LAB-2781).
+        # rewrite, which is how `cat <<'EOF' \` + `&& rm -rf /` came back
+        # allowed (LAB-2765).
         #
         # A trailing `|` or `&&` does NOT continue a line here: bash emits a
-        # newline token and starts the body on the very next line even though the
-        # command carries on. That is what this already did, and it stays.
+        # newline token and starts the body on the very next line even though
+        # the command carries on.
         pending: list[tuple[str, bool, int]] = []
         parts: list[str] = []
         while True:
             raw = lines[index]
-            line, openers, quote, ends_with_backslash = _rewrite_openers(raw, quote)
+            line, openers, quote, ends_with_backslash = _rewrite_openers(raw, quote, "".join(parts)[-1:])
             index += 1
 
             if base_command is None and openers:
@@ -1059,14 +1063,11 @@ def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines ne
                 parts.append(line)
                 break
 
-            # Emit the logical line as one line rather than keeping the physical
-            # breaks: bash deletes a backslash-newline outright, so the pieces
-            # join with nothing between them. Leaving the break in would hand
-            # `_escalate_past_heredoc` segments with a continuation inside, and
-            # stripping the placeholder redirection back off one of those leaves
-            # a dangling `\` that parses nowhere - denying `cat <<'A' \` +
-            # `<<'B'`, and reading `cat <<'EOF' \` + `> out.txt` as a truncation
-            # the same command on one line is not.
+            # Emit the logical line as ONE line rather than keeping the
+            # physical breaks: bash deletes a backslash-newline outright. Keeping
+            # the break hands `_escalate_past_heredoc` a segment with a
+            # continuation inside, and stripping the placeholder redirection back
+            # off that leaves a dangling `\` which parses nowhere.
             #
             # `ends_with_backslash` is set only where that backslash is the
             # line's last character, and nothing is emitted after it, so the

@@ -789,6 +789,20 @@ class TestHeredocSurroundings:
             # Treating "the command continues" as the test would move these.
             ("cat <<'EOF' |\ntr a-z A-Z\nhello\nEOF\nrm -rf /", "trailing `|` still starts the body next line"),
             ("cat <<'EOF' &&\nhello\nEOF\nrm -rf /", "trailing `&&` still starts the body next line"),
+            # Position 0 of a CONTINUATION line is not the start of a word - the
+            # join glues it to the character before. `x` + `#c` is the single
+            # word `x#c`, so the `#` opens no comment and the logical line runs
+            # on to the payload, which bash really executes (confirmed by
+            # sentinel under bash 5.3). Reading it as a comment ended the line
+            # early and swallowed `; rm -rf /` as heredoc body: allowed / LOW.
+            (
+                "cat <<-'EOF' x\\\n#c \\\n; rm -rf /\nbody\nEOF",
+                "`#` glued mid-word by a continuation is not a comment",
+            ),
+            (
+                "cat <<'EOF' >out\\\n#c \\\n; rm -rf /\nbody\nEOF",
+                "same, with a redirect on the opener",
+            ),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -968,6 +982,39 @@ class TestHeredocSurroundings:
             ),
             ('cat << "E"OF \\\n&& echo ok\nhello\nEOF', RiskLevel.LOW, "continued opener, split delimiter"),
             ("cat <<'EOF' \\\\\nhello\nEOF\necho ok", RiskLevel.LOW, "doubled backslash, benign trailer"),
+            # The `#`-glue rule has to cut BOTH ways or it is just a blanket
+            # deny. A space or a `;` before the `#` does start a word, so the
+            # comment is real, the logical line ends there, and what follows is
+            # inert heredoc body - bash runs none of it (sentinel-confirmed).
+            # Reading those as live shell is a hard BLOCK on a benign command.
+            (
+                "cat <<'EOF' x \\\n#c \\\n; rm -rf /\nbody\nEOF",
+                RiskLevel.LOW,
+                "`#` after a space IS a comment; the payload is body text",
+            ),
+            (
+                "cat <<'EOF' ;\\\n#c \\\n; rm -rf /\nbody\nEOF",
+                RiskLevel.LOW,
+                "`#` after a `;` IS a comment; the payload is body text",
+            ),
+            ("cat <<'EOF' x\\\n#c \\\n; echo ok\nbody\nEOF", RiskLevel.LOW, "glued `#`, benign continuation"),
+            # A trailing `|`/`&&` starts the body on the next line, so the
+            # payload below is inert body text that bash never runs. These rows,
+            # not their BLOCKED twins, are what fail if the rule is loosened to
+            # "the command continues": the deny rows stay BLOCKED either way.
+            (
+                "cat <<'EOF' |\nrm -rf /\nhello\nEOF\ntr a-z A-Z",
+                RiskLevel.LOW,
+                "after a trailing `|` the next line is body, not command",
+            ),
+            (
+                "cat <<'EOF' &&\nrm -rf /\nhello\nEOF\necho ok",
+                RiskLevel.LOW,
+                "after a trailing `&&` the next line is body, not command",
+            ),
+            # A continuation that runs off the end with NO opener pending is not
+            # an error - it just ends. Denying it would be a false positive.
+            ("cat <<'EOF'\nx\nEOF\necho hi \\", RiskLevel.LOW, "trailing continuation, no opener pending"),
         ],
     )
     def test_legitimate_heredoc_keeps_its_verdict(self, safety_rules_path, command, expected_risk, description):
@@ -1018,6 +1065,25 @@ class TestHeredocSurroundings:
         """
         with pytest.raises(ParseError, match="has no terminator"):
             val_module._neuter_heredocs(command)
+
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            # `\\` is an escaped backslash, so the line ENDS and the body starts
+            # on the next one. Joining it instead only ever produces a false
+            # positive, never a bypass - which means every end-to-end verdict is
+            # identical either way and no risk-level row can tell the two
+            # readings apart. Pinning the rewrite is the only thing that can.
+            ("cat <<'EOF' \\\\\nhello\nEOF", "cat <<SCHLOCK_HEREDOC \\\\\n\nSCHLOCK_HEREDOC"),
+            (
+                "cat <<'EOF' &&\nhello\nEOF\necho ok",
+                "cat <<SCHLOCK_HEREDOC &&\n\nSCHLOCK_HEREDOC\necho ok",
+            ),
+        ],
+    )
+    def test_a_line_that_ends_is_not_joined(self, command, expected):
+        """Only a backslash-newline is deleted; a `\\` or a `&&` ends the line."""
+        assert val_module._neuter_heredocs(command)[0] == expected
 
     @pytest.mark.parametrize(
         "continued,one_line,expected",
