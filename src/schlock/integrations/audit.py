@@ -22,7 +22,8 @@ Log Format (JSONL):
 
 Security:
     Secrets (passwords, tokens, API keys) are automatically redacted before logging.
-    Patterns like password=secret, --token VALUE, Authorization: Bearer TOKEN are scrubbed.
+    Patterns like password=secret, --token VALUE, Authorization: Bearer TOKEN are scrubbed,
+    as are HTTP credentials in curl -u/--user user:pass and URL userinfo (scheme://user:pass@host).
 
 Thread Safety:
     File writes are atomic (append mode with single write call).
@@ -114,6 +115,15 @@ class AuditLogger:
         # -p PASSWORD (but not -p in other contexts like docker -p for ports)
         # Only match if followed by something that looks like a password (not a number/port)
         (re.compile(r"(-p\s+)(?![0-9:]+\b)(\S+)", re.I), r"\1***REDACTED***"),
+        # -u user:pass, --user user:pass, --user=user:pass (curl/wget HTTP auth; -U catches curl --proxy-user)
+        # The value must contain a colon so `sort -u file`, `python -u x.py`, `useradd -u 1001 bob` pass through;
+        # a digits-and-colons-only value (`docker run -u 1000:1000`) is uid:gid, not a credential.
+        # ponytail: shape heuristic, so `docker run -u node:node` over-redacts; a shell-word tokeniser is the upgrade.
+        (re.compile(r"(?<!\S)(-u|--user)(\s+|=)(?![\d:]+(?!\S))[^\s:]*:\S+", re.I), r"\1\2***REDACTED***"),
+        # scheme://user:pass@host and scheme://token@host (GitHub PATs ride as a bare username).
+        # Authority ends at `/`, `?` or `#` (RFC 3986), so `https://host/a:b` and `?x=a@b` never match;
+        # greedy up to the last `@` before that boundary keeps an unencoded `@` in the password redacted too.
+        (re.compile(r"(://)[^\s/?#]+@"), r"\1***REDACTED***@"),
     ]
 
     def __init__(self, log_file: Optional[Path] = None):

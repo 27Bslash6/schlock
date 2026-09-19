@@ -230,3 +230,56 @@ class TestEdgeCases:
         scrubbed = logger._scrub_secrets("mysql --password")
         # --password with no following value shouldn't match \S+
         assert scrubbed == "mysql --password"
+
+
+class TestHttpCredentials:
+    """curl -u/--user values and URL userinfo (user:pass@host) are redacted; look-alike flags are not."""
+
+    def test_curl_user_flag_redacted(self):
+        """-u user:pass, --user user:pass and --user=user:pass keep the flag and lose the value."""
+        logger = AuditLogger()
+        for cmd, expected in [
+            ("curl -u deploy:hunter2 https://api.example.com/x", "curl -u ***REDACTED*** https://api.example.com/x"),
+            ("curl --user deploy:hunter2 https://api.example.com/x", "curl --user ***REDACTED*** https://api.example.com/x"),
+            ("curl --user=deploy:hunter2 https://api.example.com/x", "curl --user=***REDACTED*** https://api.example.com/x"),
+        ]:
+            assert logger._scrub_secrets(cmd) == expected
+
+    def test_url_userinfo_redacted(self):
+        """scheme://user:pass@host/path keeps scheme, host and path; the userinfo goes."""
+        logger = AuditLogger()
+        assert logger._scrub_secrets("scheme://user:pass@host/path") == "scheme://***REDACTED***@host/path"
+        # A token riding as a bare username (GitHub PAT shape) is a credential too.
+        assert (
+            logger._scrub_secrets("git clone https://ghp_ABCDEF123456@github.com/org/repo.git")
+            == "git clone https://***REDACTED***@github.com/org/repo.git"
+        )
+
+    def test_reported_leak_samples_redacted(self):
+        """The three shapes that logged verbatim before this fix."""
+        logger = AuditLogger()
+        for cmd, secret in [
+            ("curl -u deploy:hunter2 https://api.example.com/x", "hunter2"),
+            ("git clone https://x-access-token:ghp_ABCDEF123456@github.com/org/repo.git", "ghp_ABCDEF123456"),
+            ("pip install --index-url https://user:pypi_pw@pypi.internal/simple pkg", "pypi_pw"),
+        ]:
+            scrubbed = logger._scrub_secrets(cmd)
+            assert secret not in scrubbed, f"Secret leaked: {cmd}"
+            assert "***REDACTED***" in scrubbed
+
+    def test_non_credential_u_and_urls_unchanged(self):
+        """-u/--user without a user:pass value, and URLs without userinfo, pass through byte-for-byte."""
+        logger = AuditLogger()
+        for cmd in [
+            "sort -u file",
+            "python -u x.py",
+            "id -u",
+            "useradd -u 1001 bob",
+            "mysql -u root -e 'SELECT 1'",
+            "docker run -u 1000:1000 nginx",  # uid:gid, not a credential
+            "curl --username=bob https://host",  # --user is a whole flag, not a prefix
+            "https://host/a:b",
+            "https://host?x=a@b",  # authority ends at `?`; the `@` is in the query
+            "https://api.example.com/v1/users",
+        ]:
+            assert logger._scrub_secrets(cmd) == cmd, f"Safe command was modified: {cmd}"
