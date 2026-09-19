@@ -985,9 +985,7 @@ def _rewrite_openers(line: str, quote: str, prev: str = "") -> tuple[str, list[t
     return "".join(out), openers, quote, ends_with_backslash
 
 
-def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines nest in bodies; flattening hides that
-    command: str,
-) -> tuple[str, str]:
+def _neuter_heredocs(command: str) -> tuple[str, str]:
     """Rewrite a heredoc into something bashlex parses, keeping the rest verbatim.
 
     bashlex rejects a quoted heredoc delimiter outright, which is why this
