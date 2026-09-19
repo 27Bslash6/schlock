@@ -11,6 +11,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from schlock.integrations.audit import AuditLogger
 
 
@@ -56,6 +58,61 @@ class TestSecretScrubbing:
         scrubbed = logger._scrub_secrets("curl -H 'Authorization: Basic dGVzdDpzZWNyZXQ='")
         assert "dGVzdDpzZWNyZXQ=" not in scrubbed
         assert "Authorization: Basic ***REDACTED***" in scrubbed
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            (
+                """curl -H 'Authorization: Digest username="Mufasa", realm="r", nonce="n", uri="/", """
+                """response="RESPONSE_SECRET"' -H "Accept: json" https://x""",
+                """curl -H 'Authorization: Digest ***REDACTED***' -H "Accept: json" https://x""",
+            ),
+            (
+                'curl -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIA/20260919/r/s3/aws4_request, '
+                'SignedHeaders=host, Signature=SIGNATURE_SECRET" https://x',
+                'curl -H "Authorization: AWS4-HMAC-SHA256 ***REDACTED***" https://x',
+            ),
+            (
+                'curl -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIA/20260919/r/s3/aws4_request, \\\n'
+                '  SignedHeaders=host, Signature=SIGNATURE_SECRET" https://x',
+                'curl -H "Authorization: AWS4-HMAC-SHA256 ***REDACTED***" https://x',
+            ),
+            (
+                'curl -H "Authorization: Digest username=\\"u\\", response=\\"RESPONSE_SECRET\\"" https://x',
+                'curl -H "Authorization: Digest ***REDACTED***" https://x',
+            ),
+            (
+                'curl -H Authorization:"Bearer BEARER_SECRET" https://x',
+                'curl -H Authorization:"Bearer ***REDACTED***" https://x',
+            ),
+            (
+                """curl -H 'Authorization: Token token="TOKEN_SECRET"' -H 'X-Trace: y' https://x""",
+                """curl -H 'Authorization: Token ***REDACTED***' -H 'X-Trace: y' https://x""",
+            ),
+            (
+                "Authorization: Bearer BARE_TOKEN && echo done",
+                "Authorization: Bearer ***REDACTED*** && echo done",
+            ),
+            (
+                'curl -H "Authorization: Bearer sk-abc',
+                'curl -H "Authorization: Bearer ***REDACTED***',
+            ),
+        ],
+        ids=[
+            "digest",
+            "aws4-hmac-sha256",
+            "aws4-line-continuation",
+            "escaped-inner-quotes",
+            "quote-after-colon",
+            "token-param-last",
+            "bare-first-token",
+            "cap-cut-quote",
+        ],
+    )
+    def test_authorization_credential_redacted(self, command, expected):
+        """Quoted: the credential runs to the closing quote (Digest/AWS4 carry the secret in a later parameter)
+        and the rest of the command survives. Bare: one token. Cap-cut: no closing quote, redact to end of line."""
+        assert AuditLogger()._scrub_secrets(command) == expected
 
     def test_long_flag_password_redacted(self):
         """--password VALUE should be redacted."""

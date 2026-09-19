@@ -115,10 +115,18 @@ class AuditLogger:
 
     # Secret patterns to redact (compiled once for performance)
     SECRET_PATTERNS = [
+        # Authorization: <scheme> <credential>. Digest and AWS4-HMAC-SHA256 carry the secret in a later parameter
+        # (response=, Signature=), not the first token, so a quoted header is redacted to its closing quote, through
+        # escaped characters and backslash-newline continuations. These run before the token=/secret= rule, whose
+        # \S+ would otherwise eat a closing quote and shift the boundary onto the next argument.
+        # Quote before the header - the curl form, -H "Authorization: Bearer x".
+        (re.compile(r"""(["'])(Authorization:\s*[\w-]+\s+)(?:\\[\s\S]|(?!\1|\\).)+""", re.I), r"\1\2***REDACTED***"),
+        # Quote after the colon - bash word concatenation and YAML in heredocs, Authorization:"Bearer x".
+        (re.compile(r"""(Authorization:\s*)(["'])([\w-]+\s+)(?:\\[\s\S]|(?!\2|\\).)+""", re.I), r"\1\2\3***REDACTED***"),
+        # Bare header, no value boundary - one token. The lookbehind skips headers the quoted rules handled.
+        (re.compile(r"""(?<!["'])(Authorization:\s*[\w-]+\s+)\S+""", re.I), r"\1***REDACTED***"),
         # password=VALUE, token=VALUE, api-key=VALUE, secret=VALUE
         (re.compile(r"(password|passwd|pwd|token|secret|api[-_]?key)=\S+", re.I), r"\1=***REDACTED***"),
-        # Authorization: <scheme> CREDENTIAL, first token only - Digest's response= param (its secret) survives.
-        (re.compile(r"(Authorization:\s*[\w-]+\s+)\S+", re.I), r"\1***REDACTED***"),
         # --password VALUE, --token VALUE, --api-key VALUE
         (re.compile(r"(--(password|passwd|token|secret|api[-_]?key)\s+)\S+", re.I), r"\1***REDACTED***"),
         # -p PASSWORD (but not -p in other contexts like docker -p for ports)
