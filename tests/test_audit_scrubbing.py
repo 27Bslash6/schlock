@@ -290,6 +290,8 @@ class TestHttpCredentials:
             "pip install -U git+https://github.com/o/r.git",  # a URL value is not a credential
             "https://host/a:b",
             "https://host?x=a@b",  # authority ends at `?`; the `@` is in the query
+            "https://host/a@b",  # authority ends at `/`; the `@` is in the path
+            "https://host/#a@b",  # authority ends at `/`; the `@` is in the fragment
             "https://api.example.com/v1/users",
         ]:
             assert logger._scrub_secrets(cmd) == cmd, f"Safe command was modified: {cmd}"
