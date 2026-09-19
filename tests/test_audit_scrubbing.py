@@ -50,6 +50,13 @@ class TestSecretScrubbing:
         assert "sk-1234567890abcdef" not in scrubbed
         assert "Authorization: Bearer ***REDACTED***" in scrubbed
 
+    def test_basic_credential_redacted(self):
+        """Authorization: Basic CREDENTIAL should be redacted - the pattern covers any scheme."""
+        logger = AuditLogger()
+        scrubbed = logger._scrub_secrets("curl -H 'Authorization: Basic dGVzdDpzZWNyZXQ='")
+        assert "dGVzdDpzZWNyZXQ=" not in scrubbed
+        assert "Authorization: Basic ***REDACTED***" in scrubbed
+
     def test_long_flag_password_redacted(self):
         """--password VALUE should be redacted."""
         logger = AuditLogger()

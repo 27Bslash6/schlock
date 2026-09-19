@@ -561,7 +561,7 @@ class TestAuditCommandLength:
         return json.loads(log_file.read_text().splitlines()[-1])
 
     def test_commit_with_heredoc_body_is_logged_in_full(self, tmp_path):
-        """Incident shape: a ~3 KB `git commit -F - <<'EOF'` chained with a push. A flat cap kept
+        """Observed shape: a ~3 KB `git commit -F - <<'EOF'` chained with a push. A flat cap kept
         the opener and dropped the body and everything after the terminator - the part that
         explained what the filter had judged."""
         body = "\n".join(f"line {i}: " + "x" * 60 for i in range(40))

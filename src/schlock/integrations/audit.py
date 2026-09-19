@@ -23,7 +23,7 @@ Log Format (JSONL):
 
 Security:
     Secrets (passwords, tokens, API keys) are automatically redacted before logging.
-    Patterns like password=secret, --token VALUE, Authorization: Bearer TOKEN are scrubbed.
+    Patterns like password=secret, --token VALUE, Authorization: <scheme> CREDENTIAL are scrubbed.
 
 Thread Safety:
     File writes are atomic (append mode with single write call).
@@ -117,8 +117,8 @@ class AuditLogger:
     SECRET_PATTERNS = [
         # password=VALUE, token=VALUE, api-key=VALUE, secret=VALUE
         (re.compile(r"(password|passwd|pwd|token|secret|api[-_]?key)=\S+", re.I), r"\1=***REDACTED***"),
-        # Authorization: Bearer TOKEN
-        (re.compile(r"(Authorization:\s*Bearer\s+)\S+", re.I), r"\1***REDACTED***"),
+        # Authorization: <scheme> CREDENTIAL, first token only - Digest's response= param (its secret) survives.
+        (re.compile(r"(Authorization:\s*[\w-]+\s+)\S+", re.I), r"\1***REDACTED***"),
         # --password VALUE, --token VALUE, --api-key VALUE
         (re.compile(r"(--(password|passwd|token|secret|api[-_]?key)\s+)\S+", re.I), r"\1***REDACTED***"),
         # -p PASSWORD (but not -p in other contexts like docker -p for ports)
