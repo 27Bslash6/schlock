@@ -1385,7 +1385,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         error=None,
                         matched_rules=[],
                     )
-                    _global_cache.set(command, result)
+                    if _depth == 0 and _shellcheck:
+                        _global_cache.set(command, result)
                     return result
 
                 highest_risk = RiskLevel.SAFE
@@ -1574,8 +1575,9 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # level, and the cache is keyed on the command string alone. Caching a capped inner
         # verdict flipped `watch watch watch watch ls` from SAFE to BLOCKED for the rest of the
         # process once a deeper chain had been seen. Never with ShellCheck skipped, for the same
-        # reason: that verdict is weaker than the one a fresh call would produce for the key. (The
-        # Step 5 whitelist write is exempt: that verdict depends on neither depth nor ShellCheck.)
+        # reason: that verdict is weaker than the one a fresh call would produce for the key. The
+        # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
+        # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
         if _depth == 0 and _shellcheck:
             _global_cache.set(command, result)
 

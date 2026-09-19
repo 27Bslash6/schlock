@@ -855,7 +855,7 @@ class TestHeredocSurroundings:
         assert "ShellCheck: deletes a system directory" in result.message
 
     def test_a_verdict_without_shellcheck_is_not_cached(self, safety_rules_path, monkeypatch):
-        """A segment's ShellCheck-less verdict must not answer for the same string later.
+        """A ShellCheck-less verdict must not answer for the same string later.
 
         The cache is keyed on the command string alone. Behind a whitelisted head
         the per-segment pass is the only one that sees `rm -r$''f /`, and it
@@ -870,6 +870,12 @@ class TestHeredocSurroundings:
 
         result = validate_command("rm -r$''f /", config_path=safety_rules_path)
         assert result.risk_level == RiskLevel.BLOCKED
+
+        # The Step 5 whitelist return has a cache write of its own. Pin it with a
+        # whole-command whitelist entry, which reaches Step 5 by prefix or full-span match.
+        whitelisted = "gh auth token | docker login ghcr.io -u me --password-stdin"
+        validate_command(whitelisted, config_path=safety_rules_path, _shellcheck=False)
+        assert val_module._global_cache.get(whitelisted) is None
 
     @pytest.mark.parametrize(
         "command,expected_error",
