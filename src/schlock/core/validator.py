@@ -1070,7 +1070,7 @@ def _validate_heredoc_command(
         engine = _get_rule_engine(config_path)
         neutered, base_command = _neuter_heredocs(command)
         base_result = _heredoc_base_result(engine, base_command)
-        return _escalate_past_heredoc(engine, command, neutered, base_result, config_path)
+        return _escalate_past_heredoc(command, neutered, base_result, config_path)
     except ParseError as e:
         # Shell we cannot read is shell we cannot vouch for.
         logger.debug(f"Heredoc unreadable, failing closed: {e}")
@@ -1135,7 +1135,6 @@ def _heredoc_base_result(engine: "RuleEngine", base_command: str) -> ValidationR
 
 
 def _escalate_past_heredoc(
-    engine: "RuleEngine",
     command: str,
     neutered: str,
     result: ValidationResult,
@@ -1156,16 +1155,18 @@ def _escalate_past_heredoc(
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
     whitelist cannot silence.
 
-    The extra passes cost real time, and the reason they are worth it is that
-    this is the exceptional path - only a quoted heredoc delimiter arrives here.
-    Measured: `cat <<'EOF' > s.sh … EOF` plus two commands is 21ms against 7ms
-    for the same work without a heredoc (ShellCheck installed, one subprocess
-    per pass); a pathological 2000-command chain is 538ms against 409ms for that
-    chain with no heredoc in front of it. Gating the per-segment pass on
-    "was the whole-command pass whitelisted" would recover most of that, and is
-    deliberately not done: it would make this control's correctness depend on a
-    predicate about another function's short-circuit, which is a fail-open
-    coupling traded for milliseconds on a path that is already the slow one.
+    The per-segment pass runs that same pipeline with ShellCheck off. ShellCheck
+    is a subprocess per call, so running it per segment cost N+1 spawns on top
+    of the whole-command pass (LAB-2780: a heredoc followed by 20 commands was
+    22 spawns and 144ms, against 21ms for the same 20 commands without the
+    heredoc). Rule matching alone would not do in its place: re-entering the
+    pipeline is also what gives a segment behind a whitelisted head its
+    quote-stripped match (`r\\m -rf /`) and its contextual checks
+    (`kubectl delete`), neither of which the whole-command pass reaches once
+    the whitelist short-circuits it. Gating the per-segment pass on "was the
+    whole-command pass whitelisted" is deliberately not done either: it would
+    make this control's correctness depend on a predicate about another
+    function's short-circuit, a fail-open coupling.
 
     Escalation only ever raises risk. That is what keeps a legitimate heredoc's
     existing verdict intact, and it bounds a misread rewrite to a false positive.
@@ -1177,18 +1178,18 @@ def _escalate_past_heredoc(
 
     # `neutered != command` keeps the recursion finite: re-validating an
     # unchanged command would re-enter this same fallback forever.
-    candidates = [neutered] if neutered != command else []
+    candidates = [(neutered, True)] if neutered != command else []
     # A segment that owns a heredoc keeps its redirection, and standalone that
     # reads as an unterminated heredoc - which would deny every heredoc there
     # is. Strip the redirection instead of skipping the segment: the command in
     # front of it is exactly the one nothing used to look at, and
     # `chmod -R 777 / <<'Y'` is not made safe by owning a body.
-    candidates += [_HEREDOC_REDIRECT_RE.sub("", segment) for segment in segments]
+    candidates += [(_HEREDOC_REDIRECT_RE.sub("", segment), False) for segment in segments]
 
-    for candidate in candidates:
+    for candidate, shellcheck in candidates:
         if not candidate.strip():
             continue
-        candidate_result = validate_command(candidate, config_path)
+        candidate_result = validate_command(candidate, config_path, _shellcheck=shellcheck)
         if candidate_result.risk_level.value > result.risk_level.value:
             result = replace(candidate_result, message=f"Alongside heredoc: {candidate_result.message}")
 
@@ -1200,6 +1201,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
     config_path: Optional[str] = None,
     *,
     _depth: int = 0,
+    _shellcheck: bool = True,
 ) -> ValidationResult:
     """Validate command for safety.
 
@@ -1222,6 +1224,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         command: Bash command string to validate
         config_path: Optional path to rules file (for testing)
         _depth: Internal, keyword-only. Shell-delegation recursion depth; callers leave it at 0.
+        _shellcheck: Internal, keyword-only. False skips the ShellCheck subprocess and leaves the
+            verdict out of the cache; for a fragment of a command that is validated whole elsewhere.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -1502,7 +1506,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # SC2114: "Warning: deletes a system directory" catches rm -r$''f /
         shellcheck_elevated = False
         security_findings: list = []  # Initialize for type checker
-        if is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
+        if _shellcheck and is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
             findings = run_shellcheck(command)
             security_findings = get_security_findings(findings)
             if security_findings:
@@ -1549,8 +1553,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # Never at depth > 0: the shell-delegation depth cap makes a verdict depend on nesting
         # level, and the cache is keyed on the command string alone. Caching a capped inner
         # verdict flipped `watch watch watch watch ls` from SAFE to BLOCKED for the rest of the
-        # process once a deeper chain had been seen.
-        if _depth == 0:
+        # process once a deeper chain had been seen. Never with ShellCheck skipped, for the same
+        # reason: the cache is keyed on the command string alone, and a verdict computed with a
+        # pass left out is weaker than the one a fresh call would produce for that string.
+        if _depth == 0 and _shellcheck:
             _global_cache.set(command, result)
 
         # Step 8: Return

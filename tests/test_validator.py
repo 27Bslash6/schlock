@@ -17,6 +17,7 @@ from schlock.core.validator import (
     validate_command,
 )
 from schlock.exceptions import ConfigurationError, ParseError
+from schlock.integrations.shellcheck import ShellCheckFinding, ShellCheckSeverity
 
 
 class TestValidator:
@@ -694,6 +695,17 @@ rules:
         assert any(r.name == "schlock_config_write" for r in engine.rules)
 
 
+_SC2114 = ShellCheckFinding(
+    code=2114,
+    level=ShellCheckSeverity.WARNING,
+    message="deletes a system directory",
+    line=1,
+    column=1,
+    end_line=1,
+    end_column=1,
+)
+
+
 class TestHeredocSurroundings:
     """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
 
@@ -790,6 +802,52 @@ class TestHeredocSurroundings:
         assert result.risk_level == RiskLevel.HIGH
         assert result.allowed is True
         assert result.message == "Alongside heredoc: Force push overwrites remote history"
+
+    def test_heredoc_costs_one_shellcheck_subprocess(self, safety_rules_path, monkeypatch):
+        """The whole rewrite is ShellChecked once; its segments are not ShellChecked again.
+
+        ShellCheck is a subprocess per call. Re-entering the full pipeline per
+        segment spent N+1 of them: a heredoc followed by 20 commands was 22
+        spawns and 144ms, against 21ms for those 20 commands alone (LAB-2780).
+        """
+        checked: list[str] = []
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: checked.append(command) or [])
+        tail = " && ".join(f"echo {i}" for i in range(20))
+
+        validate_command(f"cat <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
+        assert checked == [f"cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n{tail}"]
+
+        checked.clear()
+        validate_command(f"ls <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
+        assert len(checked) <= 1
+
+    def test_shellcheck_still_reaches_the_shell_around_a_heredoc(self, safety_rules_path, monkeypatch):
+        """Skipping ShellCheck per segment must not skip it for the whole rewrite."""
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
+
+        result = validate_command("cat <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.message == "Alongside heredoc: ShellCheck: deletes a system directory"
+
+    def test_a_verdict_without_shellcheck_is_not_cached(self, safety_rules_path, monkeypatch):
+        """A segment's ShellCheck-less verdict must not answer for the same string later.
+
+        The cache is keyed on the command string alone. Behind a whitelisted head
+        the per-segment pass is the only one that sees `rm -r$''f /`, and it
+        sees it without ShellCheck; caching that HIGH would hand it to the next
+        top-level call, which ShellCheck should raise to BLOCKED.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
+
+        validate_command("ls <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
+        assert val_module._global_cache.get("rm -r$''f /") is None
+
+        result = validate_command("rm -r$''f /", config_path=safety_rules_path)
+        assert result.risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         "command,expected_error",
@@ -901,6 +959,12 @@ class TestHeredocSurroundings:
                 RiskLevel.LOW,
                 "a dangerous-looking quoted argument on the opener line",
             ),
+            # ... and the segments after the terminator get the same quote
+            # context. Matched without it, `echo "rm -rf /"` is a real `rm -rf /`
+            # and a hard BLOCK (LAB-2780). Behind a whitelisted head the
+            # per-segment pass is the only one that looks at the echo at all.
+            ("cat <<'EOF'\nx\nEOF\necho \"rm -rf /\"", RiskLevel.LOW, "a quoted dangerous command after the terminator"),
+            ("ls <<'EOF'\nx\nEOF\necho \"rm -rf /\"", RiskLevel.SAFE, "the same, behind a whitelisted head"),
             ("cat <<'EOF' | <<'X'\nx\nEOF\ny\nX", RiskLevel.LOW, "a segment that is only a redirection"),
             # Delimiter spellings whose quote removal has to happen across the
             # whole word: reading only the first quoted run gives `E`, and the
@@ -956,13 +1020,12 @@ class TestHeredocSurroundings:
         seen = []
         real = val_module.validate_command
 
-        def spy(command, config_path=None):
+        def spy(command, config_path=None, **kwargs):
             seen.append(command)
-            return real(command, config_path)
+            return real(command, config_path, **kwargs)
 
         monkeypatch.setattr(val_module, "validate_command", spy)
         val_module._escalate_past_heredoc(
-            val_module._get_rule_engine(safety_rules_path),
             "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
             "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
             val_module.ValidationResult(allowed=True, risk_level=RiskLevel.LOW, message="base"),
