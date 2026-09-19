@@ -536,6 +536,36 @@ class TestWrappedRunnerAndWatchDelegation:
         assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
         assert result.allowed is True
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "strace -o bash ls -la",
+            "strace -o sh -f python3 app.py",
+            "ltrace -o watch make",
+            "flock /var/lock/find ls -la",
+            "flock /var/lock/watch git status",
+            "nsenter --root=/tmp/bash ls",
+        ],
+    )
+    def test_benign_delegator_named_operand_is_not_denied(self, command):
+        """The over-approximation has a bound, and this is it.
+
+        The scan re-enters on a wrapper's own operands and option VALUES too, not only on the
+        wrapped command, because telling them apart needs a per-wrapper getopt table whose
+        failure mode is fail-OPEN: one wrong entry skips the real command and drops the payload,
+        which is the decoy bypass this class exists to close. The price is that a benign file
+        named after a delegator gets its tail re-validated - so pin that the price stays below
+        ask/deny. Measured across every `_DELEGATOR_COMMANDS` name x 10 benign tails (1380
+        pairs), one verdict moved at all (`ltrace -o watch make`, SAFE -> LOW, still allowed);
+        the only ask/deny hits were `sudo`/`su`/`doas`/`pkexec` FILENAMES, which the
+        pre-existing `sudo_use` / `privilege_escalation_variants` regex rules block on `main`
+        identically - not this scan. Asserted as "never denied", not "always SAFE", because
+        LOW is the honest current value and pinning SAFE would be pinning a fiction.
+        """
+        result = validate_command(command)
+        assert result.allowed is True, f"{command!r} -> {result.risk_level.name}"
+        assert result.risk_level < RiskLevel.HIGH, f"{command!r} -> {result.risk_level.name}"
+
 
 class TestFindExecUnchanged:
     """AC-2: absolute verdicts pinned against `main` @ `1de8e4c` (ShellCheck unavailable).
