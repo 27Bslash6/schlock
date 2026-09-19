@@ -803,34 +803,56 @@ class TestHeredocSurroundings:
         assert result.allowed is True
         assert result.message == "Alongside heredoc: Force push overwrites remote history"
 
-    def test_heredoc_costs_one_shellcheck_subprocess(self, safety_rules_path, monkeypatch):
-        """The whole rewrite is ShellChecked once; its segments are not ShellChecked again.
+    @pytest.mark.parametrize("head", ["cat", "ls"])
+    def test_heredoc_costs_one_shellcheck_subprocess(self, safety_rules_path, monkeypatch, head):
+        """ShellCheck sees the whole rewrite exactly once, whatever the head.
 
         ShellCheck is a subprocess per call. Re-entering the full pipeline per
-        segment spent N+1 of them: a heredoc followed by 20 commands was 22
-        spawns and 144ms, against 21ms for those 20 commands alone (LAB-2780).
+        segment spent N+2 of them for a heredoc followed by N commands (LAB-2780).
+        The whitelisted head is pinned to one as well, not zero: there the
+        whole-command pass is short-circuited before its own ShellCheck step,
+        so this one spawn is the only ShellCheck the trailing commands get.
         """
         checked: list[str] = []
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: checked.append(command) or [])
         tail = " && ".join(f"echo {i}" for i in range(20))
 
-        validate_command(f"cat <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
-        assert checked == [f"cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n{tail}"]
+        validate_command(f"{head} <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
 
-        checked.clear()
-        validate_command(f"ls <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
-        assert len(checked) <= 1
+        assert checked == [f"{head} <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n{tail}"]
 
-    def test_shellcheck_still_reaches_the_shell_around_a_heredoc(self, safety_rules_path, monkeypatch):
-        """Skipping ShellCheck per segment must not skip it for the whole rewrite."""
+    @pytest.mark.parametrize("head", ["cat", "ls"])
+    def test_shellcheck_still_reaches_the_shell_around_a_heredoc(self, safety_rules_path, monkeypatch, head):
+        """One ShellCheck spawn still elevates, behind a whitelisted head too.
+
+        `rm -r$''f /` matches `recursive_delete` at HIGH; only ShellCheck reads
+        the `$''` splice and raises it to BLOCKED. Behind `ls` no pass would
+        spawn ShellCheck on its own, so this pins the escalation's own spawn.
+        """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
 
-        result = validate_command("cat <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
+        result = validate_command(f"{head} <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.message == "Alongside heredoc: ShellCheck: deletes a system directory"
+        assert result.matched_rules[-1] == "shellcheck:SC2114"
+
+    def test_a_delegated_payload_keeps_its_own_shellcheck(self, safety_rules_path, monkeypatch):
+        """Skipping ShellCheck for a segment must not skip it for the payload the segment runs.
+
+        ShellCheck never reads inside a `-c` string, so the payload's own
+        re-entry (Step 5c) is the only ShellCheck it gets. Threading
+        `_shellcheck` through that re-entry would drop this to HIGH.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -r$''f /" else [])
+
+        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -r$''f /\"", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "ShellCheck: deletes a system directory" in result.message
 
     def test_a_verdict_without_shellcheck_is_not_cached(self, safety_rules_path, monkeypatch):
         """A segment's ShellCheck-less verdict must not answer for the same string later.

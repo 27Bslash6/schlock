@@ -1155,18 +1155,22 @@ def _escalate_past_heredoc(
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
     whitelist cannot silence.
 
-    The per-segment pass runs that same pipeline with ShellCheck off. ShellCheck
-    is a subprocess per call, so running it per segment cost N+1 spawns on top
-    of the whole-command pass (LAB-2780: a heredoc followed by 20 commands was
-    22 spawns and 144ms, against 21ms for the same 20 commands without the
-    heredoc). Rule matching alone would not do in its place: re-entering the
-    pipeline is also what gives a segment behind a whitelisted head its
+    Both passes run with ShellCheck off, and ShellCheck runs once here, on the
+    whole rewrite. It is a subprocess per call, so leaving it on in every pass
+    cost N+2 spawns for a heredoc followed by N commands (LAB-2780). It cannot
+    simply stay on in the whole-command pass alone: a whitelisted head
+    short-circuits that pass before its ShellCheck step, and the per-segment
+    pass is then the only place the trailing commands are ShellChecked at all -
+    `"rm" -rf /` and `rm -$''rf /` are caught by nothing else. Running it here
+    sees every segment in one spawn and depends on no predicate about the other
+    function's short-circuit; gating on "was the whole-command pass
+    whitelisted" would, and was rejected as a fail-open coupling. Rule matching
+    alone in place of the per-segment re-entry was rejected for the same kind of
+    loss: the re-entry is what gives a segment behind a whitelisted head its
     quote-stripped match (`r\\m -rf /`) and its contextual checks
-    (`kubectl delete`), neither of which the whole-command pass reaches once
-    the whitelist short-circuits it. Gating the per-segment pass on "was the
-    whole-command pass whitelisted" is deliberately not done either: it would
-    make this control's correctness depend on a predicate about another
-    function's short-circuit, a fail-open coupling.
+    (`kubectl delete`). A payload a segment delegates to a shell (`bash -c …`)
+    is re-entered with ShellCheck on by Step 5c, deliberately: ShellCheck never
+    reads inside a `-c` string, so that re-entry is the payload's only check.
 
     Escalation only ever raises risk. That is what keeps a legitimate heredoc's
     existing verdict intact, and it bounds a misread rewrite to a false positive.
@@ -1178,20 +1182,33 @@ def _escalate_past_heredoc(
 
     # `neutered != command` keeps the recursion finite: re-validating an
     # unchanged command would re-enter this same fallback forever.
-    candidates = [(neutered, True)] if neutered != command else []
+    candidates = [neutered] if neutered != command else []
     # A segment that owns a heredoc keeps its redirection, and standalone that
     # reads as an unterminated heredoc - which would deny every heredoc there
     # is. Strip the redirection instead of skipping the segment: the command in
     # front of it is exactly the one nothing used to look at, and
     # `chmod -R 777 / <<'Y'` is not made safe by owning a body.
-    candidates += [(_HEREDOC_REDIRECT_RE.sub("", segment), False) for segment in segments]
+    candidates += [_HEREDOC_REDIRECT_RE.sub("", segment) for segment in segments]
 
-    for candidate, shellcheck in candidates:
+    for candidate in candidates:
         if not candidate.strip():
             continue
-        candidate_result = validate_command(candidate, config_path, _shellcheck=shellcheck)
+        candidate_result = validate_command(candidate, config_path, _shellcheck=False)
         if candidate_result.risk_level.value > result.risk_level.value:
             result = replace(candidate_result, message=f"Alongside heredoc: {candidate_result.message}")
+
+    if result.risk_level < RiskLevel.BLOCKED and is_shellcheck_available():
+        findings = get_security_findings(run_shellcheck(neutered))
+        if findings:
+            result = replace(
+                result,
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"Alongside heredoc: ShellCheck: {findings[0].message}",
+                alternatives=[f"See {findings[0].wiki_url}"],
+                exit_code=1,
+                matched_rules=[*result.matched_rules, f"shellcheck:{findings[0].sc_code}"],
+            )
 
     return result
 
@@ -1225,7 +1242,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         config_path: Optional path to rules file (for testing)
         _depth: Internal, keyword-only. Shell-delegation recursion depth; callers leave it at 0.
         _shellcheck: Internal, keyword-only. False skips the ShellCheck subprocess and leaves the
-            verdict out of the cache; for a fragment of a command that is validated whole elsewhere.
+            verdict out of the cache; for a fragment of a command that is ShellChecked whole
+            elsewhere. Applies to this call only: a shell-delegated payload (Step 5c) is re-entered
+            with ShellCheck on, deliberately - ShellCheck never reads inside a `-c` string, so that
+            re-entry is the payload's only check.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -1554,8 +1574,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # level, and the cache is keyed on the command string alone. Caching a capped inner
         # verdict flipped `watch watch watch watch ls` from SAFE to BLOCKED for the rest of the
         # process once a deeper chain had been seen. Never with ShellCheck skipped, for the same
-        # reason: the cache is keyed on the command string alone, and a verdict computed with a
-        # pass left out is weaker than the one a fresh call would produce for that string.
+        # reason: that verdict is weaker than the one a fresh call would produce for the key. (The
+        # Step 5 whitelist write is exempt: that verdict depends on neither depth nor ShellCheck.)
         if _depth == 0 and _shellcheck:
             _global_cache.set(command, result)
 
