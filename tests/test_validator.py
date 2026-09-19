@@ -759,6 +759,36 @@ class TestHeredocSurroundings:
             # nor by carrying a literal `<<` argument.
             ("ls << 'X'\nX\nchmod -R 777 / << 'Y'\nY", "the dangerous command owns the second heredoc"),
             ("ls << 'X'\nX\nchmod -R 777 / \"<<\"", "a literal `<<` argument does not hide a segment"),
+            # LAB-2781: the opener's line does not end there. Bash deletes the
+            # backslash-newline, so the body starts after the continuation and
+            # everything on it really runs - confirmed under bash 5.3 by side
+            # effect (a sentinel file), never by output: `cat` prints its own
+            # body, so a marker seen on stdout proves nothing about execution.
+            # Reading the body from the next physical line deleted the payload
+            # from the rewrite instead, which is how these came back LOW (#148).
+            ("cat <<'EOF' \\\n&& rm -rf /\nhello\nEOF", "continued opener, `&&` payload"),
+            ("cat <<'EOF' \\\n; rm -rf /\nhello\nEOF", "continued opener, `;` payload"),
+            ("cat <<'EOF' \\\n| rm -rf /\nhello\nEOF", "continued opener, `|` payload"),
+            ("cat <<'EOF' \\\n> f ; rm -rf /\nhello\nEOF", "continued opener, redirect then `;`"),
+            ("cat <<-'EOF' \\\n&& rm -rf /\n\thello\n\tEOF", "continued opener on a `<<-` heredoc"),
+            ('cat << "E"OF \\\n&& rm -rf /\nhello\nEOF', "continued opener, delimiter split by a quoted run"),
+            (
+                "for f in a b; do cat <<'EOF' \\\n&& rm -rf /\nx\nEOF\ndone",
+                "continued opener inside a compound statement",
+            ),
+            ("cat <<'EOF' \\\n<<'X'\na\nEOF\nb\nX\nrm -rf /", "two openers across a continuation"),
+            # A `\\` is an escaped backslash, not a continuation: the line DOES
+            # end, so the body starts on the next line and the payload sits
+            # after the terminator. Joining here would swallow it.
+            ("cat <<'EOF' \\\\\nhello\nEOF\nrm -rf /", "a doubled backslash does not continue the line"),
+            # The blank line is what finishes the command, so the body starts
+            # after IT - one line further down than the opener.
+            ("cat <<'EOF' \\\n\nhello\nEOF\nrm -rf /", "blank line after the backslash ends the command"),
+            # A trailing `|` or `&&` does emit a newline token, so bash starts
+            # the body on the very next line even though the command carries on.
+            # Treating "the command continues" as the test would move these.
+            ("cat <<'EOF' |\ntr a-z A-Z\nhello\nEOF\nrm -rf /", "trailing `|` still starts the body next line"),
+            ("cat <<'EOF' &&\nhello\nEOF\nrm -rf /", "trailing `&&` still starts the body next line"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -804,13 +834,21 @@ class TestHeredocSurroundings:
             ("cat << ''\nx\nEOF", "Heredoc opener with an empty delimiter"),
             # A stray separator survives the rewrite and fails bashlex there.
             ("ls << 'EOF'\nx\nEOF\n; rm -rf /", "unexpected token ';'"),
-            # An opener on a line that does not end there: bash starts the body
-            # after the line that finishes the command, so consuming from the
-            # next one would delete the commands in between. Denied either way,
-            # which costs a false positive on the benign spelling - the shape is
-            # rare, and reading it wrong drops a payload silently.
-            ("cat <<'EOF' \\\n&& rm -rf /\nhello\nEOF", "line that continues"),
-            ("cat <<'EOF' \\\n&& echo ok\nhello\nEOF", "line that continues"),
+            # AC-3 (LAB-2781): the OTHER way an opener's line runs on. Bash
+            # swallows a newline inside a quoted string exactly as it does a
+            # backslash-newline, so joining would be correct about bash - and
+            # wrong about this validator, which cannot see inside a multi-line
+            # substitution (`echo "$(echo a` + `rm -rf /)"` is SAFE with no
+            # heredoc anywhere, LAB-4114). Joining would promote that standing
+            # hole to a heredoc bypass, so this arm is denied deliberately.
+            ("cat <<'EOF' \"abc\nmore\"\nx\nEOF", "ends inside a quote"),
+            ("cat <<'EOF' 'abc\nmore'\nx\nEOF", "ends inside a quote"),
+            ("cat <<'EOF' $'abc\nmore'\nx\nEOF", "ends inside a quote"),
+            ("cat <<'EOF' \"$(echo a\nrm -rf /)\"\nbody\nEOF", "ends inside a quote"),
+            ("cat <<'EOF' \"abc\nmore\" ; rm -rf /\nx\nEOF", "ends inside a quote"),
+            # A backslash continuation that runs INTO an unclosed quote lands on
+            # the same arm rather than slipping between the two.
+            ("cat <<'EOF' \\\n\"abc\nmore\"\nx\nEOF", "ends inside a quote"),
         ],
     )
     def test_unreadable_heredoc_fails_closed(self, safety_rules_path, command, expected_error):
@@ -912,6 +950,24 @@ class TestHeredocSurroundings:
             ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
             ("python3 << 'EOF'\nprint(1)\nEOF", RiskLevel.LOW, "python heredoc"),
             ("ssh host << 'EOF'\nuptime\nEOF", RiskLevel.LOW, "ssh heredoc"),
+            # AC-1 (LAB-2781): an opener whose line continues is read the way
+            # bash reads it, and the commands on the continuation are validated
+            # instead of the whole shape being denied. Every one of these was a
+            # hard BLOCKED before.
+            ("cat <<'EOF' \\\n&& echo ok\nhello\nEOF", RiskLevel.LOW, "continued opener, benign `&&`"),
+            ("cat <<'EOF' \\\n| grep x\nhello\nEOF", RiskLevel.LOW, "continued opener, benign pipe"),
+            ("cat <<'EOF' \\\n> out.txt\nhello\nEOF", RiskLevel.LOW, "continued opener, redirect"),
+            ("ls <<'EOF' \\\n&& echo ok\nhello\nEOF", RiskLevel.SAFE, "continued opener, whitelisted head"),
+            ("cat <<'EOF' \\\n\nhello\nEOF\necho ok", RiskLevel.LOW, "blank line after the backslash"),
+            ("cat <<'A' \\\n<<'B'\n1\nA\n2\nB\necho ok", RiskLevel.LOW, "two openers across a continuation"),
+            ("cat <<-'EOF' \\\n&& echo ok\n\thello\n\tEOF", RiskLevel.LOW, "continued `<<-` opener"),
+            (
+                "for f in a b; do cat <<'EOF' \\\n&& echo ok\nx\nEOF\ndone",
+                RiskLevel.LOW,
+                "continued opener inside a compound statement",
+            ),
+            ('cat << "E"OF \\\n&& echo ok\nhello\nEOF', RiskLevel.LOW, "continued opener, split delimiter"),
+            ("cat <<'EOF' \\\\\nhello\nEOF\necho ok", RiskLevel.LOW, "doubled backslash, benign trailer"),
         ],
     )
     def test_legitimate_heredoc_keeps_its_verdict(self, safety_rules_path, command, expected_risk, description):
@@ -935,6 +991,49 @@ class TestHeredocSurroundings:
 
         assert neutered == "ls <<-SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /"
         assert base == "ls"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ("cat <<'EOF' \\", "nothing after the backslash at all"),
+            ("cat <<'EOF' \\\n&& echo ok \\", "every physical line continues"),
+            ("cat <<'EOF' \\\n\\", "a continuation that only continues"),
+        ],
+    )
+    def test_logical_line_that_never_ends_fails_closed(self, command, description):
+        """A command that never finishes is a body that never starts.
+
+        Pinned directly rather than through `validate_command`, which denies
+        these earlier: bashlex blames the unterminated command rather than the
+        here-document, so the heredoc fallback is never reached - the same
+        reason `_read_delimiter` is pinned directly above. Joining physical
+        lines is what makes this backstop necessary; without it the loop would
+        run off the end of the input with bodies still pending.
+        """
+        with pytest.raises(ParseError, match="never finishes its command"):
+            val_module._neuter_heredocs(command)
+
+    @pytest.mark.parametrize(
+        "continued,one_line",
+        [
+            ("cat <<'EOF' \\\n&& echo ok\nhello\nEOF", "cat <<'EOF' && echo ok\nhello\nEOF"),
+            ("cat <<'EOF' \\\n> out.txt\nhello\nEOF", "cat <<'EOF' > out.txt\nhello\nEOF"),
+            ("cat <<'A' \\\n<<'B'\n1\nA\n2\nB", "cat <<'A' <<'B'\n1\nA\n2\nB"),
+            ("cat <<'EOF' \\\n| grep x\nhello\nEOF", "cat <<'EOF' | grep x\nhello\nEOF"),
+        ],
+    )
+    def test_a_continuation_rewrites_to_the_same_thing_as_one_line(self, continued, one_line):
+        """Bash deletes a backslash-newline, so both spellings are one command.
+
+        This is the property the fix rests on, and it is worth pinning on its
+        own: keeping the physical line break instead handed the escalation pass
+        segments with a continuation inside them, and stripping the placeholder
+        redirection back off one of those left a dangling `\\`. That read
+        `cat <<'EOF' \\` + `> out.txt` as a truncation the identical one-line
+        command is not, and denied `cat <<'A' \\` + `<<'B'` outright - two
+        unrelated-looking wrong verdicts from one malformed rewrite.
+        """
+        assert val_module._neuter_heredocs(continued) == val_module._neuter_heredocs(one_line)
 
     def test_rewrite_denies_a_command_with_no_opener_it_can_see(self):
         """Reaching the fallback means bashlex blamed a heredoc; finding none means we misread it.

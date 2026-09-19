@@ -898,7 +898,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
 
 def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting it hides the state machine
     line: str, quote: str
-) -> tuple[str, list[tuple[str, bool, int]], str]:
+) -> tuple[str, list[tuple[str, bool, int]], str, bool]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted* `<<` opens a heredoc. Bash reads `echo "x << y"` and
@@ -911,9 +911,16 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
     ``quote`` carries the quote character left open by the previous line, since a
     string spanning lines means the next line is not shell to be scanned. Returns
     ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener order, open
-    quote)``; each ``offset`` is where its `<<` sits, which is the only honest
-    source for "what command owns this heredoc" - a second regex looking for the
-    first `<<` would find the quoted ones this deliberately skipped.
+    quote, line continues)``; each ``offset`` is where its `<<` sits, which is
+    the only honest source for "what command owns this heredoc" - a second regex
+    looking for the first `<<` would find the quoted ones this deliberately
+    skipped.
+
+    The trailing flag is true when an unescaped `\\` ends the line. Together with
+    a still-open ``quote`` it tells the caller the newline here is not a newline
+    *token* - bash removes a backslash-newline and swallows a newline inside a
+    quoted string - so the command, and with it the start of any pending heredoc
+    body, carries on to the next physical line (LAB-2781).
     """
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
@@ -968,16 +975,12 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
             out.append(char)
             pos += 1
 
-    if openers and (quote or continued):
-        # A trailing `\` or an unclosed quote means this line does not finish
-        # the command, so bash starts the body after a later line. Consuming
-        # from the next one would delete the commands in between.
-        raise ParseError("Heredoc opener on a line that continues; the body's start is unknown")
-
-    return "".join(out), openers, quote
+    return "".join(out), openers, quote, continued
 
 
-def _neuter_heredocs(command: str) -> tuple[str, str]:
+def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines nest in bodies; flattening hides that
+    command: str,
+) -> tuple[str, str]:
     """Rewrite a heredoc into something bashlex parses, keeping the rest verbatim.
 
     bashlex rejects a quoted heredoc delimiter outright, which is why this
@@ -1011,17 +1014,68 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
     index = 0
 
     while index < len(lines):
-        line, openers, quote = _rewrite_openers(lines[index], quote)
-        rewritten.append(line)
-        index += 1
+        # A body starts after the newline that ENDS THE COMMAND, not after the
+        # physical line its opener sits on. Bash removes a backslash-newline, so
+        # that newline is not the newline *token* that triggers body collection:
+        # the logical line, and the body's start with it, runs on. Consuming from
+        # the next physical line instead deleted the continuation from the
+        # rewrite, which is how `cat <<'EOF' \` + `&& rm -rf /` came back allowed
+        # (LAB-2765); denying the whole shape was that hole's first, blunter
+        # patch, and this reads it instead (LAB-2781).
+        #
+        # A trailing `|` or `&&` does NOT continue a line here: bash emits a
+        # newline token and starts the body on the very next line even though the
+        # command carries on. That is what this already did, and it stays.
+        pending: list[tuple[str, bool, int]] = []
+        parts: list[str] = []
+        while True:
+            raw = lines[index]
+            line, openers, quote, continued = _rewrite_openers(raw, quote)
+            index += 1
 
-        if base_command is None and openers:
-            base_command = lines[index - 1][: openers[0][2]].strip()
+            if base_command is None and openers:
+                base_command = raw[: openers[0][2]].strip()
+            pending.extend(openers)
+
+            if pending and quote:
+                # The other way a line runs on. Joining it would be correct
+                # about bash and wrong about this validator: a newline inside a
+                # double-quoted substitution hides its payload from the rule
+                # engine even with no heredoc in sight - `echo "$(echo a` +
+                # `rm -rf /)"` is SAFE today (LAB-4114). Joining here would turn
+                # that standing hole into a heredoc bypass, so this arm keeps
+                # failing closed until the engine reads multi-line substitutions.
+                raise ParseError("Heredoc opener on a line that ends inside a quote; the body's start is unknown")
+            if not continued:
+                parts.append(line)
+                break
+
+            # Emit the logical line as one line rather than keeping the physical
+            # breaks: bash deletes a backslash-newline outright, so the pieces
+            # join with nothing between them. Leaving the break in would hand
+            # `_escalate_past_heredoc` segments with a continuation inside, and
+            # stripping the placeholder redirection back off one of those leaves
+            # a dangling `\` that parses nowhere - denying `cat <<'A' \` +
+            # `<<'B'`, and reading `cat <<'EOF' \` + `> out.txt` as a truncation
+            # the same command on one line is not.
+            #
+            # `continued` is set only where the backslash is the line's last
+            # character, and nothing is emitted after it, so the slice drops that
+            # escape and nothing else.
+            parts.append(line[:-1])
+
+            if index >= len(lines):
+                if pending:
+                    # The command never ends, so the body never starts. Shell we
+                    # cannot locate is shell we cannot vouch for.
+                    raise ParseError("Heredoc opener on a line that never finishes its command; the body's start is unknown")
+                break
+        rewritten.append("".join(parts))
 
         # Bodies are consumed in opener order. `<<-` strips leading tabs from the
         # terminator line as well as the body, so the comparison has to match
         # bash's or a body line would be mistaken for the terminator.
-        for delimiter, strips_tabs, _ in openers:
+        for delimiter, strips_tabs, _ in pending:
             # One placeholder line stands in for the entire body. It cannot be
             # dropped altogether: bashlex rejects an empty heredoc inside a
             # compound statement, which would deny every `for … do
