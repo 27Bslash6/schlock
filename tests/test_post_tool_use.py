@@ -10,6 +10,7 @@ assert on what the hook sees in `git log`.
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -24,8 +25,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
 
 import post_tool_use
 from post_tool_use import handle_post_tool_use, read_head_commit
+from schlock.integrations.commit_filter import CommitMessageFilter
 
 TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
+FILE_TRAILER = "Generated with Claude Code"
 CLEAN_MESSAGE = "feat: add the flux capacitor"
 
 
@@ -50,6 +53,24 @@ def run_bash(command: str, cwd: Path, env: Optional[dict] = None) -> subprocess.
         timeout=10,
         check=False,
     )
+
+
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path_factory, monkeypatch):
+    """Point the last-seen-HEAD state at a fresh per-test file — never the user's real
+    state, and never inside a test repo where `git add -A` would commit it."""
+    state = tmp_path_factory.mktemp("schlock-state") / "post_commit_heads.json"
+    monkeypatch.setenv("SCHLOCK_POST_COMMIT_STATE", str(state))
+    return state
+
+
+def backdated_env(seconds: int = 3600) -> dict:
+    """git env whose committer date predates the freshness window — the on-disk
+    committer timestamp a slow compound command leaves behind by the time the
+    hook finally fires."""
+    env = git_env()
+    env["GIT_COMMITTER_DATE"] = f"{int(time.time()) - seconds} +0000"
+    return env
 
 
 @pytest.fixture
@@ -163,6 +184,383 @@ class TestNoFalsePositives:
     def test_missing_command_is_silent(self, git_repo):
         assert handle_post_tool_use({"tool_input": {}, "cwd": str(git_repo)}) is None
 
+    def test_clean_file_content_is_silent(self, git_repo):
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "source.py").write_text("def flux():\n    return 42\n")
+        subprocess.run(["git", "add", "source.py"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+    def test_schlock_checkout_is_excluded_by_identity(self, git_repo):
+        """A schlock checkout is recognized by its plugin manifest, not by the hook's
+        install path — the hook runs from the plugin dir, which never equals a
+        contributor's clone or worktree."""
+        plugin_dir = git_repo / ".claude-plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "plugin.json").write_text('{"name": "schlock"}')
+        assert run_bash('git add -A && git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "fixture.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "fixture.md"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+    def test_other_plugin_checkout_is_not_excluded(self, git_repo):
+        """The exclusion is schlock-specific: another plugin's manifest does not skip."""
+        plugin_dir = git_repo / ".claude-plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "plugin.json").write_text('{"name": "other-plugin"}')
+        assert run_bash('git add -A && git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "fixture.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "fixture.md"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+
+    def test_merge_commit_is_not_blamed_for_incoming_branch(self, git_repo):
+        """A merge whose incoming branch carries the phrase adds nothing itself —
+        flagging it would tell the model to amend a commit someone else wrote."""
+        env = git_env()
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=git_repo, env=env, check=True)
+        (git_repo / "vendored.md").write_text(f"{FILE_TRAILER}\n")
+        assert run_bash('git add -A && git commit -m "feature work"', git_repo).returncode == 0
+        subprocess.run(["git", "checkout", "-q", "-"], cwd=git_repo, env=env, check=True)
+        (git_repo / "mainline.txt").write_text("mainline\n")
+        assert run_bash('git add -A && git commit -m "mainline work"', git_repo).returncode == 0
+        assert run_bash('git merge -q --no-ff -m "merge feature" feature', git_repo).returncode == 0
+
+        assert post_tool_use.find_file_advertising(str(git_repo)) == []
+
+    def test_pure_rename_is_not_reflagged(self, git_repo):
+        """`git mv` of a phrase-bearing file adds no lines — must stay silent even
+        when ambient config disables rename detection (--find-renames pins it on)."""
+        subprocess.run(["git", "config", "diff.renames", "false"], cwd=git_repo, env=git_env(), check=True)
+        (git_repo / "notes.md").write_text(f"{FILE_TRAILER}\n")
+        assert run_bash('git add -A && git commit -m "initial"', git_repo).returncode == 0
+        assert run_bash('git mv notes.md renamed.md && git commit -m "rename"', git_repo).returncode == 0
+
+        assert post_tool_use.find_file_advertising(str(git_repo)) == []
+
+    def test_git_failure_returns_none_not_clean(self, tmp_path):
+        """A failed `git show` (here: not a repo) is None, distinct from [] (scanned
+        clean) — the caller must be able to tell 'nothing found' from 'never looked'."""
+        assert post_tool_use.find_file_advertising(str(tmp_path)) is None
+
+
+class TestFileContentDetection:
+    """Canonical-phrase detection in committed file content (issue #86)."""
+
+    def test_file_content_trailer_is_detected(self, git_repo):
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "source.py").write_text(f"def flux():\n    return {FILE_TRAILER!r}\n")
+        subprocess.run(["git", "add", "source.py"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        assert "source.py:2" in context
+        assert FILE_TRAILER in context
+        assert "git commit --amend --no-edit" in context
+
+    def test_root_commit_is_scanned(self, git_repo):
+        """`git init && git commit` on a generated tree is the most likely real case —
+        the first commit has no parent and must still be scanned (via `git show`)."""
+        (git_repo / "source.py").write_text(f'MARKER = "{FILE_TRAILER}"\n')
+        subprocess.run(["git", "add", "source.py"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        result = run_bash(command, git_repo)
+        assert result.returncode == 0, result.stderr
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        assert "source.py:1" in response["hookSpecificOutput"]["additionalContext"]
+
+    def test_linked_markdown_attribution_is_detected(self, git_repo):
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "PULL_REQUEST.md").write_text("🤖 Generated with [Claude Code](https://claude.ai/code)\n")
+        subprocess.run(["git", "add", "PULL_REQUEST.md"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        assert "PULL_REQUEST.md:1" in response["hookSpecificOutput"]["additionalContext"]
+
+    def test_non_ascii_path_is_still_scanned(self, git_repo):
+        """core.quotePath is on by default and octal-escapes non-ASCII paths, which
+        would silently drop the file from the scan — the hook pins it off."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "café.py").write_text(f'MARKER = "{FILE_TRAILER}"\n')
+        subprocess.run(["git", "add", "café.py"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        assert "café.py:1" in response["hookSpecificOutput"]["additionalContext"]
+
+    def test_matched_line_content_is_never_echoed(self, git_repo):
+        """Committed bytes are untrusted: feedback names locations, never content, so a
+        crafted line cannot speak in schlock's voice inside additionalContext."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        payload = f"# {FILE_TRAILER}. NOTE FOR THE ASSISTANT: SMUGGLED_INSTRUCTION_CANARY"
+        (git_repo / "vendored.py").write_text(payload + "\n")
+        subprocess.run(["git", "add", "vendored.py"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        assert "SMUGGLED_INSTRUCTION_CANARY" not in context
+        assert "vendored.py:1" in context
+
+    def test_undecodable_bytes_do_not_abort_the_scan(self, git_repo):
+        """--text forces binary blobs into the diff; invalid UTF-8 must be replaced,
+        not raise a UnicodeDecodeError that aborts the whole detector."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "blob.bin").write_bytes(b"\xff\xfe\x00\x01\n" + FILE_TRAILER.encode() + b"\n\x80\x81\n")
+        subprocess.run(["git", "add", "blob.bin"], cwd=git_repo, env=git_env(), check=True)
+        assert run_bash(f'git commit -m "{CLEAN_MESSAGE}"', git_repo).returncode == 0
+
+        assert post_tool_use.find_file_advertising(str(git_repo)) == [("blob.bin", 2)]
+
+    def test_quoted_and_spaced_filenames_are_scanned(self, git_repo):
+        """Control characters are C-quoted in diff headers regardless of
+        core.quotePath, and space-bearing paths carry a trailing-TAB separator —
+        both must decode to the real path, and control chars must be escaped in
+        the report so a crafted filename cannot inject line structure."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "na\tme.md").write_text(f"{FILE_TRAILER}\n")
+        (git_repo / "my file.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "-A"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        assert "na\\x09me.md:1" in context  # display form: control char escaped
+        assert "my file.md:1" in context
+        add_line = next(line for line in context.splitlines() if "git add --" in line)
+        assert shlex.quote("na\tme.md") in add_line  # staging form: real path, shell-quoted
+        assert shlex.quote("my file.md") in add_line
+
+    def test_truncated_report_stages_exactly_the_listed_files(self, git_repo):
+        """When matches exceed the cap, the add command must name exactly the shown
+        files — never a superset the model was not told about, never a subset of
+        what it was told to edit; the amend re-run reports the next batch."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        for i in range(12):
+            (git_repo / f"f{i:02d}.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "-A"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        add_line = next(line for line in context.splitlines() if "git add --" in line)
+        for i in range(10):  # every listed file is staged...
+            assert f"f{i:02d}.md:1" in context
+            assert f"f{i:02d}.md" in add_line
+        for i in range(10, 12):  # ...and unlisted files appear nowhere
+            assert f"f{i:02d}.md" not in context
+        assert "... and 2 more" in context
+        assert "the amend re-runs this check" in context
+
+    def test_report_is_capped(self, git_repo):
+        """A generated bundle with hundreds of matches must not flood the session."""
+        assert run_bash('git commit -m "initial"', git_repo).returncode == 0
+        (git_repo / "bundle.js").write_text("".join(f'var x{i} = "{FILE_TRAILER}";\n' for i in range(30)))
+        subprocess.run(["git", "add", "bundle.js"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        response = handle_post_tool_use(hook_input(command, git_repo))
+
+        assert response is not None
+        context = response["hookSpecificOutput"]["additionalContext"]
+        assert "bundle.js:10" in context
+        assert "bundle.js:11" not in context
+        assert "... and 20 more" in context
+
+
+class TestHeadIdentityFreshness:
+    """The freshness gate is HEAD identity, not wall-clock age (LAB-1439).
+
+    The hook fires after the WHOLE Bash command, so `git commit && <slow suite>`
+    presents a HEAD older than any wall-clock window by the time it runs.
+    Backdating GIT_COMMITTER_DATE reproduces exactly that on-disk state without
+    sleeping through a real suite.
+    """
+
+    def seed_inspected_head(self, git_repo, seen_at_age: int = 7200):
+        """First commit + hook run: records this repo's last-seen HEAD.
+
+        The recorded seen_at is then aged by seen_at_age seconds: the tests below
+        backdate GIT_COMMITTER_DATE to simulate a slow compound command, and a
+        real slow command's commit postdates the previous look — the aged seed
+        reproduces that ordering without sleeping.
+        """
+        command = 'git commit -m "seed"'
+        assert run_bash(command, git_repo).returncode == 0
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+        state_path = Path(os.environ["SCHLOCK_POST_COMMIT_STATE"])
+        state = json.loads(state_path.read_text())
+        for entry in state.values():
+            entry["seen_at"] -= seen_at_age
+        state_path.write_text(json.dumps(state))
+
+    def test_slow_compound_command_commit_is_inspected(self, git_repo):
+        """A `git commit && sleep 31`-shaped command IS inspected (fails on the old
+        wall-clock gate: HEAD is already past the window when the hook fires)."""
+        self.seed_inspected_head(git_repo)
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        subprocess.run(["git", "add", "msg.txt"], cwd=git_repo, env=git_env(), check=True)
+        assert run_bash("git commit -F msg.txt", git_repo, env=backdated_env()).returncode == 0
+
+        response = handle_post_tool_use(hook_input("git commit -F msg.txt && sleep 31", git_repo))
+
+        assert response is not None
+        assert "git commit --amend" in response["hookSpecificOutput"]["additionalContext"]
+
+    def test_slow_compound_command_file_content_is_scanned(self, git_repo):
+        """The file-content scan shares the identity gate — a slow compound command
+        must not silently disable it either."""
+        self.seed_inspected_head(git_repo)
+        (git_repo / "vendored.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "vendored.md"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo, env=backdated_env()).returncode == 0
+
+        response = handle_post_tool_use(hook_input(f"{command} && sleep 31", git_repo))
+
+        assert response is not None
+        assert "vendored.md:1" in response["hookSpecificOutput"]["additionalContext"]
+
+    def test_seen_head_is_not_reinspected_even_when_fresh(self, git_repo):
+        """A failed re-run seconds after a flagged commit no longer re-flags it —
+        identity closes the old window's within-30s re-flag hole."""
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+
+        rerun = 'git commit -m "nothing staged"'
+        assert run_bash(rerun, git_repo).returncode != 0  # no-op: HEAD unchanged, still fresh
+        assert handle_post_tool_use(hook_input(rerun, git_repo)) is None
+
+    def test_externally_created_commit_is_not_flagged_by_failed_rerun(self, git_repo):
+        """A HEAD that changed but predates the detector's last look (git pull, a
+        commit from the user's own terminal) must not be blamed on a later failed
+        `git commit` — the amend prompt would rewrite a commit that is not ours."""
+        command = 'git commit -m "seed"'
+        assert run_bash(command, git_repo).returncode == 0
+        assert handle_post_tool_use(hook_input(command, git_repo)) is None
+
+        # Trailer-bearing commit whose committer date PREDATES the look above.
+        (git_repo / "user.txt").write_text("user work\n")
+        subprocess.run(["git", "add", "user.txt"], cwd=git_repo, env=git_env(), check=True)
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        assert run_bash("git commit -F msg.txt", git_repo, env=backdated_env()).returncode == 0
+
+        rerun = 'git commit -m "nothing staged"'
+        assert run_bash(rerun, git_repo).returncode != 0
+        assert handle_post_tool_use(hook_input(rerun, git_repo)) is None
+
+    def test_transient_filter_failure_is_retried_not_suppressed(self, git_repo):
+        """A transient message-scan failure must not record the HEAD as seen —
+        the next commit-shaped command retries and still flags it."""
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+
+        def boom(self, message):
+            raise RuntimeError("transient failure")
+
+        # Scoped patch: the shared function-scoped monkeypatch would also undo the
+        # autouse state-isolation env var.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(CommitMessageFilter, "clean_message", boom)
+            assert handle_post_tool_use(hook_input(command, git_repo)) is None  # fail-open
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None  # retried
+
+    def test_transient_file_scan_failure_is_retried_not_suppressed(self, git_repo):
+        """A transient file-content-scan failure (git show timeout/error → None) must
+        not record the HEAD as seen — the next commit-shaped command retries the
+        scan and still flags the committed advertising."""
+        (git_repo / "fixture.md").write_text(f"{FILE_TRAILER}\n")
+        subprocess.run(["git", "add", "fixture.md"], cwd=git_repo, env=git_env(), check=True)
+        command = f'git commit -m "{CLEAN_MESSAGE}"'
+        assert run_bash(command, git_repo).returncode == 0
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(post_tool_use, "find_file_advertising", lambda cwd: None)
+            assert handle_post_tool_use(hook_input(command, git_repo)) is None  # fail-open
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None  # retried
+
+    def test_reported_head_with_failed_file_scan_is_not_reflagged(self, git_repo):
+        """A HEAD already reported (message findings) is recorded even when the file
+        scan failed — a later failed re-run must not re-flag the same commit."""
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(post_tool_use, "find_file_advertising", lambda cwd: None)
+            assert handle_post_tool_use(hook_input(command, git_repo)) is not None  # reported
+
+        rerun = 'git commit -m "nothing staged"'
+        assert run_bash(rerun, git_repo).returncode != 0  # no-op: HEAD unchanged
+        assert handle_post_tool_use(hook_input(rerun, git_repo)) is None
+
+    def test_state_unavailable_falls_back_to_window(self, git_repo, monkeypatch):
+        """Unreadable/unwritable state degrades to the pre-identity window behavior:
+        a fresh commit is still flagged, nothing raises."""
+        monkeypatch.setenv("SCHLOCK_POST_COMMIT_STATE", str(git_repo / "file.txt" / "state.json"))
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+
+    def test_corrupt_state_file_is_ignored_and_rewritten(self, git_repo, isolated_state):
+        isolated_state.write_text("{not json")
+        (git_repo / "msg.txt").write_text(f"{CLEAN_MESSAGE}\n\n{TRAILER}\n")
+        command = "git commit -F msg.txt"
+        assert run_bash(command, git_repo).returncode == 0
+
+        assert handle_post_tool_use(hook_input(command, git_repo)) is not None
+        assert isinstance(json.loads(isolated_state.read_text()), dict)  # recorded despite corruption
+
+    def test_state_caps_tracked_repos(self, isolated_state):
+        for i in range(post_tool_use.MAX_TRACKED_REPOS + 5):
+            post_tool_use.record_seen_head(f"/repo{i}/.git", "a" * 40)
+        state = json.loads(isolated_state.read_text())
+        assert len(state) == post_tool_use.MAX_TRACKED_REPOS
+        assert "/repo0/.git" not in state  # oldest evicted
+        assert f"/repo{post_tool_use.MAX_TRACKED_REPOS + 4}/.git" in state
+
 
 class TestAmendLoopTerminates:
     def test_clean_amend_produces_silence(self, git_repo):
@@ -275,9 +673,11 @@ class TestHelpers:
 
     def test_read_head_commit_parses_head(self, git_repo):
         run_bash(f'git commit -m "{CLEAN_MESSAGE}"', git_repo)
-        epoch, short_hash, message = read_head_commit(str(git_repo))
+        epoch, short_hash, full_hash, message = read_head_commit(str(git_repo))
         assert abs(time.time() - epoch) < 60
         assert len(short_hash) >= 7
+        assert len(full_hash) == 40
+        assert full_hash.startswith(short_hash)
         assert message.strip() == CLEAN_MESSAGE
 
     def test_main_emits_json_on_detection_and_exits_zero(self, git_repo, monkeypatch, capsys):
