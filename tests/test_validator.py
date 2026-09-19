@@ -971,3 +971,93 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+class TestMultilineSubstitution:
+    """LAB-4114: a substitution body spanning a newline was rated on its first line only.
+
+    bashlex read one input unit of ``$( … )``, ``<( … )`` and `` ` … ` ``, so everything after
+    the first newline never reached the AST. ``echo "$(echo a\\nrm -rf /)"`` was SAFE while bash
+    ran ``rm -rf /``. The assignment and unquoted spellings were caught only because they carry
+    no quoted-literal suppression range, so the raw regex pass still saw the payload.
+
+    Every verdict is pinned as an absolute value with ShellCheck forced off; a cross-check
+    against the single-line spelling would move with the code under test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """Pin verdicts to the rules, not to whether ShellCheck is installed."""
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # AC-1: the two spellings from the report.
+            ('echo "$(echo a\nrm -rf /)"', "double-quoted, argument position"),
+            ('echo "a$(echo b\nrm -rf /)"', "double-quoted, prefixed"),
+            # AC-3: rows that were already caught keep their verdict.
+            ('x="$(echo a\nrm -rf /)"', "assignment position"),
+            ("echo `echo a\nrm -rf /`", "backticks"),
+            # Same hole, other spellings.
+            ("echo $(echo a\nrm -rf /)", "unquoted argument"),
+            ('echo "`echo a\nrm -rf /`"', "double-quoted backticks"),
+            ("cat <(echo a\nrm -rf /)", "process substitution"),
+            ('echo "x" "$(echo a\nrm -rf /)"', "second argument"),
+            ('echo "$(echo a\nrm -rf /)" tail', "followed by another word"),
+            ('echo "$(echo a # note\nrm -rf /)"', "comment ends the first line"),
+            ('echo "$(echo a\n\nrm -rf /)"', "blank line between"),
+            ('echo "$(echo a\nrm -rf /\n)"', "closing paren on its own line"),
+            ('x="$(\n  echo a\n  rm -rf /\n)"', "indented block layout"),
+            ('echo "$(git status\nrm -rf /)"', "whitelisted first line does not vouch for the second"),
+            ('echo "$(cat <<EOF\nbody\nEOF\nrm -rf /)"', "heredoc body before the payload"),
+            ('echo "$(echo a\nrm -rf /\necho c)"', "payload on a middle line"),
+            ('echo "$(echo a;\nrm -rf /)"', "`;` then newline"),
+            ('echo "$(echo a &&\n  echo b\nrm -rf /)"', "continued AND-list then a new line"),
+            ('echo "$(echo "$(echo a\nrm -rf /)")"', "nested one level down"),
+        ],
+    )
+    def test_payload_after_a_newline_is_denied(self, safety_rules_path, command, description):
+        """Every line of the body reaches the substitution check; a dangerous one denies the command."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.allowed is False, description
+        assert result.exit_code == 1, description
+
+    @pytest.mark.parametrize(
+        "command,risk_level,description",
+        [
+            # AC-2: inert spellings. Escalation only raises, so a false positive here has no
+            # downstream fix.
+            ("echo '$(echo a\nrm -rf /)'", RiskLevel.SAFE, "single quotes: bash prints it, never runs it"),
+            ('echo "a\nb"', RiskLevel.SAFE, "plain multi-line string"),
+            ('echo "$(echo a)\nrm -rf /"', RiskLevel.SAFE, "the `)` closes the body; the rest is quoted text"),
+            # Benign multi-line bodies keep the verdict of their single-line spelling.
+            ('echo "$(echo a\necho b)"', RiskLevel.SAFE, "two whitelisted lines"),
+            ('echo "`echo a\necho b`"', RiskLevel.SAFE, "two whitelisted lines in backticks"),
+            ('echo "$(echo a\n)"', RiskLevel.SAFE, "trailing newline before the paren"),
+            ("echo `echo a\n`", RiskLevel.SAFE, "backtick body, trailing newline: the unit loop ends on EOF, not `)`"),
+            ('x="$(\n  git rev-parse HEAD\n)"', RiskLevel.SAFE, "indented block layout, whitelisted body"),
+            ('echo "$( (echo a\necho b) )"', RiskLevel.SAFE, "subshell body, already a list in stock bashlex"),
+            # Each of these pins one seam of the unit loop: the `;` must not be doubled with a
+            # newline operator, a unit that is itself a list must be flattened, and the resume
+            # point must be the tokenizer's index (past a heredoc body), not the newline's.
+            ('echo "$(echo a;\necho b)"', RiskLevel.SAFE, "`;` then newline, both lines benign"),
+            ('echo "$(echo a; echo b\necho c)"', RiskLevel.SAFE, "a list unit followed by a plain unit"),
+            ('echo "$(cat <<EOF\nrm -rf /\nEOF\n)"', RiskLevel.SAFE, "payload is heredoc data, never a command"),
+        ],
+    )
+    def test_inert_spellings_keep_their_verdict(self, safety_rules_path, command, risk_level, description):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is True, description
+        assert result.risk_level == risk_level, description
+
+    def test_multiline_body_gets_the_single_line_verdict(self, safety_rules_path):
+        """A non-whitelisted second line is escalated exactly as it is after a `;`."""
+        for command in ('echo "$(cd foo\nmake)"', 'echo "$(cd foo; make)"'):
+            result = validate_command(command, config_path=safety_rules_path)
+            assert result.allowed is False, command
+            assert result.risk_level == RiskLevel.HIGH, command

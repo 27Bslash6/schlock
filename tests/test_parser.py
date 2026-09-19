@@ -339,8 +339,8 @@ class TestEvalExecDetection:
         )
 
 
-def _inner_subst_command(nodes):
-    """Return the `command` node inside the first command-substitution reachable from `nodes`.
+def _first_substitution(nodes):
+    """Return the first command- or process-substitution node reachable from ``nodes``.
 
     Accepts either a single node or the list returned by ``parser.parse``.
     """
@@ -349,8 +349,8 @@ def _inner_subst_command(nodes):
     def walk(n):
         if found:
             return
-        if getattr(n, "kind", None) == "commandsubstitution":
-            found.append(n.command)
+        if getattr(n, "kind", None) in ("commandsubstitution", "processsubstitution"):
+            found.append(n)
             return
         for attr in ("parts", "command", "list"):
             child = getattr(n, attr, None)
@@ -366,6 +366,12 @@ def _inner_subst_command(nodes):
     else:
         walk(nodes)
     return found[0] if found else None
+
+
+def _inner_subst_command(nodes):
+    """Return the ``command`` node inside the first substitution reachable from ``nodes``."""
+    sub = _first_substitution(nodes)
+    return sub.command if sub is not None else None
 
 
 def _op_signature(node):
@@ -587,3 +593,90 @@ class TestAndOrSubstitutionCorrection:
         finally:
             bashlex.parser.yaccparser = real_yacc
             parser_mod._apply_andor_substitution_correction()  # restore the real correction
+
+
+class TestMultilineSubstitutionCorrection:
+    """LAB-4114: bashlex 0.18 read only the first line of a substitution body.
+
+    ``$(echo a\\nrm -rf /)`` produced an AST holding ``echo a`` alone; the second line was re-read
+    as inert word text, so the validator rated the command SAFE while bash ran ``rm -rf /``.
+    ``_parse_all_substitution_units`` replaces bashlex's one-unit parse of the body.
+    """
+
+    @pytest.mark.parametrize(
+        "command,semicolon_spelling",
+        [
+            ('echo "$(echo a\nrm -rf /)"', "echo a; rm -rf /"),
+            ("echo $(echo a\nrm -rf /)", "echo a; rm -rf /"),
+            ("echo `echo a\nrm -rf /`", "echo a; rm -rf /"),
+            ("cat <(echo a\nrm -rf /)", "echo a; rm -rf /"),
+            ('echo "$(echo a # trailing comment\nrm -rf /)"', "echo a; rm -rf /"),
+            ('echo "$(echo a\n\n\nrm -rf /)"', "echo a; rm -rf /"),
+            ('echo "$(echo a\nrm -rf /\n)"', "echo a; rm -rf /"),
+            ('echo "$(\n  echo a\n  rm -rf /\n)"', "echo a; rm -rf /"),
+            ('echo "$(echo a;\nrm -rf /)"', "echo a; rm -rf /"),
+            ('echo "$(echo a &\nrm -rf /)"', "echo a & rm -rf /"),
+            ('echo "$(echo a\nrm -rf /\necho c)"', "echo a; rm -rf /; echo c"),
+            ('echo "$(echo a | tr a b\nrm -rf /)"', "echo a | tr a b; rm -rf /"),
+            ('echo "$(echo a &&\n  echo b\nrm -rf /)"', "echo a && echo b; rm -rf /"),
+            ('echo "$(cat <<EOF\nbody\nEOF\nrm -rf /)"', "cat <<EOF; rm -rf /\nbody\nEOF"),
+            ('echo "$(echo "$(echo a\nrm -rf /)")"', 'echo "$(echo a; rm -rf /)"'),
+        ],
+    )
+    def test_every_line_reaches_the_ast(self, parser, command, semicolon_spelling):
+        """The multi-line body parses to the same words and separators as its ``;`` spelling."""
+        body = _inner_subst_command(parser.parse(command))
+        assert body is not None
+        got = [("op", ";") if item == ("op", "\n") else item for item in _op_signature(body)]
+        assert got == _op_signature(parser.parse(semicolon_spelling)[0])
+
+    def test_body_ends_at_the_first_closing_paren(self, parser):
+        """Text after the ``)`` inside the same quoted word is data, never a second unit."""
+        body = _inner_subst_command(parser.parse('echo "$(echo a)\nrm -rf /"'))
+        assert _op_signature(body) == [("word", "echo"), ("word", "a")]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(a\n&& b)",
+            "echo $(a\n| b)",
+            "echo $()",
+            "echo $(\n)",
+            "echo $(\n# only a comment\n)",
+        ],
+    )
+    def test_malformed_bodies_still_rejected(self, parser, command):
+        """Reading more lines must not make bashlex accept what bash rejects, nor swallow an empty body."""
+        with pytest.raises(ParseError):
+            parser.parse(command)
+
+    def test_empty_body_is_a_deliberate_parse_error(self, parser):
+        """A body with nothing to parse raises ``ParsingError``, not the ``AttributeError`` stock bashlex hit.
+
+        ``$()`` is rejected by the grammar inside the first unit's parse; a blank backtick body is
+        the one spelling where ``parse()`` hands back a bare string instead of a node or raising.
+        """
+        with pytest.raises(ParseError) as excinfo:
+            parser.parse("echo ` `")
+        assert isinstance(excinfo.value.original_error, bashlex.errors.ParsingError)
+
+    @pytest.mark.parametrize(
+        "command,span,body_kind,body_span",
+        [
+            # Stock bashlex 0.18 values, recorded before the correction: a one-unit body must be
+            # byte-identical, including the sloppy end offset bashlex gives ``$(echo a )``.
+            ('echo "$(rm -rf /)"', (6, 17), "command", (8, 16)),
+            ("echo $(a; b)", (5, 12), "list", (7, 11)),
+            ("echo `a`", (5, 8), "command", (6, 7)),
+            ('echo "$(a)$(b)"', (6, 10), "command", (8, 9)),
+            ('echo "$(echo a )"', (6, 15), "command", (8, 14)),
+            ("echo $(a\n)", (5, 9), "command", (7, 8)),
+        ],
+    )
+    def test_one_unit_bodies_are_untouched(self, parser, command, span, body_kind, body_span):
+        """A one-unit body takes the same path and yields the same spans as stock bashlex."""
+        sub = _first_substitution(parser.parse(command))
+        assert sub is not None
+        assert tuple(sub.pos) == span
+        assert sub.command.kind == body_kind
+        assert tuple(sub.command.pos) == body_span

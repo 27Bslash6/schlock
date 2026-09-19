@@ -7,11 +7,16 @@ The parser is security-critical and REQUIRES bashlex for proper AST parsing.
 Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
+import copy
 import logging
 from typing import Any, Optional
 
 import bashlex
+import bashlex.ast
 import bashlex.errors
+import bashlex.parser
+import bashlex.subst
+import bashlex.tokenizer
 
 from schlock.exceptions import ParseError
 
@@ -118,6 +123,104 @@ def _apply_andor_substitution_correction() -> None:
 
 
 _apply_andor_substitution_correction()
+
+
+def _parse_all_substitution_units(
+    parserobj: Any, base: str, sindex: int, tokenizerargs: Optional[dict[str, Any]] = None
+) -> tuple[Any, int]:
+    r"""Drop-in for ``bashlex.subst._recursiveparse`` that reads EVERY line of a substitution body.
+
+    bashlex 0.18 parses the body of ``$( … )``, ``<( … )`` and `` ` … ` `` with a single call to
+    its top-level ``inputunit`` production, and a bare newline ends an input unit. So for
+    ``$(echo a\nrm -rf /)`` only ``echo a`` reached the AST: the tokenizer had already delimited
+    the whole word, so nothing raised, and ``rm -rf /)`` was re-read as inert word text. The
+    validator was handed a truncated tree and rated the command SAFE while bash ran the second
+    line (LAB-4114). ``;``, ``|``, ``&&`` and ``||`` joins were never affected — they are
+    intra-unit — which is why the single-line spelling was always caught.
+
+    This parses unit after unit until the tokenizer stops at the closing ``)`` (or the end of a
+    backtick body) and joins the units into the ``list`` / ``operator('\n')`` shape bashlex's
+    own grammar produces for ``(a\nb)``, so the validator's list-segment path sees each line as
+    a segment exactly as it does for ``$(a; b)``. A one-unit body yields the same node and end
+    offset as before. Comment lines, blank lines and heredoc bodies are skipped by the tokenizer
+    itself — its post-parse index is the only resume signal, never a hand-rolled scan.
+
+    Fail closed by construction: a unit that does not parse raises exactly as it does today; a
+    body with nothing to parse (stock bashlex handed back the bare ``'\n'`` string for ``` ` ` ```
+    and crashed on ``.pos``) and a unit ending on a token that is not a newline, ``)`` or EOF
+    both raise ``ParsingError``, so they take the normal deny path.
+    """
+    tok = parserobj.tok
+    if tokenizerargs is None:
+        tokenizerargs = {
+            "parserstate": copy.copy(tok._parserstate),
+            "lastreadtoken": tok._last_read_token,
+            "tokenbeforethat": tok._token_before_that,
+            "twotokensago": tok._two_tokens_ago,
+        }
+    limit = parserobj._expansionlimit
+    if limit is not None:
+        limit -= 1
+
+    newline_type = bashlex.tokenizer.tokentype.NEWLINE
+    unit_end_types = (bashlex.tokenizer.tokentype.EOF, bashlex.tokenizer.tokentype.RIGHT_PAREN)
+    string = base[sindex:]
+    parts: list[Any] = []
+    offset = 0
+    while True:
+        # ``_parser`` pops ``parserstate`` out of the dict it is given and the tokenizer mutates
+        # the state as it runs, so every unit gets its own copy of both.
+        args = dict(tokenizerargs)
+        args["parserstate"] = copy.copy(tokenizerargs["parserstate"])
+        unit = bashlex.parser._parser(string[offset:], tokenizerargs=args, expansionlimit=limit)
+        parsed = unit.parse()
+        if not isinstance(parsed, bashlex.ast.node):
+            # ``None`` for an empty body, a bare str for a whitespace-only one: neither is a unit.
+            raise bashlex.errors.ParsingError("empty command substitution", string, offset)
+        node: Any = parsed  # bashlex is untyped; every attribute below is dynamic
+        end = offset + node.pos[1]
+        bashlex.subst._adjustpositions(node, sindex + offset, len(base))
+        parts.extend(node.parts if node.kind == "list" else [node])
+
+        terminator: Any = unit.tok._current_token
+        if terminator.ttype in unit_end_types:
+            break  # the unit ended at the closing ``)`` or at the end of the body
+        if terminator.ttype is not newline_type:
+            # Only a newline, ``)`` or EOF can end an ``inputunit``. Anything else means the grammar
+            # moved under us; handing back the prefix would silently drop the rest of the body.
+            raise bashlex.errors.ParsingError(
+                f"unexpected {terminator.value!r} after substitution unit", string, offset + terminator.lexpos
+            )
+        # The tokenizer has consumed the terminator - and any heredoc body it opened - so its
+        # index is where the next unit starts. Capture it before peeking moves it on.
+        resume = unit.tok._shell_input_line_index
+        # Blank and comment lines yield further NEWLINE tokens, which the parser absorbs. What
+        # follows them decides: another unit, or nothing but the terminator, which bashlex's
+        # ``$( )`` grammar cannot parse on a line of its own.
+        following: Any = unit.tok.token()
+        while following.ttype is newline_type:
+            following = unit.tok.token()
+        if following.ttype in unit_end_types:
+            break
+        # ``a;\nb`` already carries its separator; mirror ``p_list1`` and never emit two in a row.
+        if parts[-1].kind != "operator":
+            pos = (sindex + offset + terminator.lexpos, sindex + offset + terminator.endlexpos)
+            parts.append(bashlex.ast.node(kind="operator", op="\n", pos=pos))
+        offset += resume
+
+    if len(parts) == 1:
+        return parts[0], end
+    return bashlex.ast.node(kind="list", parts=parts, pos=(parts[0].pos[0], parts[-1].pos[1])), end
+
+
+# ``_parsedolparen`` (``$( )``, ``<( )``) and the backtick branch of ``_expandwordinternal`` both
+# reach ``_recursiveparse`` by module-global lookup, so one rebind covers all three spellings.
+# Assigning to a name bashlex no longer reads would install nothing and leave the truncating
+# parse live, so a bashlex that renamed it must fail this import - the hook then denies every
+# command, loudly - rather than run.
+if not hasattr(bashlex.subst, "_recursiveparse"):
+    raise ImportError("bashlex.subst._recursiveparse is missing; the multi-line substitution correction cannot install")
+bashlex.subst._recursiveparse = _parse_all_substitution_units
 
 # Interpreters that EXECUTE their standard input as a program when given no program source.
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:

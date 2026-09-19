@@ -34,7 +34,9 @@ MAX_SUBSTITUTION_DEPTH = 10
 
 # Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
-_LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
+# "\n" is bash's other statement separator. bashlex emits it for `(a\nb)` and, since LAB-4114, for a
+# multi-line `$(a\nb)` body; without it a benign two-line substitution fails the topology check.
+_LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&", "\n"})
 
 # Commands that are ALWAYS safe inside substitution
 # These are read-only, pure, or security-critical tools that don't modify state
