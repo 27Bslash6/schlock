@@ -242,6 +242,12 @@ class TestHttpCredentials:
             ("curl -u deploy:hunter2 https://api.example.com/x", "curl -u ***REDACTED*** https://api.example.com/x"),
             ("curl --user deploy:hunter2 https://api.example.com/x", "curl --user ***REDACTED*** https://api.example.com/x"),
             ("curl --user=deploy:hunter2 https://api.example.com/x", "curl --user=***REDACTED*** https://api.example.com/x"),
+            ("curl -sSu deploy:hunter2 https://x", "curl -sSu ***REDACTED*** https://x"),  # bundled short flags
+            ("curl --proxy-user proxy:pw https://x", "curl --proxy-user ***REDACTED*** https://x"),
+            ("curl --proxy-user=proxy:pw https://x", "curl --proxy-user=***REDACTED*** https://x"),
+            ("curl -u 12345:67890 https://x", "curl -u ***REDACTED*** https://x"),  # numeric credentials count
+            ("docker run -u 1000:1000 nginx", "docker run -u ***REDACTED*** nginx"),  # uid:gid over-redacts, by design
+            ("curl -p -u deploy:hunter2 -x proxy:3128", "curl -p -u ***REDACTED*** -x proxy:3128"),  # -p must not eat -u
         ]:
             assert logger._scrub_secrets(cmd) == expected
 
@@ -276,8 +282,12 @@ class TestHttpCredentials:
             "id -u",
             "useradd -u 1001 bob",
             "mysql -u root -e 'SELECT 1'",
-            "docker run -u 1000:1000 nginx",  # uid:gid, not a credential
+            "mysql -p -u root",  # -p stops short of a following flag
+            "set -eu && ls",
+            "tar -xu -f a.tar",
+            "find . -user bob",  # single dash: not --user, and -user does not end in u
             "curl --username=bob https://host",  # --user is a whole flag, not a prefix
+            "pip install -U git+https://github.com/o/r.git",  # a URL value is not a credential
             "https://host/a:b",
             "https://host?x=a@b",  # authority ends at `?`; the `@` is in the query
             "https://api.example.com/v1/users",
