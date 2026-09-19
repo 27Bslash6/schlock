@@ -561,8 +561,9 @@ class CommitMessageFilter:
     # Inside a double-quoted (`"…"`) or ANSI-C (`$'…'`) string only the closer and `\` matter.
     _DQ_SPECIAL_RE = re.compile(r'["\\]')
     _ANSI_SPECIAL_RE = re.compile(r"['\\]")
-    # A `#` opens a comment only at the start of a word.
-    _COMMENT_LEAD = frozenset(" \t;|&(")
+    # A `#` opens a comment only at the start of a word: after a blank or one of bash's
+    # metacharacters (verified: `)#c`, `>#c` and `<#c` comment; `{#c`, `}#c`, `$#`, `=#` do not).
+    _COMMENT_LEAD = frozenset(" \t;|&()<>")
     # Command / process substitution on the opener's line: an inner heredoc binds INSIDE the
     # substitution and its newlines are not the command's newline token — beyond what a line
     # scanner can model, so refuse to bind (unscannable) rather than guess a body.
@@ -630,9 +631,12 @@ class CommitMessageFilter:
         multi-line quoted argument could decoy). Quote forms as bash reads them: ``'…'`` takes no
         escapes; ``"…"`` and ``$'…'`` let ``\\`` escape the next char (so ``$'it\\'s'`` does not
         close at ``\\'``); a bare ``\\`` escapes the next char, so ``\\"`` opens no quote and a
-        ``\\``-newline is a continuation. An unquoted ``#`` at the start of a word comments out
-        the rest of the line. An unterminated quote runs to the end of the command (under-scan
-        rather than trust unbalanced text). Linear: the scan jumps between special characters.
+        ``\\``-newline is a continuation. An unquoted ``#`` comments out the rest of the line
+        when it starts a word: preceded by a blank or metacharacter that is not itself escaped,
+        judged after continuations are removed (``x \\``-newline-``#c`` is a comment;
+        ``x\\``-newline-``#c`` and ``a\\ #b`` are the words ``x#c`` and ``a #b``). An unterminated
+        quote runs to the end of the command (under-scan rather than trust unbalanced text).
+        Linear: the scan jumps between special characters.
         """
         n = len(command)
         i = pos
@@ -645,7 +649,14 @@ class CommitMessageFilter:
             if ch == "\n":
                 return i
             if ch == "#":
-                if i > pos and command[i - 1] not in cls._COMMENT_LEAD:
+                prev = i - 1
+                while prev > pos and command[prev] == "\n" and command[prev - 1] == "\\":
+                    prev -= 2  # bash removes a `\`-newline before tokenizing
+                run = prev
+                while run > pos and command[run - 1] == "\\":
+                    run -= 1
+                escaped_lead = (prev - run) % 2 == 1  # `a\ #b`, `\;#x`: the lead char is a word char
+                if prev >= pos and (escaped_lead or command[prev] not in cls._COMMENT_LEAD):
                     i += 1  # mid-word `#` (`a#b`, `$#`) is literal
                     continue
                 newline = command.find("\n", i)
@@ -720,7 +731,7 @@ class CommitMessageFilter:
                         break
                     if next_nl == -1:
                         return None  # unterminated heredoc
-                    body_lines.append(body_line)
+                    body_lines.append(test_line)  # `<<-` strips each body line's leading tabs, as bash and bashlex do
                     cursor = next_nl + 1
                 scan_chars[body_start:cursor] = " " * (cursor - body_start)
                 results.append((opener_pos, "\n".join(body_lines), self._heredoc_target_fd(command, opener_pos)))

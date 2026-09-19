@@ -1485,6 +1485,17 @@ class TestHeredocStdinExtraction:
         cmd = "git commit -F- <<-MSG\n\tfeat: x\n\tGenerated with Claude Code\n\tMSG"
         assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
 
+    def test_dash_strip_on_fallback_path_matches_ast_path(self):
+        # Review finding (PR #154 follow-up): `<<-` strips each body line's leading tabs. The
+        # fallback scanner (quoted delimiter) stripped them only to recognise the terminator and
+        # returned the body with tabs intact, so a `^`-anchored pattern could match through the
+        # AST path and miss through the fallback. Both tiers must yield bash's body.
+        filt = self._filter(self._ad_rules())
+        body = "\tfeat: x\n\t\tGenerated with Claude Code\n\tMSG"
+        via_ast = filt._extract_heredoc_stdin_message(f"git commit -F- <<-MSG\n{body}")
+        via_scanner = filt._extract_heredoc_stdin_message(f"git commit -F- <<-'MSG'\n{body}")
+        assert via_ast == via_scanner == "feat: x\nGenerated with Claude Code"
+
     def test_separate_dash_form(self):
         cmd = "git commit -F - <<EOF\nfeat: x\n\nGenerated with Claude Code\nEOF"
         assert self._filter(self._ad_rules()).filter_commit_message(cmd).patterns_removed
@@ -1738,6 +1749,44 @@ class TestHeredocStdinExtraction:
         # a real fd-0 opener whose (empty) body then won as the LAST one on the line — an EMPTY
         # scannable message while bash fed the ad.
         cmd = "git commit -F- <<'EOF' # <<DECOY\nGenerated with Claude Code\nEOF\nDECOY\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_comment_after_line_continuation_is_a_comment(self):
+        # Review finding (PR #154 follow-up): bash removes a `\`-newline before tokenizing, so a
+        # `#` that follows one is judged by the character BEFORE the continuation. The scanner
+        # saw the raw newline, called the `#` mid-word, and bound the commented `<<DECOY` as the
+        # last fd-0 opener: an EMPTY scannable message while bash fed the ad.
+        cmd = "git commit -F- <<'EOF' \\\n# <<DECOY\nGenerated with Claude Code\nEOF\nDECOY\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_continuation_joined_word_keeps_hash_literal(self):
+        # Guard for the rule above: `x\`-newline-`#y` joins to the single word `x#y`, so its `#`
+        # is literal and the opener after it is real. Treating any post-newline `#` as a comment
+        # would blank the commit's own `<<'EOF'` and leave the command unscannable.
+        cmd = "git commit -F- x\\\n#y <<'EOF'\nGenerated with Claude Code\nEOF\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_escaped_lead_char_keeps_hash_literal(self):
+        # Guard: a `#` after an ESCAPED blank or metacharacter (`a\ #b` is the word `a #b`,
+        # `\;#x` the word `;#x`) is mid-word, so the opener after it is real and wins as the
+        # commit's last fd-0 heredoc. Calling it a comment blanked that opener and reported the
+        # earlier, clean heredoc as the message while bash fed the later one.
+        for arg in ("a\\ #b", "\\;\\\n#x"):
+            cmd = f"git commit -F- <<'EOF' {arg} <<'B'\nclean\nEOF\nGenerated with Claude Code\nB\n"
+            result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+            assert result.message_delivery == "scannable", arg
+            assert result.patterns_removed, arg
+
+    def test_comment_after_close_paren_is_a_comment(self):
+        # `)` ends a word as `;` and `&` do, so `)#<<DECOY` is a comment: the decoy of
+        # test_comment_opener_is_not_bound reached through a subshell close instead of a blank.
+        cmd = "( git commit -F- <<'EOF' )#<<DECOY\nGenerated with Claude Code\nEOF\nDECOY\n"
         result = self._filter(self._ad_rules()).filter_commit_message(cmd)
         assert result.message_delivery == "scannable"
         assert result.patterns_removed
