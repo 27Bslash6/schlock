@@ -765,7 +765,7 @@ class TestHeredocSurroundings:
             # effect (a sentinel file), never by output: `cat` prints its own
             # body, so a marker seen on stdout proves nothing about execution.
             # Reading the body from the next physical line deleted the payload
-            # from the rewrite instead, which is how these came back LOW (#148).
+            # from the rewrite instead, which is how these came back LOW (LAB-2765).
             ("cat <<'EOF' \\\n&& rm -rf /\nhello\nEOF", "continued opener, `&&` payload"),
             ("cat <<'EOF' \\\n; rm -rf /\nhello\nEOF", "continued opener, `;` payload"),
             ("cat <<'EOF' \\\n| rm -rf /\nhello\nEOF", "continued opener, `|` payload"),
@@ -998,32 +998,68 @@ class TestHeredocSurroundings:
             ("cat <<'EOF' \\", "nothing after the backslash at all"),
             ("cat <<'EOF' \\\n&& echo ok \\", "every physical line continues"),
             ("cat <<'EOF' \\\n\\", "a continuation that only continues"),
+            ("cat <<'A' \\\n<<'B' \\", "two openers, neither body ever reached"),
         ],
     )
     def test_logical_line_that_never_ends_fails_closed(self, command, description):
         """A command that never finishes is a body that never starts.
 
+        There is no dedicated guard for this and there does not need to be:
+        running out of input breaks the join loop, and the pending opener then
+        reaches the body loop, which finds no terminator and says so. A second
+        raise here would be a redundant one - the reason asserted below is the
+        no-terminator message, deliberately, so this keeps pinning the outcome
+        rather than the mechanism.
+
         Pinned directly rather than through `validate_command`, which denies
         these earlier: bashlex blames the unterminated command rather than the
         here-document, so the heredoc fallback is never reached - the same
-        reason `_read_delimiter` is pinned directly above. Joining physical
-        lines is what makes this backstop necessary; without it the loop would
-        run off the end of the input with bodies still pending.
+        reason `_read_delimiter` is pinned directly above.
         """
-        with pytest.raises(ParseError, match="never finishes its command"):
+        with pytest.raises(ParseError, match="has no terminator"):
             val_module._neuter_heredocs(command)
 
     @pytest.mark.parametrize(
-        "continued,one_line",
+        "continued,one_line,expected",
         [
-            ("cat <<'EOF' \\\n&& echo ok\nhello\nEOF", "cat <<'EOF' && echo ok\nhello\nEOF"),
-            ("cat <<'EOF' \\\n> out.txt\nhello\nEOF", "cat <<'EOF' > out.txt\nhello\nEOF"),
-            ("cat <<'A' \\\n<<'B'\n1\nA\n2\nB", "cat <<'A' <<'B'\n1\nA\n2\nB"),
-            ("cat <<'EOF' \\\n| grep x\nhello\nEOF", "cat <<'EOF' | grep x\nhello\nEOF"),
+            (
+                "cat <<'EOF' \\\n&& echo ok\nhello\nEOF",
+                "cat <<'EOF' && echo ok\nhello\nEOF",
+                ("cat <<SCHLOCK_HEREDOC && echo ok\n\nSCHLOCK_HEREDOC", "cat"),
+            ),
+            (
+                "cat <<'EOF' \\\n> out.txt\nhello\nEOF",
+                "cat <<'EOF' > out.txt\nhello\nEOF",
+                ("cat <<SCHLOCK_HEREDOC > out.txt\n\nSCHLOCK_HEREDOC", "cat"),
+            ),
+            (
+                "cat <<'A' \\\n<<'B'\n1\nA\n2\nB",
+                "cat <<'A' <<'B'\n1\nA\n2\nB",
+                ("cat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC", "cat"),
+            ),
+            # The opener sitting on the CONTINUATION line is the case that
+            # breaks if the head is read from the physical line instead of the
+            # logical one: `raw[:offset]` is empty here, which denied this
+            # outright as "no command in front of it".
+            (
+                "cat \\\n<<'EOF'\nx\nEOF",
+                "cat <<'EOF'\nx\nEOF",
+                ("cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC", "cat"),
+            ),
+            (
+                "rm -rf / \\\ncat <<'EOF'\nx\nEOF",
+                "rm -rf / cat <<'EOF'\nx\nEOF",
+                ("rm -rf / cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC", "rm -rf / cat"),
+            ),
         ],
     )
-    def test_a_continuation_rewrites_to_the_same_thing_as_one_line(self, continued, one_line):
+    def test_a_continuation_rewrites_to_the_same_thing_as_one_line(self, continued, one_line, expected):
         """Bash deletes a backslash-newline, so both spellings are one command.
+
+        Both sides are pinned against a literal rather than against each other:
+        asserting the two calls agree is a cross-check between the code under
+        test and itself, which survives the lexer breaking identically for both
+        - the same trap this class's docstring warns about for verdicts.
 
         This is the property the fix rests on, and it is worth pinning on its
         own: keeping the physical line break instead handed the escalation pass
@@ -1033,7 +1069,8 @@ class TestHeredocSurroundings:
         command is not, and denied `cat <<'A' \\` + `<<'B'` outright - two
         unrelated-looking wrong verdicts from one malformed rewrite.
         """
-        assert val_module._neuter_heredocs(continued) == val_module._neuter_heredocs(one_line)
+        assert val_module._neuter_heredocs(continued) == expected
+        assert val_module._neuter_heredocs(one_line) == expected
 
     def test_rewrite_denies_a_command_with_no_opener_it_can_see(self):
         """Reaching the fallback means bashlex blamed a heredoc; finding none means we misread it.

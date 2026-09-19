@@ -916,15 +916,17 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
     looking for the first `<<` would find the quoted ones this deliberately
     skipped.
 
-    The trailing flag is true when an unescaped `\\` ends the line. Together with
-    a still-open ``quote`` it tells the caller the newline here is not a newline
-    *token* - bash removes a backslash-newline and swallows a newline inside a
-    quoted string - so the command, and with it the start of any pending heredoc
-    body, carries on to the next physical line (LAB-2781).
+    The trailing flag is exactly "an unescaped `\\` ends this line", not "this
+    line continues" - a line ending inside an open ``quote`` continues in bash
+    too and reports ``False`` here. Either way the newline is not a newline
+    *token* (bash removes a backslash-newline and swallows one inside a quoted
+    string), so the command, and with it the start of any pending heredoc body,
+    carries on to the next physical line. The caller handles the two separately
+    because only one of them can be joined safely (LAB-2781).
     """
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
-    continued = False
+    ends_with_backslash = False
     pos = 0
 
     while pos < len(line):
@@ -942,7 +944,7 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
             out.append(char)
             pos += 1
         elif char == "\\":
-            continued = pos + 1 >= len(line)
+            ends_with_backslash = pos + 1 >= len(line)
             out.append(line[pos : pos + 2])
             pos += 2
         elif char == "$" and pos + 1 < len(line) and line[pos + 1] in "'\"":
@@ -975,7 +977,7 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
             out.append(char)
             pos += 1
 
-    return "".join(out), openers, quote, continued
+    return "".join(out), openers, quote, ends_with_backslash
 
 
 def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines nest in bodies; flattening hides that
@@ -1030,11 +1032,16 @@ def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines ne
         parts: list[str] = []
         while True:
             raw = lines[index]
-            line, openers, quote, continued = _rewrite_openers(raw, quote)
+            line, openers, quote, ends_with_backslash = _rewrite_openers(raw, quote)
             index += 1
 
             if base_command is None and openers:
-                base_command = raw[: openers[0][2]].strip()
+                # The command owning this heredoc starts where the LOGICAL line
+                # does. Taking only `raw` denied `cat \` + `<<'EOF'` outright
+                # ("no command in front of it") - a false positive on exactly
+                # the shape this reads - and undercounted the head everywhere
+                # else, so the two spellings of one command disagreed.
+                base_command = ("".join(parts) + raw[: openers[0][2]]).strip()
             pending.extend(openers)
 
             if pending and quote:
@@ -1045,8 +1052,10 @@ def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines ne
                 # `rm -rf /)"` is SAFE today (LAB-4114). Joining here would turn
                 # that standing hole into a heredoc bypass, so this arm keeps
                 # failing closed until the engine reads multi-line substitutions.
-                raise ParseError("Heredoc opener on a line that ends inside a quote; the body's start is unknown")
-            if not continued:
+                raise ParseError(
+                    f"Heredoc opener on a line that ends inside a quote (line {index}); the body's start is unknown"
+                )
+            if not ends_with_backslash:
                 parts.append(line)
                 break
 
@@ -1059,16 +1068,16 @@ def _neuter_heredocs(  # noqa: PLR0912 - physical lines nest in logical lines ne
             # `<<'B'`, and reading `cat <<'EOF' \` + `> out.txt` as a truncation
             # the same command on one line is not.
             #
-            # `continued` is set only where the backslash is the line's last
-            # character, and nothing is emitted after it, so the slice drops that
-            # escape and nothing else.
+            # `ends_with_backslash` is set only where that backslash is the
+            # line's last character, and nothing is emitted after it, so the
+            # slice drops the escape and nothing else.
             parts.append(line[:-1])
 
             if index >= len(lines):
-                if pending:
-                    # The command never ends, so the body never starts. Shell we
-                    # cannot locate is shell we cannot vouch for.
-                    raise ParseError("Heredoc opener on a line that never finishes its command; the body's start is unknown")
+                # The command never ends, so the body never starts. Breaking
+                # here is what makes that a clean denial rather than an
+                # IndexError: any pending opener falls through to the body loop
+                # below, which finds no terminator and says so.
                 break
         rewritten.append("".join(parts))
 
