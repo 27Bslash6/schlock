@@ -618,13 +618,28 @@ class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
         # without stripping first, one stray newline lands this pipeline on BLOCKED.
         assert validate_command(command + "\n").risk_level == RiskLevel.SAFE
 
+    def test_a_payload_cannot_ride_a_slot_of_an_entry_that_does_declare_a_separator(self):
+        # Writing a separator is not sufficient either: `\S+` matches `;` and `&`, so a payload
+        # rides the entry's own argument slots and the pattern still matches end to end. The
+        # entry declared TWO commands; bash finds four. Both payloads are denied bare.
+        for sep in (";", "&"):
+            for payload in ("sudo", "mkfs.ext4"):
+                command = f"gh auth token | docker login ghcr.io -u foo{sep}{payload}{sep}true --password-stdin"
+                assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
     def test_a_newline_is_a_separator_the_pattern_writes_for_the_author(self):
-        # `\s` matches a newline, but bash SPLITS on one. So the entry's own whitespace spans
-        # a line break its author never wrote, and the one regex "command" is several to bash.
-        # Both payloads below are denied bare, and rode the entry's two `\S+` slots.
+        # `\s` matches a newline, but bash SPLITS on one. So the entry's own whitespace spans a
+        # line break its author never wrote, and one regex "command" is several to bash.
         injected = "gh auth token | docker login\n{}\n-u\nfoo\n--password-stdin"
         for payload in ("sudo", "mkfs.ext4"):
             assert validate_command(injected.format(payload)).risk_level == RiskLevel.BLOCKED
+
+    def test_the_legal_multi_line_spelling_of_the_pipeline_still_clears(self):
+        # A newline AFTER `|` is a bash continuation, not a separator — still one two-command
+        # pipeline (`bash -n` agrees), so counting clears it where banning newlines would not.
+        # A newline BEFORE `|` is a bash syntax error, and is not a case worth preserving.
+        command = "gh auth token |\n  docker login ghcr.io -u me --password-stdin"
+        assert validate_command(command).risk_level == RiskLevel.SAFE
 
     def test_the_everyday_cleanup_the_new_guard_must_not_break(self):
         # The separator test is what stops `rm -rf dist/ && rm -rf /`; it must not cost the

@@ -18,12 +18,15 @@ from schlock.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
-# Does a whitelist pattern's SOURCE write a command separator? Used by `is_whitelisted_whole`
-# to tell an entry authored about a command LINE from one authored about a command. Matches a
-# literal pipe as a regex spells it (`\|` or `[|]`), plus `&` and `;`, which are not regex
-# metacharacters and so already mean themselves. A BARE `|` is deliberately absent: in a regex
-# it is alternation, which is what `(node_modules|dist|build)` uses and what must NOT count.
-_WRITES_A_SEPARATOR = re.compile(r"\\\||\[\|\]|&|;")
+# Counts the command separators a whitelist pattern's SOURCE writes, so `is_whitelisted_whole`
+# can ask how many commands the entry claims to describe. Longest alternative first, so `&&`
+# counts once rather than twice. A literal pipe is matched as a regex spells it (`\|`, `\|\|`
+# or `[|]`); `&` and `;` are not regex metacharacters and already mean themselves. A BARE `|`
+# is deliberately absent: in a regex it is alternation, which is what `(node_modules|dist)`
+# uses and what must NOT count. Ceiling: a pipe spelled `\x7c`, `\174` or inside a wider class
+# is not recognised, so such an entry is read as describing one command and clears no line --
+# the fail-closed direction, costing a false positive on an exotic spelling, never a denial.
+_DECLARED_SEPARATORS = re.compile(r"&&|\\\|\\\||\\\||\[\|\]|;|&")
 
 
 class RiskLevel(Enum):
@@ -651,52 +654,54 @@ class RuleEngine:
         """
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
-    def is_whitelisted_whole(self, command: str) -> bool:
-        """Check if a whitelist entry was written about this ENTIRE command line.
+    def is_whitelisted_whole(self, command: str, segment_count: int) -> bool:
+        """Check if a whitelist entry describes this command line, commands and all.
 
         `is_whitelisted` is a prefix test, which is what a single command needs: `^ls\\b` is
-        meant to clear `ls -la`. Applied to a command with several segments it clears the
-        segments the author never wrote down — `^ls\\b` matches `ls && rm -rf /` on its first
-        two characters, whitelisting the `rm`.
+        meant to clear `ls -la`. Applied to a line with several commands it clears the ones the
+        author never wrote down — `^ls\\b` matches `ls && rm -rf /` on its first two characters,
+        whitelisting the `rm`. So a line with several commands needs a different question.
 
-        Two things have to hold, and consuming the line is only the second of them.
+        The question is whether the entry describes THIS MANY commands. An entry declares its
+        count by writing separators: `^ls\\b` writes none and so speaks for one command and can
+        never clear a line; the gh/docker entry writes one `\\|` and so speaks for exactly two.
+        If bash finds more commands than the entry declared, the extra ones are not the author's
+        and the entry does not cover them.
 
-        Anchoring is NOT sufficient on its own. A pattern can be anchored and still open-ended:
-        the shipped build-cleanup entry ends `(/.*)?$`, whose `.*` eats `&& rm -rf /` quite
-        legitimately, so it fullmatches the whole line and clears the payload. `rm -rf dist`
-        is denied while `rm -rf dist/ && rm -rf /` was allowed, on one trailing slash.
+        Counting is what makes this hold where the two weaker tests do not:
 
-        So the first test is whether the entry MENTIONS a separator. Writing one is how an
-        author says "I am describing a command line, not a command" — the `\\|` in the gh/docker
-        entry is deliberate, and nothing else in the shipped set writes one (the `|`s in that
-        cleanup entry are regex alternation, not pipes, which is exactly the distinction). An
-        entry that never writes a separator cannot have been written about a line that has one.
+        * Consuming the line is not sufficient. A pattern can be anchored AND open-ended -- the
+          shipped cleanup entry ends `(/.*)?$`, whose `.*` eats `&& rm -rf /` quite legitimately.
+          It declares no separator, so it now speaks for one command and clears no line.
+        * Writing a separator is not sufficient either. `\\S+` matches `;`, so
+          `docker login ghcr.io -u foo;sudo;true --password-stdin` satisfies the gh/docker entry
+          end to end while bash runs four commands. Declared two, found four: refused.
+        * And a newline is a separator to bash while `\\s` matches one, so an entry's own
+          whitespace could span a line break its author never wrote. Counting sees through that
+          too -- and, unlike rejecting newlines outright, it still clears the LEGAL multi-line
+          spelling, `gh auth token |` + newline + `docker login ...`, which bash reads as one
+          two-command pipeline because the newline follows a pipe.
 
-        Known ceiling: this reads the pattern's SOURCE, so an entry that mentions a separator
-        only incidentally (a `;` inside a character class) is judged separator-literate and
-        falls back to the anchoring test alone. That is the old behaviour for that one entry,
-        not a new hole.
+        What this deliberately does NOT judge is how loose a single command's arguments are. The
+        same `\\S+` also accepts `>/path`, a redirection rather than a command, which leaves the
+        count at two. That is the entry's own shape to fix, not this gate's.
 
         Args:
-            command: Command string to check
+            command: Full command line being validated
+            segment_count: How many commands the parser found in it
 
         Returns:
-            True if a separator-writing whitelist pattern matches the command end to end
+            True if a whitelist entry declares exactly this many commands and matches them all
         """
         # Surrounding blank space is not executable content, and `$` matches BEFORE a trailing
-        # newline while `fullmatch` would have to consume it — without this, a trailing "\n"
+        # newline while `fullmatch` would have to consume it -- without this, a trailing "\n"
         # unseats the anchored entry and lands the pipeline on BLOCKED.
         command = command.strip()
-        # A newline IS a command separator, and `\s` matches one — so an entry's own whitespace
-        # spans a line break the author never wrote, and what the regex reads as one command is
-        # several to bash. Measured: `docker login\n/tmp/evil.sh\n-u\nfoo\n--password-stdin`
-        # satisfies the gh/docker entry end to end, and bash runs line two. `sudo` and
-        # `mkfs.ext4` ride the same slots, both denied bare. An entry vouches for ONE line.
-        if "\n" in command:
-            return False
-        return any(
-            _WRITES_A_SEPARATOR.search(pattern.pattern) and pattern.fullmatch(command) for pattern in self.whitelist_patterns
-        )
+        for pattern in self.whitelist_patterns:
+            declared = len(_DECLARED_SEPARATORS.findall(pattern.pattern))
+            if declared and declared + 1 == segment_count and pattern.fullmatch(command):
+                return True
+        return False
 
     def match_command(
         self,

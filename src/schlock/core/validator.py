@@ -1366,13 +1366,14 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # alone is credential theft, and only the whole pipe to `docker login
                 # --password-stdin` is safe. That entry is the reason this fast path exists.
                 #
-                # SECURITY: it must take a whitelist entry AUTHORED about a command line, which
-                # `is_whitelisted_whole` decides and `is_whitelisted` does not. A prefix test
-                # here handed every single-command entry the rest of the line — `ls && rm -rf /`
-                # cleared on its first two characters, past the very segment loop below that
-                # exists to catch it. Anchoring alone is not the test either; see that method.
-                # Do NOT "simplify" this back to `is_whitelisted` (LAB-4290).
-                if engine.is_whitelisted_whole(command):
+                # SECURITY: it must take a whitelist entry that describes THIS MANY commands,
+                # which `is_whitelisted_whole` decides and `is_whitelisted` does not. A prefix
+                # test here handed every single-command entry the rest of the line — so
+                # `ls && rm -rf /` cleared on its first two characters, past the very segment
+                # loop below that exists to catch it. Neither anchoring nor merely mentioning a
+                # separator is sufficient; the segment count is what the entry is held to, so
+                # it is passed in. Do NOT "simplify" this back to `is_whitelisted` (LAB-4290).
+                if engine.is_whitelisted_whole(command, len(segments)):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
