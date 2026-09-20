@@ -178,7 +178,9 @@ rules:
   - name: git_merge
     description: Can create conflicts
     risk_level: MEDIUM
-    patterns: ['git\s+merge']
+    # Bounded: unanchored 'git\s+merge' also matched the read-only `git merge-base`, which is
+    # the most common git invocation there is inside a substitution ($(git merge-base a b)).
+    patterns: ['git\s+merge(\s|$)']
     alternatives: ["Clean working directory"]
 
   - name: git_rebase

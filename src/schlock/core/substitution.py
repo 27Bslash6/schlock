@@ -4,7 +4,8 @@ This module provides AST-based detection and validation of command substitution
 $(cmd) and process substitution <(cmd) patterns.
 
 Security Model:
-1. WHITELIST FIRST - Known-safe commands (op, date, git, etc.) pass immediately
+1. WHITELIST FIRST - Known-safe base commands take the fast path, but every tier
+   still runs the YAML rules: a whitelist judges the base command, not the invocation
 2. AST STRUCTURAL CHECKS - Detect brace expansion, variable commands, etc.
 3. RECURSIVE VALIDATION - Full validation of inner commands with depth limit
 4. DEFAULT-DENY - Unknown commands in substitution context are blocked
@@ -90,7 +91,9 @@ SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         "sha256sum",
         "shasum",
         "cksum",
-        # Git (read-only operations - write ops would fail in substitution anyway)
+        # Git. A substitution EXECUTES what it expands, so write ops do NOT "fail in
+        # substitution anyway" — $(git push) really pushes. Whitelisting admits the base
+        # command only; the YAML rules judge the subcommand. See _check_inner_rules.
         "git",
         # Directory change (subshell-pure: only affects cwd inside the $() subshell, no exec).
         # Safe to whitelist now that $(cd … && …) parses; without it the canonical repro
@@ -145,11 +148,10 @@ SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
-# Commands that are conditionally safe inside substitution
-# These require subcommand-level analysis AND still go through YAML rules.
-# Unlike SAFE_SUBSTITUTION_COMMANDS (which bypass rules), contextual commands
-# preserve defense-in-depth: the YAML rule engine catches dangerous patterns
-# (e.g., kubectl_secrets_theft) that the subcommand allowlist alone would miss.
+# Commands that are conditionally safe inside substitution.
+# Every tier runs the YAML rules (_check_inner_rules); what this tier ADDS is
+# subcommand-level structural analysis in _has_dangerous_inner_structure(), for commands
+# whose safety is decided by the subcommand rather than by the base command.
 CONTEXTUAL_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
     {
         # kubectl: read-only subcommands safe, state-modifying subcommands dangerous
@@ -1453,17 +1455,9 @@ class SubstitutionValidator:
             all_whitelisted = all_whitelisted and result.whitelisted
 
         # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
-        if sub_node.inner_command and self.rule_engine is not None:
-            rule_match = self.rule_engine.match_command(sub_node.inner_command)
-            if rule_match and rule_match.matched:
-                amplified_risk = self._amplify_risk(rule_match.risk_level)
-                if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-                    return SubstitutionValidationResult(
-                        allowed=False,
-                        risk_level=RiskLevel.BLOCKED,
-                        message=f"Inner command blocked: {rule_match.message}",
-                        inner_results=inner_results,
-                    )
+        blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
+        if blocked:
+            return blocked
 
         return SubstitutionValidationResult(
             allowed=True,
@@ -1513,6 +1507,10 @@ class SubstitutionValidator:
         if getattr(cmd_node, "kind", None) == "pipeline":
             return self._validate_pipeline_stages(sub_node, cmd_node, depth)
 
+        # INVARIANT: every path below that returns allowed=True must first pass
+        # _check_inner_rules(). Skipping it is what made a whitelisted command get a
+        # weaker check than an unrecognised one (LAB-4182).
+        #
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):
             blocked = self._check_structural_and_nested(sub_node, depth)
@@ -1529,16 +1527,13 @@ class SubstitutionValidator:
             )
 
         # Layer 1b: Contextual whitelist — commands with subcommand-dependent safety.
-        # Unlike the full whitelist, these STILL go through YAML rules (defense in depth).
+        # Adds subcommand structural analysis on top of the rules every tier runs.
         # e.g., kubectl: "get pods" is safe, but "get secrets -o json" is caught by YAML rules.
         if sub_node.base_command in CONTEXTUAL_SUBSTITUTION_COMMANDS:
             blocked = self._check_structural_and_nested(sub_node, depth)
             if blocked:
                 return blocked
 
-            # YAML rule check — defense in depth for contextual commands.
-            # This catches patterns like kubectl_secrets_theft, kubectl_rbac_manipulation
-            # that the structural checks alone would miss.
             blocked = self._check_inner_rules(sub_node)
             if blocked:
                 return blocked
@@ -1620,31 +1615,42 @@ class SubstitutionValidator:
             inner_results=inner_results,
         )
 
-    def _check_inner_rules(self, sub_node: SubstitutionNode) -> SubstitutionValidationResult | None:
+    def _check_inner_rules(
+        self,
+        sub_node: SubstitutionNode,
+        inner_results: list[SubstitutionValidationResult] | None = None,
+    ) -> SubstitutionValidationResult | None:
         """Run the YAML rule engine over a substitution's inner command.
 
-        Defense in depth for the two whitelist tiers. Being on a whitelist means the base
-        command is safe to *name* in a substitution, not that every invocation of it is: a
-        whitelist is a base-command judgement, and base commands like ``git`` and ``kubectl``
-        carry their real risk in the subcommand. Without this, a whitelisted command got a
-        weaker check than an unrecognised one, which reaches the same rule engine at Layer 4.
+        Defense in depth for every tier that would otherwise return allowed=True. Being on a
+        whitelist means the base command is safe to *name* in a substitution, not that every
+        invocation of it is: a whitelist is a base-command judgement, and base commands like
+        ``git`` and ``kubectl`` carry their real risk in the subcommand. Without this, a
+        whitelisted command got a weaker check than an unrecognised one (LAB-4182).
+
+        The returned risk is the rule's own level amplified by one, NOT a flat BLOCKED. The
+        hook maps risk to the action (HIGH -> ask, BLOCKED -> deny), so flattening turned a
+        MEDIUM rule into an un-promptable denial — a two-level jump the amplifier does not
+        claim, and enough over-blocking to make users switch schlock off.
 
         Returns:
             A denial result if a rule matches at amplified HIGH or above, else None.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
-        if not sub_node.inner_command:
+        if not sub_node.inner_command or self.rule_engine is None:
             return None
         rule_match = self.rule_engine.match_command(sub_node.inner_command)
         if not (rule_match and rule_match.matched):
             return None
-        if self._amplify_risk(rule_match.risk_level) not in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+        amplified_risk = self._amplify_risk(rule_match.risk_level)
+        if amplified_risk not in (RiskLevel.BLOCKED, RiskLevel.HIGH):
             return None
         return SubstitutionValidationResult(
             allowed=False,
-            risk_level=RiskLevel.BLOCKED,
+            risk_level=amplified_risk,
             message=f"Inner command blocked: {rule_match.message}",
+            inner_results=inner_results or [],
         )
 
     def _amplify_risk(self, risk_level: RiskLevel) -> RiskLevel:

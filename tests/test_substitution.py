@@ -1488,6 +1488,10 @@ class TestWhitelistedSubstitutionYamlRules:
             'echo "$(ls -la)"',
             'echo "$(git log --oneline -5)"',
             'X=$(cd "$(git rev-parse --git-dir)" && pwd)',
+            # git_merge's pattern was unanchored and matched the read-only `git merge-base`
+            "X=$(git merge-base main HEAD)",
+            # a *scoped* find sits one character from the blocked unscoped one
+            'FILES=$(find . -name "*.py")',
         ],
     )
     def test_read_only_whitelisted_substitutions_stay_safe(self, command, validator, parser):
@@ -1514,17 +1518,32 @@ class TestWhitelistedSubstitutionYamlRules:
         assert result.allowed is False
         assert expected in result.message.lower()
 
-    def test_resource_advisory_is_amplified_into_a_denial(self):
-        """Documented collateral of mirroring Layer 1b: MEDIUM + 1 == HIGH, which denies.
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # resource_intensive_operations (advisory: these are read-only, just expensive)
+            "echo $(find / -name foo)",
+            'echo "$(du -h /)"',
+            'echo "$(grep -r x /)"',
+            # the three side-effecting MEDIUM git rules
+            'echo "$(git push)"',
+            'echo "$(git merge main)"',
+            'echo "$(git rebase main)"',
+        ],
+    )
+    def test_medium_rules_escalate_to_ask_not_deny(self, command):
+        """Full collateral of the change: FOUR MEDIUM rules rate a whitelisted base command.
 
-        `resource_intensive_operations` is the only advisory (non-side-effecting) MEDIUM rule
-        that rates a whitelisted base command, so an unscoped `find /` inside a substitution now
-        denies rather than warns. Pinned deliberately: re-rate the rule or drop the amplifier on
-        this path to change it, but do not change it by accident.
+        MEDIUM + 1 == HIGH, and the hook maps HIGH to *ask*. That is the whole point of
+        returning the amplified level rather than a flat BLOCKED: three of these four rules
+        describe real side effects worth a prompt, and the fourth
+        (`resource_intensive_operations`) is a pure performance advisory that must never
+        become an un-promptable denial. Pinned so neither half moves by accident.
         """
-        result = validate_command("echo $(find / -name foo)")
+        result = validate_command(command)
         assert result.allowed is False
-        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.risk_level == RiskLevel.HIGH
+        assert not result.message.startswith("BLOCKED")
 
 
 class TestRemainingBranchCoverage:

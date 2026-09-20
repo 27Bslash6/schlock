@@ -1289,10 +1289,14 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             sub_results = sub_validator.validate_all_substitutions(ast)
             for sub_result in sub_results:
                 if not sub_result.allowed:
+                    # The hook maps risk to the action, so only a genuine BLOCKED verdict may
+                    # claim the word: an amplified-HIGH one is shown as an "ask" prompt, and a
+                    # prompt whose text reads "BLOCKED" tells the user the opposite of the truth.
+                    denied = sub_result.risk_level == RiskLevel.BLOCKED
                     return ValidationResult(
                         allowed=False,
                         risk_level=sub_result.risk_level,
-                        message=f"BLOCKED: {sub_result.message}",
+                        message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
                         alternatives=[
                             "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
                             "Run the command directly instead of using substitution",
