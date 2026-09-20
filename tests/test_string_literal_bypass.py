@@ -197,6 +197,26 @@ class TestSuppressionIsPerOccurrence:
         assert match.matched, "heredoc decoy suppressed the rule for the payload after the terminator"
         assert match.risk_level == RiskLevel.BLOCKED
 
+    def test_sole_non_shell_heredoc_occurrence_stays_suppressed(self, rules_dir_path):
+        """Running out of occurrences is an answer, not a failure to find one.
+
+        The scan keeps looking past a suppressed match because a later one may
+        be executable. When none is - a `cat` heredoc body and nothing after it
+        - it has to exhaust and report nothing. This is the only guard on the
+        heredoc branch that can FAIL: the end-to-end row for the same shape
+        (`tests/test_dangerous_commands.py`, "Heredoc with rm -rf") reports a
+        false positive with `pytest.skip`, so it degrades to a skip rather than
+        a failure and cannot pin this direction.
+        """
+        body_start = len("cat <<'EOF'\n")
+        command = f"cat <<'EOF'\n{self.FORK_BOMB}\nEOF"
+        body_end = body_start + len(self.FORK_BOMB)
+
+        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=[(body_start, body_end, False)])
+
+        assert not match.matched, "inert heredoc body rated dangerous - suppression stopped covering the only occurrence"
+        assert match.risk_level == RiskLevel.SAFE
+
     @pytest.mark.parametrize(
         "template,description",
         [
