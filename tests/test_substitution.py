@@ -1614,6 +1614,27 @@ class TestWhitelistedSubstitutionYamlRules:
         assert validate_command(command).allowed is False
 
     @pytest.mark.parametrize(
+        "command",
+        [
+            # git is whitelisted per BASE command, but its risk lives in the subcommand and the
+            # structural guard enumerates only `-c KEY=VAL`. These hand the payload to a shell.
+            "echo \"$(git submodule foreach 'rm -rf /')\"",
+            "echo \"$(git bisect run 'rm -rf /')\"",
+            "echo \"$(git filter-branch --tree-filter 'rm -rf /' HEAD)\"",
+            "echo \"$(git rebase --exec 'rm -rf /' main)\"",
+            # the space-form spellings of the flags whose `=` form _STRUCTURED_WORD catches
+            "echo \"$(git difftool --extcmd 'rm -rf /' HEAD)\"",
+            "echo \"$(git fetch --upload-pack 'rm -rf /' origin)\"",
+            "echo \"$(sort --compress-program 'rm -rf /' f)\"",
+        ],
+    )
+    def test_argument_executing_shapes_suppress_nothing(self, command):
+        """A command that runs one of its own arguments receives no opaque data at all."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
         ("command", "expected_ranges"),
         [
             # The command name is never data, however it is quoted — it IS the command.
@@ -1864,12 +1885,20 @@ class TestSubstitutionWriteAndWordlessShapes:
         assert result.allowed is True
         assert result.risk_level == RiskLevel.SAFE
 
-    def test_brace_group_still_fails_closed_on_a_malformed_list(self):
-        """Peeling the terminator must not relax the topology rule for what remains."""
+    def test_brace_group_still_validates_every_segment_after_peeling(self):
+        """Peeling the terminator must not let the group's own segments go unvalidated.
+
+        NOT a topology test, despite where it sits: the peeled list is well-formed, so the
+        denial here comes from `rm` being blacklisted. `_is_valid_list_topology` cannot be
+        reached from source at all — bashlex rejects every malformed spelling at parse time —
+        so it is pinned directly in `test_list_topology_validation` and against a synthetic AST
+        in `test_malformed_list_topology_blocked_end_to_end` instead.
+        """
         validator_module.clear_caches()
         result = validate_command('echo "$( { ls; cat /etc/hosts; rm -rf /; } )"')
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
+        assert "rm" in result.message
 
 
 class TestRemainingBranchCoverage:

@@ -790,6 +790,36 @@ def _command_tokens(node: Any) -> list[tuple[str, bool]]:
     return [(part.word, index > 0 and _is_opaque_argument(part)) for index, part in enumerate(parts)]
 
 
+# Shapes that hand one of their own arguments to a shell. These take the command as a SEPARATE
+# word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD.
+_ARGUMENT_EXECUTING_FLAGS = frozenset(
+    {
+        "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
+        "--parent-filter", "--exec", "-x", "--extcmd", "--upload-pack", "--receive-pack",
+        "--to-cmd", "--cc-cmd", "--header-cmd", "--access-hook", "--compress-program",
+        "--diff-program", "--pager",
+    }
+)  # fmt: skip
+_ARGUMENT_EXECUTING_GIT = (("submodule", "foreach"), ("bisect", "run"), ("filter-branch",))
+
+
+def _executes_an_argument(words: list[str]) -> bool:
+    """Does this command hand one of its own arguments to a shell?
+
+    Then NOTHING it receives is opaque data, however it was quoted, and the whole-text rule
+    pass has to see all of it. ``git`` is the case that matters: it is whitelisted per BASE
+    command, but its risk lives in the subcommand, and the structural guard enumerates only
+    ``-c KEY=VAL`` — so ``git submodule foreach 'rm -rf /'`` would otherwise have its payload
+    suppressed as an argument (LAB-4234).
+
+    Deliberately coarse: a match disables suppression for the whole rendered command, which
+    only ever costs a false positive on an exotic spelling, never a missed denial.
+    """
+    if any(word in _ARGUMENT_EXECUTING_FLAGS for word in words):
+        return True
+    return "git" in words and any(all(part in words for part in shape) for shape in _ARGUMENT_EXECUTING_GIT)
+
+
 def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, int]]]:
     """Join tokens with single spaces; return the text and the spans holding opaque data.
 
@@ -798,6 +828,8 @@ def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, i
     demands the WHOLE match sit inside a span, so an unwidened span misses the suppression.
     """
     text = " ".join(token for token, _ in tokens)
+    if _executes_an_argument([token for token, _ in tokens]):
+        return text, []
     ranges: list[tuple[int, int]] = []
     position = 0
     for token, is_data in tokens:
