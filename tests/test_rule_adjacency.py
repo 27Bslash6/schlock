@@ -511,6 +511,7 @@ class TestACredentialNameNeedsAPosition:
         assert "extended_credential_exposure" in result.matched_rules, command
 
 
+@pytest.mark.slow
 class TestUnanchoredSearchStaysLinear:
     """Per-word parsing being unambiguous does NOT make the search linear.
 
@@ -575,6 +576,7 @@ class TestUnanchoredSearchStaysLinear:
         assert large < small * 40, f"{small:.4f}s -> {large:.4f}s is worse than quadratic"
 
 
+@pytest.mark.slow
 class TestPatternsDoNotBacktrackCatastrophically:
     """The git flag group nests quantifiers, so its branches are kept disjoint.
 
