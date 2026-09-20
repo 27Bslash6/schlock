@@ -3,6 +3,8 @@
 Also includes FIX 5: matched_rules field population test.
 """
 
+import time
+
 import pytest
 
 import schlock.core.validator as val_module
@@ -1000,3 +1002,175 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+class TestArithmeticCommandShift:
+    """LAB-4317: a `<<` inside `(( … ))` is a left shift, not a heredoc opener.
+
+    bashlex reads `(( 1<<b ))` as two nested subshells, which makes `1 <<b` a
+    command owning a heredoc delimited by `b` - so `rm -rf /` on the next line
+    became an inert body that no rule ever saw, while bash evaluated the shift
+    and ran it. The fail-open yielded `SAFE`, which every preset maps to *allow*,
+    and only a ShellCheck SC2154 escalation caught it - a correlated backstop,
+    not a guard.
+
+    Verdicts are pinned as absolute values with ShellCheck forced off, and the
+    denials are pinned to the *rule the payload matched*. Asserting `BLOCKED`
+    alone would pass on a downstream bashlex parse failure, which is exactly how
+    this bug hid: the deny was real but the reason was wrong.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """Pin verdicts to the rules, not to whether ShellCheck is installed."""
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # AC-1: the two spellings from the report.
+            ("(( 1<<b ))\nrm -rf /\nb", "`))` on the opener line"),
+            ("((\n1<<b\n))\nrm -rf /\nb", "`))` on a later line"),
+            # The same hole reached by other routes.
+            ("(( 1<<b )) ; rm -rf /", "payload after `;` on the arithmetic line"),
+            ("(( 1<<b )) && rm -rf /", "payload after `&&`"),
+            ("(( 1<<b )) 2>/dev/null\nrm -rf /\nb", "a redirect on the arithmetic"),
+            ("if (( 1<<b )); then rm -rf /; fi\nb", "payload inside the `if` it guards"),
+            ("(( (( 1<<b )) ))\nrm -rf /\nb", "nested arithmetic"),
+            ("(( 1<<b )) && (( 2<<c ))\nrm -rf /\nb\nc", "two arithmetic commands, two shifts"),
+            ("(( 1<<b )) <<'Q'\nbody\nQ\nrm -rf /", "a real heredoc alongside the shift"),
+            # A quoted heredoc elsewhere used to send this down the fallback and
+            # the arithmetic re-hid the payload there too.
+            ("cat <<'EOF'\nx\nEOF\n(( 1<<b ))\nrm -rf /\nb", "after an unrelated quoted heredoc"),
+        ],
+    )
+    def test_payload_after_arithmetic_shift_is_validated(self, safety_rules_path, command, description):
+        """The lines bash runs after the arithmetic reach the rules that match them."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False, description
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        # AC-2: attributable. The payload was validated on its merits - this
+        # fails if the deny comes from a parse error instead.
+        assert "system_destruction" in result.matched_rules, description
+
+    def test_a_different_payload_matches_its_own_rule(self, safety_rules_path):
+        """Nothing here is special-cased to `rm -rf /`."""
+        result = validate_command("(( 1<<b ))\nchmod -R 777 /\nb", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules and "system_destruction" not in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command,allowed,risk,description",
+        [
+            # AC-3: the measured baseline on main. `for (( … ))` is already
+            # denied by a bashlex parse error - that over-block is 27Bslash6/schlock#106
+            # and #112, an explicit non-goal here, so it must stay exactly as it is.
+            ("(( i++ ))", True, RiskLevel.SAFE, "bare increment"),
+            ("for (( i=0; i<3; i++ )); do echo $i; done", False, RiskLevel.BLOCKED, "`for ((` stays denied"),
+            ("while (( n < 3 )); do echo hi; done", True, RiskLevel.SAFE, "`while ((`"),
+            ("if (( x )); then echo y; fi", True, RiskLevel.SAFE, "`if ((`"),
+            # Arithmetic expansion is not an arithmetic command; it is out of
+            # scope and its verdict must not move either.
+            ("echo $(( 1<<3 ))", False, RiskLevel.BLOCKED, "`$((` expansion stays denied"),
+        ],
+    )
+    def test_everyday_arithmetic_keeps_its_verdict(self, safety_rules_path, command, allowed, risk, description):
+        """Measured on main @ a285078 with ShellCheck off; none of these may move."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is allowed, description
+        assert result.risk_level == risk, description
+
+    def test_two_subshells_keep_their_real_heredoc(self, safety_rules_path):
+        """`( ( 1<<b ) )` is not arithmetic, and its `<<` really does open a heredoc.
+
+        Bash only reads `((` as arithmetic when the `)` balancing the second `(`
+        is immediately followed by another `)`. Verified against bash 5.3.9: the
+        payload below never runs, because the heredoc body swallows it. A guard
+        that fired on the doubled parens alone would start un-hiding genuine
+        heredoc bodies and denying commands bash treats as data.
+        """
+        result = validate_command("( ( 1<<b ) )\nrm -rf /\nb", config_path=safety_rules_path)
+
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ('echo "(( 1<<b ))"', "inside a double-quoted word"),
+            ("echo '(( 1<<b ))'", "inside a single-quoted word"),
+            ("echo $'(( 1<<b ))'", "inside an ANSI-C string"),
+            ("# (( 1<<b ))", "inside a comment"),
+        ],
+    )
+    def test_quoted_arithmetic_is_text_not_an_opener(self, safety_rules_path, command, description):
+        """A `((` bash reads as text is not rewritten here either."""
+        assert val_module._neuter_arithmetic_shifts(command) == command, description
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ("(( 1<<b ))", "a plain arithmetic command"),
+            ("(( x = 1<<8 ))", "an arithmetic assignment"),
+            ("(( flags |= 1<<3 ))", "the idiomatic flag shift"),
+            ("if (( x<<1 )); then echo y; fi", "a shift in an `if` condition"),
+        ],
+    )
+    def test_inert_arithmetic_is_allowed(self, safety_rules_path, command, description):
+        """Bash runs nothing here, so schlock stops denying it.
+
+        These were denied on main only by accident - the phantom heredoc had no
+        terminator, so the fallback refused to guess. Removing the phantom
+        removes that denial with it; it is the same construct as the exploit and
+        cannot be told apart from it after the fact.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, description
+
+    def test_substitution_inside_the_arithmetic_is_still_seen(self, safety_rules_path):
+        """Only the shift is rewritten, so `$( )` in a subscript stays visible.
+
+        Blanking the whole arithmetic region would be simpler and would hide
+        this - trading one fail-open for another, since bash really does run a
+        command substitution in an arithmetic subscript.
+        """
+        result = validate_command("(( a[$(rm -rf /)] << b ))\nls\nb", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_unterminated_arithmetic_is_left_alone(self):
+        """Bash runs nothing without the closing `))`, so there is nothing to un-hide."""
+        command = "(( 1<<b\nrm -rf /"
+
+        assert val_module._neuter_arithmetic_shifts(command) == command
+
+    def test_rewrite_preserves_offsets_and_is_idempotent(self):
+        """The placeholder is the same width, and a second pass is a no-op."""
+        once = val_module._neuter_arithmetic_shifts("(( 1<<b ))\nrm -rf /\nb")
+
+        assert once == "(( 1==b ))\nrm -rf /\nb"
+        assert val_module._neuter_arithmetic_shifts(once) == once
+
+    def test_many_shifts_stay_linear(self):
+        """Collecting a region's shifts by bisection, not by scanning them all.
+
+        `(((((…` has a `((` at every offset, so a per-candidate rescan is
+        quadratic. 2000 shifts in one 22 KB command took 97 ms that way; this is
+        a loose ceiling that still fails by two orders of magnitude if the
+        quadratic comes back.
+        """
+
+        command = "(( 1<<b ))\n" * 2000 + "ls\nb"
+        start = time.perf_counter()
+        val_module._neuter_arithmetic_shifts(command)
+
+        assert time.perf_counter() - start < 1.0

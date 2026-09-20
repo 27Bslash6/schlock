@@ -9,6 +9,7 @@ import logging
 import re
 import subprocess
 import threading
+from bisect import bisect_left
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
@@ -856,6 +857,136 @@ _WORD_END = frozenset(" \t;&|<>()")
 # opener that bash - and bashlex - both read as a comment.
 _WORD_START_AFTER = frozenset(" \t;&|()<>")
 
+# A comment also opens at the start of a line, which the line-oriented scan above
+# gets from `pos == 0` and a whole-text scan has to spell out.
+_COMMENT_AFTER = _WORD_START_AFTER | {"\n"}
+
+# What a `<<` inside an arithmetic command is rewritten to. Any two characters
+# with no shell meaning would do; `==` keeps the offsets of everything after it
+# and still reads as arithmetic to whoever opens the audit log.
+_ARITH_SHIFT = "=="
+
+
+def _scan_shell_text(  # noqa: PLR0912 - one branch per lexical state; splitting it hides the state machine
+    text: str,
+) -> tuple[dict[int, int], list[int], list[int]]:
+    r"""Pair the unquoted parens, and locate the unquoted `<<` and `((`.
+
+    Returns ``(partners, shift offsets, `((` offsets)``, where ``partners`` maps
+    each unquoted `(` to its closing `)`.
+
+    Bash's `((` matcher is a plain depth counter: `'…'`, `"…"`, `$'…'`, `\x` and
+    backticks are opaque, while `${…}` and newlines are transparent, so the `)`
+    in `${x:-)}` really does balance the pair (pinned against bash 5.3.9). `#` is
+    transparent there too, but it is a comment everywhere else and comments hold
+    unbalanced parens far more often than arithmetic holds a `#` - which is not
+    valid arithmetic anyway - so this reads it as a comment.
+
+    Pairing everything in one pass rather than re-reading to the partner from
+    each candidate is what keeps `((((((…` linear: that text has a `((` at every
+    offset, and a scan per candidate is quadratic in the length of the command.
+    """
+    partners: dict[int, int] = {}
+    shifts: list[int] = []
+    dparens: list[int] = []
+    open_parens: list[int] = []
+    pos = 0
+    end = len(text)
+
+    while pos < end:
+        char = text[pos]
+
+        if char == "\\":
+            pos += 2
+        elif char == "'":
+            close = text.find("'", pos + 1)
+            pos = end if close < 0 else close + 1
+        elif char in '"`' or (char == "$" and text[pos + 1 : pos + 2] == "'"):
+            # $'…' is ANSI-C quoting, where a backslash does not close the string; a
+            # backslash escapes inside `"…"` and backticks as well.
+            quote = "'" if char == "$" else char
+            pos += 2 if char == "$" else 1
+            while pos < end and text[pos] != quote:
+                pos += 2 if text[pos] == "\\" else 1
+            pos += 1
+        elif char == "#" and (pos == 0 or text[pos - 1] in _COMMENT_AFTER):
+            newline = text.find("\n", pos)
+            pos = end if newline < 0 else newline
+        elif char == "(":
+            # `$(` is a substitution, not an arithmetic opener - it only balances.
+            if text[pos + 1 : pos + 2] == "(" and (pos == 0 or text[pos - 1] != "$"):
+                dparens.append(pos)
+            open_parens.append(pos)
+            pos += 1
+        elif char == ")":
+            if open_parens:
+                partners[open_parens.pop()] = pos
+            pos += 1
+        elif text.startswith("<<<", pos):
+            pos += 3  # here-string, not a heredoc (LAB-2768)
+        elif text.startswith("<<", pos):
+            shifts.append(pos)
+            pos += 2
+        else:
+            pos += 1
+
+    return partners, shifts, dparens
+
+
+def _neuter_arithmetic_shifts(command: str) -> str:
+    """Rewrite a `<<` that bash reads as a left shift, not as a heredoc opener.
+
+    Bash reads `(( … ))` as one arithmetic command, so the `<<` in `(( 1<<b ))`
+    is a shift. bashlex reads the same bytes as two nested subshells, where
+    `1 <<b` is a command owning a heredoc delimited by `b` - and every line up to
+    a lone `b`, `rm -rf /` included, becomes a body that `extract_heredoc_ranges`
+    marks inert and no rule ever sees, while bash runs it (LAB-4317).
+
+    The two readings are told apart the way bash tells them apart: the construct
+    is arithmetic iff the partner of the second `(` is immediately followed by
+    another `)`. That test is not decoration - `( ( 1<<b ) )` really is two
+    subshells and its `<<` really does open a heredoc, so a guard that fired on
+    both would start deleting genuine heredoc bodies.
+
+    Only the shift is rewritten, not the arithmetic around it: an arithmetic
+    subscript can carry a command substitution (`(( a[$(id)] ))`), and blanking
+    the region would hide it from the substitution validator - trading this
+    fail-open for another one.
+    """
+    if "((" not in command or "<<" not in command:
+        return command
+
+    partners, shifts, dparens = _scan_shell_text(command)
+    if not shifts or not dparens:
+        return command
+
+    # `dparens` and `shifts` both arrive in ascending order, which is what keeps
+    # this linear: a nested region is wholly inside the one before it, so it is
+    # skipped rather than re-collected, and the shifts of a region are a
+    # contiguous slice found by bisection. Walking every shift per region
+    # instead is quadratic - 2000 arithmetic shifts in one 22 KB command took
+    # 97 ms that way, against 2.5 ms for the scan that found them.
+    hidden: set[int] = set()
+    collected_to = -1
+    for opener in dparens:
+        closer = partners.get(opener + 1)
+        if closer is None or command[closer + 1 : closer + 2] != ")":
+            # Unterminated, or a `)` that does not double: bash reads this as
+            # subshells (or refuses to run it at all), and bashlex agrees.
+            continue
+        if closer <= collected_to:
+            continue
+        collected_to = closer
+        hidden.update(shifts[bisect_left(shifts, opener + 2) : bisect_left(shifts, closer)])
+
+    if not hidden:
+        return command
+
+    rewritten = list(command)
+    for offset in hidden:
+        rewritten[offset : offset + 2] = _ARITH_SHIFT
+    return "".join(rewritten)
+
 
 def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     """Read the heredoc delimiter word at ``pos``, applying bash's quote removal.
@@ -1258,6 +1389,16 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         if special_check is not None:
             # Special case triggered, return result (don't cache, state may change)
             return special_check
+
+        # Step 3b: Reconcile the one place bashlex and bash disagree about what
+        # is even a command. A `<<` inside `(( … ))` is a left shift to bash and
+        # a heredoc opener to bashlex, and the phantom body hides every line
+        # after it from the rules (LAB-4317). Rewriting the shift hands those
+        # lines back to the flow below, which validates them on their merits -
+        # so the verdict comes from the rule the payload matches, not from this.
+        neutered = _neuter_arithmetic_shifts(command)
+        if neutered != command:
+            return validate_command(neutered, config_path, _depth=_depth)
 
         # Step 4: Parse command and extract AST context
         parser = _get_parser()
