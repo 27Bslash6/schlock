@@ -197,25 +197,54 @@ class TestSuppressionIsPerOccurrence:
         assert match.matched, "heredoc decoy suppressed the rule for the payload after the terminator"
         assert match.risk_level == RiskLevel.BLOCKED
 
-    def test_sole_non_shell_heredoc_occurrence_stays_suppressed(self, rules_dir_path):
-        """Running out of occurrences is an answer, not a failure to find one.
+    @pytest.mark.parametrize(
+        "start_delta,is_shell,expect_match,description",
+        [
+            # Running out of occurrences is an answer, not a failure to find one:
+            # the scan looks past a suppressed match because a later one may be
+            # executable, and when none is it must exhaust and report nothing.
+            (0, False, False, "inert body, sole occurrence - stays suppressed"),
+            # The discriminator, in the under-block direction. A shell runs its
+            # heredoc body, so the identical text must still match.
+            (0, True, True, "same body fed to a shell - it executes, so it matches"),
+            # Containment is both-ended, like `_is_in_string_literal`. A range
+            # opening inside the match does not cover it and cannot excuse it.
+            (4, False, True, "range opens mid-match - not covered, not inert"),
+        ],
+    )
+    def test_heredoc_suppression_covers_exactly_the_inert_body(
+        self, rules_dir_path, start_delta, is_shell, expect_match, description
+    ):
+        """Every decision `_is_in_non_shell_heredoc` makes, pinned in the direction that fails.
 
-        The scan keeps looking past a suppressed match because a later one may
-        be executable. When none is - a `cat` heredoc body and nothing after it
-        - it has to exhaust and report nothing. This is the only guard on the
-        heredoc branch that can FAIL: the end-to-end row for the same shape
-        (`tests/test_dangerous_commands.py`, "Heredoc with rm -rf") reports a
-        false positive with `pytest.skip`, so it degrades to a skip rather than
-        a failure and cannot pin this direction.
+        None of the three had a guard that could go red. Disabling the heredoc
+        arm of `_first_executable_match`, making `_is_in_non_shell_heredoc`
+        ignore `is_shell`, or dropping its `start <= match_start` bound each
+        left the whole suite green. The end-to-end row for the same shape
+        (`tests/test_dangerous_commands.py`, "Heredoc with rm -rf") passes
+        today, but its helper answers a false positive with `pytest.skip`, so
+        on any of these regressions it degrades to a skip rather than a
+        failure and can never pin this branch.
+
+        Ranges come from the parser rather than hand-counted offsets: it emits
+        `(10, 27, False)` here, running through the terminator line, so a
+        hand-built body-only range would be testing a shape production never
+        produces.
         """
-        body_start = len("cat <<'EOF'\n")
-        command = f"cat <<'EOF'\n{self.FORK_BOMB}\nEOF"
-        body_end = body_start + len(self.FORK_BOMB)
+        command = f"cat <<EOF\n{self.FORK_BOMB}\nEOF"
+        parser = BashCommandParser()
+        ((start, end, _),) = parser.extract_heredoc_ranges(command, parser.parse(command))
 
-        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=[(body_start, body_end, False)])
+        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=[(start + start_delta, end, is_shell)])
 
-        assert not match.matched, "inert heredoc body rated dangerous - suppression stopped covering the only occurrence"
-        assert match.risk_level == RiskLevel.SAFE
+        assert match.matched is expect_match, description
+        if expect_match:
+            assert match.risk_level == RiskLevel.BLOCKED, description
+            assert match.rule is not None and match.rule.name == "fork_bomb", description
+        else:
+            assert match.risk_level == RiskLevel.SAFE, description
+            # Not the whitelist short-circuit, which returns the same (False, SAFE) pair.
+            assert match.message == "No security rules matched", description
 
     @pytest.mark.parametrize(
         "template,description",
