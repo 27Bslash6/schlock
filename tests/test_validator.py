@@ -4,6 +4,8 @@ Also includes FIX 5: matched_rules field population test.
 """
 
 import time
+import timeit
+from bisect import bisect_left
 
 import pytest
 
@@ -1004,6 +1006,29 @@ class TestHeredocSurroundings:
         assert seen == ["cat", "echo ok"]
 
 
+def _bisect_calls(monkeypatch: "pytest.MonkeyPatch", command: str) -> int:
+    """How many times the region loop bisects during one real rewrite pass.
+
+    `bisect_left` is a module global of the validator and resolves at call time,
+    so counting calls to it reads the loop's work directly instead of timing a
+    proxy for it. That matters here specifically: CI runs under `--cov`, and
+    3.9's C tracer bills the linear character scan about four times over while
+    leaving the quadratic C-level slice work untraced, which squeezes a 13.6x
+    regression down to 9.4x. A clock cannot be trusted across that; a count is
+    identical on every machine, tracer and interpreter (LAB-4337).
+    """
+    calls = 0
+
+    def counting(offsets: list[int], target: int) -> int:
+        nonlocal calls
+        calls += 1
+        return bisect_left(offsets, target)
+
+    monkeypatch.setattr(val_module, "bisect_left", counting)
+    val_module._neuter_arithmetic_shifts(command)
+    return calls
+
+
 class TestArithmeticCommandShift:
     """LAB-4317: a `<<` inside `(( … ))` is a left shift, not a heredoc opener.
 
@@ -1243,31 +1268,56 @@ class TestArithmeticCommandShift:
         assert once == "(( 1==b ))\nrm -rf /\nb"
         assert val_module._neuter_arithmetic_shifts(once) == once
 
-    def test_many_shifts_stay_linear(self):
+    def test_many_shifts_stay_linear(self, monkeypatch: "pytest.MonkeyPatch"):
         """Collecting a region's shifts by bisection, not by scanning them all.
 
         `(((((…` has a `((` at every offset, so a per-candidate rescan is
-        quadratic. Measured on this input: 3.6 ms as shipped, 100 ms with the
-        rescan restored. The ceiling has to sit between those two, not merely
-        above both - at the 1.0 s it started out with, the quadratic passed.
+        quadratic - 2000 regions against 2000 shifts is four million
+        comparisons where two bisections per region is four thousand probes.
+        The rescan reaches `bisect_left` not at all, so the count separates the
+        two exactly: two per region as shipped, zero if the scan comes back.
         """
-        command = "(( 1<<b ))\n" * 2000 + "ls\nb"
-        start = time.perf_counter()
-        val_module._neuter_arithmetic_shifts(command)
+        regions = 2000
+        calls = _bisect_calls(monkeypatch, "(( 1<<b ))\n" * regions + "ls\nb")
 
-        assert time.perf_counter() - start < 0.025
+        assert calls == 2 * regions, f"{calls} bisections over {regions} regions, not the 2 per region a bisected collect makes"
 
-    def test_nested_regions_over_many_shifts_stay_linear(self):
+    def test_nested_regions_over_many_shifts_stay_linear(self, monkeypatch: "pytest.MonkeyPatch"):
         """Every nested region contains every shift, so re-collecting them is d*k.
 
         This is the shape the `collected_to` skip exists for, and the only one
         that notices if it goes. No verdict differs either way - the Step 3b
         recursion re-runs the rewrite, so a region missed on one pass is caught
         on the next - which is exactly why only a cost measurement can pin it.
-        Measured at this size: 2.8 ms as shipped, 54 ms without the skip.
+        The skip collapses every nested opener to a single collected region,
+        so the count is 2 whatever the depth; without it each opener re-collects
+        and the count is 4n-2 (verified at n=1000, 2000 and 4000).
         """
-        command = "((" * 2000 + "1<<b " * 2000 + "))" * 2000
-        start = time.perf_counter()
-        val_module._neuter_arithmetic_shifts(command)
+        calls = _bisect_calls(monkeypatch, "((" * 2000 + "1<<b " * 2000 + "))" * 2000)
 
-        assert time.perf_counter() - start < 0.025
+        assert calls == 2, f"{calls} bisections where collapsing every nested opener to one collected region makes 2"
+
+    def test_whole_pass_stays_inside_a_loose_budget(self):
+        """The counts pin the region loop; this pins everything around it.
+
+        `_scan_shell_text` could go quadratic without moving a single bisection,
+        and no other test bounds this function's cost on a run that reaches CI -
+        `tests/test_performance.py` skips entirely without pytest-benchmark, and
+        the timing suites are `skip_in_ci`. So one deliberately slack ceiling
+        stays. `process_time`, because wall clock bills a shared runner's
+        descheduling to whoever is running, which is what failed a correct guard
+        at 25 ms on 3.9. Shipped costs 13 ms here and 52 ms under `--cov`; two
+        seconds is far enough above that a loaded runner cannot reach it and
+        still close enough that a lost complexity class cannot hide under it.
+        """
+        command = "(( 1<<b ))\n" * 4000 + "ls\nb"
+        cpu = min(
+            timeit.repeat(
+                lambda: val_module._neuter_arithmetic_shifts(command),
+                timer=time.process_time,
+                number=1,
+                repeat=3,
+            )
+        )
+
+        assert cpu < 2.0, f"one rewrite pass burned {cpu * 1e3:.0f} ms of CPU against a 2000 ms budget"
