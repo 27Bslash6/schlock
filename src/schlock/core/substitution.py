@@ -1423,10 +1423,8 @@ class SubstitutionValidator:
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
-        risk_order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
-
         inner_results: list[SubstitutionValidationResult] = []
-        max_risk = RiskLevel.SAFE
+        worst_result: SubstitutionValidationResult | None = None
         all_whitelisted = True
 
         for segment in segments:
@@ -1441,15 +1439,8 @@ class SubstitutionValidator:
                 )
             result = self.validate_substitution(child, depth)
             inner_results.append(result)
-            if not result.allowed:
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=result.risk_level,
-                    message=result.message,
-                    inner_results=inner_results,
-                )
-            if risk_order.index(result.risk_level) > risk_order.index(max_risk):
-                max_risk = result.risk_level
+            if worst_result is None or result.risk_level > worst_result.risk_level:
+                worst_result = result
             all_whitelisted = all_whitelisted and result.whitelisted
 
         # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
@@ -1458,16 +1449,26 @@ class SubstitutionValidator:
             if rule_match and rule_match.matched:
                 amplified_risk = self._amplify_risk(rule_match.risk_level)
                 if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-                    return SubstitutionValidationResult(
+                    cross_segment_result = SubstitutionValidationResult(
                         allowed=False,
                         risk_level=RiskLevel.BLOCKED,
                         message=f"Inner command blocked: {rule_match.message}",
                         inner_results=inner_results,
                     )
+                    if worst_result is None or cross_segment_result.risk_level > worst_result.risk_level:
+                        worst_result = cross_segment_result
+
+        if worst_result is not None and not worst_result.allowed:
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=worst_result.risk_level,
+                message=worst_result.message,
+                inner_results=inner_results,
+            )
 
         return SubstitutionValidationResult(
             allowed=True,
-            risk_level=max_risk,
+            risk_level=worst_result.risk_level if worst_result is not None else RiskLevel.SAFE,
             message=success_message,
             whitelisted=all_whitelisted,
             inner_results=inner_results,
