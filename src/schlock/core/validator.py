@@ -1237,11 +1237,15 @@ def _escalate_past_heredoc(
     # `neutered != command` keeps the recursion finite: re-validating an
     # unchanged command would re-enter this same fallback forever.
     candidates = [neutered] if neutered != command else []
-    # A segment that owns a heredoc keeps its redirection, and standalone that
-    # reads as an unterminated heredoc - which would deny every heredoc there
-    # is. Strip the redirection instead of skipping the segment: the command in
-    # front of it is exactly the one nothing used to look at, and
-    # `chmod -R 777 / <<'Y'` is not made safe by owning a body.
+    # Shed the rewritten heredoc rather than skipping the segment: the command
+    # in front of it is exactly the one nothing used to look at, and
+    # `chmod -R 777 / <<'Y'` is not made safe by owning a body. Since LAB-1732
+    # a segment closes its own heredoc, so this is no longer what makes the
+    # candidate parseable - it is what makes it a PLAIN command. That still
+    # matters: an end-anchored rule (`^\s*env\s*$`) cannot match past a
+    # trailing placeholder, so leaving one on flips `env` to SAFE at the rule
+    # layer, and the reconstructed view is no substitute because it drops
+    # redirection targets (`cat <<X > out.txt` reconstructs to `cat`).
     candidates += [_HEREDOC_REDIRECT_RE.sub("", segment) for segment in segments]
 
     for candidate in candidates:

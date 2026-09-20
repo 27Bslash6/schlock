@@ -123,6 +123,12 @@ _apply_andor_substitution_correction()
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
 # those run a *named* command, not stdin-as-program, and are covered by the download->shell
 # and wrapper-command checks.
+# A heredoc body is inert text to `cat` and source code to `bash`, which decides
+# both whether its matches are suppressed (extract_heredoc_ranges) and whether a
+# segment has to carry it (extract_command_segments). One set, so the two answers
+# cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
+_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish"})
+
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
         "bash",
@@ -525,6 +531,39 @@ class BashCommandParser:
 
         return results
 
+    @staticmethod
+    def _close_heredocs(segment: str, node: Any) -> str:
+        """Re-attach this command's heredocs so the segment parses on its own.
+
+        bashlex hangs a heredoc body off the redirect node, PAST the command's
+        span, so the bare slice ends at a `<<EOF` whose body never arrives. It
+        then fails to re-parse, and a segment with no AST loses both literal
+        suppression and the quote-stripped pass - which is how
+        `echo hi && "chmod" 777 /etc/shadow <<EOF` scored SAFE.
+
+        Only a shell's body comes back with it. `cat`'s body is inert text that
+        the rule patterns would scan for nothing, and they backtrack over it:
+        an everyday `cat <<EOF > file` with a 1000-line body cost seconds on a
+        hook that runs before every bash call. `bash`'s body is source code,
+        and dropping it would let `bash <<EOF | tee log` hide an `rm -rf /`.
+
+        The terminator is always bashlex's own delimiter word, stripped exactly
+        as the slice was, so a CRLF opener cannot desync from its terminator and
+        fail closed on a legitimate command.
+        """
+        cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
+        executes_body = cmd_name in _HEREDOC_SHELL_COMMANDS
+
+        for part in node.parts:
+            heredoc = getattr(part, "heredoc", None)
+            if heredoc is None:
+                continue
+            # bashlex's value is the body followed by its terminator line.
+            body, _, _ = heredoc.value.rpartition("\n")
+            segment += f"\n{body if executes_body else ''}\n{part.output.word.strip()}"
+
+        return segment
+
     def extract_command_segments(self, command: str, ast_nodes: list[Any]) -> list[str]:
         """Extract full command segments from pipelines and command lists.
 
@@ -556,11 +595,7 @@ class BashCommandParser:
                     if start < len(command) and end <= len(command):
                         segment = command[start:end].strip()
                         if segment:
-                            # bashlex hangs a heredoc body off the redirect, past the
-                            # command's span, so the bare slice would not re-parse.
-                            # Carry the body: a segment must be the command as bash sees it.
-                            bodies = [p.heredoc.value for p in node.parts if getattr(p, "heredoc", None)]
-                            segments.append("\n".join([segment, *bodies]))
+                            segments.append(self._close_heredocs(segment, node))
                     return  # Don't recurse into command parts
 
                 # Pipeline nodes - visit each command in the pipeline
@@ -758,7 +793,6 @@ class BashCommandParser:
             is_shell=True means the heredoc will be executed by a shell.
         """
         heredoc_ranges = []
-        shell_commands = {"bash", "sh", "zsh", "ksh", "dash", "ash", "fish"}
 
         def visit(node, parent_cmd=None):
             """Recursively visit AST nodes to find heredocs."""
@@ -776,7 +810,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in shell_commands if parent_cmd else False
+                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes

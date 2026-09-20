@@ -697,6 +697,9 @@ rules:
 class TestHeredocSurroundings:
     """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
 
+    Also covers the LAB-1732 seam: segments close their own heredocs now, so the
+    shed below has to account for the terminator as well as the redirection.
+
     bashlex cannot parse a quoted heredoc delimiter, so these commands take the
     `_validate_heredoc_command` fallback. It used to check the first word against
     the whitelist and return, leaving every command after the terminator - and
@@ -951,7 +954,8 @@ class TestHeredocSurroundings:
             ("cat <<'EOF'\nhello\nEOF", ["cat"]),
             # A redirect after the opener must survive; only the heredoc goes.
             ("cat <<'EOF' > out.txt\nhello\nEOF", ["cat > out.txt"]),
-            # Owning a body does not make a dangerous command safe (LAB-2765).
+            # The dangerous command survives the shed intact, so it still reaches
+            # validate_command as itself (its verdict is pinned separately).
             ("chmod -R 777 / <<'Y'\nx\nY", ["chmod -R 777 /"]),
             ("ls <<'EOF'\nx\nEOF\nrm -rf /", ["ls", "rm -rf /"]),
             ("cat <<'A' <<'B'\n1\nA\n2\nB", ["cat"]),
