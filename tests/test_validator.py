@@ -966,6 +966,8 @@ class TestHeredocSurroundings:
             ("awk '{print $1}' f[0 <<'EOF'\nx\nEOF", RiskLevel.LOW, "unclosed `[` on the opener line"),
             ("((cd /tmp) && cat <<'EOF'\nBODY\nEOF\n)", RiskLevel.LOW, "`((` opening two subshells"),
             ("((:) && cat <<'EOF'\nBODY\nEOF\n)", RiskLevel.LOW, "`((` opening two subshells, empty first"),
+            ("echo --option=val a[1\ncat <<'EOF'\nhello\nEOF", RiskLevel.LOW, "a flag carrying `=` before a glob bracket"),
+            ("curl -d a=b f[0 <<'EOF'\nx\nEOF", RiskLevel.LOW, "an argument carrying `=` before a glob bracket"),
             ("echo \"`date`\" ; cat <<'E'\nx\nE", RiskLevel.LOW, "a command substitution in a quoted argument"),
             # LAB-4270: an expansion carrying `<<` alongside a real heredoc. bash
             # opens exactly one heredoc here (verified: `cat <<'EOF' ${x:-a<<b }`
@@ -1070,6 +1072,21 @@ class TestHeredocSurroundings:
             ("(( `echo )`+1<<b ))", [], "a backtick is opaque to the matcher: still arithmetic"),
             ("(( \\)+1<<b ))", [], "an escaped `)` is opaque to the matcher: still arithmetic"),
             ("(( $'\\')'+1<<b ))", [], "`$'…'` honours `\\'`, so its `)` is inside the quote: still arithmetic"),
+            # Inside the pair, quotes are not flat: `${…}`, `$(…)` and backticks
+            # nest inside `"…"`, quotes nest inside those, and a `$(…)` is shell
+            # again. Each row ran bash with a canary after the shift; bash read
+            # arithmetic and deleted it.
+            ('(( "$(echo "x)")" + 1<<b ))', [], "a quote nested in `$(…)` nested in a quote"),
+            ('(( "${x:-")"}" + 1<<b ))', [], "a quote nested in `${…}` nested in a quote"),
+            ('(( "`echo ")"`" + 1<<b ))', [], "a quote nested in a backtick nested in a quote"),
+            ('(( "${x:-)}" + 1<<b ))', [], "`${…}` nests inside a quote, so its `)` is opaque there"),
+            ("(( $(echo ${x:-)}) + 1<<b ))", [], "`${…}` nests inside `$(…)`, where the text is shell again"),
+            ("(( $(echo ')') + 1<<b ))", [], "a single quote inside `$(…)`"),
+            ('(( `echo ")"` + 1<<b ))', [], "a quote inside a top-level backtick"),
+            ('(( ${x:-")"} + 1<<b ))', [], "a quote inside a paren-level `${…}` is still opaque"),
+            ('(( "\\")" + 1<<b ))', [], "an escaped quote does not end a quoted span"),
+            ('(( "${x:-"})"}" + 1<<b ))', [], "a quoted `}` does not end a `${…}` nested in a quote"),
+            ("(( \"${x:-'})'}\" + 1<<b ))", [], "nor does a single-quoted one"),
             ("(( $(echo ')')+1<<b ))", [], "`$(…)` balances its own parens: still arithmetic"),
             # `name[` is a subscript only at command position - where bash could
             # start a command or an assignment. Elsewhere `[` is a glob character
@@ -1086,6 +1103,20 @@ class TestHeredocSurroundings:
             ("time -p a[1<<b]=1", [], "after `time -p` is command position"),
             ("case q in q) a[1<<b]=1;; esac", [], "after a case pattern is command position"),
             ("{ a[1<<b]=1; }", [], "after `{` is command position"),
+            ("< /dev/null a[1<<b]=1", [], "after a redirection and its target"),
+            (">& /dev/null a[1<<b]=1", [], "`>&` with a target is one redirection, not `>` then `&`"),
+            ("&> /dev/null a[1<<b]=1", [], "so is `&>`"),
+            ("<<< str a[1<<b]=1", [], "a here-string is a redirection with a target"),
+            ('ENV="foo bar" a[1<<b]=1', [], "a quoted assignment with a blank inside is one word"),
+            ("ENV=$'a b' a[1<<b]=1", [], "so is an ANSI-C quoted one"),
+            ("x=1 y=2 a[1<<b]=1", [], "any run of assignments keeps command position"),
+            ("echo --k=v a[1<<b]", ["b]"], "an option carrying `=` is not an assignment"),
+            ('curl -d "a=b" a[1<<b]', ["b]"], "nor is a quoted argument carrying one"),
+            ("cmd < f a[1<<b]", ["b]"], "a redirection after a command name does not restore command position"),
+            ("1x=2 a[1<<b]", ["b]"], "a word that is not a valid name is a command, `=` or not"),
+            ("1a[1<<b]=1", ["b]=1"], "a subscript needs a valid name in front of it"),
+            ("$x[1<<b]", ["b]"], "an expansion in front of `[` is not a name"),
+            ("a=b=c a[1<<b]=1", [], "an assignment whose value carries `=` is still an assignment"),
             ("if true;then a[1<<b]=1;fi", [], "a reserved word glued to the operator before it still counts"),
             ("x;if a[1<<b]=1; then :; fi", [], "…whichever operator it is glued to"),
             ("echo ${x:-;a[1 }; cat <<c", ["c"], "inside an expansion `;` starts no command, so `a[` is text"),
@@ -1149,6 +1180,11 @@ class TestHeredocSurroundings:
             ("if true; then ((\n1<<b )); fi", "`((` after `then`"),
             ("time ((\n1<<b ))", "`((` after `time`"),
             ("x=1 a[\n1<<b ]=1", "`name[` after an assignment"),
+            ("< /dev/null a[\n1<<b ]=1", "`name[` after a redirection with a separate target"),
+            (">& /dev/null a[\n1<<b ]=1", "`name[` after `>&` and its target"),
+            ('ENV="foo bar" a[\n1<<b ]=1', "`name[` after a quoted assignment containing a blank"),
+            ('(( "$(echo "x)")" + 1<<b ))', "a `((` whose quoted `$(…)` nests quotes"),
+            ("(( $(echo # )\n) + 1<<b ))", "a `((` whose `$(…)` holds a comment with a `)` in it"),
             ("if true;then a[\n1<<b ]=1;fi", "`name[` after a reserved word glued to `;`"),
             ("if true; then((\n1<<b)); fi", "`((` glued to `then`"),
             ("!((\n1<<b))", "`((` glued to `!`"),
@@ -1172,10 +1208,12 @@ class TestHeredocSurroundings:
     @pytest.mark.parametrize(
         "command,reason",
         [
-            ("(( 1<<b\nrm -rf /\nb", "no matching"),
+            ("(( 1<<b\nrm -rf /\nb", "never closes"),
             ("a[\n1<<b\nrm -rf /\nb", "unclosed"),
-            ('(( "1<<b ))\nrm -rf /\nb', "Unterminated"),
+            ('(( "1<<b ))\nrm -rf /\nb', "never closes"),
             ("cat <<'A'\nz\nA\necho ${x:-\nrm -rf /", "unclosed"),
+            ("(( $(case a in a) :;; esac) + 1<<b ))\nrm -rf /\nb", "`case`"),
+            ("(( $(cat <<E\n)\nE) + 1<<b ))\nrm -rf /\nb", "`<<`"),
         ],
     )
     def test_a_pair_the_command_never_closes_fails_closed(self, command, reason):
