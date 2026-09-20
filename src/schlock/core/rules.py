@@ -18,6 +18,13 @@ from schlock.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
+# Does a whitelist pattern's SOURCE write a command separator? Used by `is_whitelisted_whole`
+# to tell an entry authored about a command LINE from one authored about a command. Matches a
+# literal pipe as a regex spells it (`\|` or `[|]`), plus `&` and `;`, which are not regex
+# metacharacters and so already mean themselves. A BARE `|` is deliberately absent: in a regex
+# it is alternation, which is what `(node_modules|dist|build)` uses and what must NOT count.
+_WRITES_A_SEPARATOR = re.compile(r"\\\||\[\|\]|&|;")
+
 
 class RiskLevel(Enum):
     """Risk levels for command validation.
@@ -625,35 +632,64 @@ class RuleEngine:
         logger.info(f"Loaded {len(self.rules)} rules from {len(yaml_files)} files")
 
     def is_whitelisted(self, command: str) -> bool:
-        """Check if command matches whitelist patterns.
+        """Check if a whitelist pattern matches the START of one command.
 
         Whitelisted commands always return SAFE regardless of other rules.
+
+        This is a PREFIX test (`re.match`), which is what a single command needs — `^ls\\b`
+        has to clear `ls -la`. It is therefore the WRONG test for anything that may hold more
+        than one command: it would clear `ls && rm -rf /` on two characters. Use
+        `is_whitelisted_whole` for a full command line. Pass this one a single command, and
+        remember it reads only the front of it — a shipped entry with no trailing anchor also
+        clears whatever trails the part it matched.
 
         Args:
             command: Command string to check
 
         Returns:
-            True if command matches any whitelist pattern
+            True if command starts with any whitelist pattern
         """
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
     def is_whitelisted_whole(self, command: str) -> bool:
-        """Check if a whitelist pattern describes the ENTIRE command line.
+        """Check if a whitelist entry was written about this ENTIRE command line.
 
         `is_whitelisted` is a prefix test, which is what a single command needs: `^ls\\b` is
         meant to clear `ls -la`. Applied to a command with several segments it clears the
         segments the author never wrote down — `^ls\\b` matches `ls && rm -rf /` on its first
-        two characters, whitelisting the `rm`. So a multi-segment command may only be cleared
-        as a whole by a pattern that consumes the whole of it, which is what an author signals
-        by anchoring the pattern (`...--password-stdin$`).
+        two characters, whitelisting the `rm`.
+
+        Two things have to hold, and consuming the line is only the second of them.
+
+        Anchoring is NOT sufficient on its own. A pattern can be anchored and still open-ended:
+        the shipped build-cleanup entry ends `(/.*)?$`, whose `.*` eats `&& rm -rf /` quite
+        legitimately, so it fullmatches the whole line and clears the payload. `rm -rf dist`
+        is denied while `rm -rf dist/ && rm -rf /` was allowed, on one trailing slash.
+
+        So the first test is whether the entry MENTIONS a separator. Writing one is how an
+        author says "I am describing a command line, not a command" — the `\\|` in the gh/docker
+        entry is deliberate, and nothing else in the shipped set writes one (the `|`s in that
+        cleanup entry are regex alternation, not pipes, which is exactly the distinction). An
+        entry that never writes a separator cannot have been written about a line that has one.
+
+        Known ceiling: this reads the pattern's SOURCE, so an entry that mentions a separator
+        only incidentally (a `;` inside a character class) is judged separator-literate and
+        falls back to the anchoring test alone. That is the old behaviour for that one entry,
+        not a new hole.
 
         Args:
             command: Command string to check
 
         Returns:
-            True if any whitelist pattern matches the command end to end
+            True if a separator-writing whitelist pattern matches the command end to end
         """
-        return any(pattern.fullmatch(command) for pattern in self.whitelist_patterns)
+        # Surrounding blank space is not executable content, and `$` matches BEFORE a trailing
+        # newline while `fullmatch` would have to consume it — without this, a trailing "\n"
+        # unseats the anchored entry and lands the pipeline on BLOCKED.
+        command = command.strip()
+        return any(
+            _WRITES_A_SEPARATOR.search(pattern.pattern) and pattern.fullmatch(command) for pattern in self.whitelist_patterns
+        )
 
     def match_command(
         self,

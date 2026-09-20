@@ -575,6 +575,19 @@ class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
         "git status && rm -rf /",
         "git status && bash -c 'rm -rf /'",
         "chmod 755 /tmp/x && rm -rf /",
+        # Anchoring an entry is NOT enough, which is why the guard asks a second question.
+        # The build-cleanup entry ends `(/.*)?$`, and that `.*` consumes the chained payload,
+        # so the pattern genuinely fullmatches the whole line. One trailing slash was the
+        # difference between `rm -rf dist` (denied) and `rm -rf dist/ && rm -rf /` (allowed).
+        "rm -rf dist/ && rm -rf /",
+        "rm -rf dist/; rm -rf /",
+        "rm -rf dist/ | rm -rf /",
+        "rm -rf build/ && sudo rm -rf /",
+        "rm -rf coverage/ && dd if=/dev/zero of=/dev/sda",
+        "rm -rf node_modules/ && rm -rf /",
+        "rm -rf dist/ && bash -c 'rm -rf /'",
+        "rm -rf dist/ && git config core.pager 'rm -rf /'",
+        "rm -rf .git/hooks && rm -rf /",
     ]
 
     @pytest.mark.parametrize("command", BYPASSES)
@@ -585,30 +598,28 @@ class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
     # the chained verdict must equal the verdict that command already carries on its own, so
     # closing the hole cannot make the daily driver stricter than it already was.
     PARITY = [
-        ("ls && git status", "git status"),
-        ("ls -la && pwd", "pwd"),
-        ("ls && cat README.md", "cat README.md"),
-        ("ls && make build", "make build"),
-        ("ls && npm test", "npm test"),
-        ("ls && cargo build", "cargo build"),
-        ("ls && docker ps", "docker ps"),
-        ("ls && grep -rn TODO src/", "grep -rn TODO src/"),
-        ("git status && git add -A", "git add -A"),
-        ("git status && git diff", "git diff"),
-        ("git status && git commit -m wip", "git commit -m wip"),
+        ("ls && git status", "git status"),  # SAFE, no rule
+        ("ls && make build", "make build"),  # LOW from a rule
+        ("git status && git add -A", "git add -A"),  # MEDIUM from a rule
+        ("ls && sudo apt update", "sudo apt update"),  # BLOCKED from a rule
     ]
 
     @pytest.mark.parametrize(("chained", "bare"), PARITY)
     def test_chaining_is_never_stricter_than_the_same_command_bare(self, chained, bare):
         assert validate_command(chained).risk_level == validate_command(bare).risk_level
 
-    def test_an_anchored_entry_still_whitelists_its_whole_pipeline(self):
-        # The fast path exists for pipelines no single segment can vouch for. An author anchors
-        # such an entry end to end, and that is exactly what survives the tightening.
+    def test_a_deliberate_pipeline_entry_still_whitelists_its_whole_pipeline(self):
+        # The fast path exists for pipelines no single segment can vouch for — `gh auth token`
+        # alone is credential theft. That entry writes its own `\|` and anchors end to end,
+        # which is exactly what survives the tightening.
         command = "gh auth token | docker login ghcr.io -u me --password-stdin"
         assert validate_command(command).risk_level == RiskLevel.SAFE
+        # `$` matches BEFORE a trailing newline but `fullmatch` would have to consume it, so
+        # without stripping first, one stray newline lands this pipeline on BLOCKED.
+        assert validate_command(command + "\n").risk_level == RiskLevel.SAFE
 
-    def test_single_command_whitelisting_is_untouched(self):
-        # The prefix test is still correct for one command — `^ls\b` must go on clearing `ls -la`.
-        for command in ("ls -la", "git status", "pwd", "rm -rf node_modules", "chmod 755 /tmp/x"):
+    def test_the_everyday_cleanup_the_new_guard_must_not_break(self):
+        # The separator test is what stops `rm -rf dist/ && rm -rf /`; it must not cost the
+        # cleanup that entry was added for. These clear per-segment, not via the fast path.
+        for command in ("rm -rf dist", "rm -rf dist/", "rm -rf node_modules/.bin", "ls -la"):
             assert validate_command(command).risk_level == RiskLevel.SAFE

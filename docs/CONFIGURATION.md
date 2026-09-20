@@ -119,14 +119,33 @@ whitelist:
 
 #### How It Works
 
-- Patterns are regex, matched against the start of the command string (like `re.match()`)
+- Patterns are regex, matched against the start of a **single command** (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
+A command **line** with several commands in it (`a && b`, `a; b`, `a | b`) is checked one
+command at a time, and your pattern is applied to each command separately. It is not enough
+for your pattern to match the front of the line — `^ls` does not whitelist `ls && rm -rf /`,
+it whitelists the `ls`, and the `rm -rf /` is still judged on its own.
+
+To whitelist a whole pipeline as one unit, **write the separator into the pattern** and anchor
+it end to end:
+
+```yaml
+whitelist:
+  # Whitelists this pipeline as a whole; `gh auth token` alone stays blocked.
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+-u\s+\S+\s+--password-stdin$
+```
+
+A pattern with no `|`, `&` or `;` in it is read as describing one command, and will never
+clear a multi-command line on its own — that is deliberate, and it is what stops a broad
+entry silently vouching for whatever an agent appends to it.
+
 #### Writing Good Patterns
 
-Whitelist patterns use prefix matching (anchored at the start, not the end). Write patterns specific enough to avoid unintended matches:
+Whitelist patterns match from the start of a command and, unless you anchor them, run to
+whatever follows. Write patterns specific enough to avoid unintended matches:
 
 ```yaml
 # GOOD: Specific command with anchored end
@@ -142,7 +161,13 @@ whitelist:
   - ^gcloud
 ```
 
-Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
+Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches
+any command that starts with the pattern text — including extra arguments you did not intend
+to allow, so `^chmod\s+[0-7]{3}\s+/tmp/` also clears `chmod 755 /tmp/x /etc/shadow`.
+
+`$` on its own is not enough if what precedes it is open-ended: `^mytool\s+.*$` is anchored
+and still matches anything, arguments and appended commands alike. Anchor against a bounded
+expression — `^mytool\s+[\w.-]+$`, not `^mytool\s+.*$`.
 
 #### Security: User-Level Only
 

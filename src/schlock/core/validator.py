@@ -1164,8 +1164,10 @@ def _escalate_past_heredoc(
     The rewritten command is validated through the front door, so it gets the
     whole pipeline - segments, substitutions, dangerous flags, rules - rather
     than a second hand-rolled approximation of it. Its segments are then
-    validated individually as well, because a whitelisted prefix short-circuits
-    the whole-command pass before the per-segment loop it relies on (LAB-2752).
+    validated individually as well, because a whitelist entry covering the whole
+    line short-circuits the whole-command pass before the per-segment loop it
+    relies on (LAB-2752; since LAB-4290 that takes a deliberate entry rather than
+    any entry whose prefix happens to match, but one entry is enough).
     Neither pass subsumes the other: the whole-command pass is the only one that
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
     whitelist cannot silence.
@@ -1359,18 +1361,17 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
 
             # If we have multiple segments, validate each one
             if len(segments) > 1:
-                # Full-command whitelist check before segment validation.
-                # Per-segment validation cannot detect safe multi-command patterns
-                # (e.g., "gh auth token | docker login ... --password-stdin") because
-                # each segment is evaluated in isolation. Whitelisting the full command
-                # here allows specific safe pipe patterns without whitelisting the
-                # constituent commands standalone.
+                # Full-command whitelist check before segment validation, for the safe
+                # multi-command patterns per-segment validation cannot see: `gh auth token`
+                # alone is credential theft, and only the whole pipe to `docker login
+                # --password-stdin` is safe. That entry is the reason this fast path exists.
                 #
-                # SECURITY: end-to-end, never by prefix. The whitelist is written for single
-                # commands, so most entries are open-ended (`^ls\b`); a prefix test hands any
-                # of them the rest of the line, and `ls && rm -rf /` clears on its first two
-                # characters — the exact bypass the segment loop below exists to stop. Only a
-                # pattern anchored over the whole line was written about a whole line.
+                # SECURITY: it must take a whitelist entry AUTHORED about a command line, which
+                # `is_whitelisted_whole` decides and `is_whitelisted` does not. A prefix test
+                # here handed every single-command entry the rest of the line — `ls && rm -rf /`
+                # cleared on its first two characters, past the very segment loop below that
+                # exists to catch it. Anchoring alone is not the test either; see that method.
+                # Do NOT "simplify" this back to `is_whitelisted` (LAB-4290).
                 if engine.is_whitelisted_whole(command):
                     result = ValidationResult(
                         allowed=True,
@@ -1480,8 +1481,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
         # higher verdict, so no spelling of the wrapper scores below the bare payload.
-        # NOT a general guarantee: this runs after the multi-segment whitelist, so a
-        # whitelisted prefix still short-circuits it (LAB-2759). Deliberately NOT routed through
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a whitelist
+        # entry that covers the whole line still short-circuits it — which since LAB-4290 means
+        # a deliberate one only, not any entry whose prefix happens to match (LAB-2759).
+        # Deliberately NOT routed through
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.

@@ -384,31 +384,64 @@ rules: []
         """`^ls\\b` describes one command, so it may not clear a line that continues past it."""
         engine = RuleEngine.from_directory(rules_directory)
 
-        # The prefix test still clears the single command each pattern was written for.
+        # The prefix test still clears the single command each pattern was written for --
+        # including, and this is the bug, a line that carries a second command.
         assert engine.is_whitelisted("ls -la")
         assert engine.is_whitelisted("ls && rm -rf /")
 
-        # End to end, the open-ended pattern only covers what it actually consumes.
-        assert engine.is_whitelisted_whole("ls")
+        # A single-command entry clears nothing as a whole line, so it cannot vouch for the
+        # `rm`. (Single commands never consult this; they go through `is_whitelisted` above.)
+        assert not engine.is_whitelisted_whole("ls")
         assert not engine.is_whitelisted_whole("ls -la")
         assert not engine.is_whitelisted_whole("ls && rm -rf /")
         assert not engine.is_whitelisted_whole("git status && rm -rf /")
 
-    def test_whole_command_whitelist_honours_an_anchored_pattern(self, tmp_path):
-        """An author anchoring a pattern is how a whole pipeline gets whitelisted deliberately."""
+    def test_whole_command_whitelist_needs_the_author_to_write_a_separator(self, tmp_path):
+        """Anchoring is not sufficient: an anchored pattern can still be open-ended."""
         rules_dir = tmp_path / "anchored"
         rules_dir.mkdir()
         (rules_dir / "01_whitelist.yaml").write_text(r"""
 whitelist:
+  - ^rm\s+-rf\s+(dist|build)(/.*)?$
   - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+--password-stdin$
 
 rules: []
 """)
         engine = RuleEngine.from_directory(rules_dir)
 
+        # Anchored AND open-ended: `.*` consumes the chained payload, so this pattern really
+        # does fullmatch the whole line. Only "did the author write a separator" separates it
+        # from the entry below — note its `|`s are alternation, and must not count as one.
+        assert engine.whitelist_patterns[0].fullmatch("rm -rf dist/ && rm -rf /")
+        assert not engine.is_whitelisted_whole("rm -rf dist/ && rm -rf /")
+
+        # The entry that does write a separator keeps clearing its own pipeline...
         assert engine.is_whitelisted_whole("gh auth token | docker login ghcr.io --password-stdin")
-        # ...and the anchor is what stops it being extended.
+        # ...and `$` matches before a trailing newline, so the command is stripped first.
+        assert engine.is_whitelisted_whole("gh auth token | docker login ghcr.io --password-stdin\n")
+        # ...but the anchor still stops it being extended.
         assert not engine.is_whitelisted_whole("gh auth token | docker login ghcr.io --password-stdin && rm -rf /")
+
+    def test_a_separator_entry_that_forgot_its_anchor_covers_only_what_it_consumes(self, tmp_path):
+        """Both halves of the guard are load-bearing; the shipped entries hide the second.
+
+        Every separator-writing pattern schlock ships is also `$`-anchored, so `match` and
+        `fullmatch` agree on all of them and the end-to-end half looks redundant. It is not:
+        a user writing their own pipeline entry need not anchor it, and then only `fullmatch`
+        stops that entry vouching for whatever gets appended to it.
+        """
+        rules_dir = tmp_path / "unanchored"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^foo\s*\|\s*bar
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        assert engine.is_whitelisted_whole("foo | bar")
+        assert not engine.is_whitelisted_whole("foo | bar && rm -rf /")
 
     def test_directory_files_loaded_in_order(self, rules_directory):
         """Test that files are loaded in alphabetical order."""
