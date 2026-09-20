@@ -1062,13 +1062,17 @@ class TestParseFailureFailsClosed:
             # rewrites the body away and re-validates; the rewrite is no more
             # parseable than the original, so it denies.
             ("coproc bash <<'EOF'\nrm -rf /\nEOF", "unparseable head owning a quoted-delimiter heredoc"),
+            # Reaches the fallback like the cases above, but was already denied
+            # at a508274 - by the *other* exit, `Parse error`. So the routing
+            # for this spelling moved between a508274 and #148 while the verdict
+            # did not, which is why it is not counted among the regressions.
+            ('coproc bash <<< "$(rm -rf /)"', "substitution payload, denied at both heads"),
             # Controls. These never reach the fallback at all - bashlex blames
             # them on something whose text lacks "heredoc", so the trigger's
-            # second half is false and the handler denies directly. They were
-            # already BLOCKED at a508274; the report compared against `case`.
+            # second half is false and the handler denies directly. All three
+            # were already BLOCKED at a508274; the report compared against `case`.
             ('case x in y) bash;; esac <<< "rm -rf /"', "case: denied before the fallback"),
             ('select x in a; do bash; done <<< "rm -rf /"', "select: denied before the fallback"),
-            ('coproc bash <<< "$(rm -rf /)"', "substitution payload: denied before the fallback"),
             ('coproc CO { bash; } <<< "rm -rf /"', "named coprocess: denied before the fallback"),
         ],
     )
@@ -1107,9 +1111,10 @@ class TestParseFailureFailsClosed:
         """The fallback's catch-all hands back `None`; the caller must not read that as a pass.
 
         Reached when `_neuter_heredocs` fails for a reason other than an
-        unreadable heredoc - `_heredoc_base_result` indexing a whitespace-only
-        base command is one live route. Forced here rather than provoked, since
-        the point is the sentinel's meaning, not the bug that produces it.
+        unreadable heredoc. Nothing produces that today - the base command is
+        stripped and an empty one already raises - so it is forced rather than
+        provoked: an exit that only ever runs on an unforeseen bug is exactly
+        the one worth pinning fail-closed.
         """
 
         def boom(command):
