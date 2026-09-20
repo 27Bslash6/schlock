@@ -770,19 +770,58 @@ class _ListSegment:
         self.command = command
 
 
+# Redirect operators that only ever READ. Everything else writes, truncates or opens for
+# write — including the ones an enumeration of write operators keeps missing (`>|` clobber,
+# `&>`/`&>>` all-streams, `<>` read-write). The guard below tests membership of THIS set and
+# treats the complement as a write, so a redirect operator nobody here has thought of fails
+# closed instead of sailing through.
+_READ_REDIRECT_TYPES = frozenset({"<", "<<", "<<-", "<<<", "<&"})
+
+
+def _is_write_redirect(part: Any) -> bool:
+    """True if this RedirectNode writes anywhere but /dev/null.
+
+    >/dev/null and 2>/dev/null DISCARD output — nothing is written, so the noise-suppression
+    idiom `$(ls dir 2>/dev/null | wc -l)` stays allowed. Any other target counts as a write,
+    including `>&2`, whose output is an int fd rather than a word. See #104.
+    """
+    if getattr(part, "kind", None) != "redirect":
+        return False
+    if getattr(part, "type", None) in _READ_REDIRECT_TYPES:
+        return False
+    return getattr(getattr(part, "output", None), "word", None) != "/dev/null"
+
+
+class _TrimmedList:
+    """A ListNode with its trailing terminator operator removed — see _strip_group_terminator."""
+
+    __slots__ = ("kind", "parts")
+
+    def __init__(self, parts: list[Any]) -> None:
+        self.kind = "list"
+        self.parts = parts
+
+
 def _strip_group_terminator(node: Any) -> Any:
-    """`{ cmd; }` -> `cmd`. The `;` before `}` is mandatory grouping syntax, so bashlex renders a
-    one-command brace group as a ListNode ending in a terminator operator. That shape is a
-    malformed list to ``_is_valid_list_topology`` (which requires ending on a segment) and would
-    block every brace group with a message about topology rather than about the command. Only the
-    single-segment form is peeled; anything longer stays a list and fails closed there.
+    """`{ a; b; }` -> `a; b`. The `;` before `}` is mandatory grouping syntax, so bashlex renders
+    a brace group as a ListNode ending in a terminator operator. That shape is a malformed list to
+    ``_is_valid_list_topology`` (which requires ending on a segment), so every brace group was
+    reported as a malformed AST — the exact message this function exists to avoid — while the
+    identical subshell `( a; b )` validated normally.
+
+    Peeling the terminator is not a relaxation of the topology rule: what remains is checked by
+    it unchanged, so `{ a; ; b; }` still fails closed. A single command is returned as itself;
+    anything longer is returned as a list for per-segment validation.
     """
     if getattr(node, "kind", None) != "list":
         return node
     parts = list(getattr(node, "parts", []))
-    if len(parts) == 2 and getattr(parts[1], "kind", None) == "operator" and getattr(parts[1], "op", None) in (";", "&"):  # noqa: PLR2004 - segment + its terminator
+    if not parts or getattr(parts[-1], "kind", None) != "operator" or getattr(parts[-1], "op", None) not in (";", "&"):
+        return node
+    parts = parts[:-1]
+    if len(parts) == 1:
         return parts[0]
-    return node
+    return _TrimmedList(parts)
 
 
 def _unwrap_compound(node: Any) -> Any:
@@ -795,14 +834,18 @@ def _unwrap_compound(node: Any) -> Any:
     ``$( (rm -rf /) )`` read SAFE. Subshell/brace grouping changes nothing a validator cares about,
     so the grouping is transparent: `$( ( X ) )` is validated exactly as `$( X )`.
 
-    NOT unwrapped — these keep their compound node and fail closed downstream:
-    a compound carrying its own redirections (`$( (ls) > f )`, a real write), and one holding
-    anything but a single command (`if`/`for`/`while`, whose branches this module cannot decompose).
+    NOT unwrapped — these keep their compound node and fail closed downstream: a compound whose
+    own redirections WRITE (`$( (ls) > f )`, a real side effect), and one holding anything but a
+    single command (`if`/`for`/`while`, whose branches this module cannot decompose). A read or a
+    discard (`$( (ls) 2>/dev/null )`) is inert, so it unwraps — refusing on *any* redirect made
+    grouping lose the /dev/null exemption that the same redirect gets on a bare command.
     """
     for _ in range(MAX_SUBSTITUTION_DEPTH):
         cmd = getattr(node, "command", None)
-        if getattr(cmd, "kind", None) != "compound" or getattr(cmd, "redirects", None):
+        if getattr(cmd, "kind", None) != "compound":
             return node
+        if any(_is_write_redirect(r) for r in getattr(cmd, "redirects", None) or []):
+            return node  # a write on the group is a real side effect, not inert grouping
         inner = [c for c in getattr(cmd, "list", None) or [] if getattr(c, "kind", None) != "reservedword"]
         if len(inner) != 1 or getattr(inner[0], "kind", None) not in ("command", "list", "pipeline", "compound"):
             return node
@@ -824,11 +867,6 @@ class SubstitutionValidationResult:
 
 class SubstitutionValidator:
     """Validates commands inside shell substitution constructs.
-
-    Uses a three-layer approach:
-    1. Whitelist check for known-safe commands (fast path)
-    2. AST structural checks for suspicious patterns
-    3. Recursive validation with depth limit
 
     Example:
         >>> validator = SubstitutionValidator(parser, rule_engine)
@@ -910,14 +948,14 @@ class SubstitutionValidator:
         # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
         # survive even when text rendering is partial (e.g. a compound segment renders to None).
         # Dropping it here would silently skip validation -> fail OPEN. Per-segment logic blocks
-        # the unrenderable segment instead. A compound that survived _unwrap_compound (an `if`,
-        # or a redirecting subshell) renders to None too and must survive for the same reason:
-        # dropping it is what let `$( { git push --force; } )` read SAFE. It has no base command,
-        # so every tier below fails it closed. Anything else with no extractable command stays
-        # dropped (genuinely unparseable).
+        # the unrenderable segment instead. So does every other shape that renders to None: a
+        # compound that survived _unwrap_compound (an `if`, a write-redirecting subshell), and a
+        # command with no words at all (`$( > file )`, which bash still opens and truncates).
+        # Enumerating the kinds that may survive is what let those through — the node is kept
+        # whenever there IS one, and having no base command fails it closed in every tier below.
+        # Only a substitution with no command node at all is dropped (genuinely unparseable).
         cmd_node = getattr(node, "command", None)
-        undroppable = getattr(cmd_node, "kind", None) in ("list", "compound")
-        if not inner_command and not undroppable:
+        if not inner_command and cmd_node is None:
             return None
 
         base_command = self._extract_base_command(node)
@@ -1279,10 +1317,8 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             return True, "command chain in substitution"
 
-        # Compound command: $(if ...; then ...; fi) etc. Unreachable today and kept as a backstop:
-        # this helper only runs behind a whitelist hit, and a compound that survives
-        # _unwrap_compound has no base command to hit one with, so it is already blocked by the
-        # time it would get here. It fires if base-command extraction ever learns compounds.
+        # Compound command: $(if ...; then ...; fi). A backstop — no base command means no
+        # whitelist hit, so this helper is not reached for one today.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "compound":
             return True, "compound command in substitution"
 
@@ -1290,16 +1326,9 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "parts"):
             args: list[str] = []
             for part in cmd_node.parts:
-                # Output redirection: $(echo x > file) or $(echo x >> file)
-                if hasattr(part, "kind") and part.kind == "redirect":
-                    if hasattr(part, "type") and part.type in (">", ">>", ">&"):
-                        # >/dev/null and 2>/dev/null DISCARD output — nothing is written, so the
-                        # common noise-suppression idiom $(ls dir 2>/dev/null | wc -l) stays
-                        # allowed. Any other target (including >&2, whose output is an int fd,
-                        # not a word) keeps the blunt no-writes-in-substitution block. See #104.
-                        target = getattr(getattr(part, "output", None), "word", None)
-                        if target != "/dev/null":
-                            return True, "output redirection in substitution"
+                # Any write redirection: $(echo x > file), $(… >| file), $(… &> file), $(… <> file)
+                if _is_write_redirect(part):
+                    return True, "output redirection in substitution"
 
                 # Collect arguments for dangerous pattern checks
                 if hasattr(part, "word"):
@@ -1487,6 +1516,7 @@ class SubstitutionValidator:
         inner_results: list[SubstitutionValidationResult] = []
         max_risk = RiskLevel.SAFE
         all_whitelisted = True
+        worst_denial: SubstitutionValidationResult | None = None
 
         for segment in segments:
             child = self._create_substitution_node(_ListSegment(segment), sub_node.substitution_type, depth)
@@ -1501,15 +1531,23 @@ class SubstitutionValidator:
             result = self.validate_substitution(child, depth)
             inner_results.append(result)
             if not result.allowed:
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=result.risk_level,
-                    message=result.message,
-                    inner_results=inner_results,
-                )
+                # Worst segment wins, not the first denied one. The level decides the action
+                # (HIGH -> ask, BLOCKED -> deny), so returning here reported `$( (a && rm -rf /) )`
+                # at the unknown-command level of `a` and never looked at the blacklisted `rm`.
+                if worst_denial is None or risk_order.index(result.risk_level) > risk_order.index(worst_denial.risk_level):
+                    worst_denial = result
+                continue
             if risk_order.index(result.risk_level) > risk_order.index(max_risk):
                 max_risk = result.risk_level
             all_whitelisted = all_whitelisted and result.whitelisted
+
+        if worst_denial is not None:
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=worst_denial.risk_level,
+                message=worst_denial.message,
+                inner_results=inner_results,
+            )
 
         # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
         blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
