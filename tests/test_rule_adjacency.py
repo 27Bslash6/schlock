@@ -823,17 +823,35 @@ class TestKeyNamesAndPublicKeys:
         assert verdict("cat ~/.ssh/*.pub", rules_dir_path).allowed
 
 
-class TestDecoyPaddingFailsClosed:
-    """Scanning past a suppressed match is bounded, and the bound denies.
+class TestDecoyPaddingIsScannedExactly:
+    """The scan past a suppressed match is EXACT -- it never gives up early.
 
-    Without a bound, padding a quoted literal with decoy matches scales the cost
-    of a hook that runs on every command. Exhausting the budget reports the last
-    suppressed match rather than letting the padding buy an unrated command.
+    A bound here looks like cheap insurance and is not. An earlier cut capped the
+    rescan and reported the last SUPPRESSED match on exhaustion, reasoning that
+    padding should buy a denial. It bought the opposite: `validate_command` runs
+    its cross-segment scan only when NO segment matched, so a bogus segment match
+    hides a BLOCKED the whole command would have earned. Padding with 32 repeats
+    of any unanchored low-risk pattern switched off every cross-segment rule.
+    Returning None on exhaustion is no better -- then padding silences the rule.
+
+    Both directions are pinned below at 40 repeats, past where the cap sat.
+    Found by adversarial review of this branch (LAB-4321 / PR #170, whose
+    rules.py this file's engine change is byte-identical to).
     """
 
-    def test_heavily_padded_literal_is_not_silently_allowed(self, rules_dir_path):
-        command = "echo '" + ("od ~/.ssh/id_rsa " * 200) + "' ; true"
-        assert not verdict(command, rules_dir_path).allowed
+    def test_padding_does_not_hide_a_cross_segment_block(self, rules_dir_path):
+        """The under-block, and the serious one: a fork bomb behind the padding.
+
+        `_segment_nodes` fragments `:(){ :|:& };:` into inert `:` segments, so the
+        whole-command scan is the ONLY thing that can see it. A bogus segment match
+        skips that scan.
+        """
+        padded = "echo '" + ("pip install -r requirements.txt " * 40) + "' && :(){ :|:& };:"
+        assert not verdict(padded, rules_dir_path).allowed
+
+    def test_padding_does_not_deny_inert_text(self, rules_dir_path):
+        """The over-block: a quoted doc listing many install lines is not a command."""
+        assert verdict("echo '" + ("sudo apt-get install -y pkg " * 40) + "'", rules_dir_path).allowed
 
     def test_a_modest_number_of_decoys_still_finds_the_real_read(self, rules_dir_path):
         command = "echo '" + ("od ~/.ssh/id_rsa " * 4) + "' ; nl ~/.ssh/id_ed25519"
