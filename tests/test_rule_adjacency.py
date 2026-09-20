@@ -366,6 +366,48 @@ class TestCredentialRulesDoNotOverReach:
         assert verdict("sort -o /root/.ssh/authorized_keys k", rules_dir_path).risk_level == RiskLevel.HIGH
 
 
+class TestUnanchoredSearchStaysLinear:
+    """Per-word parsing being unambiguous does NOT make the search linear.
+
+    The git patterns are unanchored by design, so `sudo git push --force` rates.
+    That means `git` appearing inside an argument -- `-C git`, a directory
+    literally called git -- starts another candidate match, and an unbounded
+    option group greedily consumed the whole remaining suffix from every one of
+    them: O(n) starts x O(n) scan. The earlier linearity checks all fed ONE start
+    position, which is why they missed it. The option run is now bounded, so a
+    failed search gives up after a fixed number of options.
+    """
+
+    ADVERSARY = "git" + " -c user.name=x' y' -C git" * 512 + " status"
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["push --force", "reset --hard", "add -A", "push -f", "rebase", "commit -m x"],
+    )
+    def test_many_candidate_starts_stay_fast(self, operation, rules_dir_path, clean_worktree):
+        """Every rule carrying the option group, not just the one that found it."""
+        command = self.ADVERSARY.replace(" status", " " + operation)
+        start = time.perf_counter()
+        verdict(command, rules_dir_path)
+        assert time.perf_counter() - start < 1.0
+
+    def test_cost_grows_linearly_not_quadratically(self, rules_dir_path):
+        """A quadratic scan quadruples per doubling; a linear one doubles.
+
+        Pinned loosely -- the point is the exponent, not the constant."""
+
+        def elapsed(n):
+            command = "git" + " -c user.name=x' y' -C git" * n + " status"
+            start = time.perf_counter()
+            verdict(command, rules_dir_path)
+            return time.perf_counter() - start
+
+        small = min(elapsed(256) for _ in range(3))
+        large = min(elapsed(1024) for _ in range(3))
+        # 4x the input: linear predicts ~4x, quadratic ~16x.
+        assert large < small * 9, f"{small:.4f}s -> {large:.4f}s looks superlinear"
+
+
 class TestPatternsDoNotBacktrackCatastrophically:
     """The git flag group nests quantifiers, so its branches are kept disjoint.
 
