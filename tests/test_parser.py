@@ -680,3 +680,11 @@ class TestMultilineSubstitutionCorrection:
         assert tuple(sub.pos) == span
         assert sub.command.kind == body_kind
         assert tuple(sub.command.pos) == body_span
+
+
+def test_extract_command_segments_keeps_an_escaped_trailing_blank():
+    r"""`\ ` is a one-blank argument; stripping the segment must not leave `echo hi \`."""
+    parser = parser_mod.BashCommandParser()
+    command = "echo hi \\ ; echo \\\\ ; ls"
+    segments = parser.extract_command_segments(command, parser.parse(command))
+    assert segments == ["echo hi \\ ", "echo \\\\", "ls"]

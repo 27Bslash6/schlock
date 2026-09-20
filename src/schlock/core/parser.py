@@ -658,6 +658,15 @@ class BashCommandParser:
                     start, end = node.pos
                     if start < len(command) and end <= len(command):
                         segment = command[start:end].strip()
+                        # An escaped trailing blank (`echo hi \ ; ls`) is a
+                        # one-blank argument, and the strip just ate the blank.
+                        # Both callers re-parse the segment, and a dangling
+                        # `echo hi \` parses nowhere: the main loop then loses
+                        # its quote context, the heredoc fallback denies it
+                        # outright. Give the blank back. An even run of
+                        # backslashes is a literal argument and needs nothing.
+                        if (len(segment) - len(segment.rstrip("\\"))) % 2:
+                            segment += " "
                         if segment:
                             segments.append(segment)
                     return  # Don't recurse into command parts
