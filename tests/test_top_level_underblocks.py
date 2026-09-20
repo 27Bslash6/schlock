@@ -618,6 +618,14 @@ class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
         # without stripping first, one stray newline lands this pipeline on BLOCKED.
         assert validate_command(command + "\n").risk_level == RiskLevel.SAFE
 
+    def test_a_newline_is_a_separator_the_pattern_writes_for_the_author(self):
+        # `\s` matches a newline, but bash SPLITS on one. So the entry's own whitespace spans
+        # a line break its author never wrote, and the one regex "command" is several to bash.
+        # Both payloads below are denied bare, and rode the entry's two `\S+` slots.
+        injected = "gh auth token | docker login\n{}\n-u\nfoo\n--password-stdin"
+        for payload in ("sudo", "mkfs.ext4"):
+            assert validate_command(injected.format(payload)).risk_level == RiskLevel.BLOCKED
+
     def test_the_everyday_cleanup_the_new_guard_must_not_break(self):
         # The separator test is what stops `rm -rf dist/ && rm -rf /`; it must not cost the
         # cleanup that entry was added for. These clear per-segment, not via the fast path.

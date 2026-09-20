@@ -687,6 +687,13 @@ class RuleEngine:
         # newline while `fullmatch` would have to consume it — without this, a trailing "\n"
         # unseats the anchored entry and lands the pipeline on BLOCKED.
         command = command.strip()
+        # A newline IS a command separator, and `\s` matches one — so an entry's own whitespace
+        # spans a line break the author never wrote, and what the regex reads as one command is
+        # several to bash. Measured: `docker login\n/tmp/evil.sh\n-u\nfoo\n--password-stdin`
+        # satisfies the gh/docker entry end to end, and bash runs line two. `sudo` and
+        # `mkfs.ext4` ride the same slots, both denied bare. An entry vouches for ONE line.
+        if "\n" in command:
+            return False
         return any(
             _WRITES_A_SEPARATOR.search(pattern.pattern) and pattern.fullmatch(command) for pattern in self.whitelist_patterns
         )

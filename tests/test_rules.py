@@ -442,6 +442,9 @@ rules: []
 
         assert engine.is_whitelisted_whole("foo | bar")
         assert not engine.is_whitelisted_whole("foo | bar && rm -rf /")
+        # `\s` matches a newline and bash splits on one, so the pattern's own whitespace must
+        # not be allowed to span a line break: an entry vouches for a single line.
+        assert not engine.is_whitelisted_whole("foo |\nbar")
 
     def test_directory_files_loaded_in_order(self, rules_directory):
         """Test that files are loaded in alphabetical order."""
