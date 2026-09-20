@@ -377,6 +377,23 @@ class TestCredentialRulesDoNotOverReach:
             'cat "ordinary\nfile" ~/.kube/config',
             'nl "ordinary\nfile" ~/.aws/credentials',
             'cat "ordinary\nfile" ~/.ssh/authorized_keys',
+            # A backslash-escaped quote must not end the quoted span early --
+            # same bypass, different spelling, and it is why the span carries an
+            # escape branch rather than a plain `"[^"]*"`.
+            'cat "a\\"b" ~/.ssh/id_ed25519',
+            'cat "a\'b" ~/.ssh/id_rsa',
+            "cat 'a\"b' ~/.ssh/id_rsa",
+            'cat "" ~/.ssh/id_ed25519',
+            # A backslash OUTSIDE quotes is an escape too. These carry a quote AS
+            # WELL, and that pairing is what makes them load-bearing: a quote
+            # creates string literals, which disables the validator's
+            # reconstruction rescue, so the span is the only thing left. The
+            # unquoted spelling `cat a\\ b <key>` is caught by reconstruction
+            # either way and therefore pins nothing here.
+            'cat "x y" a\\ b ~/.ssh/id_ed25519',
+            'cat "a\nb" c\\ d ~/.ssh/id_ed25519',
+            "cat 'x y' a\\ b ~/.ssh/id_ed25519",
+            'cat a\\ b "x y" ~/.ssh/id_ed25519',
         ],
     )
     def test_a_quoted_newline_is_operand_data_not_a_boundary(self, command, rules_dir_path):
