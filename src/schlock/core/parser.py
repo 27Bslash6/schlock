@@ -583,6 +583,15 @@ class BashCommandParser:
             return None
         raw = command[start:end]
         text = raw.strip()
+        # An escaped trailing blank (`echo hi \ ; ls`) is a one-blank argument,
+        # and the strip just ate the blank. Callers re-parse the segment, and a
+        # dangling `echo hi \` parses nowhere: the main loop then loses its
+        # quote context, the heredoc fallback denies it outright. Give the blank
+        # back. An even run of backslashes is a literal argument and needs
+        # nothing. Restored here, at the one place the slice is taken, so every
+        # caller of extract_command_segments{,_with_literals} gets it.
+        if (len(text) - len(text.rstrip("\\"))) % 2:
+            text += " "
         if not text:
             return None
         return text, start + (len(raw) - len(raw.lstrip()))

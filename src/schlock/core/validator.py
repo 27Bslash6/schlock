@@ -842,8 +842,11 @@ def _check_special_cases(command: str) -> Optional[ValidationResult]:
 _HEREDOC_PLACEHOLDER = "SCHLOCK_HEREDOC"
 
 # Strips the rewritten redirection back off a segment. Exact rather than a
-# guess, because the rewrite chose this delimiter itself.
-_HEREDOC_REDIRECT_RE = re.compile(rf"\s*<<-?{re.escape(_HEREDOC_PLACEHOLDER)}")
+# guess, because the rewrite chose this delimiter itself. The blank run in
+# front of it goes too, unless a backslash escapes its first character: that
+# blank is an argument (`cat \ <<'EOF'`), and taking it leaves a dangling
+# `cat \` that parses nowhere.
+_HEREDOC_REDIRECT_RE = re.compile(rf"(?:(?<!\\)\s+)?<<-?{re.escape(_HEREDOC_PLACEHOLDER)}")
 
 # Bash ends an unquoted word at a blank or an operator character.
 _WORD_END = frozenset(" \t;&|<>()")

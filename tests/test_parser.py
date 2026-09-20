@@ -587,3 +587,30 @@ class TestAndOrSubstitutionCorrection:
         finally:
             bashlex.parser.yaccparser = real_yacc
             parser_mod._apply_andor_substitution_correction()  # restore the real correction
+
+
+def test_extract_command_segments_keeps_an_escaped_trailing_blank():
+    r"""`\ ` is a one-blank argument; stripping the segment must not leave `echo hi \`."""
+    parser = parser_mod.BashCommandParser()
+    command = "echo hi \\ ; echo \\\\ ; ls"
+    segments = parser.extract_command_segments(command, parser.parse(command))
+    assert segments == ["echo hi \\ ", "echo \\\\", "ls"]
+
+
+def test_restored_escaped_blank_keeps_rebased_literals_honest():
+    r"""The restored blank must not shift the segment-relative literal ranges.
+
+    The blank is given back at the one place the slice is taken, so it also
+    lands in the parse-once path that rebases literal offsets off the parent
+    AST. A segment ending `\ ` is exactly where that could break: a dangling
+    `echo 'rm -rf /' \` does not re-parse at all, so the ranges would be
+    derived against a segment nothing else can reproduce. Absolute expected
+    values, not a both-sides comparison — the two paths share the restore, so
+    an over-shift would move them together and stay green.
+    """
+    parser = parser_mod.BashCommandParser()
+    command = "echo 'rm -rf /' \\ ; ls"
+    pairs = parser.extract_command_segments_with_literals(command, parser.parse(command))
+    assert pairs == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
+    text, literals = pairs[0]
+    assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
