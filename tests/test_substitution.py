@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from schlock.core import validator as validator_module
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
@@ -1448,6 +1449,82 @@ class TestWhitelistedWithDangerousStructure:
         result = validator.validate_substitution(node)
         assert result.allowed is False
         assert "pipeline topology" in result.message
+
+
+class TestWhitelistedSubstitutionYamlRules:
+    """The full whitelist must not get a weaker rule pass than an unknown command (LAB-4182).
+
+    Layer 1 used to return SAFE after structural checks only, so every YAML rule that rates a
+    whitelisted base command was unreachable inside a substitution — while Layer 1b (contextual)
+    and Layer 4 (unrecognised) both consulted the rule engine. A `git push --force` hidden in
+    `echo "$(...)"` therefore read SAFE and ran, because the shell executes a substitution while
+    expanding it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """Pin the rules path: ShellCheck must not be what produces these verdicts."""
+        monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(git push --force)"',  # double-quoted: invisible to the top-level regex pass
+            "echo $(git push --force)",
+            "X=$(git push --force origin main)",
+        ],
+    )
+    def test_force_push_in_substitution_blocked(self, command):
+        """A HIGH-rated rule inside a whitelisted substitution denies, amplified to BLOCKED."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "force push" in result.message.lower()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(git status)"',
+            'echo "$(ls -la)"',
+            'echo "$(git log --oneline -5)"',
+            'X=$(cd "$(git rev-parse --git-dir)" && pwd)',
+        ],
+    )
+    def test_read_only_whitelisted_substitutions_stay_safe(self, command, validator, parser):
+        """Read-only invocations keep the fast path's SAFE verdict and its whitelisted flag."""
+        assert validate_command(command).allowed is True
+
+        results = validator.validate_all_substitutions(parser.parse(command))
+        assert results
+        assert all(r.allowed and r.risk_level == RiskLevel.SAFE for r in results)
+        assert any(r.whitelisted for r in results)
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            # Credential theft through a whitelisted reader — a BLOCKED rule Layer 1 skipped.
+            ('echo "$(cat ~/.aws/credentials)"', "credential"),
+            # schlock's own config: a self-protection rule reached through a whitelisted editor.
+            ('echo "$(sed -i s/x/y/ ~/.claude/hooks/schlock-config.yaml)"', "schlock"),
+        ],
+    )
+    def test_non_git_whitelisted_commands_also_reach_the_rules(self, command, expected):
+        """The gap was never git-specific: 25 HIGH/BLOCKED rules rate whitelisted base commands."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert expected in result.message.lower()
+
+    def test_resource_advisory_is_amplified_into_a_denial(self):
+        """Documented collateral of mirroring Layer 1b: MEDIUM + 1 == HIGH, which denies.
+
+        `resource_intensive_operations` is the only advisory (non-side-effecting) MEDIUM rule
+        that rates a whitelisted base command, so an unscoped `find /` inside a substitution now
+        denies rather than warns. Pinned deliberately: re-rate the rule or drop the amplifier on
+        this path to change it, but do not change it by accident.
+        """
+        result = validate_command("echo $(find / -name foo)")
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
 
 
 class TestRemainingBranchCoverage:

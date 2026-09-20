@@ -1518,6 +1518,9 @@ class SubstitutionValidator:
             blocked = self._check_structural_and_nested(sub_node, depth)
             if blocked:
                 return blocked
+            blocked = self._check_inner_rules(sub_node)
+            if blocked:
+                return blocked
             return SubstitutionValidationResult(
                 allowed=True,
                 risk_level=RiskLevel.SAFE,
@@ -1536,16 +1539,9 @@ class SubstitutionValidator:
             # YAML rule check — defense in depth for contextual commands.
             # This catches patterns like kubectl_secrets_theft, kubectl_rbac_manipulation
             # that the structural checks alone would miss.
-            if sub_node.inner_command:
-                rule_match = self.rule_engine.match_command(sub_node.inner_command)
-                if rule_match and rule_match.matched:
-                    amplified_risk = self._amplify_risk(rule_match.risk_level)
-                    if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-                        return SubstitutionValidationResult(
-                            allowed=False,
-                            risk_level=RiskLevel.BLOCKED,
-                            message=f"Inner command blocked: {rule_match.message}",
-                        )
+            blocked = self._check_inner_rules(sub_node)
+            if blocked:
+                return blocked
 
             # Passed structural checks AND YAML rules — safe in substitution
             return SubstitutionValidationResult(
@@ -1622,6 +1618,33 @@ class SubstitutionValidator:
             risk_level=RiskLevel.HIGH,
             message=f"Unknown command in substitution: {sub_node.base_command}. Add to whitelist if safe.",
             inner_results=inner_results,
+        )
+
+    def _check_inner_rules(self, sub_node: SubstitutionNode) -> SubstitutionValidationResult | None:
+        """Run the YAML rule engine over a substitution's inner command.
+
+        Defense in depth for the two whitelist tiers. Being on a whitelist means the base
+        command is safe to *name* in a substitution, not that every invocation of it is: a
+        whitelist is a base-command judgement, and base commands like ``git`` and ``kubectl``
+        carry their real risk in the subcommand. Without this, a whitelisted command got a
+        weaker check than an unrecognised one, which reaches the same rule engine at Layer 4.
+
+        Returns:
+            A denial result if a rule matches at amplified HIGH or above, else None.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        if not sub_node.inner_command:
+            return None
+        rule_match = self.rule_engine.match_command(sub_node.inner_command)
+        if not (rule_match and rule_match.matched):
+            return None
+        if self._amplify_risk(rule_match.risk_level) not in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+            return None
+        return SubstitutionValidationResult(
+            allowed=False,
+            risk_level=RiskLevel.BLOCKED,
+            message=f"Inner command blocked: {rule_match.message}",
         )
 
     def _amplify_risk(self, risk_level: RiskLevel) -> RiskLevel:
