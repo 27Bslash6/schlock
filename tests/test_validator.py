@@ -1033,6 +1033,9 @@ class TestSiblingSubstitutionsRateTheWorst:
             'echo "$(tar czf /tmp/x.tar.gz ~/.ssh/id_rsa $(x=1))"',
             # Layer 1b: contextual command whose danger only a YAML rule knows.
             'echo "$(kubectl create clusterrolebinding x --clusterrole=cluster-admin --user=y $(x=1))"',
+            # Fail-closed hard block: the substitution's base command cannot be
+            # determined, which outranks the held HIGH denial from the nested `$(x=1)`.
+            'echo "$(<input /tmp/exploit.sh $(x=1))"',
             # Top level: the enclosing command itself is BLOCKED.
             "rm -rf / $(x=1)",
             "mkfs.ext4 /dev/sda $(x=1)",

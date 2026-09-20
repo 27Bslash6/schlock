@@ -1620,16 +1620,18 @@ class SubstitutionValidator:
                         inner_results=inner_results,
                     )
 
-        if nested_denial is not None:
-            return nested_denial
-
-        # Unknown command - default deny in substitution context
+        # Unknown command - default deny in substitution context. Ordered BEFORE the held
+        # nested denial: this is a fail-closed BLOCKED and a held denial is at most HIGH,
+        # so returning the denial first would downgrade it (LAB-4149).
         if not sub_node.base_command:
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
                 message="Cannot determine command in substitution",
             )
+
+        if nested_denial is not None:
+            return nested_denial
 
         # Command not in whitelist and not explicitly dangerous
         # This is the "gray area" - we block by default for security
