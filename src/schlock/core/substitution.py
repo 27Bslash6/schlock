@@ -746,6 +746,37 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
     return None
 
 
+def _command_tokens(node: Any) -> list[tuple[str, bool]]:
+    """Words of one simple command as ``(text, is_quoted_data)`` pairs.
+
+    A word that STILL holds whitespace after bashlex stripped its quotes can only have got
+    there by being quoted — shell word-splitting guarantees it. So the quoting survives the
+    dequoting, which is what lets the rendered text carry data spans it no longer shows.
+
+    The first word is exempt: a quoted command name is still the command being run, so
+    ``$('rm -rf /' foo)`` must keep matching the rule it names.
+    """
+    words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+    return [(word, index > 0 and any(char.isspace() for char in word)) for index, word in enumerate(words)]
+
+
+def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, int]]]:
+    """Join tokens with single spaces; return the text and the spans holding quoted data.
+
+    Each span widens by one onto the separators, which is where the quote characters stood.
+    Rules anchored with ``(\\s|$)`` consume the separator, and ``_is_in_string_literal``
+    demands the WHOLE match sit inside a span, so an unwidened span misses the suppression.
+    """
+    text = " ".join(token for token, _ in tokens)
+    ranges: list[tuple[int, int]] = []
+    position = 0
+    for token, is_data in tokens:
+        if is_data:
+            ranges.append((max(0, position - 1), min(len(text), position + len(token) + 1)))
+        position += len(token) + 1
+    return text, ranges
+
+
 @dataclass
 class SubstitutionNode:
     """Represents a command or process substitution in the AST."""
@@ -756,6 +787,8 @@ class SubstitutionNode:
     ast_node: Any  # The bashlex AST node
     nested_substitutions: list[SubstitutionNode] = field(default_factory=list)
     depth: int = 0  # Nesting depth
+    # Spans of inner_command that are quoted arguments, for the rule engine's string_literals.
+    literal_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 class _ListSegment:
@@ -944,7 +977,7 @@ class SubstitutionValidator:
             SubstitutionNode or None if extraction fails
         """
         node = _unwrap_compound(node)
-        inner_command = self._extract_inner_command_text(node)
+        inner_command, literal_ranges = self._extract_inner_command_text(node)
         # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
         # survive even when text rendering is partial (e.g. a compound segment renders to None).
         # Dropping it here would silently skip validation -> fail OPEN. Per-segment logic blocks
@@ -976,77 +1009,77 @@ class SubstitutionValidator:
             ast_node=node,
             nested_substitutions=nested,
             depth=depth,
+            literal_ranges=literal_ranges,
         )
 
-    def _extract_inner_command_text(self, node: Any) -> str | None:  # noqa: PLR0911, PLR0912
-        """Extract the command text from inside a substitution.
+    def _extract_inner_command_text(self, node: Any) -> tuple[str | None, list[tuple[int, int]]]:  # noqa: PLR0911, PLR0912
+        """Extract the command text from inside a substitution, with its quoted-data spans.
+
+        The text is the shell's WORD view, so the quotes are gone and the spans are the only
+        thing left telling the rule engine which stretches of it are arguments rather than
+        code. Without them a whitelisted reader searching for a dangerous string matches the
+        very rule it is searching for, and the substitution amplifier turns an ordinary
+        recursive grep into a denial (LAB-4234).
 
         Args:
             node: The substitution AST node
 
         Returns:
-            Command string or None
+            ``(command string or None, quoted-data ranges into that string)``
         """
         if not hasattr(node, "command"):
-            return None
+            return None, []
 
         cmd_node = node.command
         if not cmd_node:
-            return None
+            return None, []
 
         # Handle pipeline: $(cmd1 | cmd2)
         if hasattr(cmd_node, "kind") and cmd_node.kind == "pipeline":
-            parts_text: list[str] = []
+            tokens: list[tuple[str, bool]] = []
             if hasattr(cmd_node, "parts"):
                 for part in cmd_node.parts:
                     if hasattr(part, "kind"):
                         if part.kind == "command" and hasattr(part, "parts"):
-                            cmd_words = [p.word for p in part.parts if hasattr(p, "word")]
-                            if cmd_words:
-                                parts_text.append(" ".join(cmd_words))
+                            tokens.extend(_command_tokens(part))
                         elif part.kind == "pipe":
-                            parts_text.append("|")
-            return " ".join(parts_text) if parts_text else None
+                            tokens.append(("|", False))
+            return _join_tokens(tokens) if tokens else (None, [])
 
         # Handle command list: $(cmd1; cmd2), $(cmd1 && cmd2), $(cmd1 | cmd2 || cmd3), ...
         # This text feeds the Layer-4 YAML rule match and the audit log, so it must render EVERY
         # segment faithfully. A segment that cannot be rendered returns None (fail closed) rather
         # than a truncated string that would hide a dropped pipeline/compound from the rule engine.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
-            parts_text = []
+            tokens = []
             if hasattr(cmd_node, "parts"):
                 for part in cmd_node.parts:
                     kind = getattr(part, "kind", None)
                     if kind == "operator":
                         if not hasattr(part, "op"):
-                            return None
-                        parts_text.append(part.op)
+                            return None, []
+                        tokens.append((part.op, False))
                         continue
-                    rendered = self._render_segment_text(part)
+                    rendered = self._render_segment_tokens(part)
                     if rendered is None:
-                        return None  # unrenderable segment -> fail closed
-                    parts_text.append(rendered)
-            return " ".join(parts_text) if parts_text else None
+                        return None, []  # unrenderable segment -> fail closed
+                    tokens.extend(rendered)
+            return _join_tokens(tokens) if tokens else (None, [])
 
         # Handle simple command: try to get from parts
-        words: list[str] = []
-        if hasattr(cmd_node, "parts"):
-            for part in cmd_node.parts:
-                if hasattr(part, "word"):
-                    words.append(part.word)
-
-        if words:
-            return " ".join(words)
+        tokens = _command_tokens(cmd_node)
+        if tokens:
+            return _join_tokens(tokens)
 
         # Fallback: try to get from list (compound commands)
         if hasattr(cmd_node, "list") and cmd_node.list:
             # For compound commands, return first command
             first = cmd_node.list[0] if cmd_node.list else None
-            if first and hasattr(first, "parts"):
-                words = [p.word for p in first.parts if hasattr(p, "word")]
-                return " ".join(words) if words else None
+            tokens = _command_tokens(first) if first else []
+            if tokens:
+                return _join_tokens(tokens)
 
-        return None
+        return None, []
 
     def _segment_base_command(self, node: Any) -> str | None:
         """First word of a list segment (a `command`, or the first command of a `pipeline`).
@@ -1070,33 +1103,35 @@ class SubstitutionValidator:
             return None
         return None
 
-    def _render_segment_text(self, node: Any) -> str | None:
-        """Render one list segment (command or pipeline) to faithful command text.
+    def _render_segment_tokens(self, node: Any) -> list[tuple[str, bool]] | None:
+        """Render one list segment (command or pipeline) to faithful command tokens.
 
         Returns None for anything that cannot be rendered verbatim (compound `{ … }`/`( … )`,
         a pipeline containing a reserved word like `!`, or an empty command). Callers treat None
         as fail-closed: the segment is still validated structurally via its AST node, but it never
         contributes a truncated string to the rule engine or audit log. Redirections are dropped
         from the text (they are detected structurally), matching the simple-command rendering.
+
+        Tokens rather than text, so the caller can join the whole list in one pass and get the
+        quoted-data spans at their final offsets (see :func:`_join_tokens`).
         """
         kind = getattr(node, "kind", None)
         if kind == "command":
-            words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
-            return " ".join(words) if words else None
+            return _command_tokens(node) or None
         if kind == "pipeline":
-            rendered: list[str] = []
+            rendered: list[tuple[str, bool]] = []
             for part in getattr(node, "parts", []):
                 part_kind = getattr(part, "kind", None)
                 if part_kind == "pipe":
-                    rendered.append("|")
+                    rendered.append(("|", False))
                 elif part_kind == "command":
-                    words = [p.word for p in getattr(part, "parts", []) if hasattr(p, "word")]
-                    if not words:
+                    tokens = _command_tokens(part)
+                    if not tokens:
                         return None
-                    rendered.append(" ".join(words))
+                    rendered.extend(tokens)
                 else:
                     return None  # reserved word / unexpected node -> fail closed
-            return " ".join(rendered) if rendered else None
+            return rendered or None
         return None  # compound or unknown segment -> cannot render faithfully
 
     def _extract_base_command(self, node: Any) -> str | None:  # noqa: PLR0911, PLR0912
@@ -1671,6 +1706,11 @@ class SubstitutionValidator:
                 )
 
         # Layer 4: Validate inner command against YAML rules
+        # NO literal_ranges here, deliberately: this tier judges commands the whitelist does not
+        # recognise, and "the quoted argument is data" is only true of a command we have vetted.
+        # An unknown binary may hand its argument straight to a shell — `ssh host 'rm -rf /'` is
+        # the plain case — so the tier that exists to fail closed must keep reading quoted text as
+        # code. Vetted readers get the suppression in _check_inner_rules instead.
         if sub_node.inner_command:
             rule_match = self.rule_engine.match_command(sub_node.inner_command)
             if rule_match and rule_match.matched:
@@ -1728,6 +1768,15 @@ class SubstitutionValidator:
         MEDIUM rule into an un-promptable denial — a two-level jump the amplifier does not
         claim, and enough over-blocking to make users switch schlock off.
 
+        The inner text is the parser's WORD view, so the quotes are gone by the time a rule
+        sees it and a reader searching for a dangerous string matches the string it is
+        searching for — ``grep -rn 'rm -rf' src/`` went from SAFE to an un-promptable BLOCKED,
+        a four-level jump on an ordinary recursive grep (LAB-4234). ``literal_ranges`` is what
+        tells the engine which stretches were quoted arguments. It is passed HERE and not at
+        Layer 4 because this tier only ever judges commands the whitelist vetted: their quoted
+        arguments really are data, whereas an unknown binary may hand its own straight to a
+        shell.
+
         Returns:
             A denial result if a rule matches at amplified HIGH or above, else None.
         """
@@ -1735,7 +1784,7 @@ class SubstitutionValidator:
 
         if not sub_node.inner_command or self.rule_engine is None:
             return None
-        rule_match = self.rule_engine.match_command(sub_node.inner_command)
+        rule_match = self.rule_engine.match_command(sub_node.inner_command, string_literals=sub_node.literal_ranges)
         if not (rule_match and rule_match.matched):
             return None
         amplified_risk = self._amplify_risk(rule_match.risk_level)

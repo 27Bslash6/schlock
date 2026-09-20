@@ -458,7 +458,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             pass
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is None
 
     def test_null_command(self, validator):
@@ -467,7 +467,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             command = None
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is None
 
     def test_pipeline_with_parts(self, validator):
@@ -490,7 +490,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             command = MockPipeline()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is not None
         assert "date" in result
 
@@ -503,7 +503,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             command = MockPipeline()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is None
 
     def test_list_with_operators(self, validator):
@@ -527,7 +527,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             command = MockList()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is not None
         assert "echo" in result
 
@@ -548,7 +548,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             command = MockList()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         # Should return None since no command parts with words
         assert result is None
 
@@ -568,7 +568,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             command = MockCompound()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is not None
         assert "pwd" in result
 
@@ -582,7 +582,7 @@ class TestExtractInnerCommandTextEdgeCases:
         class MockNode:
             command = MockCompound()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is None
 
 
@@ -1545,6 +1545,65 @@ class TestWhitelistedSubstitutionYamlRules:
         assert result.risk_level == RiskLevel.HIGH
         assert not result.message.startswith("BLOCKED")
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Searching your own tree for a dangerous string is the archetype: SAFE at top
+            # level, and it must stay SAFE when the search runs inside a substitution.
+            "echo \"$(grep -rn 'rm -rf' src/)\"",
+            "echo \"$(grep -c 'mkfs.ext4 /dev/sda' notes.txt)\"",
+            "echo \"$(git log --grep='git push --force')\"",
+            # through the pipeline and list renderers, which join tokens of their own
+            "echo \"$(grep -rn 'rm -rf' src/ | head)\"",
+            "echo \"$(cd src && grep -rn 'rm -rf' .)\"",
+        ],
+    )
+    def test_quoted_arguments_are_data_not_commands(self, command):
+        """A quoted argument is data the shell hands over, not code it runs (LAB-4234).
+
+        The inner text handed to the rule engine is the parser's WORD view, so the quotes are
+        already gone by the time a rule sees it and `grep -rn 'rm -rf' src/` reads as the very
+        command it is searching for. Amplification then turned SAFE into an un-promptable
+        BLOCKED — a four-level jump on an ordinary recursive grep. The literal ranges are what
+        keep the substitution verdict equal to the same command's verdict at top level.
+        """
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The command NAME is never data, however it was quoted: this is the word the
+            # shell actually runs, so suppressing it would be an under-block.
+            "echo \"$('rm -rf /' foo)\"",
+            # Real code, merely adjacent to a quoted argument.
+            "echo \"$(grep -rn 'rm -rf' src/; git push --force)\"",
+            "echo \"$(grep -rn 'rm -rf' src/ | xargs rm -rf)\"",
+        ],
+    )
+    def test_literal_ranges_do_not_suppress_real_commands(self, command):
+        """Suppression covers the quoted span only — it must not leak onto the code around it."""
+        assert validate_command(command).allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo \"$(ssh host 'rm -rf /')\"",
+            "echo \"$(someunknownbin 'mkfs.ext4 /dev/sda')\"",
+        ],
+    )
+    def test_unknown_commands_still_read_quoted_text_as_code(self, command):
+        """The literal ranges stop at the whitelist: an unrecognised binary gets no benefit.
+
+        "The quoted argument is data" holds only for a command we have vetted. An unknown one
+        may hand its argument straight to a shell — `ssh host '...'` is the plain case — so the
+        tier that exists to fail closed keeps matching rules against quoted text. Layer 4 is
+        therefore the one rule-match site that is NOT given `literal_ranges`; pinned here so a
+        later tidy-up does not "consistently" pass them everywhere and silently drop this.
+        """
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
 
 class TestGroupedAndRedirectedSubstitutions:
     """Substitutions the extractor dropped before any tier could judge them (#164 review).
@@ -1764,7 +1823,7 @@ class TestRemainingBranchCoverage:
         class MockNode:
             command = MockPipeline()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         # Pipe is added as "|" even when no words extracted
         # Result is "|" which is still a valid (though odd) result
         assert result is not None
@@ -1796,7 +1855,7 @@ class TestRemainingBranchCoverage:
         class MockNode:
             command = MockList()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is None
 
     def test_list_part_without_parts(self, validator):
@@ -1813,7 +1872,7 @@ class TestRemainingBranchCoverage:
         class MockNode:
             command = MockList()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         # Should handle gracefully
         assert result is None
 
@@ -1830,7 +1889,7 @@ class TestRemainingBranchCoverage:
         class MockNode:
             command = MockCompound()
 
-        result = validator._extract_inner_command_text(MockNode())
+        result, _ = validator._extract_inner_command_text(MockNode())
         assert result is None
 
     def test_suspicious_patterns_no_suspicious(self, validator):
@@ -2154,14 +2213,14 @@ class TestListSegmentBranchCoverage:
         """A compound segment has no leading word -> None."""
         assert validator._segment_base_command(_mock("compound")) is None
 
-    # --- _render_segment_text ---
+    # --- _render_segment_tokens ---
 
-    def test_render_segment_text_command_without_words(self, validator):
+    def test_render_segment_tokens_command_without_words(self, validator):
         """A command with no words renders to None (fail-closed)."""
-        assert validator._render_segment_text(_mock("command", parts=[])) is None
+        assert validator._render_segment_tokens(_mock("command", parts=[])) is None
 
-    def test_render_segment_text_pipeline(self, validator):
-        """A pipeline renders as 'cmd | cmd' with words preserved."""
+    def test_render_segment_tokens_pipeline(self, validator):
+        """A pipeline renders as 'cmd | cmd' tokens with words preserved."""
         pipeline = _mock(
             "pipeline",
             parts=[
@@ -2170,21 +2229,26 @@ class TestListSegmentBranchCoverage:
                 _mock("command", parts=[_mock("word", word="head")]),
             ],
         )
-        assert validator._render_segment_text(pipeline) == "grep x | head"
+        assert validator._render_segment_tokens(pipeline) == [
+            ("grep", False),
+            ("x", False),
+            ("|", False),
+            ("head", False),
+        ]
 
-    def test_render_segment_text_pipeline_with_reserved_word(self, validator):
+    def test_render_segment_tokens_pipeline_with_reserved_word(self, validator):
         """A pipeline containing a reserved word (e.g. `!`) is unrenderable -> None."""
         pipeline = _mock("pipeline", parts=[_mock("reservedword"), _mock("command", parts=[_mock("word", word="x")])])
-        assert validator._render_segment_text(pipeline) is None
+        assert validator._render_segment_tokens(pipeline) is None
 
-    def test_render_segment_text_pipeline_command_without_words(self, validator):
+    def test_render_segment_tokens_pipeline_command_without_words(self, validator):
         """A pipeline whose command has no words is unrenderable -> None."""
         pipeline = _mock("pipeline", parts=[_mock("command", parts=[])])
-        assert validator._render_segment_text(pipeline) is None
+        assert validator._render_segment_tokens(pipeline) is None
 
-    def test_render_segment_text_compound_returns_none(self, validator):
+    def test_render_segment_tokens_compound_returns_none(self, validator):
         """A compound segment cannot be rendered faithfully -> None."""
-        assert validator._render_segment_text(_mock("compound")) is None
+        assert validator._render_segment_tokens(_mock("compound")) is None
 
     # --- _extract_base_command list branch (operator handling) ---
 
@@ -2217,7 +2281,7 @@ class TestListSegmentBranchCoverage:
             message = "mock cross-segment rule"
 
         class _Engine:
-            def match_command(self, command):  # noqa: ARG002
+            def match_command(self, command, string_literals=None):  # noqa: ARG002
                 return _Match()
 
         v = SubstitutionValidator(parser, _Engine())
