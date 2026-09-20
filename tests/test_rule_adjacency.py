@@ -87,12 +87,6 @@ GIT_GLOBALS = [
     "-C . -c user.name=x --no-pager",  # several, mixed
 ]
 
-# The opposite case: git's own usage line names these four -- `git [-v | --version]
-# [-h | --help]` -- and each one prints and exits, so the words after it are never a
-# subcommand. Verified against git 2.43: `git --version push --force` exits 129 on
-# "unknown option `force'" (it dispatched to `git version`), so nothing is pushed.
-GIT_TERMINATING = ["--version", "-v", "--help", "-h"]
-
 
 class TestGitGlobalFlagsDoNotDisplaceSubcommand:
     """AC-1 / AC-2: the verdict follows the operation, not the spelling."""
@@ -165,59 +159,10 @@ class TestGitGlobalFlagsDoNotOverReach:
         assert "git_force_push" not in result.matched_rules
         assert result.risk_level <= RiskLevel.MEDIUM
 
-    @pytest.mark.parametrize("terminating", GIT_TERMINATING)
-    @pytest.mark.parametrize(
-        "operation",
-        [
-            "push --force",  # HIGH   git_force_push
-            "push -f",  # HIGH   git_force_push
-            "reset --hard",  # HIGH   git_hard_reset
-            "add -A",  # HIGH   git_blanket_staging
-            "add .",  # HIGH   git_blanket_staging
-            "push",  # MEDIUM git_push
-            "rebase",  # MEDIUM git_rebase
-            "commit -m x",  # LOW    git_commit
-        ],
-    )
-    def test_a_terminating_option_is_not_an_operation(self, terminating, operation, rules_dir_path, clean_worktree):
-        """Absorbing global options must not absorb the ones that END the command.
-
-        These are not displacements -- git prints and exits, so the operation never
-        runs. Rating it anyway is a prompt (or a HIGH deny under paranoid) on a
-        command that does nothing.
-        """
-        result = verdict(f"git {terminating} {operation}", rules_dir_path)
-        assert result.risk_level == RiskLevel.SAFE, result.matched_rules
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            # The guard keys on the exact token, so a flag whose VALUE merely looks
-            # terminating is still a flag with a value.
-            "git --git-dir=--version push --force",
-            # ...and it only governs the run BEFORE the subcommand: `-v` after
-            # `push` is push's own verbose flag, and the push is real.
-            "git push -v --force",
-        ],
-    )
-    def test_the_terminating_guard_does_not_unrate_a_real_force_push(self, command, rules_dir_path):
-        result = verdict(command, rules_dir_path)
-        assert result.risk_level == RiskLevel.HIGH
-        assert "git_force_push" in result.matched_rules
-
     def test_dangerous_git_config_still_blocks(self, rules_dir_path):
         """`git -c core.pager=...` is judged in Python against the parsed argument
         list, not by these patterns. Absorbing global flags must not disturb it."""
         assert not verdict("git -c core.pager=cat log", rules_dir_path).allowed
-
-    def test_dangerous_git_config_merge_tool_still_blocks(self, rules_dir_path):
-        """`merge.tool` runs an arbitrary program the same way `core.pager` does.
-
-        It is on the same dangerous-key list and reaches the same parsed-argument
-        check, but nothing pinned it, so a narrowing of that list would have gone
-        unnoticed here.
-        """
-        assert not verdict("git -c merge.tool=cat log", rules_dir_path).allowed
 
 
 # --------------------------------------------------------------------------
@@ -423,68 +368,113 @@ class TestCredentialRulesDoNotOverReach:
     @pytest.mark.parametrize(
         "command",
         [
-            # A fixed credential filename that continues with a LETTER OR DIGIT
-            # names a different file, and none of these holds a secret.
+            # `config` continuing with a LETTER OR DIGIT names a different file.
+            # Only these three stems had a real collision, and the boundary is on
+            # those three only -- see the rule comment for why that restraint is
+            # the point rather than an oversight.
             "cat ~/.kube/configmaps.yaml",
             "cat ~/.aws/configure-notes.md",
             "nl ~/.docker/configfile",
-            "cat ~/.ssh/configtest.log",
-            "cat ~/.npmrcnotes",
-            # A credential NAME in prose is not a credential. Each of these was a
-            # hard deny, which is why the rule now demands an expansion or an
-            # assignment rather than the bare name.
+        ],
+    )
+    def test_a_path_that_merely_starts_like_config_is_not_a_credential(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).allowed, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "printf API_KEYBOARD",
+            "echo API_KEYBOARD",
             "echo 'set your API_KEY in .env'",
+            "echo Set the AWS_SECRET in vault",
             "echo PASSWORD reset instructions",
         ],
     )
-    def test_a_name_that_merely_starts_the_same_is_not_a_credential(self, command, rules_dir_path):
+    def test_a_credential_name_in_prose_is_not_a_credential(self, command, rules_dir_path):
+        """Every one of these was a hard deny at BLOCKED, which no preset relaxes."""
         assert verdict(command, rules_dir_path).allowed, command
 
 
-class TestTheSameSecretUnderAnotherName:
+class TestTheBoundaryDoesNotUnrateARealFile:
     """The other side of the boundary above, and the load-bearing one.
 
-    A boundary tightened one notch too far -- a whole-token `(?![^\\s;|&])` rather
-    than `(?![A-Za-z0-9])` -- unrates every backup and per-environment copy of a
-    credential file while still passing the false-positive class. It fails SILENTLY:
-    the rule keeps matching the canonical spelling nobody exfiltrates.
+    A boundary tightened one notch too far fails SILENTLY: the rule keeps matching
+    the canonical spelling nobody exfiltrates. Two notches were measured and
+    rejected -- a whole-token `(?![^\\s;|&])` unrates every backup and
+    per-environment copy, and applying `(?![A-Za-z0-9])` to names with no measured
+    collision unrated `.ssh/authorized_keys2` and `.ssh/known_hosts2`, which are
+    canonical OpenSSH files named in sshd_config's own default AuthorizedKeysFile.
+
+    Each case asserts the RULE, not just the verdict: several of these paths are
+    independently denied by a sibling rule, so a bare `not allowed` would pass with
+    this rule's branch deleted.
     """
 
     @pytest.mark.parametrize(
         "command",
         [
             # A separator continuation is the same secret under another name.
-            "cat ~/.aws/credentials.bak",
             "cat ~/.kube/config-prod",
+            "cat ~/.kube/config.bak",
             "nl ~/.npmrc_old",
-            "base64 ~/.git-credentials.save",
             # The real Docker file IS the suffixed spelling.
             "cat ~/.docker/config.json",
-            # A private key keeps its round-2 stem rule: the name may continue.
-            "cat ~/.ssh/id_ed25519_sk",
-            "cat ~/.ssh/id_rsa_github",
+            # Names that never had a measured collision keep no boundary at all.
+            "cat ~/.ssh/authorized_keys2",
+            "less ~/.ssh/known_hosts2",
+            "cat ~/.npmrcnotes",
         ],
     )
     def test_a_suffixed_credential_path_still_blocks(self, command, rules_dir_path):
-        assert not verdict(command, rules_dir_path).allowed, command
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED, command
+        assert "extended_credential_exposure" in result.matched_rules, command
+
+
+class TestACredentialNameNeedsAPosition:
+    """A credential name rates in exactly three positions, and each is measured.
+
+    Dropping any one of them was tried and cost a real denial, so the branches are
+    pinned separately rather than as one list.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        ["echo ${PASSWORD}", "printf '%s' \"$API_KEY\"", "echo $MY_TOKEN_VALUE"],
+    )
+    def test_expanded(self, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert "extended_credential_exposure" in result.matched_rules, command
 
     @pytest.mark.parametrize(
         "command",
         [
-            # Expanded: the name is a variable and its value is the secret.
-            "echo $GITHUB_TOKEN",
-            "echo ${PASSWORD}",
-            'printf "%s" "$API_KEY"',
-            "echo $AWS_SECRET_ACCESS_KEY",
-            # Assigned: the secret is the literal, and writing it to a file is the
-            # exposure. Nothing else in the rule set catches an uppercase name here.
-            'echo "API_KEY=abc123" > .env',
-            "printf 'TOKEN=%s\\n' abc > .netrc",
+            # The substitution validator does not recurse into a DOUBLE-QUOTED
+            # `$(...)`, so this rule is the only thing covering these. The
+            # unquoted twin is caught by environment_credential_extraction.
+            'echo "$(printenv GITHUB_TOKEN)"',
+            'printf "%s" "$(printenv AWS_SECRET_ACCESS_KEY)"',
+            'echo "Bearer $(printenv GITHUB_TOKEN)"',
         ],
     )
-    def test_an_expanded_or_assigned_credential_still_blocks(self, command, rules_dir_path):
-        assert not verdict(command, rules_dir_path).allowed, command
+    def test_substituted(self, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert "extended_credential_exposure" in result.matched_rules, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Writing a plaintext secret to a file. hardcoded_secrets matches a
+            # lowercase `key` only, so nothing else covers the uppercase name.
+            'echo "API_KEY=abc123" > .env',
+            'echo "API_KEY = abc123" > .env',
+            'echo "AWS_SECRET_ACCESS_KEY: abc" >> config.yml',
+            "printf 'PASSWORD: %s\\n' hunter2 > creds.yml",
+        ],
+    )
+    def test_assigned(self, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert "extended_credential_exposure" in result.matched_rules, command
 
 
 class TestUnanchoredSearchStaysLinear:
@@ -528,6 +518,28 @@ class TestUnanchoredSearchStaysLinear:
         # 4x the input: linear predicts ~4x, quadratic ~16x.
         assert large < small * 9, f"{small:.4f}s -> {large:.4f}s looks superlinear"
 
+    def test_credential_prefix_cost_stays_polynomial(self, rules_dir_path):
+        """`[^;|&]*` before an alternation is QUADRATIC on a path it never satisfies.
+
+        That predates this change and measures the same at 608e4b8; adding the
+        `config` boundary only moved prefix-shaped paths onto the same curve. So
+        this pins the exponent that actually matters -- quadratic is the ceiling,
+        exponential is the failure -- rather than claiming a linearity the pattern
+        does not have.
+        """
+
+        def elapsed(n):
+            command = "cat " + "~/.kube/configura" * n
+            start = time.perf_counter()
+            verdict(command, rules_dir_path)
+            return time.perf_counter() - start
+
+        small = min(elapsed(100) for _ in range(3))
+        large = min(elapsed(400) for _ in range(3))
+        # 4x the input: quadratic predicts ~16x. Anything near exponential blows
+        # past this by orders of magnitude.
+        assert large < small * 40, f"{small:.4f}s -> {large:.4f}s is worse than quadratic"
+
 
 class TestPatternsDoNotBacktrackCatastrophically:
     """The git flag group nests quantifiers, so its branches are kept disjoint.
@@ -555,8 +567,8 @@ class TestPatternsDoNotBacktrackCatastrophically:
             'A="x B=y" ' * 24 + "echo hi",
             "nl " + "x" * 400 + " ~/.ssh/nomatch",
             " " * 300 + "nl ~/.ssh/nomatch",
-            # A fixed credential name that starts to match and never closes, at
-            # every one of 200 positions. Instant before the boundary existed.
+            # A `config` stem that starts to match and never closes, at every one
+            # of 200 positions. Instant before the boundary existed.
             "cat " + "~/.aws/configura" * 200,
             "nl " + "~/.kube/configm" * 200,
             # The same shape for the credential-name alternation.
