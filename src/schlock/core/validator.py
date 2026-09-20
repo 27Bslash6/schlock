@@ -879,28 +879,38 @@ _EXPANSION_NESTS_ON = {")": "(", "]": "["}
 # What each opener owes, longest first so `$((` is never read as `$(`.
 _EXPANSION_FRAMES = (("$((", "))"), ("${", "}"), ("$[", "]"))
 
+# Every frame above starts with one of these, so the scan only probes on them.
+# A double-quoted span is otherwise the whole line, one probe per character.
+_FRAME_START_CHARS = frozenset("$(`")
 
-def _expansion_frame_at(line: str, pos: int, in_quote: bool) -> Optional[tuple[str, str]]:
+
+def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str, str]]:
     """The expansion opening at ``pos`` as ``(text, closers owed)``, or None.
 
-    ``in_quote`` swaps two cases rather than widening the set. Inside `"…"`
-    nothing can open a heredoc, so tracking `$(…)` and `` `…` `` there costs
-    nothing and is the only way to find which `"` really ends the string.
-    Outside one, both re-lex as shell and a heredoc inside them is real
-    (`x=$(cat <<'E' … E)`), so they stay untracked and their openers are found.
-    `((…))` and `a[…]` are arithmetic only outside a quote, where they are a
-    command and an assignment rather than literal text.
+    ``nested`` - some frame is already open - swaps two cases rather than
+    widening the set. Inside any frame nothing can open a heredoc, so tracking
+    `$(…)` and `` `…` `` there is free, and it is the only way to find which
+    closer really ends the enclosing frame: the `}` in `${x:-$(echo })<<ZZ }`
+    belongs to the substitution, and popping the `${…}` on it re-arms the very
+    phantom opener this exists to prevent. At the top level both re-lex as shell
+    and a heredoc inside them is real (`x=$(cat <<'E' … E)`), so they stay
+    untracked and their openers are found.
+
+    `((…))` and `a[…]` are arithmetic, and only at the top level - inside a
+    frame they are literal text. Both are heuristics, so both require their
+    closer on the same line: a frame opened on a guess and left open suppresses
+    every opener for the rest of the command, and `echo a[1` or
+    `((cd /tmp) && cat <<'EOF' …)` are legal shell that would then hard-deny.
     """
     for opener, owed in _EXPANSION_FRAMES:
         if line.startswith(opener, pos):
             return opener, owed
-    if in_quote:
+    if nested:
         return ("$(", ")") if line.startswith("$(", pos) else ("`", "`") if line[pos] == "`" else None
-    if line.startswith("((", pos) and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
-        # `(( 1<<b ))` is a left shift. Bash also accepts `((` as two subshells
-        # when the arithmetic will not parse, which this reads as arithmetic -
-        # costing a missed opener inside `( (…) )` written without the space,
-        # which denies. The other way round is the LAB-4270 fail-open.
+    if line.startswith("((", pos) and (pos == 0 or line[pos - 1] in _WORD_START_AFTER) and "))" in line[pos + 2 :]:
+        # `(( 1<<b ))` is a left shift. Bash falls back to reading `((` as two
+        # subshells when the arithmetic will not parse, and those close with
+        # `) )`, not `))` - which is exactly what the lookahead separates.
         return "((", "))"
     return None
 
@@ -910,9 +920,17 @@ def _opens_an_array_subscript(line: str, pos: int) -> bool:
 
     `a[1<<b]=1` shifts; `f[a<<b]` is a glob, and bash really does read a heredoc
     inside one (verified). An identifier starting at a word boundary is what
-    tells them apart - and reading a glob's bracket as a subscript only costs a
-    missed opener, which denies.
+    tells them apart, and an unclosed `[` is not a subscript at all - `echo a[1`
+    is legal, and a frame left open on it would suppress every opener for the
+    rest of the command.
+
+    The glob case is a deliberate mismatch with bash in the deny direction, but
+    not a free one: a missed opener moves where the NEXT heredoc's body ends, so
+    it can still lose a line. It is accepted because the alternative - reading
+    `a[1<<b]=1` as an opener - loses the lines outright and silently.
     """
+    if "]" not in line[pos + 1 :]:
+        return False
     start = pos
     while start and (line[start - 1].isalnum() or line[start - 1] == "_"):
         start -= 1
@@ -993,7 +1011,14 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     while pos < len(line):
         char = line[pos]
         top = frames[-1] if frames else ""
-        frame = None if top in ("'", "$'") else _expansion_frame_at(line, pos, top == '"')
+        # `char != top` because a backtick both opens and closes its own frame:
+        # without it the `` ` `` ending `"`date`"` opens a second one, the string
+        # never closes, and every opener after it is lost.
+        frame = (
+            _expansion_frame_at(line, pos, bool(frames))
+            if char in _FRAME_START_CHARS and char != top and top not in ("'", "$'")
+            else None
+        )
 
         if top in ("'", "$'"):
             # A single-quoted run is literal to its close. `$'…'` is ANSI-C

@@ -958,6 +958,14 @@ class TestHeredocSurroundings:
             ("ls <<'EOF' \\ \nx\nEOF", RiskLevel.SAFE, "escaped trailing space, whitelisted head"),
             ("cat <<'EOF' \\\\ \nhello\nEOF", RiskLevel.LOW, "a literal backslash argument is not an escape"),
             ("cat \\ <<'EOF'\nhello\nEOF", RiskLevel.LOW, "escaped space in front of the redirection"),
+            # Second review pass: legal shell that a heuristic frame left open
+            # would have hard-denied - each was LOW on main and BLOCKED before
+            # the same-line lookahead landed.
+            ("echo a[1\ncat <<'EOF' > f.txt\nhello\nEOF", RiskLevel.LOW, "unclosed `[` before a real heredoc"),
+            ("awk '{print $1}' f[0 <<'EOF'\nx\nEOF", RiskLevel.LOW, "unclosed `[` on the opener line"),
+            ("((cd /tmp) && cat <<'EOF'\nBODY\nEOF\n)", RiskLevel.LOW, "`((` opening two subshells"),
+            ("((:) && cat <<'EOF'\nBODY\nEOF\n)", RiskLevel.LOW, "`((` opening two subshells, empty first"),
+            ("echo \"`date`\" ; cat <<'E'\nx\nE", RiskLevel.LOW, "a command substitution in a quoted argument"),
             # LAB-4270: an expansion carrying `<<` alongside a real heredoc. bash
             # opens exactly one heredoc here (verified: `cat <<'EOF' ${x:-a<<b }`
             # passes `cat` the literal argument `a<<b`); reading the second `<<`
@@ -1040,6 +1048,20 @@ class TestHeredocSurroundings:
             ("cat f[a-z].txt <<c", ["c"], "a glob bracket is not a subscript"),
             ("(( 1<<2 )); cat <<c", ["c"], "an opener after the arithmetic command closes"),
             ('cat "${x}"<<c', ["c"], "an opener after a quote that contains an expansion"),
+            # Second review pass: a `$(…)` or backtick nested in ANY frame owns
+            # a frame too, or its `}` pops the enclosing `${…}` early and the
+            # `<<` behind it is a phantom again. bash reads both of these as one
+            # word expanding to `}<<ZZ` (canary verified).
+            ("cat ${x:-$(echo })<<ZZ }", [], "`$(…)` nested inside `${…}`"),
+            ("cat ${x:-`echo }`<<ZZ }", [], "a backtick nested inside `${…}`"),
+            # …and the mirror: `((` and `IDENT[` are guesses, so each needs its
+            # closer on the same line. Without that, one unbalanced bracket
+            # suppressed every opener for the rest of the command.
+            ("echo a[1", [], "an unclosed `[` is not a subscript"),
+            ("awk '{print $1}' f[0 <<c", ["c"], "an unclosed `[` does not eat the opener behind it"),
+            ("((cd /tmp) && cat <<c", ["c"], "`((` as two subshells closes with `) )`, not `))`"),
+            ("((:) && cat <<c", ["c"], "the same, with nothing between the parens"),
+            ('echo "`date`" ; cat <<c', ["c"], "a backtick closes its own frame, it does not reopen it"),
         ],
     )
     def test_expansion_boundaries_match_bash(self, line, delimiters, description):
