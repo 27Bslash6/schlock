@@ -375,6 +375,8 @@ class TestCredentialRulesDoNotOverReach:
             "cat ~/.kube/configmaps.yaml",
             "cat ~/.aws/configure-notes.md",
             "nl ~/.docker/configfile",
+            # A directory segment must actually follow the slash.
+            "cat ~/.kube/configs.yaml",
         ],
     )
     def test_a_path_that_merely_starts_like_config_is_not_a_credential(self, command, rules_dir_path):
@@ -388,6 +390,11 @@ class TestCredentialRulesDoNotOverReach:
             "echo 'set your API_KEY in .env'",
             "echo Set the AWS_SECRET in vault",
             "echo PASSWORD reset instructions",
+            # Prose spells `:` constantly, which is why only the colon form of an
+            # assignment has to redirect before it counts as a secret write.
+            'echo "PASSWORD: ask ops"',
+            'echo "API_KEYS: plural"',
+            'echo "TOKEN rotation: quarterly"',
         ],
     )
     def test_a_credential_name_in_prose_is_not_a_credential(self, command, rules_dir_path):
@@ -416,6 +423,9 @@ class TestTheBoundaryDoesNotUnrateARealFile:
             # A separator continuation is the same secret under another name.
             "cat ~/.kube/config-prod",
             "cat ~/.kube/config.bak",
+            # A pluralised directory holds the same secret as the file.
+            "cat ~/.kube/configs/prod",
+            "nl ~/.docker/configs/a.json",
             "nl ~/.npmrc_old",
             # The real Docker file IS the suffixed spelling.
             "cat ~/.docker/config.json",
@@ -470,6 +480,8 @@ class TestACredentialNameNeedsAPosition:
             'echo "API_KEY = abc123" > .env',
             'echo "AWS_SECRET_ACCESS_KEY: abc" >> config.yml',
             "printf 'PASSWORD: %s\\n' hunter2 > creds.yml",
+            # JSON, the other way an agent writes a config file.
+            'echo \'{"API_KEY":"sk-x"}\' > c.json',
         ],
     )
     def test_assigned(self, command, rules_dir_path):
