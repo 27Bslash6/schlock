@@ -3,6 +3,8 @@
 Also includes FIX 5: matched_rules field population test.
 """
 
+import time
+
 import pytest
 
 import schlock.core.validator as val_module
@@ -1054,13 +1056,40 @@ class TestHeredocSurroundings:
             # word expanding to `}<<ZZ` (canary verified).
             ("cat ${x:-$(echo })<<ZZ }", [], "`$(…)` nested inside `${…}`"),
             ("cat ${x:-`echo }`<<ZZ }", [], "a backtick nested inside `${…}`"),
-            # …and the mirror: `((` and `IDENT[` are guesses, so each needs its
-            # closer on the same line. Without that, one unbalanced bracket
-            # suppressed every opener for the rest of the command.
-            ("echo a[1", [], "an unclosed `[` is not a subscript"),
-            ("awk '{print $1}' f[0 <<c", ["c"], "an unclosed `[` does not eat the opener behind it"),
+            # …and the mirror. `((` is arithmetic only when the `)` balancing
+            # its second `(` is followed by another `)` - bash reads the pair
+            # with quotes, backslashes and backticks opaque and everything else
+            # transparent, then falls back to two subshells. Deciding from
+            # `"))" in line` instead got every row below wrong in one direction.
             ("((cd /tmp) && cat <<c", ["c"], "`((` as two subshells closes with `) )`, not `))`"),
             ("((:) && cat <<c", ["c"], "the same, with nothing between the parens"),
+            ('((echo "hello ))") && cat <<c', ["c"], "a quoted `))` does not close a subshell pair"),
+            ("((cd /tmp) && cat <<c # note: ))", ["c"], "a commented `))` does not close a subshell pair"),
+            ("((( 1 )) <<c", ["c"], "a subshell around an arithmetic command"),
+            ("(( ${x:-)} + 1<<b ))", ["b"], "`${…}` is transparent to the `((` matcher: this is two subshells"),
+            ('(( ")"+1<<b ))', [], "a quoted `)` is opaque to the matcher: still arithmetic"),
+            ("(( `echo )`+1<<b ))", [], "a backtick is opaque to the matcher: still arithmetic"),
+            ("(( \\)+1<<b ))", [], "an escaped `)` is opaque to the matcher: still arithmetic"),
+            ("(( $'\\')'+1<<b ))", [], "`$'…'` honours `\\'`, so its `)` is inside the quote: still arithmetic"),
+            ("(( $(echo ')')+1<<b ))", [], "`$(…)` balances its own parens: still arithmetic"),
+            # `name[` is a subscript only at command position - where bash could
+            # start a command or an assignment. Elsewhere `[` is a glob character
+            # and bash opens a heredoc right through it (verified).
+            ("echo a[1", [], "an unclosed glob bracket is a complete word"),
+            ("awk '{print $1}' f[0 <<c", ["c"], "a glob bracket does not eat the opener behind it"),
+            ("awk '{print $1}' f[0 <<c # ]", ["c"], "…nor does a `]` in a comment make it a subscript"),
+            ("cat f[a<<b]", ["b]"], "bash opens a heredoc inside a glob bracket"),
+            ("export a[1<<b]=1", ["b]=1"], "a declaration builtin's argument is a word, not a subscript"),
+            ("let a[1<<b]=1", ["b]=1"], "so is `let`'s"),
+            ("x=1 a[1<<b]=1", [], "after an assignment is command position"),
+            ("2>&1 a[1<<b]=1", [], "after a redirection is command position"),
+            ("if ! a[1<<b]=1; then :; fi", [], "after `!` is command position"),
+            ("time -p a[1<<b]=1", [], "after `time -p` is command position"),
+            ("case q in q) a[1<<b]=1;; esac", [], "after a case pattern is command position"),
+            ("{ a[1<<b]=1; }", [], "after `{` is command position"),
+            ("echo ${x} a[1<<b]", ["b]"], "the `}` of an expansion is not a `{` group opener"),
+            ('a["]"<<b ]=1', [], "a quoted `]` does not close a subscript"),
+            ("a[${x:-]}<<b ]=1", [], "a `]` inside `${…}` does not close a subscript"),
             ('echo "`date`" ; cat <<c', ["c"], "a backtick closes its own frame, it does not reopen it"),
         ],
     )
@@ -1105,6 +1134,92 @@ class TestHeredocSurroundings:
         """Same rule as an unclosed quote: the body's first line is unknown, so deny."""
         with pytest.raises(ParseError, match="line that continues"):
             val_module._neuter_heredocs("cat <<'EOF' ${x:-\n}\nhello\nEOF")
+
+    @pytest.mark.parametrize(
+        "shell,description",
+        [
+            ("((\n1<<b ))", "an arithmetic command split across lines"),
+            ("a[\n1<<b ]=1", "an array subscript split across lines"),
+            ("for ((\ni=0; i<1<<b; i++ )); do :; done", "an arithmetic for-loop header split across lines"),
+            ("true | ((\n1<<b ))", "`((` after a pipe"),
+            ("if true; then ((\n1<<b )); fi", "`((` after `then`"),
+            ("time ((\n1<<b ))", "`((` after `time`"),
+            ("x=1 a[\n1<<b ]=1", "`name[` after an assignment"),
+        ],
+    )
+    def test_arithmetic_split_across_lines_never_opens_a_heredoc(self, shell, description):
+        """Bash reads `((…))` and `name[…]` to their closer however many lines away.
+
+        Each row ran real bash with a canary file after the shift, and bash
+        deleted it. Deciding `((` and `[` from the line they start on left the
+        `<<b` on the next line at the top level, where it read as a heredoc
+        opener whose body was the payload.
+        """
+        neutered, base = val_module._neuter_heredocs(f"ls <<'A'\nz\nA\n{shell}\nrm -rf /\nb")
+
+        assert base == "ls", description
+        assert "rm -rf /" in neutered, description
+        assert shell in neutered, description
+
+    @pytest.mark.parametrize(
+        "command,reason",
+        [
+            ("(( 1<<b\nrm -rf /\nb", "no matching"),
+            ("a[\n1<<b\nrm -rf /\nb", "unclosed"),
+            ('(( "1<<b ))\nrm -rf /\nb', "Unterminated"),
+            ("cat <<'A'\nz\nA\necho ${x:-\nrm -rf /", "unclosed"),
+        ],
+    )
+    def test_a_pair_the_command_never_closes_fails_closed(self, command, reason):
+        """Bash reports `unexpected EOF while looking for matching …` and runs nothing.
+
+        Reading the `<<b` as an opener instead would swallow the payload as a
+        body and hand a verdict to a command bash refuses to parse at all.
+        """
+        with pytest.raises(ParseError, match=reason):
+            val_module._neuter_heredocs(command)
+
+    def test_a_hash_is_transparent_to_the_dparen_matcher(self):
+        """`(( 1 # )` is closed by the `)` in what looks like a comment.
+
+        Bash's matcher knows nothing of comments, so the pair balances there,
+        the next character is a newline rather than `)`, and the text is re-read
+        as two subshells - in which the `#` IS a comment and the `<<b` on the
+        next line is a real heredoc (verified: bash never ran the line after it).
+        """
+        neutered, base = val_module._neuter_heredocs("(( 1 # )\n+ 1<<b ))\nrm -rf /\nb")
+
+        assert neutered == "(( 1 # )\n+ 1<<SCHLOCK_HEREDOC ))\n\nSCHLOCK_HEREDOC"
+        assert base == "+ 1"
+
+    def test_a_glob_bracket_does_not_move_the_next_body(self):
+        """A missed opener is not fail-closed: it moves where the NEXT body ends.
+
+        `echo a[1 <<X ] <<'Q'` opens two heredocs, X then Q, and bash runs the
+        `rm` after both terminators. Reading `a[` as a subscript hid the `<<X`,
+        so the rewrite consumed the `X` line as Q's body and the `rm` line as
+        Q's terminator - and only bashlex choking on what was left denied it.
+        """
+        neutered, _ = val_module._neuter_heredocs("echo a[1 <<X ] <<'Q'\nX\nQ\nrm -rf /")
+
+        assert neutered == ("echo a[1 <<SCHLOCK_HEREDOC ] <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /")
+
+    def test_nested_subshell_pairs_are_resolved_in_linear_time(self):
+        """Every `((` is decided by reading to its balancing `)`, so nesting is the adversarial shape.
+
+        Without memoising where each `(` closes, `(( (( (( … ) ) ) ) ) )` reads
+        the tail once per level - quadratic, on a hook that runs before every
+        Bash call. 0.5s is the budget the other pathological-input tests use.
+        """
+        depth = 2000
+        command = "(( " * depth + "x" + " )" * (2 * depth) + "\ncat <<'E'\nbody\nE"
+        started = time.perf_counter()
+
+        neutered, base = val_module._neuter_heredocs(command)
+
+        assert time.perf_counter() - started < 0.5
+        assert base.endswith("cat")
+        assert neutered.endswith("cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC")
 
     def test_arithmetic_after_a_heredoc_denies_for_the_real_reason(self, safety_rules_path):
         """`$((1<<2))` still denies - because bashlex cannot parse arithmetic, not a phantom heredoc.
