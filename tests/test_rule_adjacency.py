@@ -87,6 +87,12 @@ GIT_GLOBALS = [
     "-C . -c user.name=x --no-pager",  # several, mixed
 ]
 
+# The opposite case: git's own usage line names these four -- `git [-v | --version]
+# [-h | --help]` -- and each one prints and exits, so the words after it are never a
+# subcommand. Verified against git 2.43: `git --version push --force` exits 129 on
+# "unknown option `force'" (it dispatched to `git version`), so nothing is pushed.
+GIT_TERMINATING = ["--version", "-v", "--help", "-h"]
+
 
 class TestGitGlobalFlagsDoNotDisplaceSubcommand:
     """AC-1 / AC-2: the verdict follows the operation, not the spelling."""
@@ -159,10 +165,59 @@ class TestGitGlobalFlagsDoNotOverReach:
         assert "git_force_push" not in result.matched_rules
         assert result.risk_level <= RiskLevel.MEDIUM
 
+    @pytest.mark.parametrize("terminating", GIT_TERMINATING)
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "push --force",  # HIGH   git_force_push
+            "push -f",  # HIGH   git_force_push
+            "reset --hard",  # HIGH   git_hard_reset
+            "add -A",  # HIGH   git_blanket_staging
+            "add .",  # HIGH   git_blanket_staging
+            "push",  # MEDIUM git_push
+            "rebase",  # MEDIUM git_rebase
+            "commit -m x",  # LOW    git_commit
+        ],
+    )
+    def test_a_terminating_option_is_not_an_operation(self, terminating, operation, rules_dir_path, clean_worktree):
+        """Absorbing global options must not absorb the ones that END the command.
+
+        These are not displacements -- git prints and exits, so the operation never
+        runs. Rating it anyway is a prompt (or a HIGH deny under paranoid) on a
+        command that does nothing.
+        """
+        result = verdict(f"git {terminating} {operation}", rules_dir_path)
+        assert result.risk_level == RiskLevel.SAFE, result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The guard keys on the exact token, so a flag whose VALUE merely looks
+            # terminating is still a flag with a value.
+            "git --git-dir=--version push --force",
+            # ...and it only governs the run BEFORE the subcommand: `-v` after
+            # `push` is push's own verbose flag, and the push is real.
+            "git push -v --force",
+        ],
+    )
+    def test_the_terminating_guard_does_not_unrate_a_real_force_push(self, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH
+        assert "git_force_push" in result.matched_rules
+
     def test_dangerous_git_config_still_blocks(self, rules_dir_path):
         """`git -c core.pager=...` is judged in Python against the parsed argument
         list, not by these patterns. Absorbing global flags must not disturb it."""
         assert not verdict("git -c core.pager=cat log", rules_dir_path).allowed
+
+    def test_dangerous_git_config_merge_tool_still_blocks(self, rules_dir_path):
+        """`merge.tool` runs an arbitrary program the same way `core.pager` does.
+
+        It is on the same dangerous-key list and reaches the same parsed-argument
+        check, but nothing pinned it, so a narrowing of that list would have gone
+        unnoticed here.
+        """
+        assert not verdict("git -c merge.tool=cat log", rules_dir_path).allowed
 
 
 # --------------------------------------------------------------------------
@@ -365,6 +420,72 @@ class TestCredentialRulesDoNotOverReach:
     def test_write_via_arg_to_authorized_keys_stays_high(self, rules_dir_path):
         assert verdict("sort -o /root/.ssh/authorized_keys k", rules_dir_path).risk_level == RiskLevel.HIGH
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A fixed credential filename that continues with a LETTER OR DIGIT
+            # names a different file, and none of these holds a secret.
+            "cat ~/.kube/configmaps.yaml",
+            "cat ~/.aws/configure-notes.md",
+            "nl ~/.docker/configfile",
+            "cat ~/.ssh/configtest.log",
+            "cat ~/.npmrcnotes",
+            # A credential NAME in prose is not a credential. Each of these was a
+            # hard deny, which is why the rule now demands an expansion or an
+            # assignment rather than the bare name.
+            "printf API_KEYBOARD",
+            "echo 'set your API_KEY in .env'",
+            "echo PASSWORD reset instructions",
+        ],
+    )
+    def test_a_name_that_merely_starts_the_same_is_not_a_credential(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).allowed, command
+
+
+class TestTheSameSecretUnderAnotherName:
+    """The other side of the boundary above, and the load-bearing one.
+
+    A boundary tightened one notch too far -- a whole-token `(?![^\\s;|&])` rather
+    than `(?![A-Za-z0-9])` -- unrates every backup and per-environment copy of a
+    credential file while still passing the false-positive class. It fails SILENTLY:
+    the rule keeps matching the canonical spelling nobody exfiltrates.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A separator continuation is the same secret under another name.
+            "cat ~/.aws/credentials.bak",
+            "cat ~/.kube/config-prod",
+            "nl ~/.npmrc_old",
+            "base64 ~/.git-credentials.save",
+            # The real Docker file IS the suffixed spelling.
+            "cat ~/.docker/config.json",
+            # A private key keeps its round-2 stem rule: the name may continue.
+            "cat ~/.ssh/id_ed25519_sk",
+            "cat ~/.ssh/id_rsa_github",
+        ],
+    )
+    def test_a_suffixed_credential_path_still_blocks(self, command, rules_dir_path):
+        assert not verdict(command, rules_dir_path).allowed, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Expanded: the name is a variable and its value is the secret.
+            "echo $GITHUB_TOKEN",
+            "echo ${PASSWORD}",
+            'printf "%s" "$API_KEY"',
+            "echo $AWS_SECRET_ACCESS_KEY",
+            # Assigned: the secret is the literal, and writing it to a file is the
+            # exposure. Nothing else in the rule set catches an uppercase name here.
+            'echo "API_KEY=abc123" > .env',
+            "printf 'TOKEN=%s\\n' abc > .netrc",
+        ],
+    )
+    def test_an_expanded_or_assigned_credential_still_blocks(self, command, rules_dir_path):
+        assert not verdict(command, rules_dir_path).allowed, command
+
 
 class TestUnanchoredSearchStaysLinear:
     """Per-word parsing being unambiguous does NOT make the search linear.
@@ -414,6 +535,13 @@ class TestPatternsDoNotBacktrackCatastrophically:
     The rejected path-keyed cut carried an ambiguous alternation in a lookahead and
     reached 12 SECONDS on a 247-character benign command -- on a hook with a ~1ms
     budget that runs on every bash call. These inputs are the ones that found it.
+
+    The credential alternation is covered here too. `[^;|&]*` followed by an
+    alternation is QUADRATIC on any path the alternation never satisfies, and
+    adding the `(?![A-Za-z0-9])` boundary moved prefix-shaped paths onto that
+    curve: measured 28ms at 6.4 KB, against 31ms for a path that never matched on
+    either side -- the same curve, not a new one, and 0.02ms at a realistic 68
+    characters. A test that only exercised the git group could not see this.
     """
 
     @pytest.mark.parametrize(
@@ -427,6 +555,12 @@ class TestPatternsDoNotBacktrackCatastrophically:
             'A="x B=y" ' * 24 + "echo hi",
             "nl " + "x" * 400 + " ~/.ssh/nomatch",
             " " * 300 + "nl ~/.ssh/nomatch",
+            # A fixed credential name that starts to match and never closes, at
+            # every one of 200 positions. Instant before the boundary existed.
+            "cat " + "~/.aws/configura" * 200,
+            "nl " + "~/.kube/configm" * 200,
+            # The same shape for the credential-name alternation.
+            "echo " + "API_KEYBOARD_" * 200,
         ],
     )
     def test_pathological_input_terminates(self, command, rules_dir_path):
