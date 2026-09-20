@@ -52,6 +52,19 @@ class TestValidator:
         if not should_allow:
             assert result.exit_code == 1
 
+    @pytest.mark.parametrize("blank", [" ", "\t"], ids=["space", "tab"])
+    def test_escaped_blank_between_segments_keeps_quote_context(self, safety_rules_path, monkeypatch, blank):
+        r"""A segment ending in an escaped blank still parses, so its quoted text stays inert.
+
+        Stripping the segment used to leave `echo 'rm -rf /' \`, which parses
+        nowhere; the rule engine then saw the quoted `rm -rf /` as bare text.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        result = validate_command(f"echo 'rm -rf /' \\{blank}; ls", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.SAFE, result.message
+        assert result.allowed is True
+
     def test_validate_with_alternatives(self, safety_rules_path):
         """Alternatives populated for blocked commands."""
         result = validate_command("rm -rf /", config_path=safety_rules_path)
@@ -759,6 +772,15 @@ class TestHeredocSurroundings:
             # nor by carrying a literal `<<` argument.
             ("ls << 'X'\nX\nchmod -R 777 / << 'Y'\nY", "the dangerous command owns the second heredoc"),
             ("ls << 'X'\nX\nchmod -R 777 / \"<<\"", "a literal `<<` argument does not hide a segment"),
+            # An escaped blank ending the opener line is a one-blank argument, not
+            # a continuation. Stripping the segment used to leave a dangling
+            # `ls \` that parses nowhere, denying the benign spelling; the fix
+            # must not also lose sight of what follows the terminator (LAB-4126).
+            ("ls <<'EOF' \\ \nx\nEOF\nrm -rf /", "escaped trailing space on the opener line, rm after"),
+            ("ls <<'EOF' \\\t\nx\nEOF\nrm -rf /", "escaped trailing tab on the opener line, rm after"),
+            # Pinned with the danger after the opener: `rm -rf / <<'EOF' \ ` is
+            # denied on the base command alone and never reaches the fallback.
+            ("chmod -R 777 <<'EOF' / \\ \nx\nEOF", "the dangerous command itself ends in an escaped space"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -912,6 +934,13 @@ class TestHeredocSurroundings:
             ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
             ("python3 << 'EOF'\nprint(1)\nEOF", RiskLevel.LOW, "python heredoc"),
             ("ssh host << 'EOF'\nuptime\nEOF", RiskLevel.LOW, "ssh heredoc"),
+            # `\ ` and `\<tab>` at the end of the opener line: bash hands the
+            # command a one-blank argument. Same verdict as without it (LAB-4126).
+            ("cat <<'EOF' \\ \nhello\nEOF", RiskLevel.LOW, "escaped trailing space on the opener line"),
+            ("cat <<'EOF' \\\t\nhello\nEOF", RiskLevel.LOW, "escaped trailing tab on the opener line"),
+            ("ls <<'EOF' \\ \nx\nEOF", RiskLevel.SAFE, "escaped trailing space, whitelisted head"),
+            ("cat <<'EOF' \\\\ \nhello\nEOF", RiskLevel.LOW, "a literal backslash argument is not an escape"),
+            ("cat \\ <<'EOF'\nhello\nEOF", RiskLevel.LOW, "escaped space in front of the redirection"),
         ],
     )
     def test_legitimate_heredoc_keeps_its_verdict(self, safety_rules_path, command, expected_risk, description):
