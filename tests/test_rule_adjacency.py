@@ -368,6 +368,32 @@ class TestCredentialRulesDoNotOverReach:
     @pytest.mark.parametrize(
         "command",
         [
+            # One command, two operands, and a line break INSIDE the first one.
+            # The first operand need not exist -- `cat` reports its error and
+            # still emits the second file -- so this reads a real private key.
+            'cat "ordinary\nfile" ~/.ssh/id_ed25519',
+            'head "ordinary\nfile" ~/.ssh/id_rsa',
+            "cat 'ordinary\nfile' ~/.ssh/id_rsa",
+            'cat "ordinary\nfile" ~/.kube/config',
+            'nl "ordinary\nfile" ~/.aws/credentials',
+            'cat "ordinary\nfile" ~/.ssh/authorized_keys',
+        ],
+    )
+    def test_a_quoted_newline_is_operand_data_not_a_boundary(self, command, rules_dir_path):
+        """The counterpart of test_a_reader_does_not_reach_a_path_on_the_next_line.
+
+        Both sides of one distinction, so neither fix can silently undo the other.
+        Excluding EVERY newline from the span was the first attempt at that test
+        and it lost a denial `main` had: a line break inside a quoted word is
+        operand DATA, and adding one such argument was the whole bypass. The span
+        now crosses a newline only inside a quoted span.
+        """
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             # `config` continuing with a LETTER OR DIGIT names a different file.
             # Only these three stems had a real collision, and the boundary is on
             # those three only -- see the rule comment for why that restraint is
