@@ -1258,6 +1258,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
 
         # Step 4: Parse command and extract AST context
         parser = _get_parser()
+        # A denied substitution below BLOCKED is held, not returned: the enclosing command's
+        # own rules (Step 5) may still say BLOCKED, and `rm -rf / $(x=1)` must not read as
+        # HIGH because of the `$(x=1)` (LAB-4149).
+        substitution_denial = None
         try:
             ast = parser.parse(command)
             # Extract string literals for context-aware matching
@@ -1293,7 +1297,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             denied = [r for r in sub_validator.validate_all_substitutions(ast) if not r.allowed]
             if denied:
                 worst = max(denied, key=lambda r: r.risk_level)
-                return ValidationResult(
+                substitution_denial = ValidationResult(
                     allowed=False,
                     risk_level=worst.risk_level,
                     message=f"BLOCKED: {worst.message}",
@@ -1305,6 +1309,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     exit_code=1,
                     error=None,
                 )
+                if worst.risk_level == RiskLevel.BLOCKED:
+                    return substitution_denial
 
             # SECURITY: Pure AST-based dangerous command detection
             # Uses bashlex AST for BOTH command names AND arguments (no regex shortcuts)
@@ -1355,6 +1361,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # here allows specific safe pipe patterns without whitelisting the
                 # constituent commands standalone.
                 if engine.is_whitelisted(command):
+                    if substitution_denial is not None:
+                        return substitution_denial
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -1528,6 +1536,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 )
 
         # Step 7: Build ValidationResult
+        # A held substitution denial wins unless the command itself matched something worse.
+        if substitution_denial is not None and substitution_denial.risk_level >= match.risk_level:
+            return substitution_denial
+
         # BLOCKED commands are not allowed
         allowed = match.risk_level != RiskLevel.BLOCKED
         exit_code = 0 if allowed else 1
@@ -1553,7 +1565,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # level, and the cache is keyed on the command string alone. Caching a capped inner
         # verdict flipped `watch watch watch watch ls` from SAFE to BLOCKED for the rest of the
         # process once a deeper chain had been seen.
-        if _depth == 0:
+        if _depth == 0 and substitution_denial is None:
             _global_cache.set(command, result)
 
         # Step 8: Return

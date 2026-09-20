@@ -1532,8 +1532,10 @@ class SubstitutionValidator:
         # Unlike the full whitelist, these STILL go through YAML rules (defense in depth).
         # e.g., kubectl: "get pods" is safe, but "get secrets -o json" is caught by YAML rules.
         if sub_node.base_command in CONTEXTUAL_SUBSTITUTION_COMMANDS:
+            # A BLOCKED structural/nested verdict ends it here; a lesser nested denial is held
+            # so the YAML rules below can still rate the command itself BLOCKED (LAB-4149).
             blocked = self._check_structural_and_nested(sub_node, depth)
-            if blocked:
+            if blocked and blocked.risk_level == RiskLevel.BLOCKED:
                 return blocked
 
             # YAML rule check — defense in depth for contextual commands.
@@ -1549,6 +1551,9 @@ class SubstitutionValidator:
                             risk_level=RiskLevel.BLOCKED,
                             message=f"Inner command blocked: {rule_match.message}",
                         )
+
+            if blocked:
+                return blocked
 
             # Passed structural checks AND YAML rules — safe in substitution
             return SubstitutionValidationResult(
@@ -1574,18 +1579,23 @@ class SubstitutionValidator:
                 message=f"Suspicious pattern in substitution: {reason}",
             )
 
-        # Layer 3: Recursive validation of nested substitutions, rated at the worst
-        # denied child rather than the first (LAB-4149).
+        # Layer 3: Recursive validation of nested substitutions, rated at the worst denied
+        # child rather than the first (LAB-4149). A BLOCKED child ends it here; a lesser
+        # denial is held so Layer 4 can still rate the command itself BLOCKED - otherwise
+        # `$(chmod 777 /etc/shadow $(x=1))` would read as HIGH, which permissive allows.
         inner_results = [self.validate_substitution(nested, depth + 1) for nested in sub_node.nested_substitutions]
         denied = [r for r in inner_results if not r.allowed]
+        nested_denial = None
         if denied:
             worst = max(denied, key=lambda r: r.risk_level)
-            return SubstitutionValidationResult(
+            nested_denial = SubstitutionValidationResult(
                 allowed=False,
                 risk_level=worst.risk_level,
                 message=f"Nested substitution blocked: {worst.message}",
                 inner_results=inner_results,
             )
+            if worst.risk_level == RiskLevel.BLOCKED:
+                return nested_denial
 
         # Layer 4: Validate inner command against YAML rules
         if sub_node.inner_command:
@@ -1609,6 +1619,9 @@ class SubstitutionValidator:
                         message=f"High-risk command in substitution context: {rule_match.message}",
                         inner_results=inner_results,
                     )
+
+        if nested_denial is not None:
+            return nested_denial
 
         # Unknown command - default deny in substitution context
         if not sub_node.base_command:

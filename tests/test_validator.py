@@ -1004,8 +1004,17 @@ class TestSiblingSubstitutionsRateTheWorst:
         assert "x=1" in result.message
         assert "y=2" not in result.message
 
-    def test_unknown_sibling_alone_stays_high(self, safety_rules_path):
-        result = validate_command('echo "$(x=1) $(echo b)"', config_path=safety_rules_path)
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(x=1) $(echo b)"',
+            # Multi-segment with a whitelisted prefix: the held denial must beat the
+            # full-command whitelist short-circuit, not be replaced by SAFE.
+            "ls $(x=1); echo hi",
+        ],
+    )
+    def test_unknown_sibling_alone_stays_high(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.HIGH
         assert result.allowed is False
@@ -1015,3 +1024,25 @@ class TestSiblingSubstitutionsRateTheWorst:
 
         assert result.risk_level == RiskLevel.SAFE
         assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Layer 3: the command inside the substitution is BLOCKED by a YAML rule.
+            'echo "$(chmod 777 /etc/shadow $(x=1))"',
+            'echo "$(tar czf /tmp/x.tar.gz ~/.ssh/id_rsa $(x=1))"',
+            # Layer 1b: contextual command whose danger only a YAML rule knows.
+            'echo "$(kubectl create clusterrolebinding x --clusterrole=cluster-admin --user=y $(x=1))"',
+            # Top level: the enclosing command itself is BLOCKED.
+            "rm -rf / $(x=1)",
+            "mkfs.ext4 /dev/sda $(x=1)",
+            "$(x=1); rm -rf /",
+        ],
+    )
+    def test_unknown_substitution_does_not_downgrade_the_enclosing_command(self, safety_rules_path, command):
+        """A HIGH denial from `$(x=1)` must not preempt the BLOCKED rule on the command around it."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert "x=1" not in result.message
