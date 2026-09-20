@@ -791,6 +791,18 @@ class TestHeredocSurroundings:
             ("ls <<'A'\nz\nA\necho ${x:-\nq<<b }\nrm -rf /\nb", "${…} spanning lines"),
             ("ls <<'A'\nz\nA\necho ${x:-${y:-p<<b} }\nrm -rf /\nb", "${…} nested two deep"),
             ("ls <<'A'\nz\nA\necho ${x:-$(( (1<<2) ))}\nrm -rf /\n2 ))}", "$((…)) nested inside ${…}"),
+            # Review findings: the same hole through a frame the first cut did
+            # not model. bash runs `rm -rf /` in every one (canary verified).
+            ("ls <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb", "`<<` inside the arithmetic command `((…))`"),
+            # This one denied on main too - as a phantom body that never
+            # terminates - so it discriminates nothing here; the row in
+            # `test_expansion_boundaries_match_bash` is what pins the fix. Kept
+            # because the shape is the attack, and a deny for the wrong reason
+            # still deletes `rm -rf /` before any rule sees it.
+            ("ls <<'A'\nz\nA\na[1<<b]=1\nrm -rf /\nb", "`<<` inside an array subscript"),
+            ('cat <<\'H\'\nx\nH\nls "${x:-"<<ZZ "}"\nrm -rf /\nZZ', "a quote nested in an expansion in a quote"),
+            ('cat <<\'H\'\nx\nH\nls "$(echo "<<ZZ ")"\nrm -rf /\nZZ', "`$(…)` re-opening quoting inside a quote"),
+            ('cat <<\'H\'\nx\nH\nls "`echo "<<ZZ "`"\nrm -rf /\nZZ', "a backtick re-opening quoting inside a quote"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -968,11 +980,8 @@ class TestHeredocSurroundings:
         [
             ("${x:-q<<b }", "parameter expansion"),
             ("${x:-${y:-q<<b} }", "parameter expansion nested two deep"),
-            ("$((1<<2))", "arithmetic expansion"),
-            ("$(( (1<<2) + 3 ))", "arithmetic expansion with a nested paren group"),
             ("${x:-$((1<<2))}", "arithmetic nested inside a parameter expansion"),
             ("$[1<<2]", "the deprecated $[…] arithmetic substitution"),
-            ("$[$[1<<2]]", "$[…] nested two deep"),
         ],
     )
     def test_expansion_never_opens_a_heredoc(self, expansion, description):
@@ -996,7 +1005,6 @@ class TestHeredocSurroundings:
         [
             # Nothing opens: the `<<` is text or a shift, all the way down.
             ("echo ${x:-q<<b }", [], "parameter expansion"),
-            ("echo ${x:-${y:-p<<c} }", [], "`${` nests its own frame"),
             ("echo $((1<<2))", [], "arithmetic shift"),
             ("echo $(( ((1))<<2 ))", [], "paren groups nest inside arithmetic"),
             ("echo $(( $((1)) <<2 ))", [], "arithmetic nested in arithmetic owes both parens"),
@@ -1014,6 +1022,24 @@ class TestHeredocSurroundings:
             ("echo ${x:-a(b}<<c", ["c"], "a stray `(` does not extend a `${…}`"),
             ("echo ${#arr[@]}<<c", ["c"], "subscript brackets do not extend a `${…}`"),
             (r"echo ${x//\//_}<<c", ["c"], "a substitution expansion ends at its own `}`"),
+            # Review findings: the same phantom opener, reached through a frame
+            # the first cut of this lexer did not model. Each one ran real bash
+            # with a canary file and deleted it.
+            ("(( 1<<b ))", [], "the arithmetic command `((…))`, not just `$((…))`"),
+            ("if (( x=1<<b )); then :; fi", [], "`((…))` inside a compound statement"),
+            ("a[1<<b]=1", [], "an arithmetic array subscript"),
+            ('ls "${x:-"<<ZZ "}"', [], "a quote nested inside an expansion inside a quote"),
+            ('ls "$(echo "<<ZZ ")"', [], "`$(…)` inside a quote re-opens quoting"),
+            ('ls "`echo "<<ZZ "`"', [], "a backtick inside a quote re-opens quoting"),
+            ('echo ${x:-"}" <<c }', [], "a quoted closer does not end the frame"),
+            ("echo ${x:-${y:-p} <<c }", [], "the outer `${` still owes its `}`"),
+            # …and the openers that must survive all of that. `$(…)` and a glob
+            # bracket are deliberately NOT frames outside a quote, because a
+            # heredoc inside either one is real.
+            ("x=$(cat <<E", ["E"], "`$(…)` outside a quote can own a real heredoc"),
+            ("cat f[a-z].txt <<c", ["c"], "a glob bracket is not a subscript"),
+            ("(( 1<<2 )); cat <<c", ["c"], "an opener after the arithmetic command closes"),
+            ('cat "${x}"<<c', ["c"], "an opener after a quote that contains an expansion"),
         ],
     )
     def test_expansion_boundaries_match_bash(self, line, delimiters, description):
@@ -1024,7 +1050,7 @@ class TestHeredocSurroundings:
         terminates, and missing a real one leaves body text to be parsed as
         commands. A `BLOCKED` assertion cannot tell either from a correct read.
         """
-        _, openers, _, _ = val_module._rewrite_openers(line, "", [])
+        _, openers, _ = val_module._rewrite_openers(line, [])
 
         assert [delimiter for delimiter, _, _ in openers] == delimiters, description
 

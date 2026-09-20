@@ -857,18 +857,66 @@ _WORD_END = frozenset(" \t;&|<>()")
 _WORD_START_AFTER = frozenset(" \t;&|()<>")
 
 # Inside a parameter or arithmetic expansion, `<<` is never a redirection:
-# `${x:-a<<b}` expands to the literal `a<<b` and `$((1<<2))` is a left shift.
-# The scan therefore carries a stack of the closers it still owes, typed by
-# closer so an unbalanced bracket of a *different* family (`${x:-a)b}`) cannot
-# end the expansion early and re-open the hole (LAB-4270).
+# `${x:-a<<b}` expands to the literal `a<<b`, `$((1<<2))` and `(( 1<<2 ))` are
+# left shifts, `a[1<<2]=x` is a subscript. Quotes are the same kind of state one
+# step further: bash nests them inside an expansion, so `"${x:-"<<ZZ "}"` is one
+# word and the inner `"` does NOT end the outer string.
 #
-# Only `(` and `[` nest their frame one deeper - `$(( ((1))<<2 ))` ends at the
-# last `)`, `$[arr[1]<<2]` at the last `]`. A bare `{` does NOT: bash ends a
-# `${…}` at the first unmatched `}` whatever braces the text holds, so
-# `${x:-{a}<<c` really does open a heredoc (verified). Nesting it would have
-# cost a false positive on every `${x:-{a,b}}`; only a nested `${` extends a
-# `}` frame, and that pushes its own.
+# Modelling quotes and expansions as separate variables made the two blind to
+# each other, and the `<<` right after a mis-read closing quote became a phantom
+# heredoc opener whose body deleted real commands before validation (LAB-4270).
+# So there is ONE stack of the closers still owed, and `<<` opens a heredoc only
+# when it is empty. Frames: `'`, `$'`, `"`, `` ` ``, `}`, `)`, `]`.
+#
+# Only `(` and `[` deepen their own frame - `$(( ((1))<<2 ))` ends at the last
+# `)`, `$[arr[1]<<2]` at the last `]`. A bare `{` deliberately does NOT: bash
+# ends a `${…}` at the first unmatched `}` whatever braces the text holds, so
+# `${x:-{a}<<c` really does open a heredoc (verified). Adding `"}": "{"` here
+# is the obvious-looking fix and it would miss that opener; a nested `${`
+# extends the frame by pushing its own closer, which is all that is needed.
 _EXPANSION_NESTS_ON = {")": "(", "]": "["}
+
+# What each opener owes, longest first so `$((` is never read as `$(`.
+_EXPANSION_FRAMES = (("$((", "))"), ("${", "}"), ("$[", "]"))
+
+
+def _expansion_frame_at(line: str, pos: int, in_quote: bool) -> Optional[tuple[str, str]]:
+    """The expansion opening at ``pos`` as ``(text, closers owed)``, or None.
+
+    ``in_quote`` swaps two cases rather than widening the set. Inside `"…"`
+    nothing can open a heredoc, so tracking `$(…)` and `` `…` `` there costs
+    nothing and is the only way to find which `"` really ends the string.
+    Outside one, both re-lex as shell and a heredoc inside them is real
+    (`x=$(cat <<'E' … E)`), so they stay untracked and their openers are found.
+    `((…))` and `a[…]` are arithmetic only outside a quote, where they are a
+    command and an assignment rather than literal text.
+    """
+    for opener, owed in _EXPANSION_FRAMES:
+        if line.startswith(opener, pos):
+            return opener, owed
+    if in_quote:
+        return ("$(", ")") if line.startswith("$(", pos) else ("`", "`") if line[pos] == "`" else None
+    if line.startswith("((", pos) and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+        # `(( 1<<b ))` is a left shift. Bash also accepts `((` as two subshells
+        # when the arithmetic will not parse, which this reads as arithmetic -
+        # costing a missed opener inside `( (…) )` written without the space,
+        # which denies. The other way round is the LAB-4270 fail-open.
+        return "((", "))"
+    return None
+
+
+def _opens_an_array_subscript(line: str, pos: int) -> bool:
+    """True when the `[` at ``pos`` is an arithmetic subscript, not a glob bracket.
+
+    `a[1<<b]=1` shifts; `f[a<<b]` is a glob, and bash really does read a heredoc
+    inside one (verified). An identifier starting at a word boundary is what
+    tells them apart - and reading a glob's bracket as a subscript only costs a
+    missed opener, which denies.
+    """
+    start = pos
+    while start and (line[start - 1].isalnum() or line[start - 1] == "_"):
+        start -= 1
+    return start < pos and not line[start].isdigit() and (start == 0 or line[start - 1] in _WORD_START_AFTER)
 
 
 def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
@@ -914,44 +962,67 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
 
 
 def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; splitting it hides the state machine
-    line: str, quote: str, expansions: list[str]
-) -> tuple[str, list[tuple[str, bool, int]], str, list[str]]:
+    line: str, frames: list[str]
+) -> tuple[str, list[tuple[str, bool, int]], list[str]]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
-    Only an *unquoted* `<<` opens a heredoc. Bash reads `echo "x << y"` and
-    `# note << z` as plain text, and `<<<` as a here-string; a scan that does not
-    track lexical state invents heredocs in all three, and the phantom body then
-    swallows the real commands that follow. That is the LAB-1731 lesson one
-    lexical context over: enumerate the tokenization deltas before trusting a
-    rewrite, and deny when the reading is uncertain.
+    Only an *unquoted, unexpanded* `<<` opens a heredoc. Bash reads `echo "x << y"`,
+    `# note << z`, `${x:-a<<b}` and `$((1<<2))` as plain text or arithmetic, and
+    `<<<` as a here-string; a scan that does not track lexical state invents
+    heredocs in all of them, and the phantom body then swallows the real commands
+    that follow. That is the LAB-1731 lesson: enumerate the tokenization deltas
+    before trusting a rewrite, and deny when the reading is uncertain.
 
-    ``quote`` and ``expansions`` carry the lexical state the previous line left
-    open - a quote or a `${`/`$((`/`$[` - since either means the next line is not
-    top-level shell to be scanned. Both have to cross the line break: `${` alone
-    on one line and `<<b` on the next is one newline away from the same phantom
-    opener, and bash reads that as the literal `q<<b` (LAB-4270).
+    ``frames`` is that state: the closers still owed, innermost last, carried in
+    from the previous line because bash lets every one of them span a newline.
+    A quote and an expansion are the same kind of frame on purpose - bash nests
+    them in both directions, and tracking them separately is what let
+    `"${x:-"<<ZZ "}"` read as a phantom opener (LAB-4270).
 
     Returns ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener
-    order, open quote, open expansions)``; each ``offset`` is where its `<<`
-    sits, which is the only honest source for "what command owns this heredoc" -
-    a second regex looking for the first `<<` would find the quoted ones this
-    deliberately skipped.
+    order, frames still open)``; each ``offset`` is where its `<<` sits, which is
+    the only honest source for "what command owns this heredoc" - a second regex
+    looking for the first `<<` would find the quoted ones this deliberately
+    skipped.
     """
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
-    expansions = list(expansions)
     continued = False
     pos = 0
 
     while pos < len(line):
         char = line[pos]
+        top = frames[-1] if frames else ""
+        frame = None if top in ("'", "$'") else _expansion_frame_at(line, pos, top == '"')
 
-        if quote:
-            # `quote` holds the opening sequence, so `$'` and `'` stay distinct:
-            # a backslash escapes inside `"…"` and `$'…'` but not inside `'…'`.
-            if char == quote[-1]:
-                quote = ""
-            elif char == "\\" and quote != "'" and pos + 1 < len(line):
+        if top in ("'", "$'"):
+            # A single-quoted run is literal to its close. `$'…'` is ANSI-C
+            # quoting and still honours backslash escapes, so `\'` does not end
+            # it; `'…'` has no escapes at all.
+            if char == "'":
+                frames.pop()
+            elif char == "\\" and top == "$'" and pos + 1 < len(line):
+                out.append(char)
+                pos += 1
+                char = line[pos]
+            out.append(char)
+            pos += 1
+        elif frame:
+            opener, owed = frame
+            frames.extend(owed)
+            out.append(opener)
+            pos += len(opener)
+        elif frames and char == top:
+            frames.pop()  # closes a quote, a backtick or an expansion
+            out.append(char)
+            pos += 1
+        elif frames and char == _EXPANSION_NESTS_ON.get(top):
+            frames.append(top)  # `$(( ((1))<<2 ))`, `$[arr[1]<<2]`
+            out.append(char)
+            pos += 1
+        elif top == '"':
+            # Everything else inside `"…"` is literal, `'` included.
+            if char == "\\" and pos + 1 < len(line):
                 out.append(char)
                 pos += 1
                 char = line[pos]
@@ -962,40 +1033,28 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             out.append(line[pos : pos + 2])
             pos += 2
         elif char == "$" and pos + 1 < len(line) and line[pos + 1] in "'\"":
-            # $'…' is ANSI-C quoting, $"…" is locale translation; both escape
-            # with a backslash, and $" is otherwise an ordinary double quote.
-            quote = "$'" if line[pos + 1] == "'" else '"'
+            # $'…' is ANSI-C quoting, $"…" is locale translation; $" is
+            # otherwise an ordinary double quote.
+            frames.append("$'" if line[pos + 1] == "'" else '"')
             out.append(line[pos : pos + 2])
             pos += 2
         elif char in "'\"":
-            quote = char
+            frames.append(char)
             out.append(char)
             pos += 1
-        elif line.startswith("$((", pos):
-            expansions += [")", ")"]  # arithmetic owes both parens
-            out.append("$((")
-            pos += 3
-        elif line.startswith("${", pos) or line.startswith("$[", pos):
-            expansions.append("}" if line[pos + 1] == "{" else "]")
-            out.append(line[pos : pos + 2])
-            pos += 2
-        elif expansions and char == _EXPANSION_NESTS_ON.get(expansions[-1]):
-            expansions.append(expansions[-1])
+        elif char == "[" and _opens_an_array_subscript(line, pos):
+            frames.append("]")
             out.append(char)
             pos += 1
-        elif expansions and char == expansions[-1]:
-            expansions.pop()
-            out.append(char)
-            pos += 1
-        elif char == "#" and not expansions and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
-            # `#` is ordinary inside an expansion - `${#x}`, `${x#pre}` - so the
-            # comment branch would otherwise abandon the scan mid-expansion.
+        elif char == "#" and not frames and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+            # `#` is ordinary inside every frame - `${#x}`, `${x#pre}` - so the
+            # comment branch must not abandon the scan mid-expansion.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
-        elif line.startswith("<<", pos) and not expansions:
+        elif line.startswith("<<", pos) and not frames:
             opener_at = pos
             pos += 2
             strips_tabs = line.startswith("-", pos)
@@ -1009,14 +1068,16 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             out.append(char)
             pos += 1
 
-    if openers and (quote or continued or expansions):
-        # A trailing `\`, an unclosed quote or an unclosed expansion means this
-        # line does not finish the command, so bash starts the body after a
-        # later line. Consuming from the next one would delete the commands in
-        # between.
-        raise ParseError("Heredoc opener on a line that continues; the body's start is unknown")
+    if openers and (continued or frames):
+        # A trailing `\`, or a quote or expansion still open, means this line
+        # does not finish the command, so bash starts the body after a later
+        # line. Consuming from the next one would delete the commands between.
+        raise ParseError(
+            f"Heredoc opener on a line that continues ({'trailing backslash' if continued else 'unclosed ' + frames[-1]}); "
+            "the body's start is unknown"
+        )
 
-    return "".join(out), openers, quote, expansions
+    return "".join(out), openers, frames
 
 
 def _neuter_heredocs(command: str) -> tuple[str, str]:
@@ -1049,12 +1110,11 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
     lines = command.split("\n")
     rewritten: list[str] = []
     base_command: Optional[str] = None
-    quote = ""
-    expansions: list[str] = []
+    frames: list[str] = []
     index = 0
 
     while index < len(lines):
-        line, openers, quote, expansions = _rewrite_openers(lines[index], quote, expansions)
+        line, openers, frames = _rewrite_openers(lines[index], frames)
         rewritten.append(line)
         index += 1
 
