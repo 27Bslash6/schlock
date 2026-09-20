@@ -648,9 +648,13 @@ class RuleEngine:
         Matching algorithm:
         1. Check whitelist first (returns SAFE if matched)
         2. Match against all rules, collect all matches
-        3. Skip matches that fall inside quoted string literals (AST context)
-        4. Skip matches inside non-shell heredocs (text, not executed)
+        3. Skip OCCURRENCES that fall inside quoted string literals (AST context)
+        4. Skip OCCURRENCES inside non-shell heredocs (text, not executed)
         5. Return highest risk level match
+
+        A pattern only fails to match when EVERY one of its occurrences is
+        suppressed - a quoted decoy does not excuse an unquoted occurrence
+        later in the same command (LAB-4321).
 
         Args:
             command: Command string to validate
@@ -689,29 +693,21 @@ class RuleEngine:
         for rule in self.rules:
             patterns = self.compiled_patterns.get(rule.name, [])
             for pattern in patterns:
-                match = pattern.search(command)
-                if match:
-                    # Check if match is inside a quoted string literal
-                    if string_literals and self._is_in_string_literal(match, string_literals):
-                        # Skip this match - it's in a quoted string that won't execute
-                        continue
+                match = self._first_effective_match(pattern, command, string_literals, heredoc_ranges)
+                if match is None:
+                    continue
 
-                    # Check if match is inside a non-shell heredoc (text, not executed)
-                    if heredoc_ranges and self._is_in_non_shell_heredoc(match, heredoc_ranges):
-                        # Skip this match - it's in heredoc content that won't execute
-                        continue
-
-                    # Rule matched - check if higher risk than current
-                    if rule.risk_level > highest_risk:
-                        highest_risk = rule.risk_level
-                        highest_match = RuleMatch(
-                            matched=True,
-                            rule=rule,
-                            risk_level=rule.risk_level,
-                            message=rule.description,
-                            alternatives=rule.alternatives,
-                        )
-                    break  # Don't check other patterns for this rule
+                # Rule matched - check if higher risk than current
+                if rule.risk_level > highest_risk:
+                    highest_risk = rule.risk_level
+                    highest_match = RuleMatch(
+                        matched=True,
+                        rule=rule,
+                        risk_level=rule.risk_level,
+                        message=rule.description,
+                        alternatives=rule.alternatives,
+                    )
+                break  # Don't check other patterns for this rule
 
         # Return highest risk match or SAFE if no match
         if highest_match:
@@ -723,6 +719,55 @@ class RuleEngine:
             message="No security rules matched",
             alternatives=[],
         )
+
+    def _first_effective_match(
+        self,
+        pattern: re.Pattern,
+        command: str,
+        string_literals: Optional[list[tuple]],
+        heredoc_ranges: Optional[list[tuple]],
+    ) -> Optional[re.Match]:
+        """Return the first occurrence of `pattern` that would actually execute.
+
+        SECURITY CRITICAL: suppression is per-OCCURRENCE, so the scan must be too.
+        This used to be `pattern.search()`, which yields only the FIRST occurrence;
+        when that one fell inside a quoted string or a non-shell heredoc the caller
+        abandoned the whole pattern, and every later occurrence - including unquoted,
+        executable ones - went unexamined. Quoting a decoy up front therefore
+        disarmed the rule for the rest of the command string (LAB-4321).
+
+        Hot path stays a single `search`. The per-occurrence walk allocates an
+        iterator for every pattern, and ~150 of them are tried per command with
+        almost none matching, which measured ~40% slower on the engine path - so
+        the walk only starts once a first occurrence exists AND there is some
+        range that could suppress it. The re-scan then costs one extra pass over
+        a command-length string, in the rare case where it can change the answer.
+
+        Args:
+            pattern: Compiled rule pattern
+            command: Command string to scan
+            string_literals: Optional (start, end) ranges for quoted strings
+            heredoc_ranges: Optional (start, end, is_shell) ranges for heredocs
+
+        Returns:
+            The first occurrence outside every suppression range, or None when
+            the pattern does not occur or every occurrence is suppressed.
+        """
+        match = pattern.search(command)
+        if match is None or not (string_literals or heredoc_ranges):
+            return match
+
+        for match in pattern.finditer(command):
+            # In a quoted string that won't execute
+            if string_literals and self._is_in_string_literal(match, string_literals):
+                continue
+
+            # In heredoc content going to a non-shell command - text, not code
+            if heredoc_ranges and self._is_in_non_shell_heredoc(match, heredoc_ranges):
+                continue
+
+            return match
+        return None
 
     def _is_in_string_literal(self, match: re.Match, string_literals: list[tuple]) -> bool:
         """Check if a regex match falls within a quoted string literal.

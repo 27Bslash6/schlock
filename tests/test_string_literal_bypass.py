@@ -9,7 +9,7 @@ Also tests FIX 2: Empty quoted string range bug fix.
 import pytest
 
 from schlock.core.parser import BashCommandParser
-from schlock.core.rules import RiskLevel
+from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import validate_command
 
 
@@ -152,3 +152,87 @@ class TestEmptyQuotedStringRangeFix:
             # All ranges must be valid
             for start, end in literals:
                 assert start <= end, f"Invalid range in '{command}': ({start}, {end})"
+
+
+class TestSuppressionIsPerOccurrence:
+    """A suppressed occurrence must not disable its rule for the whole command.
+
+    `RuleEngine.match_command` used `pattern.search`, which yields only the
+    FIRST occurrence. When that one sat inside a quoted string the code moved
+    straight on to the next pattern, so every later occurrence - including
+    unquoted, executable ones - went unexamined. Quoting a decoy up front
+    therefore disarmed the rule for the rest of the command (LAB-4321).
+
+    `rm -rf /` does not guard this: `system_destruction` carries two patterns
+    that match at different offsets, so a second pattern still catches the
+    payload. `fork_bomb`'s patterns both match at the decoy, and the payload
+    fragments under segment-by-segment validation, so it is the shape that
+    actually exercises the leak.
+    """
+
+    FORK_BOMB = ":(){ :|:& };:"
+
+    def test_quoted_decoy_does_not_hide_a_later_unquoted_danger(self, rules_dir_path):
+        """Suppression is per-occurrence: the range covers the decoy, not the payload."""
+        engine = RuleEngine(rules_dir_path)
+        command = f"cat '{self.FORK_BOMB}'\n{self.FORK_BOMB}"
+        start = command.index("'")
+        end = command.index("'", start + 1) + 1
+
+        match = engine.match_command(command, string_literals=[(start, end)])
+
+        assert match.matched, "quoted decoy suppressed the rule for the unquoted fork bomb"
+        assert match.risk_level == RiskLevel.BLOCKED
+
+    def test_non_shell_heredoc_decoy_does_not_hide_a_later_danger(self, rules_dir_path):
+        """Same leak via the other suppression range: heredoc body, then real payload."""
+        body_start = len("cat <<'EOF'\n")
+        command = f"cat <<'EOF'\n{self.FORK_BOMB}\nEOF\n{self.FORK_BOMB}"
+        body_end = body_start + len(self.FORK_BOMB)
+
+        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=[(body_start, body_end, False)])
+
+        assert match.matched, "heredoc decoy suppressed the rule for the payload after the terminator"
+        assert match.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "template,description",
+        [
+            # Leaked on `main` itself: the parser derives a literal for the decoy,
+            # the newline stops the pattern spanning both, and the payload after
+            # it was never looked at. Rated SAFE and ALLOWED before the fix.
+            ("cat '{bomb}'\n{bomb}", "quoted decoy, payload on the next line"),
+            ("printf '%s' '{bomb}'\n{bomb}", "decoy as a printf argument"),
+            # Blocked on `main` only by accident - it cannot derive a literal for
+            # the segment, so it matches the DECOY rather than the payload. Once
+            # the heredoc's ranges are rebased off the parent AST the decoy is
+            # correctly suppressed, which is what un-gated the defect.
+            ("cat '{bomb}' <<'EOF'\nbody\nEOF\n{bomb}", "canonical opener"),
+            ("cat '{bomb}' <<'EOF' \\ \nbody\nEOF\n{bomb}", "escaped trailing space on the opener line"),
+            ("cat '{bomb}' <<'EOF' \\\t\nbody\nEOF\n{bomb}", "escaped trailing tab on the opener line"),
+            ("cat '{bomb}' <<'EOF' \\\\ \nbody\nEOF\n{bomb}", "a literal backslash argument, not an escape"),
+        ],
+    )
+    def test_quoted_decoy_does_not_hide_the_payload_end_to_end(self, safety_rules_path, template, description):
+        """End to end, through the parser that derives the suppression ranges."""
+        command = template.format(bomb=self.FORK_BOMB)
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.allowed is False, description
+
+    @pytest.mark.parametrize(
+        "command,literal,description",
+        [
+            ('echo "rm -rf /"', slice(5, 15), "double-quoted decoy, no payload"),
+            ("echo 'rm -rf /'", slice(5, 15), "single-quoted decoy, no payload"),
+            ('echo "${HOME} rm -rf /"', slice(5, 23), "parameter expansion beside the decoy"),
+        ],
+    )
+    def test_sole_occurrence_is_still_suppressed(self, rules_dir_path, command, literal, description):
+        """Per-occurrence scanning must not break suppression when there is only one."""
+        match = RuleEngine(rules_dir_path).match_command(command, string_literals=[(literal.start, literal.stop)])
+
+        assert not match.matched, f"false positive: {description} - {command}"
+        assert match.risk_level == RiskLevel.SAFE
