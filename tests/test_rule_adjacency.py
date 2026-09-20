@@ -385,6 +385,28 @@ class TestCredentialRulesDoNotOverReach:
     @pytest.mark.parametrize(
         "command",
         [
+            # Two innocent lines. The reader is on the first, the credential path
+            # on the second, and neither command reads a secret.
+            "head -5 notes.txt\nexport KUBECONFIG=~/.kube/config",
+            "head -5 notes.txt\nls ~/.kube/config",
+            "sort data.csv\nvim ~/.npmrc",
+            "tail -2 log.txt\nssh -i ~/.ssh/id_rsa host",
+        ],
+    )
+    def test_a_reader_does_not_reach_a_path_on_the_next_line(self, command, rules_dir_path):
+        """The reader-to-path span must not cross a newline.
+
+        `[^;|&]*` is a negated class and crosses one; the `.{0,200}` it replaced
+        could not, because `.` is newline-free and `re.MULTILINE` does not change
+        that. Widening the reader list turned that into a hard deny on ordinary
+        two-line scripts -- including `export KUBECONFIG`, which the class above
+        tests is allowed on one line.
+        """
+        assert verdict(command, rules_dir_path).allowed, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "printf API_KEYBOARD",
             "echo API_KEYBOARD",
             "echo 'set your API_KEY in .env'",
