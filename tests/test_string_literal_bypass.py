@@ -6,6 +6,8 @@ ENTIRE match (both start AND end) falls within a string literal.
 Also tests FIX 2: Empty quoted string range bug fix.
 """
 
+import re
+
 import pytest
 
 from schlock.core.parser import BashCommandParser
@@ -221,6 +223,46 @@ class TestSuppressionIsPerOccurrence:
 
         assert result.risk_level == RiskLevel.BLOCKED, description
         assert result.allowed is False, description
+
+    def test_scan_advances_one_char_so_an_overlapping_match_survives(self, rules_dir_path):
+        """The scan steps by `match.start() + 1`, not `match.end()`.
+
+        A later match that OVERLAPS the suppressed one starts before it ends, so
+        resuming at `end()` steps straight over it - which is what `re.finditer`
+        does. Greedy bounded quantifiers make this reachable with the shipped
+        rules: a later-starting match can reach a target the first one cannot.
+        Pinned on a synthetic pattern so it states the helper's contract rather
+        than a rule file's current wording.
+        """
+        engine = RuleEngine(rules_dir_path)
+        pattern = re.compile(r"A.{0,3}B")
+        command = "AA..BB"
+        assert [m.span() for m in pattern.finditer(command)] == [(0, 5)], "finditer stops after the first"
+
+        match = engine._first_executable_match(pattern, command, [(0, 5)], None)
+
+        assert match is not None, "an overlapping executable match was stepped over"
+        assert match.span() == (1, 6)
+
+    def test_exhausting_the_rescan_budget_fails_closed(self, rules_dir_path):
+        """Padding a literal with decoys must buy a denial, not an unrated command.
+
+        Each rescan restarts a linear scan, so the walk is bounded. On exhaustion
+        the last suppressed match is reported rather than None - otherwise enough
+        decoy occurrences would silence the rule outright.
+        """
+        engine = RuleEngine(rules_dir_path)
+        pattern = re.compile("AB")
+
+        under = "AB" * 10
+        assert engine._first_executable_match(pattern, under, [(0, len(under))], None) is None, (
+            "within budget every occurrence is suppressed, so nothing matches"
+        )
+
+        over = "AB" * 40
+        assert engine._first_executable_match(pattern, over, [(0, len(over))], None) is not None, (
+            "budget exhausted - must fail closed, not report the command unrated"
+        )
 
     @pytest.mark.parametrize(
         "command,literal,description",
