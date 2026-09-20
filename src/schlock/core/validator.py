@@ -898,6 +898,7 @@ _DPAREN_STOP_RE = re.compile(r"[()'\"`\\]")
 # denies, where the reverse reading deletes commands.
 _COMMAND_POSITION_AFTER = frozenset({";", "|", "&", "(", ")", "{"})
 _COMMAND_POSITION_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "time", "-p", "--", "coproc"))
+_OPERATOR_SPLIT_RE = re.compile(r"[;|&(){}<>]")  # `true;then` is the word `then` after an operator
 
 
 class _DoubleParen:
@@ -918,8 +919,6 @@ class _DoubleParen:
     `(( (( (( x ) ) ) ) ) )` is otherwise quadratic in the nesting depth, on a
     hook that runs before every Bash call.
     """
-
-    __slots__ = ("partners", "text")
 
     def __init__(self, text: str) -> None:
         self.text = text
@@ -1008,11 +1007,13 @@ def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str
 def _at_command_position(line: str, pos: int) -> bool:
     """True when bash could start a command, or an assignment, at ``pos``.
 
-    Start of line, after a control operator, after a reserved word, or after an
-    assignment or redirection (`x=1 a[0]=2`, `2>&1 a[0]=2` - both put `a[0]=2`
-    at command position). A `\\`-continued previous line would make the start
-    of this one *not* command position; that is not carried, and the cost is
-    the deny-direction misread of a glob as a subscript on a shape nobody writes.
+    Start of line, after a control operator, after a reserved word - glued to
+    the operator before it or not, `true;then a[0]=1` is one - or after a word
+    carrying `=`, `<` or `>`. That last test is wider than bash's "assignment
+    or redirection" (`x=1 a[0]=2`, `2>&1 a[0]=2`): `echo foo=bar a[0]` counts
+    too, which reads a glob as a subscript and can only deny. A `\\`-continued
+    previous line would make the start of this one *not* command position;
+    that is not carried, same direction, on a shape nobody writes.
     """
     end = pos
     while end and line[end - 1] in " \t":
@@ -1023,7 +1024,7 @@ def _at_command_position(line: str, pos: int) -> bool:
     while start and line[start - 1] not in " \t":
         start -= 1
     word = line[start:end]
-    return word in _COMMAND_POSITION_WORDS or any(char in word for char in "=<>")
+    return _OPERATOR_SPLIT_RE.split(word)[-1] in _COMMAND_POSITION_WORDS or any(char in word for char in "=<>")
 
 
 def _opens_an_array_subscript(line: str, pos: int) -> bool:
@@ -1086,7 +1087,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
 
 
 def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; splitting it hides the state machine
-    line: str, frames: list[str], at: int = 0, dparen: Optional[_DoubleParen] = None
+    line: str, frames: list[str], at: int, dparen: _DoubleParen
 ) -> tuple[str, list[tuple[str, bool, int]], list[str]]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
@@ -1104,8 +1105,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     `"${x:-"<<ZZ "}"` read as a phantom opener (LAB-4270).
 
     ``at`` is where ``line`` starts in ``dparen``'s text - the whole command -
-    because a `((` is decided by text that may lie on later lines. Left unset,
-    the line is the whole text.
+    because a `((` is decided by text that may lie on later lines.
 
     Returns ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener
     order, frames still open)``; each ``offset`` is where its `<<` sits, which is
@@ -1113,7 +1113,6 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     looking for the first `<<` would find the quoted ones this deliberately
     skipped.
     """
-    dparen = dparen or _DoubleParen(line)
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
     continued = False
@@ -1148,13 +1147,12 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             frames.extend(owed)
             out.append(opener)
             pos += len(opener)
-        elif (
-            not frames
-            and line.startswith("((", pos)
-            and (pos == 0 or line[pos - 1] in _WORD_START_AFTER)
-            and dparen.is_arithmetic(at + pos)
-        ):
-            frames.extend("))")  # `(( 1<<b ))` is a left shift, on this line or a later one
+        elif not frames and line.startswith("((", pos) and dparen.is_arithmetic(at + pos):
+            # `(( 1<<b ))` is a left shift, on this line or a later one. No
+            # word-start gate: bash accepts `then((` and `{((`, and what a gate
+            # would exclude - `x=((`, `echo a((` - is a syntax error it runs
+            # nothing of, so reading it as arithmetic can only deny.
+            frames.extend("))")
             out.append("((")
             pos += 2
         elif frames and char == top:

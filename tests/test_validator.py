@@ -960,9 +960,8 @@ class TestHeredocSurroundings:
             ("ls <<'EOF' \\ \nx\nEOF", RiskLevel.SAFE, "escaped trailing space, whitelisted head"),
             ("cat <<'EOF' \\\\ \nhello\nEOF", RiskLevel.LOW, "a literal backslash argument is not an escape"),
             ("cat \\ <<'EOF'\nhello\nEOF", RiskLevel.LOW, "escaped space in front of the redirection"),
-            # Second review pass: legal shell that a heuristic frame left open
-            # would have hard-denied - each was LOW on main and BLOCKED before
-            # the same-line lookahead landed.
+            # Legal shell that was LOW on main and BLOCKED before `((` and
+            # `name[` were resolved the way bash reads them (LAB-4270).
             ("echo a[1\ncat <<'EOF' > f.txt\nhello\nEOF", RiskLevel.LOW, "unclosed `[` before a real heredoc"),
             ("awk '{print $1}' f[0 <<'EOF'\nx\nEOF", RiskLevel.LOW, "unclosed `[` on the opener line"),
             ("((cd /tmp) && cat <<'EOF'\nBODY\nEOF\n)", RiskLevel.LOW, "`((` opening two subshells"),
@@ -1087,6 +1086,11 @@ class TestHeredocSurroundings:
             ("time -p a[1<<b]=1", [], "after `time -p` is command position"),
             ("case q in q) a[1<<b]=1;; esac", [], "after a case pattern is command position"),
             ("{ a[1<<b]=1; }", [], "after `{` is command position"),
+            ("if true;then a[1<<b]=1;fi", [], "a reserved word glued to the operator before it still counts"),
+            ("x;if a[1<<b]=1; then :; fi", [], "…whichever operator it is glued to"),
+            ("echo ${x:-;a[1 }; cat <<c", ["c"], "inside an expansion `;` starts no command, so `a[` is text"),
+            ("if true; then((1<<b)); fi", [], "`((` glued to a reserved word is still arithmetic"),
+            ("{((1<<b)); }", [], "`((` glued to `{` is still arithmetic"),
             ("echo ${x} a[1<<b]", ["b]"], "the `}` of an expansion is not a `{` group opener"),
             ('a["]"<<b ]=1', [], "a quoted `]` does not close a subscript"),
             ("a[${x:-]}<<b ]=1", [], "a `]` inside `${…}` does not close a subscript"),
@@ -1101,7 +1105,7 @@ class TestHeredocSurroundings:
         terminates, and missing a real one leaves body text to be parsed as
         commands. A `BLOCKED` assertion cannot tell either from a correct read.
         """
-        _, openers, _ = val_module._rewrite_openers(line, [])
+        _, openers, _ = val_module._rewrite_openers(line, [], 0, val_module._DoubleParen(line))
 
         assert [delimiter for delimiter, _, _ in openers] == delimiters, description
 
@@ -1145,6 +1149,10 @@ class TestHeredocSurroundings:
             ("if true; then ((\n1<<b )); fi", "`((` after `then`"),
             ("time ((\n1<<b ))", "`((` after `time`"),
             ("x=1 a[\n1<<b ]=1", "`name[` after an assignment"),
+            ("if true;then a[\n1<<b ]=1;fi", "`name[` after a reserved word glued to `;`"),
+            ("if true; then((\n1<<b)); fi", "`((` glued to `then`"),
+            ("!((\n1<<b))", "`((` glued to `!`"),
+            ("time((\n1<<b))", "`((` glued to `time`"),
         ],
     )
     def test_arithmetic_split_across_lines_never_opens_a_heredoc(self, shell, description):
