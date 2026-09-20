@@ -896,16 +896,27 @@ _FRAME_START_CHARS = frozenset("$`")
 #   REDIR    - nothing but redirections since the command began (PST_REDIRLIST):
 #              an assignment may follow, a reserved word is a command
 #              (`> f if a[0]=1` is a syntax error, `> f time a[0]=1` runs `time`)
-#   ASSIGNED - the last word was an assignment, or `coproc NAME`. A reserved word
-#              here is a command (`x=1 { a[0]=1` runs `{`), and so is `time`.
+#   ASSIGNED - the last word was an assignment. A reserved word here is a
+#              command (`x=1 { a[0]=1` runs `{`), and so is `time`.
 #   COPROC   - the last word was `coproc`; the next one is a NAME or a command
+#   NAMED    - `coproc NAME` has been read: an assignment or a reserved word may
+#              follow (`coproc NAME { a[0]=1; }`), a redirection ends it
 #   LOST     - a command word has been read; nothing after it is a subscript
 # A redirection ends ASSIGNED (`x=1 > f a[0]=1` runs `a[0]=1` as a command) and
 # otherwise leads to REDIR; one whose target is the next word keeps the state
 # through that word. Inside a compound assignment `x=( … )` every word may
 # carry a subscript, a bare `[k]=v` included (PST_COMPASSIGN), whatever the
 # state.
-_FRESH, _TIME, _TIMEP, _REDIR, _ASSIGNED, _COPROC, _LOST = "fresh", "time", "time -p", "redir", "assigned", "coproc", "lost"
+_FRESH, _TIME, _TIMEP, _REDIR, _ASSIGNED, _COPROC, _NAMED, _LOST = (
+    "fresh",
+    "time",
+    "time -p",
+    "redir",
+    "assigned",
+    "coproc",
+    "coproc NAME",
+    "lost",
+)
 _RESERVED_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{"))
 _ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
 _REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
@@ -1128,11 +1139,11 @@ def _command_state_after(state: str, word: str) -> tuple[str, bool]:  # noqa: PL
     arrives as two because `>` ends a word - both things a whitespace split
     could not see.
     """
-    if state == _LOST or word.startswith(("<(", ">(")):
-        return _LOST, False  # a process substitution is a word, and as the first word it is the command
-    if _REDIRECT_WORD_RE.match(word):
+    if state == _LOST:
+        return _LOST, False
+    if _REDIRECT_WORD_RE.match(word) and not word.startswith(("<(", ">(")):  # a process substitution is a word
         owes_target = word[-1] in "<>" or word.endswith((">|", ">&", "<&"))
-        return (_LOST, False) if state == _ASSIGNED else (_REDIR, owes_target)
+        return (_LOST, False) if state in (_ASSIGNED, _NAMED) else (_REDIR, owes_target)
     if _ASSIGNMENT_WORD_RE.match(word):
         return _ASSIGNED, False
     if state in (_ASSIGNED, _REDIR):
@@ -1147,7 +1158,7 @@ def _command_state_after(state: str, word: str) -> tuple[str, bool]:  # noqa: PL
         return _COPROC, False
     if word in _RESERVED_WORDS:
         return _FRESH, False
-    return (_ASSIGNED, False) if state == _COPROC else (_LOST, False)
+    return (_NAMED, False) if state == _COPROC else (_LOST, False)
 
 
 @dataclass
