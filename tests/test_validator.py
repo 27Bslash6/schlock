@@ -1059,9 +1059,10 @@ class TestHeredocSurroundings:
             ("cat ${x:-`echo }`<<ZZ }", [], "a backtick nested inside `${…}`"),
             # …and the mirror. `((` is arithmetic only when the `)` balancing
             # its second `(` is followed by another `)` - bash reads the pair
-            # with quotes, backslashes and backticks opaque and everything else
-            # transparent, then falls back to two subshells. Deciding from
-            # `"))" in line` instead got every row below wrong in one direction.
+            # with quotes, backslashes, backticks and `$(…)` opaque at the paren
+            # level and `${…}` and `#` transparent, then falls back to two
+            # subshells. Deciding from `"))" in line` instead got every row
+            # below wrong in one direction.
             ("((cd /tmp) && cat <<c", ["c"], "`((` as two subshells closes with `) )`, not `))`"),
             ("((:) && cat <<c", ["c"], "the same, with nothing between the parens"),
             ('((echo "hello ))") && cat <<c', ["c"], "a quoted `))` does not close a subshell pair"),
@@ -1082,6 +1083,9 @@ class TestHeredocSurroundings:
             ('(( "${x:-)}" + 1<<b ))', [], "`${…}` nests inside a quote, so its `)` is opaque there"),
             ("(( $(echo ${x:-)}) + 1<<b ))", [], "`${…}` nests inside `$(…)`, where the text is shell again"),
             ("(( $(echo ')') + 1<<b ))", [], "a single quote inside `$(…)`"),
+            ("(( $((1<<2)) )); cat <<c", ["c"], "`$((…))` inside `((` is arithmetic, not a `$(…)` holding a heredoc"),
+            ("(( $(cat test-case 2>/dev/null; echo 1) )); cat <<c", ["c"], "`case` inside a word is not the keyword"),
+            ("(( $(echo a# ) + 1<<b ))", [], "`#` inside a word inside `$(…)` is not a comment"),
             ('(( `echo ")"` + 1<<b ))', [], "a quote inside a top-level backtick"),
             ('(( ${x:-")"} + 1<<b ))', [], "a quote inside a paren-level `${…}` is still opaque"),
             ('(( "\\")" + 1<<b ))', [], "an escaped quote does not end a quoted span"),
@@ -1117,6 +1121,28 @@ class TestHeredocSurroundings:
             ("1a[1<<b]=1", ["b]=1"], "a subscript needs a valid name in front of it"),
             ("$x[1<<b]", ["b]"], "an expansion in front of `[` is not a name"),
             ("a=b=c a[1<<b]=1", [], "an assignment whose value carries `=` is still an assignment"),
+            # Bash's `assignment_acceptable`, transition by transition. Each row
+            # ran real bash: `[]` rows deleted a canary after the shift, `["b]"]`
+            # rows opened the heredoc.
+            ("x=1 > f a[1<<b]", ["b]"], "a redirection after an assignment ends command position"),
+            ("x=1 2>&1 a[1<<b]", ["b]"], "so does a glued one"),
+            ("x=1 <<< s a[1<<b]", ["b]"], "and a here-string"),
+            ("coproc NAME > f a[1<<b]", ["b]"], "and one after `coproc NAME`"),
+            ("> a[1<<b]", ["b]"], "a redirection's target is not a subscript"),
+            (">| f a[1<<b]=1", [], "`>|` is one operator, not `>` then a pipe"),
+            ("{fd}> f a[1<<b]=1", [], "an fd-variable redirection"),
+            ("{fd}>&1 a[1<<b]=1", [], "…glued or not"),
+            (">f >g a[1<<b]=1", [], "any run of redirections at the start of a command"),
+            ("time > f a[1<<b]=1", [], "a redirection after a reserved word"),
+            ("coproc > f a[1<<b]=1", [], "or after `coproc`"),
+            ("coproc NAME a[1<<b]=1", [], "the word after `coproc` is a NAME; an assignment may follow it"),
+            ("coproc x=1 a[1<<b]=1", [], "or is itself an assignment"),
+            ("time>f a[1<<b]=1", [], "a reserved word glued to a redirection is still a reserved word"),
+            ("foo=$(true)b c[1<<d]=1", [], "a `$(…)` inside an assignment does not end the word"),
+            ("echo $(true) a[1<<b]", ["b]"], "the `)` of a `$(…)` does not restart command position"),
+            ("cat <(true) a[1<<b]", ["b]"], "nor does a process substitution's"),
+            ("x=$(a[1<<b]=1)", [], "a subscript at command position inside `$(…)`"),
+            ("case a in (a) b[1<<c]=1;; esac", [], "a case pattern's closing `)` starts a command"),
             ("if true;then a[1<<b]=1;fi", [], "a reserved word glued to the operator before it still counts"),
             ("x;if a[1<<b]=1; then :; fi", [], "…whichever operator it is glued to"),
             ("echo ${x:-;a[1 }; cat <<c", ["c"], "inside an expansion `;` starts no command, so `a[` is text"),
@@ -1136,7 +1162,7 @@ class TestHeredocSurroundings:
         terminates, and missing a real one leaves body text to be parsed as
         commands. A `BLOCKED` assertion cannot tell either from a correct read.
         """
-        _, openers, _ = val_module._rewrite_openers(line, [], 0, val_module._DoubleParen(line))
+        _, openers = val_module._rewrite_openers(line, val_module._ScanState(), 0, val_module._DoubleParen(line))
 
         assert [delimiter for delimiter, _, _ in openers] == delimiters, description
 
@@ -1183,6 +1209,18 @@ class TestHeredocSurroundings:
             ("< /dev/null a[\n1<<b ]=1", "`name[` after a redirection with a separate target"),
             (">& /dev/null a[\n1<<b ]=1", "`name[` after `>&` and its target"),
             ('ENV="foo bar" a[\n1<<b ]=1', "`name[` after a quoted assignment containing a blank"),
+            ("a[\n1]=1 b[\n1<<c ]=1", "a second subscript after one that spanned a line"),
+            ("foo=$(true)b c[\n1<<d ]=1", "`name[` after an assignment holding a `$(…)`"),
+            ("x=$(echo\na) a[1<<b]=1", "`name[` after an assignment whose `$(…)` spans a line"),
+            (">| f a[\n1<<b ]=1", "`name[` after `>|` and its target"),
+            ("{fd}> f a[\n1<<b ]=1", "`name[` after an fd-variable redirection"),
+            ("> f x=1 a[\n1<<b ]=1", "`name[` after a redirection then an assignment"),
+            (">f >g a[\n1<<b ]=1", "`name[` after two redirections"),
+            ("time > f a[\n1<<b ]=1", "`name[` after `time` and a redirection"),
+            ("coproc > f a[\n1<<b ]=1", "`name[` after `coproc` and a redirection"),
+            ("coproc NAME a[\n1<<b ]=1", "`name[` after `coproc NAME`"),
+            ("time>f a[\n1<<b ]=1", "`name[` after a reserved word glued to a redirection"),
+            ("(( $( (echo hi)# )\n) + 1<<b ))", "a `((` whose `$(…)` holds a comment right after a `)`"),
             ('(( "$(echo "x)")" + 1<<b ))', "a `((` whose quoted `$(…)` nests quotes"),
             ("(( $(echo # )\n) + 1<<b ))", "a `((` whose `$(…)` holds a comment with a `)` in it"),
             ("if true;then a[\n1<<b ]=1;fi", "`name[` after a reserved word glued to `;`"),
@@ -1212,8 +1250,9 @@ class TestHeredocSurroundings:
             ("a[\n1<<b\nrm -rf /\nb", "unclosed"),
             ('(( "1<<b ))\nrm -rf /\nb', "never closes"),
             ("cat <<'A'\nz\nA\necho ${x:-\nrm -rf /", "unclosed"),
+            ("cat <<'A'\nz\nA\nx=$(echo\nrm -rf /", "unclosed"),
             ("(( $(case a in a) :;; esac) + 1<<b ))\nrm -rf /\nb", "`case`"),
-            ("(( $(cat <<E\n)\nE) + 1<<b ))\nrm -rf /\nb", "`<<`"),
+            ("(( $(cat <<E\n)\nE) + 1<<b ))\nrm -rf /\nb", "heredoc"),
         ],
     )
     def test_a_pair_the_command_never_closes_fails_closed(self, command, reason):
@@ -1237,6 +1276,31 @@ class TestHeredocSurroundings:
 
         assert neutered == "(( 1 # )\n+ 1<<SCHLOCK_HEREDOC ))\n\nSCHLOCK_HEREDOC"
         assert base == "+ 1"
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            'echo "x\ny" a[1<<E]=1',
+            "echo $(true) a[1<<E]=1",
+            "cat <(true) a[1<<E]=1",
+            "> a[1<<E]=1",
+            "x=1 > f a[1<<E]=1",
+            "x=1 2>&1 a[1<<E]=1",
+            "coproc NAME > f a[1<<E]=1",
+        ],
+    )
+    def test_a_glob_read_as_a_subscript_does_not_move_the_next_body(self, head):
+        """Off command position, `a[1<<E]=1` opens a heredoc `E]=1` - bash did, in every row.
+
+        Reading the `[` as a subscript instead hides that opener, so the next
+        heredoc's body is consumed from the wrong line and the `rm` after the
+        real terminator is swallowed with it.
+        """
+        neutered, _ = val_module._neuter_heredocs(f"{head}\ncat <<'E2'\nE]=1\nrm -rf /\nE2")
+
+        # `cat <<'E2'` is the first heredoc's body and `E]=1` its terminator;
+        # `rm -rf /` and `E2` are commands, to bash and to the rewrite alike.
+        assert neutered.endswith("<<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /\nE2")
 
     def test_a_glob_bracket_does_not_move_the_next_body(self):
         """A missed opener is not fail-closed: it moves where the NEXT body ends.

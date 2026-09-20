@@ -849,7 +849,6 @@ _HEREDOC_PLACEHOLDER = "SCHLOCK_HEREDOC"
 _HEREDOC_REDIRECT_RE = re.compile(rf"(?:(?<!\\)\s+)?<<-?{re.escape(_HEREDOC_PLACEHOLDER)}")
 
 # Bash ends an unquoted word at a blank or an operator character.
-_WORD_END = frozenset(" \t;&|<>()")
 
 # `#` opens a comment only at the start of a word, which is anywhere a bash
 # metacharacter just ended one. Omitting `)` made `(echo hi)#<<Q` read as an
@@ -883,25 +882,33 @@ _EXPANSION_FRAMES = (("$((", "))"), ("${", "}"), ("$[", "]"))
 # A double-quoted span is otherwise the whole line, one probe per character.
 _FRAME_START_CHARS = frozenset("$`")
 
-# A word is at *command position* when bash could start a command or an
-# assignment there, and only then is `name[…]` an array subscript - one word to
-# its `]` however many lines away. Anywhere else `[` is a glob character, the
-# word ends at the next blank, and `export a[1<<b]=1` opens a heredoc
-# (parse.y: assignment_acceptable / reserved_word_acceptable, every entry below
-# checked against bash 5.3). Command position holds from the start of a line or
-# a control operator through any run of reserved words, assignment words and
-# redirections - each with its target - and is lost at the first other word.
-# `-p` and `--` are `time`'s options and are accepted after any word; that can
-# only read a glob as a subscript, which denies, where the reverse deletes
-# commands.
-_COMMAND_POSITION_WORDS = frozenset(
-    ("if", "then", "elif", "else", "while", "until", "do", "!", "time", "-p", "--", "coproc", "{")
-)
-_ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=")  # `x=`, `a[1]=`, `x+=`, quotes and all after
-_REDIRECT_WORD_RE = re.compile(r"[0-9]*[<>]|&>")  # `<`, `2>`, `>>`, `&>`, `<<'E'`, `<<<`
+# Bash reads `name[…]` as an array subscript - one word to its `]` however many
+# lines away - only where an assignment is acceptable: at the start of a
+# command, after another assignment, after a reserved word, or after nothing
+# but redirections since the command began (parse.y `assignment_acceptable`:
+# `last_read_token == ASSIGNMENT_WORD || PST_REDIRLIST || reserved_word_acceptable`,
+# every transition below checked against bash 5.3). Anywhere else `[` is a glob
+# character, the word ends at the next blank, and `export a[1<<b]=1` opens a
+# heredoc. The states, per command context:
+#   FRESH    - nothing but reserved words and redirections so far
+#   ASSIGNED - the last word was an assignment, or `coproc NAME`
+#   COPROC   - the last word was `coproc`; the next one is either a NAME or a command
+#   LOST     - a command word has been read; nothing after it is a subscript
+# A redirection keeps FRESH but ends ASSIGNED (`x=1 > f a[0]=1` runs `a[0]=1`
+# as a command - verified), and one whose target is the next word keeps it
+# through that word. `-p` and `--` are `time`'s options and are accepted after
+# any word; that can only read a glob as a subscript, which denies, where the
+# reverse deletes commands.
+_FRESH, _ASSIGNED, _COPROC, _LOST = "fresh", "assigned", "coproc", "lost"
+_COMMAND_POSITION_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "time", "-p", "--", "{"))
+_ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
+_REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
+_FD_RE = re.compile(r"[0-9]*|\{[A-Za-z_]\w*\}|&")  # what may sit glued in front of a redirection operator
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 # Blanks and control-operator characters end a word at the top level. `<` and
-# `>` do not: `2>&1` and `<file` are words (see `_is_word_boundary` for `&`).
+# `>` end one too, unless the word so far is an fd prefix (`2>&1`, `{fd}>`);
+# `&` and `|` are part of the word when they extend a redirection operator
+# (`>&`, `&>`, `>|`). See `_is_word_boundary`.
 _WORD_BOUNDARY = frozenset(" \t;|&()")
 
 # What bash's `((` matcher stops on, per lexical context it recurses into.
@@ -910,17 +917,20 @@ _WORD_BOUNDARY = frozenset(" \t;|&()")
 # closes the pair; inside quotes, `${…}` and `$(…)` nest; a `$(…)` re-lexes as
 # shell, where `#` opens a comment and `${…}` nests again.
 _PAREN_STOP_RE = re.compile(r"[()'\"`\\]|\$['\"(]")
-_COMSUB_STOP_RE = re.compile(r"[()'\"`\\#]|\$['\"({]|<<|\bcase\b")
+_COMSUB_STOP_RE = re.compile(r"[()'\"`\\#]|\$['\"({]|<<|case(?=[ \t\n])")
 _DOLBRACE_STOP_RE = re.compile(r"[}'\"`\\]|\$['\"({]")
 _DQUOTE_STOP_RE = re.compile(r"[\"`\\]|\$[({]")
 _NEWLINE_RE = re.compile("\n")
-# The spans with no nesting at all: `'…'` has no escapes; `$'…'` and `` `…` ``
+# The spans with no nesting at all: `'…'` has no escapes; `$'…'` and a backtick
 # honour a backslash before their own closer.
 _OPAQUE_SPANS = {
     "'": (re.compile("'"), "`'`"),
     "$'": (re.compile(r"['\\]"), "`$'`"),
-    "`": (re.compile(r"[`\\]"), "`` ` ``"),
+    "`": (re.compile(r"[`\\]"), "backtick"),
 }
+# Where `#` opens a comment and `case` is a keyword inside a `$(…)`: the same
+# places a word can start, plus the newline a comment ends on.
+_COMMENT_START_AFTER = _WORD_START_AFTER | frozenset("\n")
 
 
 class _DoubleParen:
@@ -982,7 +992,7 @@ class _DoubleParen:
             elif hit == ")":
                 self.partners[stack.pop()] = found.start()
             else:
-                pos = self._nested(hit, found.start(), pos)
+                pos = self._skip(hit, found.start(), pos)
         return self.partners[opening]
 
     def _comsub(self, start: int) -> int:
@@ -1003,15 +1013,18 @@ class _DoubleParen:
                 if depth == 0:
                     return pos
                 depth -= 1
-            elif hit == "#":
-                if found.start() == start + 1 or self.text[found.start() - 1] in " \t\n;|&(":
-                    pos = self._stop(_NEWLINE_RE, pos, "`$(`").end()
-            elif hit in ("case", "<<"):
-                if hit == "<<" and self.text.startswith("<", pos):
+            elif hit in ("#", "case"):
+                if found.start() > start + 1 and self.text[found.start() - 1] not in _COMMENT_START_AFTER:
+                    continue  # mid-word: `echo a#b`, `test-case`
+                if hit == "case":
+                    raise ParseError("`case` inside `$(…)` inside `((`; its patterns' `)` cannot be told from the closer")
+                pos = self._stop(_NEWLINE_RE, pos, "`$(`").end()
+            elif hit == "<<":
+                if self.text.startswith("<", pos):
                     continue  # a here-string is a word
-                raise ParseError(f"`{hit}` inside `$(…)` inside `((`; the closing paren cannot be located")
+                raise ParseError("a heredoc inside `$(…)` inside `((`; the closing paren cannot be located")
             else:
-                pos = self._nested(hit, found.start(), pos)
+                pos = self._skip(hit, found.start(), pos)
 
     def _dolbrace(self, pos: int) -> int:
         """Offset just past the first `}` not inside a nested quote or substitution."""
@@ -1020,7 +1033,7 @@ class _DoubleParen:
             hit, pos = found.group(), found.end()
             if hit == "}":
                 return pos
-            pos = self._nested(hit, found.start(), pos)
+            pos = self._skip(hit, found.start(), pos)
 
     def _dquote(self, pos: int) -> int:
         """Offset just past the `"` closing a double-quoted span; `$(…)`, `${…}` and backticks nest."""
@@ -1029,14 +1042,15 @@ class _DoubleParen:
             hit, pos = found.group(), found.end()
             if hit == '"':
                 return pos
-            pos = self._nested(hit, found.start(), pos)
+            pos = self._skip(hit, found.start(), pos)
 
-    def _nested(self, hit: str, start: int, after: int) -> int:
-        """Skip the opaque or nested span ``hit`` opens at ``start``; return the offset past it."""
+    def _skip(self, hit: str, start: int, after: int) -> int:
+        """Skip the span ``hit`` opens at ``start`` - opaque or nested; return the offset past it."""
         if hit == "\\":
             return after + 1
         if hit == "$(":
-            return self._comsub(start + 1)
+            # `$((…))` is arithmetic, read like the enclosing pair; `$(…)` is shell.
+            return self._paren(start + 1) + 1 if self.text.startswith("(", start + 2) else self._comsub(start + 1)
         if hit in ('"', '$"'):
             return self._dquote(after)
         if hit == "${":
@@ -1082,29 +1096,82 @@ def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str
 def _is_word_boundary(line: str, pos: int) -> bool:
     """True when the character at ``pos`` ends a top-level word.
 
-    `&` is a control operator except inside a redirection - `2>&1`, `>&`, `&>`
-    - where it is part of the word; splitting it there turned `>& file a[…`
-    into a redirection, an operator and a plain word, and lost command position.
+    `&` and `|` are control operators except where they extend a redirection
+    operator - `2>&1`, `>&`, `&>`, `>|` - and splitting them there turned
+    `>& file a[…` into a redirection, an operator and a plain word.
     """
     char = line[pos]
-    if char != "&":
-        return char in _WORD_BOUNDARY
-    return not ((pos and line[pos - 1] in "<>") or line.startswith(">", pos + 1))
+    if char == "&":
+        return not ((pos and line[pos - 1] in "<>") or line.startswith(">", pos + 1))
+    if char == "|":
+        return not (pos and line[pos - 1] == ">")
+    return char in _WORD_BOUNDARY
 
 
-def _keeps_command_position(word: str, target_pending: bool) -> tuple[bool, bool]:
-    """Whether the word after ``word`` is still at command position, and whether ``word`` owes a redirect target.
+def _command_state_after(state: str, word: str) -> tuple[str, bool]:
+    """The command-position state after ``word``, and whether ``word`` owes a redirect target.
 
-    Reserved words, assignments and redirections keep it; a redirection whose
-    target is the next word (`< file`, `>& file`) keeps it through that word
-    too. `ENV="foo bar"` arrives here as one word because the caller only ends a
-    word at the top level - which is what a whitespace split could not see.
+    The transitions are bash's (see `_FRESH`). `ENV="foo bar"` arrives as one
+    word because the caller ends a word only at the top level, and `x=1>f`
+    arrives as two because `>` ends a word - both things a whitespace split
+    could not see.
     """
-    if target_pending or word in _COMMAND_POSITION_WORDS or _ASSIGNMENT_WORD_RE.match(word):
-        return True, False
+    if state == _LOST:
+        return _LOST, False
     if _REDIRECT_WORD_RE.match(word):
-        return True, word[-1] in "<>&"
-    return False, False
+        owes_target = word[-1] in "<>" or word.endswith((">|", ">&", "<&"))
+        return (_LOST, False) if state == _ASSIGNED else (_FRESH, owes_target)
+    if word == "coproc":
+        return _COPROC, False
+    if word in _COMMAND_POSITION_WORDS:
+        return _FRESH, False
+    if _ASSIGNMENT_WORD_RE.match(word) or state == _COPROC:
+        return _ASSIGNED, False  # an assignment, or `coproc NAME`
+    return _LOST, False
+
+
+@dataclass
+class _Context:
+    """Command-position tracking for one command context - the top level or a `$(…)`.
+
+    ``prefix`` holds the open word's text from earlier lines, ``start`` where it
+    continues on this one; ``comsub`` says the outer word resumes after this
+    context's `)` (`x=$(…)y` is one word) rather than ending at it.
+    """
+
+    comsub: bool = False
+    state: str = _FRESH
+    target_pending: bool = False
+    prefix: str = ""
+    start: Optional[int] = None
+
+    def word(self, line: str, pos: int) -> str:
+        return self.prefix + line[self.start : pos]  # type: ignore[misc]  # callers check start first
+
+    def end_word(self, line: str, pos: int) -> None:
+        if self.start is None:
+            return
+        if self.target_pending:
+            self.target_pending = False  # a redirection's target is neither a command nor an assignment
+        else:
+            self.state, self.target_pending = _command_state_after(self.state, self.word(line, pos))
+        self.prefix, self.start = "", None
+
+    def operator(self) -> None:
+        self.state, self.target_pending = _FRESH, False  # a control operator starts a command
+
+
+@dataclass
+class _ScanState:
+    """What `_rewrite_openers` carries from one line to the next.
+
+    ``frames`` are the closers still owed (see `_rewrite_openers`); ``contexts``
+    the command contexts open, outermost first - bash lets every one of them
+    span a newline, so a scan that reset either per line was bypassed by one.
+    """
+
+    frames: list[str] = field(default_factory=list)
+    contexts: list[_Context] = field(default_factory=lambda: [_Context()])
 
 
 def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
@@ -1123,7 +1190,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
             caller must not vouch for anything around it.
     """
     delimiter: list[str] = []
-    while pos < len(text) and text[pos] not in _WORD_END:
+    while pos < len(text) and text[pos] not in _WORD_START_AFTER:
         char = text[pos]
         if char == "\\":
             if pos + 1 >= len(text):
@@ -1150,8 +1217,8 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
 
 
 def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; splitting it hides the state machine
-    line: str, frames: list[str], at: int, dparen: _DoubleParen
-) -> tuple[str, list[tuple[str, bool, int]], list[str]]:
+    line: str, scan: _ScanState, at: int, dparen: _DoubleParen
+) -> tuple[str, list[tuple[str, bool, int]]]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted, unexpanded* `<<` opens a heredoc. Bash reads `echo "x << y"`,
@@ -1161,40 +1228,91 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     that follow. That is the LAB-1731 lesson: enumerate the tokenization deltas
     before trusting a rewrite, and deny when the reading is uncertain.
 
-    ``frames`` is that state: the closers still owed, innermost last, carried in
-    from the previous line because bash lets every one of them span a newline.
-    A quote and an expansion are the same kind of frame on purpose - bash nests
-    them in both directions, and tracking them separately is what let
-    `"${x:-"<<ZZ "}"` read as a phantom opener (LAB-4270).
+    ``scan.frames`` is that state: the closers still owed, innermost last,
+    carried in from the previous line because bash lets every one of them span
+    a newline. A quote and an expansion are the same kind of frame on purpose -
+    bash nests them in both directions, and tracking them separately is what
+    let `"${x:-"<<ZZ "}"` read as a phantom opener (LAB-4270).
+
+    ``scan.contexts`` tracks command position (see `_FRESH`) word by word at the
+    top level, one context per open `$(…)`, so that `name[` is a subscript
+    exactly where bash reads one. A word is whatever lies between two boundaries
+    with every frame closed - `ENV="foo bar"` is one word, `x=$(echo a b)y` is
+    one word - and it, too, may continue onto the next line.
 
     ``at`` is where ``line`` starts in ``dparen``'s text - the whole command -
     because a `((` is decided by text that may lie on later lines.
 
     Returns ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener
-    order, frames still open)``; each ``offset`` is where its `<<` sits, which is
-    the only honest source for "what command owns this heredoc" - a second regex
-    looking for the first `<<` would find the quoted ones this deliberately
-    skipped.
+    order)``; each ``offset`` is where its `<<` sits, which is the only honest
+    source for "what command owns this heredoc" - a second regex looking for the
+    first `<<` would find the quoted ones this deliberately skipped.
     """
+    frames = scan.frames
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
     continued = False
     pos = 0
-    # Command position (see `_COMMAND_POSITION_WORDS`) is tracked word by word
-    # at the top level, so a word is whatever lies between two boundaries with
-    # every frame closed: `ENV="foo bar"` is one word and `< file` is a
-    # redirection plus its target. A line is taken to start at command
-    # position; a `\`-continued previous line would make that false, which
-    # reads a glob as a subscript there and can only deny.
-    command_position = True
-    target_pending = False
-    word_start: Optional[int] = None
+    if scan.contexts[-1].prefix:
+        scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
 
     while pos < len(line):
         char = line[pos]
         top = frames[-1] if frames else ""
-        if not frames and word_start is None and not _is_word_boundary(line, pos):
-            word_start = pos
+        ctx = scan.contexts[-1]
+
+        if not frames:
+            # Word and command-context bookkeeping, before the lexical dispatch.
+            if line.startswith("((", pos) and dparen.is_arithmetic(at + pos):
+                # `(( 1<<b ))` is a left shift, on this line or a later one. No
+                # word-start gate: bash accepts `then((` and `{((`, and what a
+                # gate would exclude - `x=((`, `echo a((` - is a syntax error it
+                # runs nothing of, so reading it as arithmetic can only deny.
+                ctx.end_word(line, pos)
+                frames.extend("))")
+                out.append("((")
+                pos += 2
+                continue
+            if (line.startswith("$(", pos) and not line.startswith("$((", pos)) or (
+                char in "<>" and line.startswith("(", pos + 1)
+            ):
+                # `$(…)`, `<(…)`, `>(…)`: shell again inside, and a heredoc in
+                # there is real, so it is a context rather than a frame. The
+                # outer word continues after its `)`.
+                if ctx.start is None:
+                    ctx.start = pos
+                scan.contexts.append(_Context(comsub=True))
+                out.append(line[pos : pos + 2])
+                pos += 2
+                continue
+            if char == ")" and len(scan.contexts) > 1:
+                ctx.end_word(line, pos)
+                closed = scan.contexts.pop()
+                if closed.comsub and scan.contexts[-1].start is None:
+                    scan.contexts[-1].start = pos  # the word began on an earlier line; it resumes here
+                out.append(char)
+                pos += 1
+                continue
+            if char == "(":
+                # A subshell: its own commands, its own `)`. The outer context
+                # is reset here, so after the `)` it is at command position -
+                # which is where `case a in (a) b[0]=1` needs it.
+                ctx.end_word(line, pos)
+                ctx.operator()
+                scan.contexts.append(_Context())
+                out.append(char)
+                pos += 1
+                continue
+            if char in "<>" and ctx.start is not None and not _FD_RE.fullmatch(ctx.word(line, pos)):
+                ctx.end_word(line, pos)  # `x=1>f`, `time>f`: the operator starts a new word
+                ctx.start = pos
+            elif _is_word_boundary(line, pos):
+                ctx.end_word(line, pos)
+                if char not in " \t":
+                    ctx.operator()
+            elif ctx.start is None:
+                ctx.start = pos
+
         # `char != top` because a backtick both opens and closes its own frame:
         # without it the `` ` `` ending `"`date`"` opens a second one, the string
         # never closes, and every opener after it is lost.
@@ -1221,15 +1339,6 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             frames.extend(owed)
             out.append(opener)
             pos += len(opener)
-        elif not frames and line.startswith("((", pos) and dparen.is_arithmetic(at + pos):
-            # `(( 1<<b ))` is a left shift, on this line or a later one. No
-            # word-start gate: bash accepts `then((` and `{((`, and what a gate
-            # would exclude - `x=((`, `echo a((` - is a syntax error it runs
-            # nothing of, so reading it as arithmetic can only deny.
-            frames.extend("))")
-            word_start = None
-            out.append("((")
-            pos += 2
         elif frames and char == top:
             frames.pop()  # closes a quote, a backtick or an expansion
             out.append(char)
@@ -1260,13 +1369,18 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             frames.append(char)
             out.append(char)
             pos += 1
-        elif char == "[" and command_position and word_start is not None and _IDENTIFIER_RE.fullmatch(line, word_start, pos):
-            # The identifier check also keeps this at the top level: a frame
-            # opens on a quote, `$` or `[`, none of which an identifier holds.
-            # `a[1<<b]=1` is a shift: an identifier opening a word at command
-            # position makes `[` a subscript. Inside any frame `[` is text, and
-            # off command position it is a glob character bash opens a heredoc
-            # through (`cat f[a<<b]`, verified).
+        elif (
+            char == "["
+            and not frames
+            and ctx.state != _LOST
+            and not ctx.target_pending
+            and ctx.start is not None
+            and _IDENTIFIER_RE.fullmatch(ctx.word(line, pos))
+        ):
+            # `a[1<<b]=1` is a shift: an identifier opening a word where an
+            # assignment is acceptable makes `[` a subscript. Off that position
+            # - a command's argument, a redirection's target - it is a glob
+            # character bash opens a heredoc through (`cat f[a<<b]`, verified).
             frames.append("]")
             out.append(char)
             pos += 1
@@ -1288,19 +1402,18 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             delimiter, pos = _read_delimiter(line, pos)
             openers.append((delimiter, strips_tabs, opener_at))
             out.append(f"<<{'-' if strips_tabs else ''}{_HEREDOC_PLACEHOLDER}")
-        elif not frames and _is_word_boundary(line, pos):
-            if word_start is not None:
-                command_position, target_pending = (
-                    _keeps_command_position(line[word_start:pos], target_pending) if command_position else (False, False)
-                )
-                word_start = None
-            if char not in " \t":
-                command_position, target_pending = True, False  # a control operator starts a command
-            out.append(char)
-            pos += 1
         else:
             out.append(char)
             pos += 1
+
+    ctx = scan.contexts[-1]
+    if not frames and not continued:
+        ctx.end_word(line, len(line))
+        ctx.operator()  # a newline at the top level separates commands
+    for ctx in scan.contexts:
+        if ctx.start is not None:
+            ctx.prefix += line[ctx.start :] + "\n"  # the word continues on the next line
+            ctx.start = None
 
     if openers and (continued or frames):
         # A trailing `\`, or a quote or expansion still open, means this line
@@ -1311,7 +1424,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             "the body's start is unknown"
         )
 
-    return "".join(out), openers, frames
+    return "".join(out), openers
 
 
 def _neuter_heredocs(command: str) -> tuple[str, str]:
@@ -1344,13 +1457,13 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
     lines = command.split("\n")
     rewritten: list[str] = []
     base_command: Optional[str] = None
-    frames: list[str] = []
+    scan = _ScanState()
     dparen = _DoubleParen(command)
     at = 0  # where lines[index] starts in command
     index = 0
 
     while index < len(lines):
-        line, openers, frames = _rewrite_openers(lines[index], frames, at, dparen)
+        line, openers = _rewrite_openers(lines[index], scan, at, dparen)
         rewritten.append(line)
         at += len(lines[index]) + 1
         index += 1
@@ -1377,11 +1490,12 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
             else:
                 raise ParseError(f"Heredoc {delimiter!r} has no terminator; its body has no end")
 
-    if frames:
-        # An unclosed quote, expansion, `((` or subscript at the end is a
-        # syntax error to bash - it runs nothing - and a reading this lexer
+    if scan.frames or len(scan.contexts) > 1:
+        # An unclosed quote, expansion, `((`, subscript or `$(` at the end is
+        # a syntax error to bash - it runs nothing - and a reading this lexer
         # cannot vouch for either way.
-        raise ParseError(f"Command ends inside an unclosed {frames[-1]}; bash would run none of it")
+        unclosed = scan.frames[-1] if scan.frames else "$("
+        raise ParseError(f"Command ends inside an unclosed {unclosed}; bash would run none of it")
     if base_command is None:
         raise ParseError("No heredoc opener found in a command bashlex rejected as a heredoc")
     if not base_command:
