@@ -583,13 +583,20 @@ class BashCommandParser:
             return None
         raw = command[start:end]
         text = raw.strip()
-        # An escaped trailing blank (`echo hi \ ; ls`) is a one-blank argument,
-        # and the strip just ate the blank. Callers re-parse the segment, and a
-        # dangling `echo hi \` parses nowhere: the main loop then loses its
-        # quote context, the heredoc fallback denies it outright. Give the blank
-        # back. An even run of backslashes is a literal argument and needs
-        # nothing. Restored here, at the one place the slice is taken, so every
-        # caller of extract_command_segments{,_with_literals} gets it.
+        # An escaped trailing blank (`echo hi \ ; ls`) is a one-blank argument
+        # and the strip just ate it. Callers re-parse the segment, and a
+        # dangling `echo hi \` parses nowhere: the main loop loses its quote
+        # context, the heredoc fallback denies it outright. Give it back — a
+        # space either way, since `\<tab>` is the same one-blank argument and
+        # the lengths match. An even run of backslashes is a literal argument
+        # and needs nothing.
+        # Done here, the one place the slice is taken, so every caller of
+        # extract_command_segments{,_with_literals} gets it. Sound only because
+        # `node.pos` already spans the blank: that is what keeps `base +
+        # len(text)` on the node end, which extract_command_segments_with_literals
+        # uses to bound its rebased literal ranges. Restoring a character the
+        # span does NOT cover would widen that bound and keep a suppression
+        # range it should have dropped.
         if (len(text) - len(text.rstrip("\\"))) % 2:
             text += " "
         if not text:

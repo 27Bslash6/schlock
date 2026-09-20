@@ -341,10 +341,15 @@ class _Converter:
         parts.extend(redirects)
         parts.sort(key=lambda p: p.pos[0])  # bashlex keeps source order
         # mvdan hangs Redirs off the Stmt, so CallExpr's own span excludes
-        # them — but extract_command_segments slices the segment text from the
-        # command node's pos, and a span that stops short of `> /dev/sda`
-        # silently drops the dangerous target (panel CRIT, LAB-911 review).
+        # them — but _locate_segment slices the segment text from the command
+        # node's pos, and a span that stops short of `> /dev/sda` silently
+        # drops the dangerous target (panel CRIT, LAB-911 review).
         # bashlex spans the whole command including redirects; reproduce that.
+        # The span must also cover a trailing escaped blank (`echo hi \ `):
+        # _locate_segment gives that blank back after stripping, and only a
+        # span that already contains it keeps the rebased literal-range bound
+        # on the node end. Inert until T3 unescapes — convert_word raises on
+        # backslash escapes today — but it is a span requirement, not a nicety.
         start, end = _pos(cmd)
         if parts:
             start = min(start, parts[0].pos[0])
