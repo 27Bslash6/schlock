@@ -1546,6 +1546,97 @@ class TestWhitelistedSubstitutionYamlRules:
         assert not result.message.startswith("BLOCKED")
 
 
+class TestGroupedAndRedirectedSubstitutions:
+    """Substitutions the extractor dropped before any tier could judge them (#164 review).
+
+    Two shapes never reached ``validate_substitution`` at all, so closing the Layer 1 rule gap
+    bought nothing for either: a grouped inner command (``$( (cmd) )``, ``$( { cmd; } )``), whose
+    CompoundNode wrapper made every extractor render None, and a process substitution used as a
+    redirection target (``< <(cmd)``, ``> >(cmd)``), which hangs off ``RedirectNode.output`` — an
+    attribute the AST walk did not follow. Both executed while reading SAFE.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """Pin the rules path: ShellCheck must not be what produces these verdicts."""
+        monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$( (git push --force) )"',
+            'echo "$( { git push --force; } )"',
+            'echo "` (git push --force) `"',
+            'echo "$( ( (git push --force) ) )"',  # nested grouping
+            'echo "$( { { git push --force; }; } )"',
+            'echo "$( (cat ~/.aws/credentials) )"',
+            "cat < <(git push --force)",
+            "echo hello > >(git push --force)",
+            "while read line; do echo $line; done < <(git push --force)",
+            "cat < <( (git push --force) )",  # both shapes at once
+            "cat < <(cat ~/.aws/credentials)",
+        ],
+    )
+    def test_grouped_and_redirected_inner_commands_are_judged(self, command):
+        """Grouping and redirection are not a rule-engine exemption."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$( (ls) )"',
+            'echo "$( { ls; } )"',
+            'echo "$( (git status) )"',
+            "cat < <(ls)",
+            "diff <(ls) <(ls -a)",
+            "wc -l < <(cat /etc/hosts)",
+        ],
+    )
+    def test_read_only_grouped_and_redirected_stay_safe(self, command):
+        """Grouping a read-only command must not become a false positive: `$( ( X ) )` == `$( X )`."""
+        result = validate_command(command)
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Control flow: branches this module cannot decompose, so no base command is claimed.
+            'echo "$( if true; then rm -rf /; fi )"',
+            'echo "$( for i in 1; do rm -rf /; done )"',
+            # A grouping that carries its own redirection is a real write, not inert grouping.
+            'echo "$( (ls) > /tmp/x )"',
+        ],
+    )
+    def test_undecomposable_groups_fail_closed(self, command):
+        """What cannot be unwrapped must block outright, not degrade to an unknown command.
+
+        A ReservedwordNode's ``.word`` is "if"/"for" — a keyword, not a command. Letting it stand
+        in as the base command rated a whole uninspectable branch as merely unknown (HIGH, which
+        the permissive preset allows).
+        """
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "cannot determine command" in result.message.lower()
+
+    def test_substitution_denial_does_not_downgrade_a_stronger_rule(self):
+        """Worst verdict wins, not the first one found.
+
+        A substitution denial short-circuits the rule pass, so a weaker-than-BLOCKED one used to
+        DOWNGRADE commands the rules deny outright — `base64` is merely an unknown command inside
+        a substitution (HIGH -> ask) while the whole command is base64-piped-to-shell (BLOCKED).
+        Falling through to the rule pass is not a fix: that pass works on extracted segments,
+        where a match inside a double-quoted word is suppressed as a string literal.
+        """
+        for command in ("bash<<<$(base64 -d<<<Y2F0IC9ldGMvcGFzc3dk)", 'echo "$( (a && rm -rf /) )"'):
+            result = validate_command(command)
+            assert result.allowed is False, command
+            assert result.risk_level == RiskLevel.BLOCKED, command
+
+
 class TestRemainingBranchCoverage:
     """Additional tests for remaining uncovered branches."""
 

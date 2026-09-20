@@ -770,6 +770,46 @@ class _ListSegment:
         self.command = command
 
 
+def _strip_group_terminator(node: Any) -> Any:
+    """`{ cmd; }` -> `cmd`. The `;` before `}` is mandatory grouping syntax, so bashlex renders a
+    one-command brace group as a ListNode ending in a terminator operator. That shape is a
+    malformed list to ``_is_valid_list_topology`` (which requires ending on a segment) and would
+    block every brace group with a message about topology rather than about the command. Only the
+    single-segment form is peeled; anything longer stays a list and fails closed there.
+    """
+    if getattr(node, "kind", None) != "list":
+        return node
+    parts = list(getattr(node, "parts", []))
+    if len(parts) == 2 and getattr(parts[1], "kind", None) == "operator" and getattr(parts[1], "op", None) in (";", "&"):  # noqa: PLR2004 - segment + its terminator
+        return parts[0]
+    return node
+
+
+def _unwrap_compound(node: Any) -> Any:
+    """Peel `( … )` / `{ …; }` wrappers off a substitution so the extractors see the real command.
+
+    bashlex models `$( (cmd) )` as a CompoundNode whose ``.list`` is
+    ``[ReservedwordNode('('), <cmd>, ReservedwordNode(')')]``. Every extractor in this module keys
+    off ``.command`` being a command/list/pipeline, so without unwrapping the substitution renders
+    to None, is dropped before any validation runs, and the inner command is never checked at all —
+    ``$( (rm -rf /) )`` read SAFE. Subshell/brace grouping changes nothing a validator cares about,
+    so the grouping is transparent: `$( ( X ) )` is validated exactly as `$( X )`.
+
+    NOT unwrapped — these keep their compound node and fail closed downstream:
+    a compound carrying its own redirections (`$( (ls) > f )`, a real write), and one holding
+    anything but a single command (`if`/`for`/`while`, whose branches this module cannot decompose).
+    """
+    for _ in range(MAX_SUBSTITUTION_DEPTH):
+        cmd = getattr(node, "command", None)
+        if getattr(cmd, "kind", None) != "compound" or getattr(cmd, "redirects", None):
+            return node
+        inner = [c for c in getattr(cmd, "list", None) or [] if getattr(c, "kind", None) != "reservedword"]
+        if len(inner) != 1 or getattr(inner[0], "kind", None) not in ("command", "list", "pipeline", "compound"):
+            return node
+        node = _ListSegment(_strip_group_terminator(inner[0]))
+    return node
+
+
 @dataclass
 class SubstitutionValidationResult:
     """Result of validating a substitution."""
@@ -837,8 +877,10 @@ class SubstitutionValidator:
                     substitutions.append(sub_node)
                 return
 
-            # Recurse into child nodes
-            for attr in ["parts", "command", "list", "pipe", "compound"]:
+            # Recurse into child nodes. "redirects"/"output" reach process substitutions used as
+            # redirection targets — `cat < <(git push)`, `echo x > >(cmd)` — which hang off
+            # RedirectNode.output and were otherwise never extracted, so no tier ever saw them.
+            for attr in ["parts", "command", "list", "pipe", "compound", "redirects", "output"]:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -863,15 +905,19 @@ class SubstitutionValidator:
         Returns:
             SubstitutionNode or None if extraction fails
         """
+        node = _unwrap_compound(node)
         inner_command = self._extract_inner_command_text(node)
         # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
         # survive even when text rendering is partial (e.g. a compound segment renders to None).
         # Dropping it here would silently skip validation -> fail OPEN. Per-segment logic blocks
-        # the unrenderable segment instead. Non-list substitutions with no extractable command
-        # stay dropped (genuinely unparseable).
+        # the unrenderable segment instead. A compound that survived _unwrap_compound (an `if`,
+        # or a redirecting subshell) renders to None too and must survive for the same reason:
+        # dropping it is what let `$( { git push --force; } )` read SAFE. It has no base command,
+        # so every tier below fails it closed. Anything else with no extractable command stays
+        # dropped (genuinely unparseable).
         cmd_node = getattr(node, "command", None)
-        is_list = getattr(cmd_node, "kind", None) == "list"
-        if not inner_command and not is_list:
+        undroppable = getattr(cmd_node, "kind", None) in ("list", "compound")
+        if not inner_command and not undroppable:
             return None
 
         base_command = self._extract_base_command(node)
@@ -1057,10 +1103,18 @@ class SubstitutionValidator:
             if hasattr(first_part, "word"):
                 return first_part.word
 
-        # Handle compound command (command list)
+        # Handle compound command (command list). A control-flow compound that survived
+        # _unwrap_compound ($(if …; fi), $(for …; done)) leads with a ReservedwordNode, whose
+        # .word is "if"/"for" — a keyword, not a command. Returning it made the tiers below judge
+        # a whole uninspectable branch as an unknown command (HIGH, allowed under permissive);
+        # returning None fails it closed instead.
         if hasattr(cmd_node, "list") and cmd_node.list:
             first = cmd_node.list[0]
+            if getattr(first, "kind", None) == "reservedword":
+                return None
             if hasattr(first, "parts") and first.parts:
+                if getattr(first.parts[0], "kind", None) == "reservedword":
+                    return None
                 first_part = first.parts[0]
                 if hasattr(first_part, "word"):
                     return first_part.word
@@ -1225,7 +1279,10 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             return True, "command chain in substitution"
 
-        # Compound command: $(if ...; then ...; fi) etc.
+        # Compound command: $(if ...; then ...; fi) etc. Unreachable today and kept as a backstop:
+        # this helper only runs behind a whitelist hit, and a compound that survives
+        # _unwrap_compound has no base command to hit one with, so it is already blocked by the
+        # time it would get here. It fires if base-command extraction ever learns compounds.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "compound":
             return True, "compound command in substitution"
 
@@ -1649,7 +1706,9 @@ class SubstitutionValidator:
         return SubstitutionValidationResult(
             allowed=False,
             risk_level=amplified_risk,
-            message=f"Inner command blocked: {rule_match.message}",
+            message=f"Inner command blocked: {rule_match.message}"
+            if amplified_risk == RiskLevel.BLOCKED
+            else f"Risky command in substitution: {rule_match.message}",
             inner_results=inner_results or [],
         )
 

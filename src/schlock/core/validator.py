@@ -25,7 +25,7 @@ from schlock.integrations.shellcheck import (
 from .cache import ValidationCache
 from .parser import WRAPPER_COMMANDS, BashCommandParser
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
-from .substitution import SubstitutionValidator
+from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
 logger = logging.getLogger(__name__)
 
@@ -1287,25 +1287,52 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
             sub_results = sub_validator.validate_all_substitutions(ast)
+
+            def _substitution_denial(sub_result: SubstitutionValidationResult) -> ValidationResult:
+                # The hook maps risk to the action, so only a genuine BLOCKED verdict may
+                # claim the word: an amplified-HIGH one is shown as an "ask" prompt, and a
+                # prompt whose text reads "BLOCKED" tells the user the opposite of the truth.
+                denied = sub_result.risk_level == RiskLevel.BLOCKED
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=sub_result.risk_level,
+                    message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
+                    alternatives=[
+                        "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
+                        "Run the command directly instead of using substitution",
+                        "If this command is safe, request it be added to the whitelist",
+                    ],
+                    exit_code=1,
+                    error=None,
+                )
+
+            # Worst verdict wins, not the first one found. A substitution denial short-circuits
+            # the rule pass below, so returning a weaker-than-BLOCKED one here silently DOWNGRADES
+            # a command the rules would deny outright: `bash<<<$(base64 -d<<<…)` is BLOCKED by
+            # base64_shell_execution, but its inner `base64` is merely an unknown command in a
+            # substitution (HIGH -> ask). Only a BLOCKED substitution verdict may short-circuit;
+            # a weaker one yields to a stronger top-level rule and is returned only if none is.
+            deferred_denial: Optional[SubstitutionValidationResult] = None
             for sub_result in sub_results:
-                if not sub_result.allowed:
-                    # The hook maps risk to the action, so only a genuine BLOCKED verdict may
-                    # claim the word: an amplified-HIGH one is shown as an "ask" prompt, and a
-                    # prompt whose text reads "BLOCKED" tells the user the opposite of the truth.
-                    denied = sub_result.risk_level == RiskLevel.BLOCKED
-                    return ValidationResult(
-                        allowed=False,
-                        risk_level=sub_result.risk_level,
-                        message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
-                        alternatives=[
-                            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
-                            "Run the command directly instead of using substitution",
-                            "If this command is safe, request it be added to the whitelist",
-                        ],
-                        exit_code=1,
-                        error=None,
+                if sub_result.allowed:
+                    continue  # Don't cache (substitution content may vary)
+                if sub_result.risk_level == RiskLevel.BLOCKED:
+                    return _substitution_denial(sub_result)
+                if deferred_denial is None or sub_result.risk_level > deferred_denial.risk_level:
+                    deferred_denial = sub_result
+            if deferred_denial is not None:
+                top_match = _get_rule_engine(config_path).match_command(command)
+                if top_match and top_match.matched and top_match.risk_level > deferred_denial.risk_level:
+                    # Carry the stronger level out HERE rather than falling through to the rule
+                    # pass: that pass works on extracted segments, where a match inside a
+                    # double-quoted word is suppressed as a string literal — so falling through
+                    # loses the verdict entirely and returns SAFE.
+                    deferred_denial = replace(
+                        deferred_denial,
+                        risk_level=top_match.risk_level,
+                        message=f"{top_match.message} (in substitution: {deferred_denial.message})",
                     )
-                # Don't cache (substitution content may vary)
+                return _substitution_denial(deferred_denial)
 
             # SECURITY: Pure AST-based dangerous command detection
             # Uses bashlex AST for BOTH command names AND arguments (no regex shortcuts)
