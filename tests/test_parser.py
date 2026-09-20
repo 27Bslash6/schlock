@@ -616,3 +616,11 @@ class TestAndOrSubstitutionCorrection:
         finally:
             bashlex.parser.yaccparser = real_yacc
             parser_mod._apply_andor_substitution_correction()  # restore the real correction
+
+
+def test_extract_command_segments_keeps_an_escaped_trailing_blank():
+    r"""`\ ` is a one-blank argument; stripping the segment must not leave `echo hi \`."""
+    parser = parser_mod.BashCommandParser()
+    command = "echo hi \\ ; echo \\\\ ; ls"
+    segments = parser.extract_command_segments(command, parser.parse(command))
+    assert segments == ["echo hi \\ ", "echo \\\\", "ls"]

@@ -902,7 +902,28 @@ _HEREDOC_PLACEHOLDER = "SCHLOCK_HEREDOC"
 # whole command bash runs, terminator included, so the redirection alone no
 # longer accounts for all of it). Exact rather than a guess, because the
 # rewrite chose both this delimiter and this body itself.
-_HEREDOC_REDIRECT_RE = re.compile(rf"\s*<<-?{re.escape(_HEREDOC_PLACEHOLDER)}|\s*\n\s*{re.escape(_HEREDOC_PLACEHOLDER)}")
+#
+# Neither branch may swallow a blank a backslash escapes. In front of the
+# redirection that blank is an argument (`cat \ <<'EOF'`), and in front of the
+# carried blob it is the segment's own last argument (`cat <<'EOF' \ `);
+# taking either leaves a dangling `cat \` that parses nowhere (LAB-4126).
+#
+# That is also why the second branch carries no `\s*` in front of its newline.
+# _close_heredocs appends its blob starting WITH a `\n`, and on this path the
+# body is always blank (_neuter_heredocs stands one empty line in for it), so
+# the match already begins at the blob's first character. An `\s*` there could
+# only reach backwards, into the command's own escaped blank.
+#
+# The second branch is anchored to the end of the segment because that is where
+# _close_heredocs put the blob - one run per heredoc, nothing after it. Unanchored
+# it would also delete a `SCHLOCK_HEREDOC` the CALLER wrote: the placeholder is a
+# fixed public string, and `rm \<newline>SCHLOCK_HEREDOC\<newline> -rf /` is one
+# command to bash, so deleting that token mid-segment rejoins `rm` to `-rf /`
+# having torn the text the rules match on apart. Anchoring keeps this exact, which
+# is what the paragraph above claims it is.
+_HEREDOC_REDIRECT_RE = re.compile(
+    rf"(?:(?<!\\)\s+)?<<-?{re.escape(_HEREDOC_PLACEHOLDER)}|(?:\n\s*{re.escape(_HEREDOC_PLACEHOLDER)})+\s*\Z"
+)
 
 # Bash ends an unquoted word at a blank or an operator character.
 _WORD_END = frozenset(" \t;&|<>()")
