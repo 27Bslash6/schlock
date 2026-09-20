@@ -824,6 +824,18 @@ class TestHeredocSurroundings:
                 "cat <<'EOF' x\\\n\\\n#c \\\n; rm -rf /\nbody\nEOF",
                 "`#` glued across an empty continuation line",
             ),
+            # An ESCAPED word character is word TEXT to bash, not a word
+            # boundary, so a `#` glued to it opens no comment: the logical line
+            # runs on and bash really executes the payload. Both parents denied
+            # these by ACCIDENT, for different reasons - main never joined the
+            # line at all, and this branch left a dangling `cat \` that parsed
+            # nowhere - so only merging the two could expose the class. Every
+            # character in _WORD_START_AFTER can be escaped this way, and the
+            # one-line spelling was already live on main (LAB-4332).
+            ("cat <<'EOF' \\\n\\ #\\\n; rm -rf /\nbody\nEOF", "escaped blank before a glued `#`"),
+            ("cat <<'EOF' \\\n\\\t#\\\n; rm -rf /\nbody\nEOF", "escaped tab before a glued `#`"),
+            ("cat <<'EOF' \\\n\\;#\\\n; rm -rf /\nbody\nEOF", "escaped `;` before a glued `#`"),
+            ("cat <<'EOF' \\ #\\\n; rm -rf /\nbody\nEOF", "escaped blank before a glued `#`, one line"),
             # `<` ending the opener line and `<<` starting the continuation is a
             # `<<<` here-string once bash deletes the backslash-newline - ONE
             # heredoc, not two. Reading the physical lines separately invents a

@@ -936,6 +936,9 @@ def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, 
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
     ends_with_backslash = False
+    # Where the last backslash escape ended. A `#` sitting exactly there
+    # follows an ESCAPED word character, which bash keeps inside the word.
+    after_escape = -1
     pos = 0
 
     while pos < len(line):
@@ -956,6 +959,7 @@ def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, 
             ends_with_backslash = pos + 1 >= len(line)
             out.append(line[pos : pos + 2])
             pos += 2
+            after_escape = pos
         elif char == "$" and pos + 1 < len(line) and line[pos + 1] in "'\"":
             # $'…' is ANSI-C quoting, $"…" is locale translation; both escape
             # with a backslash, and $" is otherwise an ordinary double quote.
@@ -966,7 +970,14 @@ def _rewrite_openers(line: str, quote: str) -> tuple[str, list[tuple[str, bool, 
             quote = char
             out.append(char)
             pos += 1
-        elif char == "#" and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+        # Every character in _WORD_START_AFTER can be backslash-escaped, and an
+        # escaped one is word TEXT to bash, not a word boundary: `cat \ #x` runs
+        # `#x` as part of the word, so the line does NOT end there. Reading it as
+        # a comment ends the logical line early and hands whatever follows to
+        # _neuter_heredocs as heredoc body, deleting a live command from the
+        # rewrite. `pos != after_escape` is the whole test - the raw lookup at
+        # `line[pos - 1]` cannot tell an escaped blank from a real one (LAB-4332).
+        elif char == "#" and pos != after_escape and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
