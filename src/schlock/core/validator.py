@@ -857,30 +857,49 @@ _WORD_END = frozenset(" \t;&|<>()")
 # opener that bash - and bashlex - both read as a comment.
 _WORD_START_AFTER = frozenset(" \t;&|()<>")
 
-# A comment also opens at the start of a line, which the line-oriented scan above
-# gets from `pos == 0` and a whole-text scan has to spell out.
-_COMMENT_AFTER = _WORD_START_AFTER | {"\n"}
-
-# What a `<<` inside an arithmetic command is rewritten to. Any two characters
-# with no shell meaning would do; `==` keeps the offsets of everything after it
-# and still reads as arithmetic to whoever opens the audit log.
+# What a `<<` inside an arithmetic command is rewritten to. It MUST NOT contain a
+# `<`: the rewrite recurses through validate_command, and a replacement that
+# still looks like a shift would never converge. Beyond that, any two characters
+# with no shell meaning do; `==` is the same width, so the offsets of everything
+# after it are undisturbed, and it still reads as arithmetic in the parse-error
+# messages where the rewritten text reaches a human.
 _ARITH_SHIFT = "=="
 
 
 def _scan_shell_text(  # noqa: PLR0912 - one branch per lexical state; splitting it hides the state machine
-    text: str,
-) -> tuple[dict[int, int], list[int], list[int]]:
+    text: str, *, blind: bool = False
+) -> tuple[dict[int, int], list[int], list[int], bool]:
     r"""Pair the unquoted parens, and locate the unquoted `<<` and `((`.
 
-    Returns ``(partners, shift offsets, `((` offsets)``, where ``partners`` maps
-    each unquoted `(` to its closing `)`.
+    Returns ``(partners, shift offsets, `((` offsets, ran off the end inside a
+    quote)``, where ``partners`` maps each unquoted `(` to its closing `)`.
 
     Bash's `((` matcher is a plain depth counter: `'…'`, `"…"`, `$'…'`, `\x` and
     backticks are opaque, while `${…}` and newlines are transparent, so the `)`
-    in `${x:-)}` really does balance the pair (pinned against bash 5.3.9). `#` is
-    transparent there too, but it is a comment everywhere else and comments hold
-    unbalanced parens far more often than arithmetic holds a `#` - which is not
-    valid arithmetic anyway - so this reads it as a comment.
+    in `${x:-)}` really does balance the pair (pinned against bash 5.3.9).
+
+    `#` is transparent too, and this does NOT read it as a comment even though
+    bash does everywhere else. Reading it as one swallowed the rest of the line,
+    `))` included, so `(( 1<<b ${x:- #} ))` looked like no region at all while
+    bash still closed the pair and ran the lines after it. The cost of the
+    honest reading is a `<<` inside a real comment being rewritten, which
+    changes nothing - bashlex discards comments before any rule sees them - and
+    an unbalanced `(` left in a comment is harmless because the stack is LIFO,
+    so a balanced region still pairs with itself.
+
+    This is deliberately a SECOND lexical pass over text `_rewrite_openers`
+    already knows how to read, and the two are not interchangeable: that one
+    carries quote state across lines and raises when a reading is uncertain, this
+    one pairs parens across the whole text and never raises, because it runs on
+    every command rather than only on the ones bashlex rejected. They do disagree
+    - `_rewrite_openers` reads a delimiter out of ``echo <<X`` where this treats
+    the backticks as opaque - so do not assume a fact established in one holds in
+    the other.
+
+    ``blind`` drops the quote rules. A quote that never closes - a lone `'` in a
+    heredoc body, which bash does not read as a quote at all - otherwise swallows
+    the whole rest of the command, `((` included, and the caller re-runs blind to
+    recover it.
 
     Pairing everything in one pass rather than re-reading to the partner from
     each candidate is what keeps `((((((…` linear: that text has a `((` at every
@@ -898,9 +917,13 @@ def _scan_shell_text(  # noqa: PLR0912 - one branch per lexical state; splitting
 
         if char == "\\":
             pos += 2
+        elif blind and char in "'\"`":
+            pos += 1
         elif char == "'":
             close = text.find("'", pos + 1)
-            pos = end if close < 0 else close + 1
+            if close < 0:
+                return partners, shifts, dparens, True
+            pos = close + 1
         elif char in '"`' or (char == "$" and text[pos + 1 : pos + 2] == "'"):
             # $'…' is ANSI-C quoting, where a backslash does not close the string; a
             # backslash escapes inside `"…"` and backticks as well.
@@ -908,10 +931,9 @@ def _scan_shell_text(  # noqa: PLR0912 - one branch per lexical state; splitting
             pos += 2 if char == "$" else 1
             while pos < end and text[pos] != quote:
                 pos += 2 if text[pos] == "\\" else 1
+            if pos >= end:
+                return partners, shifts, dparens, True
             pos += 1
-        elif char == "#" and (pos == 0 or text[pos - 1] in _COMMENT_AFTER):
-            newline = text.find("\n", pos)
-            pos = end if newline < 0 else newline
         elif char == "(":
             # `$(` is a substitution, not an arithmetic opener - it only balances.
             if text[pos + 1 : pos + 2] == "(" and (pos == 0 or text[pos - 1] != "$"):
@@ -930,7 +952,7 @@ def _scan_shell_text(  # noqa: PLR0912 - one branch per lexical state; splitting
         else:
             pos += 1
 
-    return partners, shifts, dparens
+    return partners, shifts, dparens, False
 
 
 def _neuter_arithmetic_shifts(command: str) -> str:
@@ -953,10 +975,23 @@ def _neuter_arithmetic_shifts(command: str) -> str:
     the region would hide it from the substitution validator - trading this
     fail-open for another one.
     """
-    if "((" not in command or "<<" not in command:
+    # Bash removes `\<newline>` before it tokenizes anything, so `(\<newline>(`
+    # is the same opener as `((`. Scan what bash scans - but hand the splice-free
+    # text back only when a shift is actually rewritten, so a command this guard
+    # has no business touching is returned exactly as it arrived.
+    spliced = command.replace("\\\n", "") if "\\\n" in command else command
+    if "((" not in spliced or "<<" not in spliced:
         return command
 
-    partners, shifts, dparens = _scan_shell_text(command)
+    partners, shifts, dparens, truncated = _scan_shell_text(spliced)
+    if truncated:
+        # The quote rules ran the scan off the end, so everything past that point
+        # was never looked at. Retry without them and keep whichever reading sees
+        # more: a `((` wrongly found inside a string only un-hides lines, while
+        # one missed leaves a payload hidden - the failure this guard exists for.
+        blind = _scan_shell_text(spliced, blind=True)
+        if len(blind[2]) > len(dparens):
+            partners, shifts, dparens = blind[0], blind[1], blind[2]
     if not shifts or not dparens:
         return command
 
@@ -970,7 +1005,7 @@ def _neuter_arithmetic_shifts(command: str) -> str:
     collected_to = -1
     for opener in dparens:
         closer = partners.get(opener + 1)
-        if closer is None or command[closer + 1 : closer + 2] != ")":
+        if closer is None or spliced[closer + 1 : closer + 2] != ")":
             # Unterminated, or a `)` that does not double: bash reads this as
             # subshells (or refuses to run it at all), and bashlex agrees.
             continue
@@ -982,7 +1017,7 @@ def _neuter_arithmetic_shifts(command: str) -> str:
     if not hidden:
         return command
 
-    rewritten = list(command)
+    rewritten = list(spliced)
     for offset in hidden:
         rewritten[offset : offset + 2] = _ARITH_SHIFT
     return "".join(rewritten)
@@ -1390,15 +1425,29 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # Special case triggered, return result (don't cache, state may change)
             return special_check
 
-        # Step 3b: Reconcile the one place bashlex and bash disagree about what
-        # is even a command. A `<<` inside `(( … ))` is a left shift to bash and
-        # a heredoc opener to bashlex, and the phantom body hides every line
-        # after it from the rules (LAB-4317). Rewriting the shift hands those
-        # lines back to the flow below, which validates them on their merits -
-        # so the verdict comes from the rule the payload matches, not from this.
+        # Step 3b: a `<<` inside `(( … ))` is a left shift to bash and a heredoc
+        # opener to bashlex, and the phantom body hides every line after it from
+        # the rules while bash runs them (LAB-4317). Rewriting the shift hands
+        # those lines back to the flow below, which validates them on their
+        # merits - so the verdict comes from the rule the payload matches.
+        #
+        # This is one instance of a class, not the whole class: bashlex and bash
+        # also disagree about `a[1<<b ]=1` (still a live fail-open) and about
+        # `$(( … ))` (denied only because bashlex crashes on it, 27Bslash6/schlock#112).
+        # Neither is fixed here.
+        #
+        # Rewriting a shift creates no parens and no new `<<`, so the regions are
+        # the same on a second pass and this recurses exactly once. It also means
+        # a shift somehow missed on one pass is caught on the next, which is why
+        # under-firing here cannot leave a payload hidden.
         neutered = _neuter_arithmetic_shifts(command)
         if neutered != command:
-            return validate_command(neutered, config_path, _depth=_depth)
+            arithmetic_result = validate_command(neutered, config_path, _depth=_depth)
+            if _depth == 0:
+                # Cached under what the user typed; the recursion cached the
+                # rewrite, which nobody will ever issue.
+                _global_cache.set(command, arithmetic_result)
+            return arithmetic_result
 
         # Step 4: Parse command and extract AST context
         parser = _get_parser()

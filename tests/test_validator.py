@@ -1040,8 +1040,8 @@ class TestArithmeticCommandShift:
             ("(( 1<<b )) 2>/dev/null\nrm -rf /\nb", "a redirect on the arithmetic"),
             ("if (( 1<<b )); then rm -rf /; fi\nb", "payload inside the `if` it guards"),
             ("(( (( 1<<b )) ))\nrm -rf /\nb", "nested arithmetic"),
-            ("(( 1<<b )) && (( 2<<c ))\nrm -rf /\nb\nc", "two arithmetic commands, two shifts"),
             ("(( 1<<b )) <<'Q'\nbody\nQ\nrm -rf /", "a real heredoc alongside the shift"),
+            ("((1<<b\\) ))\nrm -rf /\nb", "an escaped `)` does not close the region"),
             # A quoted heredoc elsewhere used to send this down the fallback and
             # the arithmetic re-hid the payload there too.
             ("cat <<'EOF'\nx\nEOF\n(( 1<<b ))\nrm -rf /\nb", "after an unrelated quoted heredoc"),
@@ -1066,40 +1066,60 @@ class TestArithmeticCommandShift:
         assert result.matched_rules and "system_destruction" not in result.matched_rules
 
     @pytest.mark.parametrize(
-        "command,allowed,risk,description",
+        "command,allowed,risk,parse_error,description",
         [
             # AC-3: the measured baseline on main. `for (( … ))` is already
             # denied by a bashlex parse error - that over-block is 27Bslash6/schlock#106
             # and #112, an explicit non-goal here, so it must stay exactly as it is.
-            ("(( i++ ))", True, RiskLevel.SAFE, "bare increment"),
-            ("for (( i=0; i<3; i++ )); do echo $i; done", False, RiskLevel.BLOCKED, "`for ((` stays denied"),
-            ("while (( n < 3 )); do echo hi; done", True, RiskLevel.SAFE, "`while ((`"),
-            ("if (( x )); then echo y; fi", True, RiskLevel.SAFE, "`if ((`"),
+            ("(( i++ ))", True, RiskLevel.SAFE, False, "bare increment"),
+            ("for (( i=0; i<3; i++ )); do echo $i; done", False, RiskLevel.BLOCKED, True, "`for ((` stays denied"),
+            ("while (( n < 3 )); do echo hi; done", True, RiskLevel.SAFE, False, "`while ((`"),
+            ("if (( x )); then echo y; fi", True, RiskLevel.SAFE, False, "`if ((`"),
             # Arithmetic expansion is not an arithmetic command; it is out of
             # scope and its verdict must not move either.
-            ("echo $(( 1<<3 ))", False, RiskLevel.BLOCKED, "`$((` expansion stays denied"),
+            ("echo $(( 1<<3 ))", False, RiskLevel.BLOCKED, True, "`$((` expansion stays denied"),
         ],
     )
-    def test_everyday_arithmetic_keeps_its_verdict(self, safety_rules_path, command, allowed, risk, description):
-        """Measured on main @ a285078 with ShellCheck off; none of these may move."""
+    def test_everyday_arithmetic_keeps_its_verdict(self, safety_rules_path, command, allowed, risk, parse_error, description):
+        """Measured on main @ a285078 with ShellCheck off; none of these may move.
+
+        The two denials here come from a bashlex parse failure, not from a rule,
+        so `parse_error` pins the reason as well as the verdict. `echo $(( … ))`
+        is a shape bash really does execute, held closed only by bashlex crashing
+        on arithmetic expansion; if that crash ever goes away this must fail
+        loudly rather than quietly start allowing it.
+        """
         result = validate_command(command, config_path=safety_rules_path)
 
         assert result.allowed is allowed, description
         assert result.risk_level == risk, description
+        if parse_error:
+            assert result.matched_rules == [], description
+            assert result.error and "pars" in result.error.lower(), description
 
-    def test_two_subshells_keep_their_real_heredoc(self, safety_rules_path):
-        """`( ( 1<<b ) )` is not arithmetic, and its `<<` really does open a heredoc.
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ("( ( 1<<b ) )\nrm -rf /\nb", "spaced: not even a `((`"),
+            ("((1<<b) )\nrm -rf /\nb", "adjacent `((`, but the closers do not double"),
+        ],
+    )
+    def test_subshell_reading_keeps_its_real_heredoc(self, safety_rules_path, command, description):
+        """These are not arithmetic, and their `<<` really does open a heredoc.
 
         Bash only reads `((` as arithmetic when the `)` balancing the second `(`
-        is immediately followed by another `)`. Verified against bash 5.3.9: the
-        payload below never runs, because the heredoc body swallows it. A guard
-        that fired on the doubled parens alone would start un-hiding genuine
-        heredoc bodies and denying commands bash treats as data.
-        """
-        result = validate_command("( ( 1<<b ) )\nrm -rf /\nb", config_path=safety_rules_path)
+        is immediately followed by another `)`. Verified against bash 5.3.9 with
+        a canary: neither payload below ever runs, because the heredoc body
+        swallows it - so allowing them is agreement with bash, not a miss.
 
-        assert result.allowed is True
-        assert result.risk_level == RiskLevel.SAFE
+        The second row is the one that pins the rule. The first has a space
+        between the parens, so it is never a `((` candidate at all and would
+        pass even with the matched-pair test deleted.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, description
+        assert result.risk_level == RiskLevel.SAFE, description
 
     @pytest.mark.parametrize(
         "command,description",
@@ -1107,11 +1127,15 @@ class TestArithmeticCommandShift:
             ('echo "(( 1<<b ))"', "inside a double-quoted word"),
             ("echo '(( 1<<b ))'", "inside a single-quoted word"),
             ("echo $'(( 1<<b ))'", "inside an ANSI-C string"),
-            ("# (( 1<<b ))", "inside a comment"),
         ],
     )
     def test_quoted_arithmetic_is_text_not_an_opener(self, safety_rules_path, command, description):
-        """A `((` bash reads as text is not rewritten here either."""
+        """A `((` bash reads as text is not rewritten here either.
+
+        A `#` comment is deliberately NOT in this list: bash's `((` matcher does
+        not honour `#`, so neither does the scan. Rewriting a `<<` inside a real
+        comment changes nothing, because bashlex discards comments.
+        """
         assert val_module._neuter_arithmetic_shifts(command) == command, description
 
     @pytest.mark.parametrize(
@@ -1147,6 +1171,65 @@ class TestArithmeticCommandShift:
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
 
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ("echo $(( 1<<b ))", "`$((` is an expansion, not an arithmetic command"),
+            ("echo $(( 1<<b ))\nrm -rf /\nb", "the same with a payload after it"),
+            ("(( $(grep x <<< y) + 1==b ))", "`<<<` inside a region is a here-string, not a shift"),
+        ],
+    )
+    def test_decisions_no_verdict_discriminates_are_still_pinned(self, command, description):
+        """Neither of these changes a verdict today, so only a direct assertion pins them.
+
+        `$((` is denied either way because bashlex cannot parse arithmetic
+        expansion at all (27Bslash6/schlock#112), and mangling a here-string into
+        `==<` happens to deny the same as leaving it. Both are still the wrong
+        reading of bash, and an unpinned decision is the one that gets
+        "simplified" away by someone who checked only the verdicts.
+        """
+        assert val_module._neuter_arithmetic_shifts(command) == command, description
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ("(( 1<<b ))", "the plain opener"),
+            ("true; (( 1<<b ))", "after `;`"),
+            ("if true; then((1<<b)); fi", "glued `then((`"),
+            ("{((1<<b)); }", "glued `{((`"),
+            ("!((1<<b))", "glued `!((`"),
+            ("time ((1<<b))", "after `time`"),
+            ("while ((1<<b)); do break; done", "a `while` condition"),
+            ("(((1<<b)))", "an extra paren pair"),
+            # Bash removes `\<newline>` before it tokenizes, so these are the
+            # same arithmetic command as the first row. The adjacency test cannot
+            # see it without the splice being removed first.
+            ("(\\\n( 1<<b ))", "a line splice between the parens"),
+            ("((\\\n1<<b ))", "a line splice after the parens"),
+            # An apostrophe that never closes used to run the scan off the end,
+            # so nothing past it was examined. Bash does not read a heredoc body
+            # as quoted at all.
+            ("cat <<'EOF'\nit's\nEOF\n(( 1<<b ))", "an unclosed `'` earlier in the command"),
+            # `#` is transparent to bash's `((` matcher: the pair still closes and
+            # the lines after it still run. Reading it as a comment swallowed the
+            # `))` and found no region at all.
+            ("(( 1<<b ${x:- #} ))", "a `#` reachable at a word start inside the region"),
+            ("(( 1<<b ${x+ #} ))", "the `${x+ …}` spelling of the same"),
+            ("(( 1<<b # ))", "a trailing `#` inside the region"),
+            ("((\n1<<b\n#\n))", "a `#` on its own line inside the region"),
+            ('cat <<"EOF"\na"b\nEOF\n(( 1<<b ))', 'an unclosed `"` earlier in the command'),
+        ],
+    )
+    def test_shapes_bash_runs_as_arithmetic_are_rewritten(self, command, description):
+        """The miss direction: every one of these is arithmetic to bash 5.3.9.
+
+        Asserting only that benign text is left ALONE cannot fail when the scan
+        misses an opener - and missing one is the direction that leaves a payload
+        hidden. Each row here was confirmed with a canary: bash evaluates the
+        shift and runs the following lines, so the rewrite has to fire.
+        """
+        assert val_module._neuter_arithmetic_shifts(command) != command, description
+
     def test_unterminated_arithmetic_is_left_alone(self):
         """Bash runs nothing without the closing `))`, so there is nothing to un-hide."""
         command = "(( 1<<b\nrm -rf /"
@@ -1164,13 +1247,27 @@ class TestArithmeticCommandShift:
         """Collecting a region's shifts by bisection, not by scanning them all.
 
         `(((((…` has a `((` at every offset, so a per-candidate rescan is
-        quadratic. 2000 shifts in one 22 KB command took 97 ms that way; this is
-        a loose ceiling that still fails by two orders of magnitude if the
-        quadratic comes back.
+        quadratic. Measured on this input: 3.6 ms as shipped, 100 ms with the
+        rescan restored. The ceiling has to sit between those two, not merely
+        above both - at the 1.0 s it started out with, the quadratic passed.
         """
-
         command = "(( 1<<b ))\n" * 2000 + "ls\nb"
         start = time.perf_counter()
         val_module._neuter_arithmetic_shifts(command)
 
-        assert time.perf_counter() - start < 1.0
+        assert time.perf_counter() - start < 0.025
+
+    def test_nested_regions_over_many_shifts_stay_linear(self):
+        """Every nested region contains every shift, so re-collecting them is d*k.
+
+        This is the shape the `collected_to` skip exists for, and the only one
+        that notices if it goes. No verdict differs either way - the Step 3b
+        recursion re-runs the rewrite, so a region missed on one pass is caught
+        on the next - which is exactly why only a cost measurement can pin it.
+        Measured at this size: 2.8 ms as shipped, 54 ms without the skip.
+        """
+        command = "((" * 2000 + "1<<b " * 2000 + "))" * 2000
+        start = time.perf_counter()
+        val_module._neuter_arithmetic_shifts(command)
+
+        assert time.perf_counter() - start < 0.025
