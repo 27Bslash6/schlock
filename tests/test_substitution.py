@@ -1552,7 +1552,11 @@ class TestWhitelistedSubstitutionYamlRules:
             # level, and it must stay SAFE when the search runs inside a substitution.
             "echo \"$(grep -rn 'rm -rf' src/)\"",
             "echo \"$(grep -c 'mkfs.ext4 /dev/sda' notes.txt)\"",
-            "echo \"$(git log --grep='git push --force')\"",
+            "echo \"$(git log --grep 'git push --force')\"",
+            # One char wider than the row above: `system_destruction` ends in (\s|$), so it
+            # consumes the separator and runs one past an unwidened span. Without the widening
+            # in _join_tokens this row alone goes BLOCKED while every other row still passes.
+            "echo \"$(grep -rn 'rm -rf /' src/)\"",
             # through the pipeline and list renderers, which join tokens of their own
             "echo \"$(grep -rn 'rm -rf' src/ | head)\"",
             "echo \"$(cd src && grep -rn 'rm -rf' .)\"",
@@ -1583,6 +1587,71 @@ class TestWhitelistedSubstitutionYamlRules:
     def test_literal_ranges_do_not_suppress_real_commands(self, command):
         """Suppression covers the quoted span only — it must not leak onto the code around it."""
         assert validate_command(command).allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # `--flag=payload` survives word-splitting whole, but only the VALUE was quoted and
+            # the program splits at the `=` and runs the right-hand side. Treating the word as
+            # data made these EIGHT flags weaker inside $() than as bare text — the substitution
+            # path became the cheapest route to the same execution, inverting the amplifier.
+            "echo \"$(git difftool --extcmd='rm -rf /' HEAD)\"",
+            "echo \"$(git fetch --upload-pack='rm -rf /' origin)\"",
+            "echo \"$(git archive --exec='rm -rf /' HEAD)\"",
+            "echo \"$(git -c uploadpack.packObjectsHook='rm -rf /' fetch)\"",
+            "echo \"$(sort --compress-program='rm -rf /' f)\"",
+            # Whitespace with no quote in sight: bashlex keeps a nested substitution's source
+            # verbatim in .word, so this word holds a space and is still code.
+            'echo "$(grep -rn $(echo rm -rf /) src/)"',
+        ],
+    )
+    def test_structured_words_are_not_data(self, command):
+        """A word is data only when the command receives it whole with nothing to interpret.
+
+        Quoting is not the test — opacity is. Both shapes here arrive as one argv entry and
+        both still carry something the receiver pulls apart, so neither may be suppressed.
+        """
+        assert validate_command(command).allowed is False
+
+    @pytest.mark.parametrize(
+        ("command", "expected_ranges"),
+        [
+            # The command name is never data, however it is quoted — it IS the command.
+            ("echo \"$('rm -rf /' foo)\"", []),
+            # A nested substitution's source text sits verbatim in the word, quotes or not.
+            ('echo "$(grep -rn $(echo rm -rf /) src/)"', []),
+            # ...and the shape that IS data, so the rows above are not vacuously empty.
+            ("echo \"$(grep -rn 'rm -rf' src/)\"", [(8, 16)]),
+        ],
+    )
+    def test_no_range_is_recorded_for_a_command_name_or_a_nested_substitution(self, validator, parser, command, expected_ranges):
+        """Pinned at this level because no verdict currently depends on either guard.
+
+        Layer 3 denies the nested substitution on its own, and per-segment validation catches a
+        quoted command name, so both guards are invisible end-to-end today — a verdict assertion
+        passes with them removed. They are still the correct direction, so pin the ranges instead
+        of trusting a neighbouring layer to keep covering them.
+        """
+        node = validator.extract_substitutions(parser.parse(command))[0]
+        assert node.literal_ranges == expected_ranges
+
+    def test_substitution_is_never_weaker_than_the_same_text_bare(self):
+        """The amplifier only ever adds a level, so `$(X)` must never rate below bare `X`.
+
+        This is the invariant the `--flag=payload` shapes broke, and the cheapest way to catch
+        the next one: measure both spellings rather than enumerate the flags.
+        """
+        order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
+        for inner in (
+            "git difftool --extcmd='rm -rf /' HEAD",
+            "git fetch --upload-pack='rm -rf /' origin",
+            "sort --compress-program='rm -rf /' f",
+            "grep -rn 'rm -rf' src/",
+            "git log --grep 'git push --force'",
+        ):
+            bare = validate_command(inner)
+            wrapped = validate_command(f'echo "$({inner})"')
+            assert order.index(wrapped.risk_level) >= order.index(bare.risk_level), inner
 
     @pytest.mark.parametrize(
         "command",

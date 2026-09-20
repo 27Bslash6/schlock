@@ -746,24 +746,54 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
     return None
 
 
-def _command_tokens(node: Any) -> list[tuple[str, bool]]:
-    """Words of one simple command as ``(text, is_quoted_data)`` pairs.
+# A word whose leading run of non-whitespace contains '=' is structured: the program splits it
+# and reads the right-hand side, and only that side was ever quoted. See _is_opaque_argument.
+_STRUCTURED_WORD = re.compile(r"^\S*=")
 
-    A word that STILL holds whitespace after bashlex stripped its quotes can only have got
-    there by being quoted — shell word-splitting guarantees it. So the quoting survives the
-    dequoting, which is what lets the rendered text carry data spans it no longer shows.
 
-    The first word is exempt: a quoted command name is still the command being run, so
-    ``$('rm -rf /' foo)`` must keep matching the rule it names.
+def _is_opaque_argument(part: Any) -> bool:
+    """Is this word ONE argument the command receives whole, with nothing to interpret inside?
+
+    Only such a word is data. The test is not "was it quoted" but "is it opaque", and the two
+    part company on exactly the shapes that bite:
+
+    * ``--extcmd='rm -rf /'`` survives word-splitting as one argv entry, yet only the VALUE was
+      quoted — git splits at the ``=`` and runs the right-hand side. Treating it as data made
+      the substitution path WEAKER than bare text for eight such flags. The top-level
+      :meth:`BashCommandParser.extract_string_literals` refuses a partially-quoted word for the
+      same reason; this keeps the two models agreeing.
+    * ``$(echo rm -rf /)`` inside a word holds whitespace with no quote anywhere — bashlex keeps
+      a nested substitution's source verbatim in ``.word``. It is code, and suppressing it would
+      silently disable this whole-text pass over every nested substitution.
+
+    Whitespace is still what proves the word arrived as one piece: shell word-splitting would
+    have torn it apart otherwise, whether it was held together by quotes or by backslashes.
     """
-    words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
-    return [(word, index > 0 and any(char.isspace() for char in word)) for index, word in enumerate(words)]
+    word = getattr(part, "word", "")
+    if not any(char.isspace() for char in word):
+        return False
+    if _STRUCTURED_WORD.match(word):
+        return False
+    return not any(
+        getattr(child, "kind", None) in ("commandsubstitution", "processsubstitution")
+        for child in getattr(part, "parts", None) or []
+    )
+
+
+def _command_tokens(node: Any) -> list[tuple[str, bool]]:
+    """Words of one simple command as ``(text, is_data)`` pairs.
+
+    The first word is exempt whatever its shape: a quoted command name is still the command
+    being run, so ``$('rm -rf /' foo)`` must keep matching the rule it names.
+    """
+    parts = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
+    return [(part.word, index > 0 and _is_opaque_argument(part)) for index, part in enumerate(parts)]
 
 
 def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, int]]]:
-    """Join tokens with single spaces; return the text and the spans holding quoted data.
+    """Join tokens with single spaces; return the text and the spans holding opaque data.
 
-    Each span widens by one onto the separators, which is where the quote characters stood.
+    Each span widens by one onto the separators that stand where the quoting used to.
     Rules anchored with ``(\\s|$)`` consume the separator, and ``_is_in_string_literal``
     demands the WHOLE match sit inside a span, so an unwidened span misses the suppression.
     """
