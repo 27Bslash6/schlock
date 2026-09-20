@@ -991,6 +991,43 @@ class TestHeredocSurroundings:
         assert "rm -rf /" in neutered, description
         assert expansion in neutered, description
 
+    @pytest.mark.parametrize(
+        "line,delimiters,description",
+        [
+            # Nothing opens: the `<<` is text or a shift, all the way down.
+            ("echo ${x:-q<<b }", [], "parameter expansion"),
+            ("echo ${x:-${y:-p<<c} }", [], "`${` nests its own frame"),
+            ("echo $((1<<2))", [], "arithmetic shift"),
+            ("echo $(( ((1))<<2 ))", [], "paren groups nest inside arithmetic"),
+            ("echo $(( $((1)) <<2 ))", [], "arithmetic nested in arithmetic owes both parens"),
+            ("echo $[1<<2]", [], "the deprecated $[…] form"),
+            ("echo $[$[1<<2]]", [], "$[…] nested in $[…]"),
+            ("echo $[arr[1]<<2]", [], "an array subscript nests inside $[…]"),
+            # The expansion ends and the `<<` after it is a real opener. These
+            # are what a stack that closes too late would miss - and missing an
+            # opener leaves the body behind as commands, which still denies, so
+            # only the opener list shows the difference.
+            ("echo ${x:-a}b<<c", ["c"], "an opener right after the expansion closes"),
+            ("echo ${x:-{a}<<c }", ["c"], "a bare `{` does not extend a `${…}`"),
+            ("echo ${x:- #y} <<X", ["X"], "`#` is not a comment inside an expansion"),
+            ("echo ${x:-a[b}<<c", ["c"], "a stray `[` does not extend a `${…}`"),
+            ("echo ${x:-a(b}<<c", ["c"], "a stray `(` does not extend a `${…}`"),
+            ("echo ${#arr[@]}<<c", ["c"], "subscript brackets do not extend a `${…}`"),
+            (r"echo ${x//\//_}<<c", ["c"], "a substitution expansion ends at its own `}`"),
+        ],
+    )
+    def test_expansion_boundaries_match_bash(self, line, delimiters, description):
+        """Every row here was run through real bash first; the expectation is what bash did.
+
+        Pinned on the opener list rather than a verdict because both failure
+        directions deny: reading a phantom opener invents a body that never
+        terminates, and missing a real one leaves body text to be parsed as
+        commands. A `BLOCKED` assertion cannot tell either from a correct read.
+        """
+        _, openers, _, _ = val_module._rewrite_openers(line, "", [])
+
+        assert [delimiter for delimiter, _, _ in openers] == delimiters, description
+
     def test_expansion_state_survives_a_line_break(self):
         """An expansion left open at end of line keeps the next line inside it.
 
@@ -1002,6 +1039,19 @@ class TestHeredocSurroundings:
 
         assert "rm -rf /" in neutered
         assert "q<<b" in neutered
+
+    def test_an_opener_after_a_closed_expansion_is_still_an_opener(self):
+        """The state machine has to close as precisely as it opens.
+
+        Verified against bash: `echo ${x:-a}b<<c` prints `ab` and opens a real
+        heredoc delimited by `c`. A stack that never popped would read the rest
+        of the command as expansion text, miss this opener, and leave the body
+        behind as commands - which still denies, so only the rewritten text
+        shows the difference.
+        """
+        neutered, _ = val_module._neuter_heredocs("ls <<'A'\nz\nA\necho ${x:-a}b<<c\nbody\nc")
+
+        assert neutered == ("ls <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ${x:-a}b<<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC")
 
     def test_an_opener_line_left_inside_an_expansion_fails_closed(self):
         """Same rule as an unclosed quote: the body's first line is unknown, so deny."""

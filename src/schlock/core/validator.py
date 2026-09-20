@@ -858,12 +858,17 @@ _WORD_START_AFTER = frozenset(" \t;&|()<>")
 
 # Inside a parameter or arithmetic expansion, `<<` is never a redirection:
 # `${x:-a<<b}` expands to the literal `a<<b` and `$((1<<2))` is a left shift.
-# The scan therefore carries a stack of the closers it still owes, and each
-# entry's own opener nests it one deeper - `${x:-{a,b}}` ends at the second
-# `}`, `$(( (1<<2) ))` at the third `)`. Typing the stack by closer is what
-# keeps an unbalanced bracket of a *different* family (`${x:-a)b}`) from
-# ending the expansion early and re-opening the hole (LAB-4270).
-_EXPANSION_NESTS_ON = {"}": "{", ")": "(", "]": "["}
+# The scan therefore carries a stack of the closers it still owes, typed by
+# closer so an unbalanced bracket of a *different* family (`${x:-a)b}`) cannot
+# end the expansion early and re-open the hole (LAB-4270).
+#
+# Only `(` and `[` nest their frame one deeper - `$(( ((1))<<2 ))` ends at the
+# last `)`, `$[arr[1]<<2]` at the last `]`. A bare `{` does NOT: bash ends a
+# `${…}` at the first unmatched `}` whatever braces the text holds, so
+# `${x:-{a}<<c` really does open a heredoc (verified). Nesting it would have
+# cost a false positive on every `${x:-{a,b}}`; only a nested `${` extends a
+# `}` frame, and that pushes its own.
+_EXPANSION_NESTS_ON = {")": "(", "]": "["}
 
 
 def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
@@ -974,7 +979,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             expansions.append("}" if line[pos + 1] == "{" else "]")
             out.append(line[pos : pos + 2])
             pos += 2
-        elif expansions and char == _EXPANSION_NESTS_ON[expansions[-1]]:
+        elif expansions and char == _EXPANSION_NESTS_ON.get(expansions[-1]):
             expansions.append(expansions[-1])
             out.append(char)
             pos += 1
