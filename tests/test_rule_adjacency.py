@@ -412,10 +412,10 @@ class TestCredentialRulesDoNotOverReach:
             "echo 'set your API_KEY in .env'",
             "echo Set the AWS_SECRET in vault",
             "echo PASSWORD reset instructions",
-            # Prose spells `:` constantly, which is why only the colon form of an
-            # assignment has to redirect before it counts as a secret write.
-            'echo "PASSWORD: ask ops"',
-            'echo "API_KEYS: plural"',
+            # A colon FAR from the name is prose; a colon immediately after it is
+            # an assignment and still rates, exactly as it does on main. Trying to
+            # separate those two by requiring a redirect cost six real denials and
+            # was reverted -- see the rule comment.
             'echo "TOKEN rotation: quarterly"',
         ],
     )
@@ -504,9 +504,36 @@ class TestACredentialNameNeedsAPosition:
             "printf 'PASSWORD: %s\\n' hunter2 > creds.yml",
             # JSON, the other way an agent writes a config file.
             'echo \'{"API_KEY":"sk-x"}\' > c.json',
+            'echo \'{"API_KEY": "sk-x"}\' > c.json',
         ],
     )
     def test_assigned(self, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert "extended_credential_exposure" in result.matched_rules, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A redirect BEFORE the credential argument.
+            'echo > c.yml "API_KEY: sk-x"',
+            'printf > c.yml "API_KEY: sk-x"',
+            # A separator inside the quoted VALUE, which is data, not structure.
+            'echo "API_KEY: sk;x" > c.yml',
+            'echo "API_KEY: sk|x" > c.yml',
+            'echo "API_KEY: sk&x" > c.yml',
+            # Bash's combined output redirect.
+            'echo "API_KEY: sk-x" &> c.yml',
+        ],
+    )
+    def test_assigned_however_the_redirect_is_spelled(self, command, rules_dir_path):
+        """Source-text order is not redirect structure.
+
+        Requiring a later `>` reachable without crossing `;|&` looked like it
+        distinguished a write from prose. It does not: each of these writes a
+        plaintext credential exactly as `echo "API_KEY: sk-x" > c.yml` does, and
+        every one of them walked through that qualifier while the control stayed
+        BLOCKED. A pattern cannot see a parsed redirect, so it must not pretend to.
+        """
         result = verdict(command, rules_dir_path)
         assert "extended_credential_exposure" in result.matched_rules, command
 
