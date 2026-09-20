@@ -746,9 +746,10 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
     return None
 
 
-# A word whose leading run of non-whitespace contains '=' is structured: the program splits it
-# and reads the right-hand side, and only that side was ever quoted. See _is_opaque_argument.
-_STRUCTURED_WORD = re.compile(r"^\S*=")
+# A word the receiving program splits before using, so only part of it was ever quoted:
+# `--flag=VALUE` (split at the `=`), or a short option carrying its value glued on (`-xVALUE`,
+# `-yxVALUE`), which getopt splits at the option letter. See _is_opaque_argument.
+_STRUCTURED_WORD = re.compile(r"^\S*=|^-")
 
 
 def _is_opaque_argument(part: Any) -> bool:
@@ -762,6 +763,10 @@ def _is_opaque_argument(part: Any) -> bool:
       the substitution path WEAKER than bare text for eight such flags. The top-level
       :meth:`BashCommandParser.extract_string_literals` refuses a partially-quoted word for the
       same reason; this keeps the two models agreeing.
+    * ``-x'rm -rf /'`` is the same shape one character shorter: getopt splits a short option
+      from a glued-on value, so ``git difftool -x'…'`` runs it exactly as the spaced form does.
+      Any word STARTING with ``-`` is therefore structured — a leading dash is an option, and
+      an argument that really is opaque data arrives after ``--`` or in its own word.
     * ``$(echo rm -rf /)`` inside a word holds whitespace with no quote anywhere — bashlex keeps
       a nested substitution's source verbatim in ``.word``. It is code, and suppressing it would
       silently disable this whole-text pass over every nested substitution.
@@ -796,11 +801,23 @@ _ARGUMENT_EXECUTING_FLAGS = frozenset(
     {
         "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
         "--parent-filter", "--exec", "-x", "--extcmd", "--upload-pack", "--receive-pack",
-        "--to-cmd", "--cc-cmd", "--header-cmd", "--access-hook", "--compress-program",
-        "--diff-program", "--pager",
+        "--to-cmd", "--cc-cmd", "--header-cmd", "--sendmail-cmd", "--access-hook",
+        "--authors-prog", "--compress-program", "--diff-program", "--pager",
     }
 )  # fmt: skip
 _ARGUMENT_EXECUTING_GIT = (("submodule", "foreach"), ("bisect", "run"), ("filter-branch",))
+# Shortest abbreviation worth resolving: "--c" alone reaches --cc-cmd, --commit-filter and
+# --compress-program, so anything shorter says nothing about which flag was meant.
+_MIN_ABBREVIATION = 4
+
+
+def _is_argument_executing_flag(word: str) -> bool:
+    """Is `word` one of :data:`_ARGUMENT_EXECUTING_FLAGS`, spelled in full or abbreviated?"""
+    if word in _ARGUMENT_EXECUTING_FLAGS:
+        return True
+    if not word.startswith("--") or len(word) < _MIN_ABBREVIATION:
+        return False
+    return any(flag.startswith(word) for flag in _ARGUMENT_EXECUTING_FLAGS)
 
 
 def _executes_an_argument(words: list[str]) -> bool:
@@ -812,10 +829,15 @@ def _executes_an_argument(words: list[str]) -> bool:
     ``-c KEY=VAL`` — so ``git submodule foreach 'rm -rf /'`` would otherwise have its payload
     suppressed as an argument (LAB-4234).
 
+    Long options match by PREFIX because git resolves any unambiguous abbreviation, so
+    ``--upload`` runs the upload-pack program exactly as ``--upload-pack`` does and an exact
+    membership test reads it as an ordinary flag. Four characters is the floor: ``--c`` would
+    otherwise reach three unrelated entries.
+
     Deliberately coarse: a match disables suppression for the whole rendered command, which
     only ever costs a false positive on an exotic spelling, never a missed denial.
     """
-    if any(word in _ARGUMENT_EXECUTING_FLAGS for word in words):
+    if any(_is_argument_executing_flag(word) for word in words):
         return True
     return "git" in words and any(all(part in words for part in shape) for shape in _ARGUMENT_EXECUTING_GIT)
 

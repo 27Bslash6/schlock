@@ -18,6 +18,7 @@ from schlock.core.substitution import (
     SubstitutionType,
     SubstitutionValidationResult,
     SubstitutionValidator,
+    _is_argument_executing_flag,
     dangerous_awk,
     dangerous_sed,
 )
@@ -1626,6 +1627,13 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git difftool --extcmd 'rm -rf /' HEAD)\"",
             "echo \"$(git fetch --upload-pack 'rm -rf /' origin)\"",
             "echo \"$(sort --compress-program 'rm -rf /' f)\"",
+            # git resolves any unambiguous abbreviation, so an exact membership test reads the
+            # short spelling as an ordinary flag while git runs the payload all the same.
+            "echo \"$(git fetch --upload 'rm -rf /' origin)\"",
+            "echo \"$(git rebase --exe 'rm -rf /' main)\"",
+            # exec surfaces outside git's own porcelain
+            "echo \"$(git send-email --sendmail-cmd 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git svn clone --authors-prog 'rm -rf /' svn://host/r)\"",
         ],
     )
     def test_argument_executing_shapes_suppress_nothing(self, command):
@@ -1656,6 +1664,24 @@ class TestWhitelistedSubstitutionYamlRules:
         node = validator.extract_substitutions(parser.parse(command))[0]
         assert node.literal_ranges == expected_ranges
 
+    @pytest.mark.parametrize(
+        ("word", "expected"),
+        [
+            ("--exec", True),  # exact
+            ("--upload", True),  # abbreviation git resolves
+            ("--exe", True),  # abbreviation, still above the floor
+            ("--e", False),  # below the floor
+            ("--c", False),  # would otherwise reach --cc-cmd, --commit-filter, --compress-program
+            ("--", False),
+            ("--execute-order-66", False),  # longer than the flag, so not an abbreviation of it
+            ("-x", True),
+            ("--grep", False),
+        ],
+    )
+    def test_abbreviated_flags_resolve_but_short_stubs_do_not(self, word, expected):
+        """git accepts any unambiguous abbreviation; the floor stops one-letter stubs matching."""
+        assert _is_argument_executing_flag(word) is expected
+
     def test_substitution_is_never_weaker_than_the_same_text_bare(self):
         """The amplifier only ever adds a level, so `$(X)` must never rate below bare `X`.
 
@@ -1669,6 +1695,10 @@ class TestWhitelistedSubstitutionYamlRules:
             "sort --compress-program='rm -rf /' f",
             "grep -rn 'rm -rf' src/",
             "git log --grep 'git push --force'",
+            # a short option carrying its value glued on is the `--flag=payload` shape one
+            # character shorter; getopt splits it the same way, so nor may it be data.
+            "git difftool -x'/bin/rm -rf /' HEAD",
+            "sdiff -W'/bin/rm -rf /' a b",
         ):
             bare = validate_command(inner)
             wrapped = validate_command(f'echo "$({inner})"')
