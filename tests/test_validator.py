@@ -694,6 +694,7 @@ rules:
         assert any(r.name == "schlock_config_write" for r in engine.rules)
 
 
+@pytest.mark.usefixtures("no_shellcheck")
 class TestHeredocSurroundings:
     """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
 
@@ -706,16 +707,6 @@ class TestHeredocSurroundings:
     off, because a cross-check like "same as without the heredoc" moves in step
     with the code under test and would survive the bug coming back.
     """
-
-    @pytest.fixture(autouse=True)
-    def _no_shellcheck(self, monkeypatch):
-        """Pin verdicts to the rules, not to whether ShellCheck is installed."""
-        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
-        val_module._global_cache.clear()
-        yield
-        # Verdicts computed with ShellCheck off must not leak into later tests
-        # that validate the same string with it on.
-        val_module._global_cache.clear()
 
     @pytest.mark.parametrize(
         "command,description",
@@ -971,3 +962,52 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestSiblingSubstitutionsRateTheWorst:
+    """LAB-4149: a command with several substitutions is rated at the worst of them.
+
+    `validate_command` used to return on the first denied substitution with
+    that substitution's own risk level. An unknown-but-harmless `$(x=1)` ahead
+    of `$(rm -rf /)` therefore downgraded the verdict to HIGH - which the
+    permissive preset allows outright, and which the balanced preset turns
+    into the wrong question ("approve unknown command x=1?").
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(x=1) $(rm -rf /)"',
+            'echo "$(rm -rf /) $(x=1)"',
+            "X=$(x=1); Y=$(rm -rf /)",
+        ],
+    )
+    def test_dangerous_sibling_is_blocked_whatever_its_position(self, safety_rules_path, command):
+        """Both orders and the assignment form get the same verdict and the same message."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert result.exit_code == 1
+        assert result.message == "BLOCKED: Dangerous command in substitution: rm"
+
+    def test_equal_risk_siblings_keep_the_first_message(self, safety_rules_path):
+        """Two denials at the same level: the earlier one still names the verdict."""
+        result = validate_command('echo "$(x=1) $(y=2)"', config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed is False
+        assert result.message == "BLOCKED: Unknown command in substitution: x=1. Add to whitelist if safe."
+
+    def test_unknown_sibling_alone_stays_high(self, safety_rules_path):
+        result = validate_command('echo "$(x=1) $(echo b)"', config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed is False
+
+    def test_whitelisted_siblings_stay_safe(self, safety_rules_path):
+        result = validate_command('echo "$(echo a) $(echo b)"', config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.allowed is True

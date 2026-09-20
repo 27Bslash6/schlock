@@ -1286,21 +1286,26 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # Validate command/process substitution using AST-based analysis
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
-            sub_results = sub_validator.validate_all_substitutions(ast)
-            for sub_result in sub_results:
-                if not sub_result.allowed:
-                    return ValidationResult(
-                        allowed=False,
-                        risk_level=sub_result.risk_level,
-                        message=f"BLOCKED: {sub_result.message}",
-                        alternatives=[
-                            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
-                            "Run the command directly instead of using substitution",
-                            "If this command is safe, request it be added to the whitelist",
-                        ],
-                        exit_code=1,
-                        error=None,
-                    )
+            # Rate the command at its WORST denied substitution, not its first. Returning
+            # on the first denial let an unknown-but-harmless `$(x=1)` (HIGH) ahead of
+            # `$(rm -rf /)` (BLOCKED) downgrade the verdict to HIGH, which the permissive
+            # preset allows outright. max() keeps the first of equal-risk results, so the
+            # message tie-break stays positional.
+            denied = [r for r in sub_validator.validate_all_substitutions(ast) if not r.allowed]
+            if denied:
+                worst = max(denied, key=lambda r: r.risk_level)
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=worst.risk_level,
+                    message=f"BLOCKED: {worst.message}",
+                    alternatives=[
+                        "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
+                        "Run the command directly instead of using substitution",
+                        "If this command is safe, request it be added to the whitelist",
+                    ],
+                    exit_code=1,
+                    error=None,
+                )
                 # Don't cache (substitution content may vary)
 
             # SECURITY: Pure AST-based dangerous command detection
