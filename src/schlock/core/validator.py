@@ -890,25 +890,31 @@ _FRAME_START_CHARS = frozenset("$`")
 # every transition below checked against bash 5.3). Anywhere else `[` is a glob
 # character, the word ends at the next blank, and `export a[1<<b]=1` opens a
 # heredoc. The states, per command context:
-#   FRESH    - nothing but reserved words and redirections so far
+#   FRESH    - the command has not begun, or only reserved words have been read
 #   TIME     - the last word was `time`, so `-p` is its option; TIMEP after that,
 #              so `--` is too. Anywhere else both are command words.
+#   REDIR    - nothing but redirections since the command began (PST_REDIRLIST):
+#              an assignment may follow, a reserved word is a command
+#              (`> f if a[0]=1` is a syntax error, `> f time a[0]=1` runs `time`)
 #   ASSIGNED - the last word was an assignment, or `coproc NAME`. A reserved word
 #              here is a command (`x=1 { a[0]=1` runs `{`), and so is `time`.
 #   COPROC   - the last word was `coproc`; the next one is a NAME or a command
 #   LOST     - a command word has been read; nothing after it is a subscript
-# A redirection keeps every state but ASSIGNED, which it ends (`x=1 > f a[0]=1`
-# runs `a[0]=1` as a command), and one whose target is the next word keeps it
+# A redirection ends ASSIGNED (`x=1 > f a[0]=1` runs `a[0]=1` as a command) and
+# otherwise leads to REDIR; one whose target is the next word keeps the state
 # through that word. Inside a compound assignment `x=( … )` every word may
 # carry a subscript, a bare `[k]=v` included (PST_COMPASSIGN), whatever the
 # state.
-_FRESH, _TIME, _TIMEP, _ASSIGNED, _COPROC, _LOST = "fresh", "time", "time -p", "assigned", "coproc", "lost"
+_FRESH, _TIME, _TIMEP, _REDIR, _ASSIGNED, _COPROC, _LOST = "fresh", "time", "time -p", "redir", "assigned", "coproc", "lost"
 _RESERVED_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{"))
 _ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
 _REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
 # What a word may hold and still absorb a following `<` or `>`: an fd prefix,
 # or the first character of a two-character operator (`>>`, `<>`, `&>>`).
 _FD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\}|&)[<>]?")
+# `2>&-` closes the descriptor: the `-` is the whole target even glued, so
+# `2>&-a[0]=1` is a redirection and then an assignment (verified).
+_FD_CLOSE_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]&")
 _ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=(…)` opens a compound assignment
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 # Blanks and control-operator characters end a word at the top level. `<` and
@@ -1122,15 +1128,15 @@ def _command_state_after(state: str, word: str) -> tuple[str, bool]:  # noqa: PL
     arrives as two because `>` ends a word - both things a whitespace split
     could not see.
     """
-    if state == _LOST:
-        return _LOST, False
+    if state == _LOST or word.startswith(("<(", ">(")):
+        return _LOST, False  # a process substitution is a word, and as the first word it is the command
     if _REDIRECT_WORD_RE.match(word):
         owes_target = word[-1] in "<>" or word.endswith((">|", ">&", "<&"))
-        return (_LOST, False) if state == _ASSIGNED else (_FRESH, owes_target)
+        return (_LOST, False) if state == _ASSIGNED else (_REDIR, owes_target)
     if _ASSIGNMENT_WORD_RE.match(word):
         return _ASSIGNED, False
-    if state == _ASSIGNED:
-        return _LOST, False  # after an assignment a reserved word is a command
+    if state in (_ASSIGNED, _REDIR):
+        return _LOST, False  # after an assignment or a redirection a reserved word is a command
     if word == "time":
         return _TIME, False
     if word == "-p" and state == _TIME:
@@ -1358,6 +1364,10 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             if char in "<>" and ctx.start is not None and not _FD_RE.fullmatch(ctx.word(line, pos)):
                 ctx.end_word(line, pos)  # `x=1>f`, `time>f`: the operator starts a new word
                 ctx.start = pos
+            elif char == "-" and ctx.start is not None and _FD_CLOSE_RE.fullmatch(ctx.word(line, pos)):
+                ctx.end_word(line, pos)  # `2>&` owes a target…
+                ctx.start = pos
+                ctx.end_word(line, pos + 1)  # …and this `-` is the whole of it
             elif _is_word_boundary(line, pos):
                 ctx.end_word(line, pos)
                 if char not in " \t":
@@ -1444,6 +1454,10 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
         elif line.startswith("<<", pos) and not frames:
+            if ctx.compound:
+                # Bash rejects the line and runs the next one; a body read from
+                # there would hide it.
+                raise ParseError("Heredoc inside a compound assignment; bash rejects the line and runs what follows")
             opener_at = pos
             pos += 2
             strips_tabs = line.startswith("-", pos)
