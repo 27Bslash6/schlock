@@ -523,8 +523,10 @@ def _shell_delegated_payloads(
     """Extract every argument the command will hand to a shell as source code.
 
     Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
-    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
-    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
+    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, `find -exec/-execdir/-ok/-okdir
+    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction, and
+    `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
+    shell on every later git command in that repo or for that user, not at this command.
 
     Deliberately NOT covered, each tracked separately: remote delegation (`ssh host "..."`,
     a different trust domain); non-shell interpreters (`python3 -c`, `perl -e`) whose payload
@@ -553,6 +555,10 @@ def _shell_delegated_payloads(
             for clause in _find_exec_clauses(args):
                 found.extend(_shell_delegated_payloads([(clause[0], clause[1:])]))
         else:
+            if base == "git":
+                from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
+
+                found.append(git_config_exec_payload(args))
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
