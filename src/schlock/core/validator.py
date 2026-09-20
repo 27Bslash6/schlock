@@ -856,6 +856,15 @@ _WORD_END = frozenset(" \t;&|<>()")
 # opener that bash - and bashlex - both read as a comment.
 _WORD_START_AFTER = frozenset(" \t;&|()<>")
 
+# Inside a parameter or arithmetic expansion, `<<` is never a redirection:
+# `${x:-a<<b}` expands to the literal `a<<b` and `$((1<<2))` is a left shift.
+# The scan therefore carries a stack of the closers it still owes, and each
+# entry's own opener nests it one deeper - `${x:-{a,b}}` ends at the second
+# `}`, `$(( (1<<2) ))` at the third `)`. Typing the stack by closer is what
+# keeps an unbalanced bracket of a *different* family (`${x:-a)b}`) from
+# ending the expansion early and re-opening the hole (LAB-4270).
+_EXPANSION_NESTS_ON = {"}": "{", ")": "(", "]": "["}
+
 
 def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     """Read the heredoc delimiter word at ``pos``, applying bash's quote removal.
@@ -899,9 +908,9 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     return "".join(delimiter), pos
 
 
-def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting it hides the state machine
-    line: str, quote: str
-) -> tuple[str, list[tuple[str, bool, int]], str]:
+def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; splitting it hides the state machine
+    line: str, quote: str, expansions: list[str]
+) -> tuple[str, list[tuple[str, bool, int]], str, list[str]]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted* `<<` opens a heredoc. Bash reads `echo "x << y"` and
@@ -911,15 +920,21 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
     lexical context over: enumerate the tokenization deltas before trusting a
     rewrite, and deny when the reading is uncertain.
 
-    ``quote`` carries the quote character left open by the previous line, since a
-    string spanning lines means the next line is not shell to be scanned. Returns
-    ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener order, open
-    quote)``; each ``offset`` is where its `<<` sits, which is the only honest
-    source for "what command owns this heredoc" - a second regex looking for the
-    first `<<` would find the quoted ones this deliberately skipped.
+    ``quote`` and ``expansions`` carry the lexical state the previous line left
+    open - a quote or a `${`/`$((`/`$[` - since either means the next line is not
+    top-level shell to be scanned. Both have to cross the line break: `${` alone
+    on one line and `<<b` on the next is one newline away from the same phantom
+    opener, and bash reads that as the literal `q<<b` (LAB-4270).
+
+    Returns ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener
+    order, open quote, open expansions)``; each ``offset`` is where its `<<`
+    sits, which is the only honest source for "what command owns this heredoc" -
+    a second regex looking for the first `<<` would find the quoted ones this
+    deliberately skipped.
     """
     out: list[str] = []
     openers: list[tuple[str, bool, int]] = []
+    expansions = list(expansions)
     continued = False
     pos = 0
 
@@ -951,13 +966,31 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
             quote = char
             out.append(char)
             pos += 1
-        elif char == "#" and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+        elif line.startswith("$((", pos):
+            expansions += [")", ")"]  # arithmetic owes both parens
+            out.append("$((")
+            pos += 3
+        elif line.startswith("${", pos) or line.startswith("$[", pos):
+            expansions.append("}" if line[pos + 1] == "{" else "]")
+            out.append(line[pos : pos + 2])
+            pos += 2
+        elif expansions and char == _EXPANSION_NESTS_ON[expansions[-1]]:
+            expansions.append(expansions[-1])
+            out.append(char)
+            pos += 1
+        elif expansions and char == expansions[-1]:
+            expansions.pop()
+            out.append(char)
+            pos += 1
+        elif char == "#" and not expansions and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+            # `#` is ordinary inside an expansion - `${#x}`, `${x#pre}` - so the
+            # comment branch would otherwise abandon the scan mid-expansion.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
-        elif line.startswith("<<", pos):
+        elif line.startswith("<<", pos) and not expansions:
             opener_at = pos
             pos += 2
             strips_tabs = line.startswith("-", pos)
@@ -971,13 +1004,14 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
             out.append(char)
             pos += 1
 
-    if openers and (quote or continued):
-        # A trailing `\` or an unclosed quote means this line does not finish
-        # the command, so bash starts the body after a later line. Consuming
-        # from the next one would delete the commands in between.
+    if openers and (quote or continued or expansions):
+        # A trailing `\`, an unclosed quote or an unclosed expansion means this
+        # line does not finish the command, so bash starts the body after a
+        # later line. Consuming from the next one would delete the commands in
+        # between.
         raise ParseError("Heredoc opener on a line that continues; the body's start is unknown")
 
-    return "".join(out), openers, quote
+    return "".join(out), openers, quote, expansions
 
 
 def _neuter_heredocs(command: str) -> tuple[str, str]:
@@ -1011,10 +1045,11 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
     rewritten: list[str] = []
     base_command: Optional[str] = None
     quote = ""
+    expansions: list[str] = []
     index = 0
 
     while index < len(lines):
-        line, openers, quote = _rewrite_openers(lines[index], quote)
+        line, openers, quote, expansions = _rewrite_openers(lines[index], quote, expansions)
         rewritten.append(line)
         index += 1
 

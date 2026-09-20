@@ -781,6 +781,16 @@ class TestHeredocSurroundings:
             # Pinned with the danger after the opener: `rm -rf / <<'EOF' \ ` is
             # denied on the base command alone and never reaches the fallback.
             ("chmod -R 777 <<'EOF' / \\ \nx\nEOF", "the dangerous command itself ends in an escaped space"),
+            # LAB-4270: bash never reads `<<` as a redirection inside a parameter
+            # or arithmetic expansion - `${x:-q<<b }` expands to the literal
+            # `q<<b`, `$((1<<2))` is a left shift. Reading one as an opener
+            # invented a heredoc whose body then deleted every line up to the
+            # attacker's chosen delimiter, and a whitelisted head reported SAFE
+            # on what was left. Each case below hides `rm -rf /` in that gap.
+            ("ls <<'A'\nz\nA\necho ${x:-q<<b }\nrm -rf /\nb", "`<<` inside ${…}"),
+            ("ls <<'A'\nz\nA\necho ${x:-\nq<<b }\nrm -rf /\nb", "${…} spanning lines"),
+            ("ls <<'A'\nz\nA\necho ${x:-${y:-p<<b} }\nrm -rf /\nb", "${…} nested two deep"),
+            ("ls <<'A'\nz\nA\necho ${x:-$(( (1<<2) ))}\nrm -rf /\n2 ))}", "$((…)) nested inside ${…}"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -818,11 +828,6 @@ class TestHeredocSurroundings:
         [
             ("ls << 'X'\nrm -rf /", "Heredoc 'X' has no terminator; its body has no end"),
             ("cat << 'EOF'\nx", "Heredoc 'EOF' has no terminator; its body has no end"),
-            # Arithmetic `<<` reads as an opener whose body never terminates.
-            # Bare `echo $((1+1))` is already blocked repo-wide, so this aligns
-            # the fallback with the rest of the validator rather than adding a
-            # new cliff.
-            ("ls << 'EOF'\nx\nEOF\necho $((1<<2))", "Heredoc '2' has no terminator; its body has no end"),
             ("cat << ''\nx\nEOF", "Heredoc opener with an empty delimiter"),
             # A stray separator survives the rewrite and fails bashlex there.
             ("ls << 'EOF'\nx\nEOF\n; rm -rf /", "unexpected token ';'"),
@@ -941,6 +946,13 @@ class TestHeredocSurroundings:
             ("ls <<'EOF' \\ \nx\nEOF", RiskLevel.SAFE, "escaped trailing space, whitelisted head"),
             ("cat <<'EOF' \\\\ \nhello\nEOF", RiskLevel.LOW, "a literal backslash argument is not an escape"),
             ("cat \\ <<'EOF'\nhello\nEOF", RiskLevel.LOW, "escaped space in front of the redirection"),
+            # LAB-4270: an expansion carrying `<<` alongside a real heredoc. bash
+            # opens exactly one heredoc here (verified: `cat <<'EOF' ${x:-a<<b }`
+            # passes `cat` the literal argument `a<<b`); reading the second `<<`
+            # as an opener denied all four of these.
+            ("cat <<'EOF' ${x:-a<<b }\nhi\nEOF", RiskLevel.LOW, "expansion with `<<` on a real opener line"),
+            ("cat <<'EOF'\nx\nEOF\necho ${x:-a<<b }", RiskLevel.LOW, "`<<` inside ${…} after the terminator"),
+            ("cat <<'EOF'\nx\nEOF\necho ${x:-\nq<<b }", RiskLevel.LOW, "${…} spanning lines after the terminator"),
         ],
     )
     def test_legitimate_heredoc_keeps_its_verdict(self, safety_rules_path, command, expected_risk, description):
@@ -950,6 +962,75 @@ class TestHeredocSurroundings:
         assert result.risk_level == expected_risk, f"{description}: {result.message}"
         assert result.allowed is True, f"{description}: {result.message}"
         assert result.exit_code == 0, description
+
+    @pytest.mark.parametrize(
+        "expansion,description",
+        [
+            ("${x:-q<<b }", "parameter expansion"),
+            ("${x:-${y:-q<<b} }", "parameter expansion nested two deep"),
+            ("$((1<<2))", "arithmetic expansion"),
+            ("$(( (1<<2) + 3 ))", "arithmetic expansion with a nested paren group"),
+            ("${x:-$((1<<2))}", "arithmetic nested inside a parameter expansion"),
+            ("$[1<<2]", "the deprecated $[…] arithmetic substitution"),
+            ("$[$[1<<2]]", "$[…] nested two deep"),
+        ],
+    )
+    def test_expansion_never_opens_a_heredoc(self, expansion, description):
+        """LAB-4270: the shell around the heredoc must survive the rewrite intact.
+
+        Asserted on the neutered text rather than only end-to-end, because that
+        text is the only thing the validator ever matches against: a `<<` misread
+        inside an expansion deletes every line up to the attacker's delimiter
+        before a single rule runs. `$((…))` and `$[…]` deny for their own reason
+        (bashlex parses neither), so an end-to-end verdict alone would stay
+        BLOCKED with the payload still gone.
+        """
+        neutered, base = val_module._neuter_heredocs(f"ls <<'A'\nz\nA\necho {expansion}\nrm -rf /\nb")
+
+        assert base == "ls", description
+        assert "rm -rf /" in neutered, description
+        assert expansion in neutered, description
+
+    def test_expansion_state_survives_a_line_break(self):
+        """An expansion left open at end of line keeps the next line inside it.
+
+        Verified against bash: `echo ${x:-\nq<<b }` prints the literal `q<<b`.
+        Without carrying the state across lines the fix is bypassed by one
+        newline - `${` on one line, `<<b` on the next.
+        """
+        neutered, _ = val_module._neuter_heredocs("ls <<'A'\nz\nA\necho ${x:-\nq<<b }\nrm -rf /\nb")
+
+        assert "rm -rf /" in neutered
+        assert "q<<b" in neutered
+
+    def test_an_opener_line_left_inside_an_expansion_fails_closed(self):
+        """Same rule as an unclosed quote: the body's first line is unknown, so deny."""
+        with pytest.raises(ParseError, match="line that continues"):
+            val_module._neuter_heredocs("cat <<'EOF' ${x:-\n}\nhello\nEOF")
+
+    def test_arithmetic_after_a_heredoc_denies_for_the_real_reason(self, safety_rules_path):
+        """`$((1<<2))` still denies - because bashlex cannot parse arithmetic, not a phantom heredoc.
+
+        The first case used to be pinned in `test_unreadable_heredoc_fails_closed`
+        with the error "Heredoc '2' has no terminator". Both verdicts are
+        unchanged; the reason is now honest, and nothing between `EOF` and the
+        arithmetic is deleted on the way to it. bashlex supporting no arithmetic
+        at all is a separate gap - bare `echo $((1+1))` denies repo-wide - and
+        widening the fallback to cover it would be a different fix.
+        """
+        for command in ("ls << 'EOF'\nx\nEOF\necho $((1<<2))", "cat <<'EOF' $((1<<2))\nhi\nEOF"):
+            result = validate_command(command, config_path=safety_rules_path)
+
+            assert result.risk_level == RiskLevel.BLOCKED, command
+            assert result.allowed is False, command
+            assert "arithmetic expansion" in result.message, command
+
+    def test_expansion_with_a_shift_is_unchanged_without_a_heredoc(self, safety_rules_path):
+        """AC-3: bashlex parses `echo ${x:-a<<b }` fine, so it never reaches this fallback."""
+        result = validate_command("echo ${x:-a<<b }", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.allowed is True
 
     def test_rewrite_replaces_the_body_and_the_delimiter(self):
         """The rewrite keeps structure and discards content, whatever the body's size.
