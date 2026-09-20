@@ -547,6 +547,15 @@ def _shell_delegated_payloads(
         base = cmd_name.rsplit("/", 1)[-1]
         found = []
 
+        # `git config <exec-key> PROG` arms PROG for every later git command. Checked ahead of the
+        # delegator/wrapper split below, and for wrappers too, because a wrapper hands the whole
+        # command straight through (`timeout 5 git config core.pager PROG`) and this scan keys on
+        # the `config` token rather than on the first word.
+        if base == "git" or base in WRAPPER_COMMANDS:
+            from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
+
+            found.append(git_config_exec_payload(args))
+
         if base == "watch":
             found.append(_watch_payload(args))
         elif base == "find":
@@ -555,10 +564,6 @@ def _shell_delegated_payloads(
             for clause in _find_exec_clauses(args):
                 found.extend(_shell_delegated_payloads([(clause[0], clause[1:])]))
         else:
-            if base == "git":
-                from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
-
-                found.append(git_config_exec_payload(args))
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
