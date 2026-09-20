@@ -527,8 +527,9 @@ class TestGitConfigWriteVerdicts:
         assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.SAFE
 
     def test_substitution_tier_denies_behind_a_whitelisted_prefix(self):
-        # A whitelisted prefix short-circuits the top-level payload check (LAB-2759), so this is
-        # the probe that proves the SubstitutionValidator wiring does work the top level cannot.
+        # Both tiers reach this now — the whitelist no longer clears a multi-segment line on a
+        # prefix (see TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine). Kept as the probe that
+        # the SubstitutionValidator wiring holds independently of that.
         result = validate_command("ls && echo \"$(git config core.pager 'rm -rf /')\"")
         assert result.risk_level == RiskLevel.BLOCKED
         assert "persists an executable value" in result.message
@@ -544,3 +545,70 @@ class TestGitConfigWriteVerdicts:
     def test_injected_form_still_denied(self):
         # The -c path this fix is the persisted twin of must not regress.
         assert validate_command("git -c core.pager='rm -rf /' log").risk_level == RiskLevel.BLOCKED
+
+
+class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
+    r"""A whitelist entry written for one command must not clear the commands chained after it.
+
+    The multi-segment fast path asked `is_whitelisted(full_command)`, a PREFIX test, so every
+    open-ended entry (`^ls\b`, `^git\s+status`) handed the rest of the line a free pass and the
+    segment loop below it never ran. Found by CodeRabbit on the git-config write payload
+    (LAB-4290); the hole predates that fix and covers everything the segment loop exists for.
+    """
+
+    BYPASSES = [
+        # The payload this PR judges, behind three different separators.
+        "ls && git config core.pager 'rm -rf /'",
+        "ls; git config core.pager 'rm -rf /'",
+        "ls | git config core.pager 'rm -rf /'",
+        "ls && git config --global alias.zz '!rm -rf /'",
+        # Shell delegation, the same Step 5c machinery.
+        "ls && bash -c 'rm -rf /'",
+        "ls && sh -c 'rm -rf /'",
+        "ls && watch 'rm -rf /'",
+        # ...and the plain chained destruction the segment loop was written for.
+        "ls && rm -rf /",
+        "ls -la; sudo rm -rf /etc",
+        "ls && chmod -R 777 /",
+        "ls && dd if=/dev/zero of=/dev/sda",
+        # Not just `ls`: every open-ended entry leaked the same way.
+        "git status && rm -rf /",
+        "git status && bash -c 'rm -rf /'",
+        "chmod 755 /tmp/x && rm -rf /",
+    ]
+
+    @pytest.mark.parametrize("command", BYPASSES)
+    def test_chained_payload_is_judged_not_whitelisted(self, command):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    # (chained form, the same trailing command run bare). Parity is the false-positive test:
+    # the chained verdict must equal the verdict that command already carries on its own, so
+    # closing the hole cannot make the daily driver stricter than it already was.
+    PARITY = [
+        ("ls && git status", "git status"),
+        ("ls -la && pwd", "pwd"),
+        ("ls && cat README.md", "cat README.md"),
+        ("ls && make build", "make build"),
+        ("ls && npm test", "npm test"),
+        ("ls && cargo build", "cargo build"),
+        ("ls && docker ps", "docker ps"),
+        ("ls && grep -rn TODO src/", "grep -rn TODO src/"),
+        ("git status && git add -A", "git add -A"),
+        ("git status && git diff", "git diff"),
+        ("git status && git commit -m wip", "git commit -m wip"),
+    ]
+
+    @pytest.mark.parametrize(("chained", "bare"), PARITY)
+    def test_chaining_is_never_stricter_than_the_same_command_bare(self, chained, bare):
+        assert validate_command(chained).risk_level == validate_command(bare).risk_level
+
+    def test_an_anchored_entry_still_whitelists_its_whole_pipeline(self):
+        # The fast path exists for pipelines no single segment can vouch for. An author anchors
+        # such an entry end to end, and that is exactly what survives the tightening.
+        command = "gh auth token | docker login ghcr.io -u me --password-stdin"
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    def test_single_command_whitelisting_is_untouched(self):
+        # The prefix test is still correct for one command — `^ls\b` must go on clearing `ls -la`.
+        for command in ("ls -la", "git status", "pwd", "rm -rf node_modules", "chmod 755 /tmp/x"):
+            assert validate_command(command).risk_level == RiskLevel.SAFE

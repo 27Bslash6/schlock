@@ -380,6 +380,36 @@ rules: []
         assert engine.is_whitelisted("ls")
         assert not engine.is_whitelisted("git push")
 
+    def test_whole_command_whitelist_refuses_an_open_ended_pattern(self, rules_directory):
+        """`^ls\\b` describes one command, so it may not clear a line that continues past it."""
+        engine = RuleEngine.from_directory(rules_directory)
+
+        # The prefix test still clears the single command each pattern was written for.
+        assert engine.is_whitelisted("ls -la")
+        assert engine.is_whitelisted("ls && rm -rf /")
+
+        # End to end, the open-ended pattern only covers what it actually consumes.
+        assert engine.is_whitelisted_whole("ls")
+        assert not engine.is_whitelisted_whole("ls -la")
+        assert not engine.is_whitelisted_whole("ls && rm -rf /")
+        assert not engine.is_whitelisted_whole("git status && rm -rf /")
+
+    def test_whole_command_whitelist_honours_an_anchored_pattern(self, tmp_path):
+        """An author anchoring a pattern is how a whole pipeline gets whitelisted deliberately."""
+        rules_dir = tmp_path / "anchored"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        assert engine.is_whitelisted_whole("gh auth token | docker login ghcr.io --password-stdin")
+        # ...and the anchor is what stops it being extended.
+        assert not engine.is_whitelisted_whole("gh auth token | docker login ghcr.io --password-stdin && rm -rf /")
+
     def test_directory_files_loaded_in_order(self, rules_directory):
         """Test that files are loaded in alphabetical order."""
         engine = RuleEngine.from_directory(rules_directory)

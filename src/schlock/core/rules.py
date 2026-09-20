@@ -637,6 +637,24 @@ class RuleEngine:
         """
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
+    def is_whitelisted_whole(self, command: str) -> bool:
+        """Check if a whitelist pattern describes the ENTIRE command line.
+
+        `is_whitelisted` is a prefix test, which is what a single command needs: `^ls\\b` is
+        meant to clear `ls -la`. Applied to a command with several segments it clears the
+        segments the author never wrote down — `^ls\\b` matches `ls && rm -rf /` on its first
+        two characters, whitelisting the `rm`. So a multi-segment command may only be cleared
+        as a whole by a pattern that consumes the whole of it, which is what an author signals
+        by anchoring the pattern (`...--password-stdin$`).
+
+        Args:
+            command: Command string to check
+
+        Returns:
+            True if any whitelist pattern matches the command end to end
+        """
+        return any(pattern.fullmatch(command) for pattern in self.whitelist_patterns)
+
     def match_command(
         self,
         command: str,
