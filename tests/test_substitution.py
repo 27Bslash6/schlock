@@ -18,7 +18,6 @@ from schlock.core.substitution import (
     SubstitutionType,
     SubstitutionValidationResult,
     SubstitutionValidator,
-    _is_argument_executing_flag,
     dangerous_awk,
     dangerous_sed,
 )
@@ -1627,13 +1626,12 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git difftool --extcmd 'rm -rf /' HEAD)\"",
             "echo \"$(git fetch --upload-pack 'rm -rf /' origin)\"",
             "echo \"$(sort --compress-program 'rm -rf /' f)\"",
-            # git resolves any unambiguous abbreviation, so an exact membership test reads the
-            # short spelling as an ordinary flag while git runs the payload all the same.
-            "echo \"$(git fetch --upload 'rm -rf /' origin)\"",
-            "echo \"$(git rebase --exe 'rm -rf /' main)\"",
-            # exec surfaces outside git's own porcelain
+            # exec surfaces outside git's own porcelain, both documented as running what they get
             "echo \"$(git send-email --sendmail-cmd 'rm -rf /' HEAD~1)\"",
             "echo \"$(git svn clone --authors-prog 'rm -rf /' svn://host/r)\"",
+            # -x, which only means "run this" next to the two subcommands that define it
+            "echo \"$(git rebase -x 'rm -rf /' main)\"",
+            "echo \"$(git difftool -x 'rm -rf /' HEAD)\"",
         ],
     )
     def test_argument_executing_shapes_suppress_nothing(self, command):
@@ -1665,22 +1663,23 @@ class TestWhitelistedSubstitutionYamlRules:
         assert node.literal_ranges == expected_ranges
 
     @pytest.mark.parametrize(
-        ("word", "expected"),
+        "command",
         [
-            ("--exec", True),  # exact
-            ("--upload", True),  # abbreviation git resolves
-            ("--exe", True),  # abbreviation, still above the floor
-            ("--e", False),  # below the floor
-            ("--c", False),  # would otherwise reach --cc-cmd, --commit-filter, --compress-program
-            ("--", False),
-            ("--execute-order-66", False),  # longer than the flag, so not an abbreviation of it
-            ("-x", True),
-            ("--grep", False),
+            # -x is an ordinary flag on all three: whole-line match, exclude pattern, sort across.
+            "echo \"$(grep -x 'rm -rf /' file)\"",
+            "echo \"$(diff -x 'rm -rf /' a b)\"",
+            "echo \"$(ls -x 'a b')\"",
+            # and an ignore-rule flag here, which is why it is paired with its subcommand
+            'echo "$(git clean -f -d -x)"',
         ],
     )
-    def test_abbreviated_flags_resolve_but_short_stubs_do_not(self, word, expected):
-        """git accepts any unambiguous abbreviation; the floor stops one-letter stubs matching."""
-        assert _is_argument_executing_flag(word) is expected
+    def test_a_short_flag_is_only_an_exec_beside_its_own_subcommand(self, command):
+        """`-x` runs a command for rebase and difftool, and means something ordinary elsewhere.
+
+        Listed flat it is matched against every command, so it cost three daily-driver shapes
+        their suppression and rated each of them above its own bare verdict.
+        """
+        assert validate_command(command).allowed is True
 
     def test_substitution_is_never_weaker_than_the_same_text_bare(self):
         """The amplifier only ever adds a level, so `$(X)` must never rate below bare `X`.
@@ -1695,10 +1694,6 @@ class TestWhitelistedSubstitutionYamlRules:
             "sort --compress-program='rm -rf /' f",
             "grep -rn 'rm -rf' src/",
             "git log --grep 'git push --force'",
-            # a short option carrying its value glued on is the `--flag=payload` shape one
-            # character shorter; getopt splits it the same way, so nor may it be data.
-            "git difftool -x'/bin/rm -rf /' HEAD",
-            "sdiff -W'/bin/rm -rf /' a b",
         ):
             bare = validate_command(inner)
             wrapped = validate_command(f'echo "$({inner})"')
