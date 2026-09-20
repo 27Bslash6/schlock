@@ -1317,15 +1317,18 @@ class SubstitutionValidator:
                 message=f"Suspicious pattern in substitution: {reason}",
             )
 
-        for nested in sub_node.nested_substitutions:
-            nested_result = self.validate_substitution(nested, depth + 1)
-            if not nested_result.allowed:
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=nested_result.risk_level,
-                    message=f"Nested substitution blocked: {nested_result.message}",
-                    inner_results=[nested_result],
-                )
+        # Rate at the WORST denied child, not the first (LAB-4149): an unknown `$(x=1)`
+        # ahead of `$(rm -rf /)` must not downgrade BLOCKED to HIGH.
+        nested_results = [self.validate_substitution(nested, depth + 1) for nested in sub_node.nested_substitutions]
+        denied = [r for r in nested_results if not r.allowed]
+        if denied:
+            worst = max(denied, key=lambda r: r.risk_level)
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=worst.risk_level,
+                message=f"Nested substitution blocked: {worst.message}",
+                inner_results=[worst],
+            )
 
         return None
 
@@ -1571,18 +1574,18 @@ class SubstitutionValidator:
                 message=f"Suspicious pattern in substitution: {reason}",
             )
 
-        # Layer 3: Recursive validation of nested substitutions
-        inner_results: list[SubstitutionValidationResult] = []
-        for nested in sub_node.nested_substitutions:
-            nested_result = self.validate_substitution(nested, depth + 1)
-            inner_results.append(nested_result)
-            if not nested_result.allowed:
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=nested_result.risk_level,
-                    message=f"Nested substitution blocked: {nested_result.message}",
-                    inner_results=inner_results,
-                )
+        # Layer 3: Recursive validation of nested substitutions, rated at the worst
+        # denied child rather than the first (LAB-4149).
+        inner_results = [self.validate_substitution(nested, depth + 1) for nested in sub_node.nested_substitutions]
+        denied = [r for r in inner_results if not r.allowed]
+        if denied:
+            worst = max(denied, key=lambda r: r.risk_level)
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=worst.risk_level,
+                message=f"Nested substitution blocked: {worst.message}",
+                inner_results=inner_results,
+            )
 
         # Layer 4: Validate inner command against YAML rules
         if sub_node.inner_command:

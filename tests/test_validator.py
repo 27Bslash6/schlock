@@ -968,11 +968,9 @@ class TestHeredocSurroundings:
 class TestSiblingSubstitutionsRateTheWorst:
     """LAB-4149: a command with several substitutions is rated at the worst of them.
 
-    `validate_command` used to return on the first denied substitution with
-    that substitution's own risk level. An unknown-but-harmless `$(x=1)` ahead
-    of `$(rm -rf /)` therefore downgraded the verdict to HIGH - which the
-    permissive preset allows outright, and which the balanced preset turns
-    into the wrong question ("approve unknown command x=1?").
+    Both the top-level loop in `validate_command` and the nested-substitution
+    loops in `SubstitutionValidator` used to return on the first denied result
+    with its own risk level, so `$(x=1)` ahead of `$(rm -rf /)` read as HIGH.
     """
 
     @pytest.mark.parametrize(
@@ -981,16 +979,21 @@ class TestSiblingSubstitutionsRateTheWorst:
             'echo "$(x=1) $(rm -rf /)"',
             'echo "$(rm -rf /) $(x=1)"',
             "X=$(x=1); Y=$(rm -rf /)",
+            # One level down: whitelisted outer, unknown outer, process substitution.
+            'echo "$(echo $(x=1) $(rm -rf /))"',
+            'echo "$(foo $(x=1) $(rm -rf /))"',
+            "cat <(echo <(x=1) <(rm -rf /))",
         ],
     )
     def test_dangerous_sibling_is_blocked_whatever_its_position(self, safety_rules_path, command):
-        """Both orders and the assignment form get the same verdict and the same message."""
+        """Every order, the assignment form and the nested forms name `rm`, not `x=1`."""
         result = validate_command(command, config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.allowed is False
         assert result.exit_code == 1
-        assert result.message == "BLOCKED: Dangerous command in substitution: rm"
+        assert result.message.endswith(": rm")
+        assert "x=1" not in result.message
 
     def test_equal_risk_siblings_keep_the_first_message(self, safety_rules_path):
         """Two denials at the same level: the earlier one still names the verdict."""
@@ -998,7 +1001,8 @@ class TestSiblingSubstitutionsRateTheWorst:
 
         assert result.risk_level == RiskLevel.HIGH
         assert result.allowed is False
-        assert result.message == "BLOCKED: Unknown command in substitution: x=1. Add to whitelist if safe."
+        assert "x=1" in result.message
+        assert "y=2" not in result.message
 
     def test_unknown_sibling_alone_stays_high(self, safety_rules_path):
         result = validate_command('echo "$(x=1) $(echo b)"', config_path=safety_rules_path)
