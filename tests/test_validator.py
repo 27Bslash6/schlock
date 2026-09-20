@@ -1142,6 +1142,21 @@ class TestHeredocSurroundings:
             ("echo $(true) a[1<<b]", ["b]"], "the `)` of a `$(…)` does not restart command position"),
             ("cat <(true) a[1<<b]", ["b]"], "nor does a process substitution's"),
             ("x=$(a[1<<b]=1)", [], "a subscript at command position inside `$(…)`"),
+            (">> f a[1<<b]=1", [], "`>>` is one operator; its second `>` does not end the word"),
+            ("<> f a[1<<b]=1", [], "so is `<>`"),
+            ("&>> f a[1<<b]=1", [], "and `&>>`"),
+            ("x=1 { a[1<<b]", ["b]"], "after an assignment a reserved word is a command"),
+            ("x=1 time a[1<<b]", ["b]"], "so is `time`"),
+            ("true; -- a[1<<b]", ["b]"], "`--` is a command word unless it follows `time`"),
+            ("x=1 -- a[1<<b]", ["b]"], "…even after an assignment"),
+            ("time -p -p a[1<<b]", ["b]"], "`time` takes one `-p`"),
+            ("time -p -- a[1<<b]=1", [], "and then a `--`"),
+            ("x=(1 2) > f a[1<<b]", ["b]"], "a compound assignment is an assignment, so a redirection after it loses position"),
+            ("x=(1 2)y b[1<<c]=1", [], "a word continues after a compound assignment's `)`"),
+            ("x=( foo a[1<<b]=1 )", [], "inside a compound assignment every word may carry a subscript"),
+            ("x=( [1<<b]=1 )", [], "…a bare `[k]=v` included"),
+            ("declare -A m=( [k<<ZZ ]=1 )", [], "…whatever precedes the assignment"),
+            ("coproc { a[1<<b]=1; }", [], "a reserved word after `coproc` is a reserved word"),
             ("case a in (a) b[1<<c]=1;; esac", [], "a case pattern's closing `)` starts a command"),
             ("if true;then a[1<<b]=1;fi", [], "a reserved word glued to the operator before it still counts"),
             ("x;if a[1<<b]=1; then :; fi", [], "…whichever operator it is glued to"),
@@ -1221,6 +1236,11 @@ class TestHeredocSurroundings:
             ("coproc NAME a[\n1<<b ]=1", "`name[` after `coproc NAME`"),
             ("time>f a[\n1<<b ]=1", "`name[` after a reserved word glued to a redirection"),
             ("(( $( (echo hi)# )\n) + 1<<b ))", "a `((` whose `$(…)` holds a comment right after a `)`"),
+            (">> f a[\n1<<b ]=1", "`name[` after `>>` and its target"),
+            ("x=1 \\\n a[\n1<<b ]=1", "a backslash-newline between an assignment and `name[`"),
+            ("a\\\n[\n1<<b ]=1", "a backslash-newline inside `name[` itself"),
+            ("\\\na[\n1<<b ]=1", "a backslash-newline at the start of a command"),
+            ("x=( foo a[\n1<<b]=1 )", "a compound assignment split across lines"),
             ('(( "$(echo "x)")" + 1<<b ))', "a `((` whose quoted `$(…)` nests quotes"),
             ("(( $(echo # )\n) + 1<<b ))", "a `((` whose `$(…)` holds a comment with a `)` in it"),
             ("if true;then a[\n1<<b ]=1;fi", "`name[` after a reserved word glued to `;`"),
@@ -1251,6 +1271,9 @@ class TestHeredocSurroundings:
             ('(( "1<<b ))\nrm -rf /\nb', "never closes"),
             ("cat <<'A'\nz\nA\necho ${x:-\nrm -rf /", "unclosed"),
             ("cat <<'A'\nz\nA\nx=$(echo\nrm -rf /", "unclosed"),
+            ("cat <<'E' <(echo\nrm -rf /\nE\n)", "line that continues"),
+            ("cat <<'E' $(echo\nrm -rf /\nE\n)", "line that continues"),
+            ("echo $(case a in a) :;; esac) y[1<<E]=1\ncat <<'E2'\nE]=1\nrm -rf /\nE2", "`case`"),
             ("(( $(case a in a) :;; esac) + 1<<b ))\nrm -rf /\nb", "`case`"),
             ("(( $(cat <<E\n)\nE) + 1<<b ))\nrm -rf /\nb", "heredoc"),
         ],
@@ -1313,6 +1336,31 @@ class TestHeredocSurroundings:
         neutered, _ = val_module._neuter_heredocs("echo a[1 <<X ] <<'Q'\nX\nQ\nrm -rf /")
 
         assert neutered == ("echo a[1 <<SCHLOCK_HEREDOC ] <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /")
+
+    def test_the_dparen_matcher_refuses_case_inside_a_substitution(self):
+        """`$(case a in a) …)` inside `((`: the pattern's `)` cannot be told from the closer.
+
+        The frame stack refuses the same shape on its own, so the verdict would
+        be a deny either way; this pins the matcher's refusal, which is what
+        keeps a `"$(case …)"` nested in a quote from mis-balancing the pair.
+        """
+        with pytest.raises(ParseError, match="`case`"):
+            val_module._DoubleParen("(( $(case a in a) :;; esac) ))").is_arithmetic(0)
+
+    def test_a_long_word_with_many_brackets_is_scanned_in_linear_time(self):
+        """Once a `[` in a word is a glob character, no later `[` in it is asked again.
+
+        Without that, every `[` re-checks whether the whole word so far is an
+        identifier - quadratic in the word's length, on a hook that runs before
+        every Bash call. 0.5s is the budget the other pathological-input tests use.
+        """
+        command = "a" * 20000 + "-" + "[" * 20000 + "\ncat <<'E'\nx\nE"
+        started = time.perf_counter()
+
+        neutered, _ = val_module._neuter_heredocs(command)
+
+        assert time.perf_counter() - started < 0.5
+        assert neutered.endswith("cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC")
 
     def test_nested_subshell_pairs_are_resolved_in_linear_time(self):
         """Every `((` is decided by reading to its balancing `)`, so nesting is the adversarial shape.

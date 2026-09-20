@@ -891,19 +891,25 @@ _FRAME_START_CHARS = frozenset("$`")
 # character, the word ends at the next blank, and `export a[1<<b]=1` opens a
 # heredoc. The states, per command context:
 #   FRESH    - nothing but reserved words and redirections so far
-#   ASSIGNED - the last word was an assignment, or `coproc NAME`
-#   COPROC   - the last word was `coproc`; the next one is either a NAME or a command
+#   TIME     - the last word was `time`, so `-p` is its option; TIMEP after that,
+#              so `--` is too. Anywhere else both are command words.
+#   ASSIGNED - the last word was an assignment, or `coproc NAME`. A reserved word
+#              here is a command (`x=1 { a[0]=1` runs `{`), and so is `time`.
+#   COPROC   - the last word was `coproc`; the next one is a NAME or a command
 #   LOST     - a command word has been read; nothing after it is a subscript
-# A redirection keeps FRESH but ends ASSIGNED (`x=1 > f a[0]=1` runs `a[0]=1`
-# as a command - verified), and one whose target is the next word keeps it
-# through that word. `-p` and `--` are `time`'s options and are accepted after
-# any word; that can only read a glob as a subscript, which denies, where the
-# reverse deletes commands.
-_FRESH, _ASSIGNED, _COPROC, _LOST = "fresh", "assigned", "coproc", "lost"
-_COMMAND_POSITION_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "time", "-p", "--", "{"))
+# A redirection keeps every state but ASSIGNED, which it ends (`x=1 > f a[0]=1`
+# runs `a[0]=1` as a command), and one whose target is the next word keeps it
+# through that word. Inside a compound assignment `x=( … )` every word may
+# carry a subscript, a bare `[k]=v` included (PST_COMPASSIGN), whatever the
+# state.
+_FRESH, _TIME, _TIMEP, _ASSIGNED, _COPROC, _LOST = "fresh", "time", "time -p", "assigned", "coproc", "lost"
+_RESERVED_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{"))
 _ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
 _REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
-_FD_RE = re.compile(r"[0-9]*|\{[A-Za-z_]\w*\}|&")  # what may sit glued in front of a redirection operator
+# What a word may hold and still absorb a following `<` or `>`: an fd prefix,
+# or the first character of a two-character operator (`>>`, `<>`, `&>>`).
+_FD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\}|&)[<>]?")
+_ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=(…)` opens a compound assignment
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 # Blanks and control-operator characters end a word at the top level. `<` and
 # `>` end one too, unless the word so far is an fd prefix (`2>&1`, `{fd}>`);
@@ -1108,7 +1114,7 @@ def _is_word_boundary(line: str, pos: int) -> bool:
     return char in _WORD_BOUNDARY
 
 
-def _command_state_after(state: str, word: str) -> tuple[str, bool]:
+def _command_state_after(state: str, word: str) -> tuple[str, bool]:  # noqa: PLR0911 - one return per transition
     """The command-position state after ``word``, and whether ``word`` owes a redirect target.
 
     The transitions are bash's (see `_FRESH`). `ENV="foo bar"` arrives as one
@@ -1121,41 +1127,78 @@ def _command_state_after(state: str, word: str) -> tuple[str, bool]:
     if _REDIRECT_WORD_RE.match(word):
         owes_target = word[-1] in "<>" or word.endswith((">|", ">&", "<&"))
         return (_LOST, False) if state == _ASSIGNED else (_FRESH, owes_target)
+    if _ASSIGNMENT_WORD_RE.match(word):
+        return _ASSIGNED, False
+    if state == _ASSIGNED:
+        return _LOST, False  # after an assignment a reserved word is a command
+    if word == "time":
+        return _TIME, False
+    if word == "-p" and state == _TIME:
+        return _TIMEP, False
+    if word == "--" and state in (_TIME, _TIMEP):
+        return _FRESH, False
     if word == "coproc":
         return _COPROC, False
-    if word in _COMMAND_POSITION_WORDS:
+    if word in _RESERVED_WORDS:
         return _FRESH, False
-    if _ASSIGNMENT_WORD_RE.match(word) or state == _COPROC:
-        return _ASSIGNED, False  # an assignment, or `coproc NAME`
-    return _LOST, False
+    return (_ASSIGNED, False) if state == _COPROC else (_LOST, False)
 
 
 @dataclass
 class _Context:
-    """Command-position tracking for one command context - the top level or a `$(…)`.
+    """Command-position tracking for one command context - the top level, a `$(…)`, a compound assignment.
 
-    ``prefix`` holds the open word's text from earlier lines, ``start`` where it
-    continues on this one; ``comsub`` says the outer word resumes after this
-    context's `)` (`x=$(…)y` is one word) rather than ending at it.
+    ``prefix`` holds the open word's text from earlier lines (and, for a word
+    that opened this context, the text before the opener); ``start`` where it
+    continues on this line. ``comsub`` says the outer word resumes after this
+    context's `)` (`x=$(…)y` is one word) rather than ending at it;
+    ``compound`` that this is a `x=( … )`, where every word may carry a
+    subscript. ``glob`` records a `[` in the open word that was not a
+    subscript, so no later `[` in the same word is asked again.
     """
 
     comsub: bool = False
+    compound: bool = False
     state: str = _FRESH
     target_pending: bool = False
     prefix: str = ""
     start: Optional[int] = None
+    glob: bool = False
 
     def word(self, line: str, pos: int) -> str:
         return self.prefix + line[self.start : pos]  # type: ignore[misc]  # callers check start first
 
+    def opens_subscript(self, line: str, pos: int) -> bool:
+        """Whether a `[` at ``pos`` starts an array subscript here."""
+        if self.glob or self.target_pending:
+            return False
+        if self.compound and (self.start is None or self.start == pos):
+            return True  # `x=( [k]=v )`
+        if self.state == _LOST and not self.compound or self.start is None:
+            return False
+        if self.prefix:
+            return _IDENTIFIER_RE.fullmatch(self.word(line, pos)) is not None
+        return _IDENTIFIER_RE.fullmatch(line, self.start, pos) is not None
+
     def end_word(self, line: str, pos: int) -> None:
         if self.start is None:
             return
+        word = self.word(line, pos)
         if self.target_pending:
             self.target_pending = False  # a redirection's target is neither a command nor an assignment
+        elif word == "case" and self.comsub and self.state != _LOST:
+            # A pattern's `)` would be read as this context's closer. The
+            # matcher for `((` refuses the same shape for the same reason.
+            raise ParseError("`case` inside `$(…)`; its patterns' `)` cannot be told from the closer")
         else:
-            self.state, self.target_pending = _command_state_after(self.state, self.word(line, pos))
-        self.prefix, self.start = "", None
+            self.state, self.target_pending = _command_state_after(self.state, word)
+        self.prefix, self.start, self.glob = "", None, False
+
+    def fold(self, line: str, end: int) -> None:
+        """Move the open word's text up to ``end`` into ``prefix``; it continues elsewhere."""
+        if self.start is not None:
+            self.prefix += line[self.start : end]
+            self.start = None
 
     def operator(self) -> None:
         self.state, self.target_pending = _FRESH, False  # a control operator starts a command
@@ -1253,6 +1296,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     openers: list[tuple[str, bool, int]] = []
     continued = False
     pos = 0
+    opener_depths: list[int] = []
     if scan.contexts[-1].prefix:
         scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
 
@@ -1278,9 +1322,11 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             ):
                 # `$(…)`, `<(…)`, `>(…)`: shell again inside, and a heredoc in
                 # there is real, so it is a context rather than a frame. The
-                # outer word continues after its `)`.
+                # outer word continues after its `)`; its head is folded away
+                # now so that nothing is re-folded per open context later.
                 if ctx.start is None:
                     ctx.start = pos
+                ctx.fold(line, pos + 2)
                 scan.contexts.append(_Context(comsub=True))
                 out.append(line[pos : pos + 2])
                 pos += 2
@@ -1288,18 +1334,24 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             if char == ")" and len(scan.contexts) > 1:
                 ctx.end_word(line, pos)
                 closed = scan.contexts.pop()
-                if closed.comsub and scan.contexts[-1].start is None:
-                    scan.contexts[-1].start = pos  # the word began on an earlier line; it resumes here
+                if closed.comsub:
+                    scan.contexts[-1].start = pos  # the outer word resumes; its head is in `prefix`
                 out.append(char)
                 pos += 1
                 continue
             if char == "(":
-                # A subshell: its own commands, its own `)`. The outer context
-                # is reset here, so after the `)` it is at command position -
-                # which is where `case a in (a) b[0]=1` needs it.
-                ctx.end_word(line, pos)
-                ctx.operator()
-                scan.contexts.append(_Context())
+                if ctx.start is not None and _ASSIGNMENT_PREFIX_RE.fullmatch(ctx.word(line, pos)):
+                    # `x=( … )`: one assignment word, in which every element
+                    # may carry a subscript - `[k]=v` included.
+                    ctx.fold(line, pos + 1)
+                    scan.contexts.append(_Context(comsub=True, compound=True))
+                else:
+                    # A subshell: its own commands, its own `)`. The outer
+                    # context is reset here, so after the `)` it is at command
+                    # position - which is where `case a in (a) b[0]=1` needs it.
+                    ctx.end_word(line, pos)
+                    ctx.operator()
+                    scan.contexts.append(_Context())
                 out.append(char)
                 pos += 1
                 continue
@@ -1369,19 +1421,18 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             frames.append(char)
             out.append(char)
             pos += 1
-        elif (
-            char == "["
-            and not frames
-            and ctx.state != _LOST
-            and not ctx.target_pending
-            and ctx.start is not None
-            and _IDENTIFIER_RE.fullmatch(ctx.word(line, pos))
-        ):
+        elif char == "[" and not frames and ctx.opens_subscript(line, pos):
             # `a[1<<b]=1` is a shift: an identifier opening a word where an
             # assignment is acceptable makes `[` a subscript. Off that position
             # - a command's argument, a redirection's target - it is a glob
             # character bash opens a heredoc through (`cat f[a<<b]`, verified).
+            if ctx.start is None:
+                ctx.start = pos  # `x=( [k]=v )`: the word begins at the bracket
             frames.append("]")
+            out.append(char)
+            pos += 1
+        elif char == "[" and not frames:
+            ctx.glob = True  # a glob character; no later `[` in this word is a subscript either
             out.append(char)
             pos += 1
         elif char == "#" and not frames and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
@@ -1401,28 +1452,29 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
                 pos += 1
             delimiter, pos = _read_delimiter(line, pos)
             openers.append((delimiter, strips_tabs, opener_at))
+            opener_depths.append(len(scan.contexts))
             out.append(f"<<{'-' if strips_tabs else ''}{_HEREDOC_PLACEHOLDER}")
         else:
             out.append(char)
             pos += 1
 
     ctx = scan.contexts[-1]
-    if not frames and not continued:
+    if continued:
+        ctx.fold(line, len(line) - 1)  # bash removes the backslash-newline pair; the word goes on
+    elif not frames:
         ctx.end_word(line, len(line))
         ctx.operator()  # a newline at the top level separates commands
-    for ctx in scan.contexts:
-        if ctx.start is not None:
-            ctx.prefix += line[ctx.start :] + "\n"  # the word continues on the next line
-            ctx.start = None
+    elif ctx.start is not None:
+        ctx.fold(line, len(line))
+        ctx.prefix += "\n"  # inside a quote or expansion the word continues, newline and all
 
-    if openers and (continued or frames):
-        # A trailing `\`, or a quote or expansion still open, means this line
-        # does not finish the command, so bash starts the body after a later
-        # line. Consuming from the next one would delete the commands between.
-        raise ParseError(
-            f"Heredoc opener on a line that continues ({'trailing backslash' if continued else 'unclosed ' + frames[-1]}); "
-            "the body's start is unknown"
-        )
+    if openers and (continued or frames or opener_depths[0] < len(scan.contexts)):
+        # A trailing `\`, a quote or expansion still open, or a `$(` opened
+        # after the opener and not yet closed, means this line does not finish
+        # the command, so bash starts the body after a later line. Consuming it
+        # from the next one would delete the commands between.
+        why = "trailing backslash" if continued else "unclosed " + (frames[-1] if frames else "$(")
+        raise ParseError(f"Heredoc opener on a line that continues ({why}); the body's start is unknown")
 
     return "".join(out), openers
 
