@@ -18,6 +18,16 @@ from schlock.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
+# How many suppressed matches of one pattern to scan past before giving up.
+# Each rescan restarts a linear scan, so an unbounded loop lets a long quoted
+# literal full of decoy matches scale the cost of the hook, which runs on every
+# command. Far more than any real command needs -- the decoy shapes this
+# exists for need one -- and exhausting the budget fails closed, so padding
+# buys a denial rather than an unrated command. Measured: lowering this to 8
+# changed nothing, so the bound is insurance against a pathological input, not
+# a throughput knob.
+_MAX_SUPPRESSED_RESCANS = 32
+
 
 class RiskLevel(Enum):
     """Risk levels for command validation.
@@ -689,18 +699,8 @@ class RuleEngine:
         for rule in self.rules:
             patterns = self.compiled_patterns.get(rule.name, [])
             for pattern in patterns:
-                match = pattern.search(command)
+                match = self._first_executable_match(pattern, command, string_literals, heredoc_ranges)
                 if match:
-                    # Check if match is inside a quoted string literal
-                    if string_literals and self._is_in_string_literal(match, string_literals):
-                        # Skip this match - it's in a quoted string that won't execute
-                        continue
-
-                    # Check if match is inside a non-shell heredoc (text, not executed)
-                    if heredoc_ranges and self._is_in_non_shell_heredoc(match, heredoc_ranges):
-                        # Skip this match - it's in heredoc content that won't execute
-                        continue
-
                     # Rule matched - check if higher risk than current
                     if rule.risk_level > highest_risk:
                         highest_risk = rule.risk_level
@@ -723,6 +723,40 @@ class RuleEngine:
             message="No security rules matched",
             alternatives=[],
         )
+
+    def _first_executable_match(
+        self,
+        pattern: "re.Pattern",
+        command: str,
+        string_literals: Optional[list[tuple]],
+        heredoc_ranges: Optional[list[tuple]],
+    ) -> Optional["re.Match"]:
+        """First match of `pattern` that is not inert text, or None.
+
+        SECURITY CRITICAL: keep scanning past a suppressed match. Stopping at the
+        first one lets an inert decoy hide a real hit from the SAME pattern --
+        `env -u \'cat ~/.ssh/identity;\' head ~/.ssh/id_ed25519` is one segment, so
+        the quoted text and the actual read compete for a single search.
+
+        Advances by one character rather than to match.end() so a later match that
+        overlaps the suppressed one is still found.
+        """
+        pos = 0
+        suppressed: Optional[re.Match] = None
+        for _ in range(_MAX_SUPPRESSED_RESCANS):
+            match = pattern.search(command, pos)
+            if match is None:
+                return None
+            in_literal = bool(string_literals) and self._is_in_string_literal(match, string_literals)
+            in_heredoc = bool(heredoc_ranges) and self._is_in_non_shell_heredoc(match, heredoc_ranges)
+            if not (in_literal or in_heredoc):
+                return match
+            suppressed = match
+            pos = match.start() + 1
+        # Budget exhausted. Padding a literal with decoy matches is the only way
+        # to get here, so fail CLOSED: report the last suppressed match rather
+        # than letting the padding buy an unrated command.
+        return suppressed
 
     def _is_in_string_literal(self, match: re.Match, string_literals: list[tuple]) -> bool:
         """Check if a regex match falls within a quoted string literal.

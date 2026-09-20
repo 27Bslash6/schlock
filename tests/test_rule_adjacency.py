@@ -81,6 +81,9 @@ GIT_GLOBALS = [
     "--work-tree .",  # long flag, separate value
     "-C 'my dir'",  # single-quoted value containing a space
     '-C "my dir"',  # double-quoted value containing a space
+    "-c user.name='Jane Doe'",  # bare run + quoted run in ONE shell word
+    '-c user.name="Jane Doe"',  # same, double-quoted
+    "-C ~/'my dir'",  # bare prefix + quoted suffix
     "-C . -c user.name=x --no-pager",  # several, mixed
 ]
 
@@ -390,3 +393,156 @@ class TestPatternsDoNotBacktrackCatastrophically:
         # Exponential backtracking takes seconds to forever; a linear scan of a few
         # hundred characters is sub-millisecond. One second is slack, not a target.
         assert time.perf_counter() - start < 1.0
+
+
+class TestSuppressedMatchCannotHideALaterRead:
+    """An inert quoted decoy must not silence the rule.
+
+    `match_command` searched each pattern once; when that first match fell inside
+    a string literal the skip abandoned the whole pattern, so a real match later
+    in the SAME segment was never looked for. Consolidating several per-path
+    patterns into one made a decoy enough to silence the rule outright. The
+    semicolons below sit inside ordinary quoted arguments, not separators, so
+    each of these is one segment and one search.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("env -u 'cat ~/.ssh/identity;' head ~/.ssh/id_ed25519", "ssh_key_exfiltration"),
+            ("env -u 'nl ~/.npmrc;' cat ~/.netrc", "extended_credential_exposure"),
+            ("echo 'nl ~/.aws/credentials' && nl ~/.ssh/id_rsa", "ssh_key_exfiltration"),
+        ],
+    )
+    def test_decoy_does_not_suppress_the_real_read(self, command, rule, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert rule in result.matched_rules
+
+    def test_a_decoy_alone_is_still_suppressed(self, rules_dir_path):
+        """The scan must not un-suppress quoted text -- only look past it."""
+        assert verdict("env -u 'cat ~/.ssh/identity;' true", rules_dir_path).allowed
+
+
+class TestReaderNameVersusReaderUse:
+    """Known, accepted false positives, and the evasions that fixing them would buy.
+
+    `nl` is a plausible username and a plausible literal argument, so these three
+    are rated as reads. Guarding them with a lookbehind on the preceding token was
+    implemented and reverted: an attacker controls that token too, so every such
+    guard is a one-token bypass. These assertions record the trade deliberately --
+    if a future change makes them allowed, check it did not also unrate the
+    evasions pinned below.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ssh -l nl -i ~/.ssh/id_ed25519 host",
+            "chown nl ~/.ssh/id_ed25519",
+            "printf '%s' nl ~/.aws/credentials",
+        ],
+    )
+    def test_reader_name_as_a_data_word_is_rated(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "foo 'x' cat ~/.ssh/id_rsa",  # a quote guard would unrate this
+            "env -i cat ~/.ssh/id_rsa",  # a short-flag guard would unrate this
+        ],
+    )
+    def test_the_evasions_those_guards_would_buy_stay_blocked(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "nl ~/.ssh/id_ed25519.pub",  # a public key is not a secret
+            "tee ~/.kube/config < config.yaml",  # writes the file, does not read it
+        ],
+    )
+    def test_public_keys_and_write_operands_are_not_reads(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).allowed
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # `split` and `csplit` LOOK like writers and are not: the operand is
+            # the INPUT file, copied into shards an attacker then reads.
+            "split -b 1m ~/.ssh/id_rsa /tmp/k",
+            "csplit -f /tmp/p ~/.ssh/id_ed25519 5",
+            "split -l 100 ~/.aws/credentials",
+        ],
+    )
+    def test_shard_writers_still_read_their_operand(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+
+class TestKeyNamesAndPublicKeys:
+    """Key files are not named uniformly, and a public key is not a secret.
+
+    An earlier cut used `\\b` to force the `id_` stem to its maximal length. `_` is
+    a word character, so no prefix could ever satisfy the boundary and the branch
+    died outright for every name that continues past the stem -- including
+    `id_ed25519_sk`, an ssh-keygen default, and the standard multi-account names.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "~/.ssh/id_rsa",
+            "~/.ssh/id_ed25519",
+            "~/.ssh/id_ed25519_sk",
+            "~/.ssh/id_ed25519_work",
+            "~/.ssh/id_rsa_github",
+            "~/.ssh/id_ecdsa_old",
+            "~/.ssh/id_dsa_backup",
+            "~/.ssh/identity",
+            "~/.ssh/identity_work",
+        ],
+    )
+    def test_every_private_key_spelling_is_blocked(self, path, rules_dir_path):
+        assert verdict(f"nl {path}", rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("reader", ["cat", "nl", "head", "base64"])
+    @pytest.mark.parametrize("path", ["~/.ssh/id_rsa.pub", "~/.ssh/id_ed25519.pub"])
+    def test_public_keys_are_allowed_for_every_reader(self, reader, path, rules_dir_path):
+        """Reader-dependent verdicts on the same file are the defect this ticket
+        exists to remove, so the legacy cat-only rule gets the same exclusion."""
+        assert verdict(f"{reader} {path}", rules_dir_path).allowed
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Appending a `.pub` must not disarm the guard for the whole word.
+            "cat ~/.ssh/{*,*.pub}",
+            "cat ~/.ssh/{id_rsa,x.pub}",
+            "nl ~/.ssh/{id_ed25519,readme.pub}",
+        ],
+    )
+    def test_a_pub_suffix_elsewhere_in_the_word_does_not_disarm_the_guard(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+    def test_a_glob_that_only_matches_public_keys_is_allowed(self, rules_dir_path):
+        assert verdict("cat ~/.ssh/*.pub", rules_dir_path).allowed
+
+
+class TestDecoyPaddingFailsClosed:
+    """Scanning past a suppressed match is bounded, and the bound denies.
+
+    Without a bound, padding a quoted literal with decoy matches scales the cost
+    of a hook that runs on every command. Exhausting the budget reports the last
+    suppressed match rather than letting the padding buy an unrated command.
+    """
+
+    def test_heavily_padded_literal_is_not_silently_allowed(self, rules_dir_path):
+        command = "echo '" + ("od ~/.ssh/id_rsa " * 200) + "' ; true"
+        assert not verdict(command, rules_dir_path).allowed
+
+    def test_a_modest_number_of_decoys_still_finds_the_real_read(self, rules_dir_path):
+        command = "echo '" + ("od ~/.ssh/id_rsa " * 4) + "' ; nl ~/.ssh/id_ed25519"
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "ssh_key_exfiltration" in result.matched_rules
