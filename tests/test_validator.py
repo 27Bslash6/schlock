@@ -1185,8 +1185,9 @@ class TestHeredocSurroundings:
             # bash: the `[]` row's canary after the delimiter ran, the others' was
             # swallowed as a body.
             ("cat <<'A' $(date)#x <<b", ["A", "b"], "a word resumes after a `$(…)`, so a `#` glued to it is text"),
-            ("x=(1 2)#y <<c", ["c"], "…and after a compound assignment's `)` too"),
+            ("echo a#b <<c", ["c"], "…and a `#` glued to plain word text is text as well"),
             ("( echo )#c <<b", [], "but a subshell's `)` ends a command, so there `#` really is a comment"),
+            ("cat 2>#f <<b", [], "and after a redirection operator, where the word is open but `prefix` is not"),
         ],
     )
     def test_expansion_boundaries_match_bash(self, line, delimiters, description):
@@ -1252,6 +1253,14 @@ class TestHeredocSurroundings:
             (
                 "$(cat <<'B') ; cat <<'C' $(echo\nrm -rf /\nB\nC\n)",
                 "the first opener's depth matches the line's final depth, but `C` is inside the unclosed `$(`",
+            ),
+            (
+                "cat <<'C' $(cat <<'D'\nrm -rf /\nD\n)\nC",
+                "openers shallow then deep: the last one's depth matches the line's, the shallowest does not",
+            ),
+            (
+                "$(cat <<'A') ; $(echo\nrm -rf /\nA\n)",
+                "one substitution closes and a sibling opens at the same depth, which no depth comparison sees",
             ),
         ],
     )

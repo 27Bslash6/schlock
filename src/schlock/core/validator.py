@@ -1176,6 +1176,7 @@ class _Context:
 
     comsub: bool = False
     compound: bool = False
+    serial: int = 0
     state: str = _FRESH
     target_pending: bool = False
     prefix: str = ""
@@ -1232,6 +1233,13 @@ class _ScanState:
 
     frames: list[str] = field(default_factory=list)
     contexts: list[_Context] = field(default_factory=lambda: [_Context()])
+    opened: int = 0  # contexts opened so far; each one's `serial`, so later ones compare greater
+
+    def open_context(self, context: _Context) -> None:
+        """Push a command context, numbered after every context opened before it."""
+        self.opened += 1
+        context.serial = self.opened
+        self.contexts.append(context)
 
 
 def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
@@ -1313,7 +1321,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     openers: list[tuple[str, bool, int]] = []
     continued = False
     pos = 0
-    opener_depths: list[int] = []
+    opener_serials: list[int] = []
     if scan.contexts[-1].prefix:
         scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
 
@@ -1344,7 +1352,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
                 if ctx.start is None:
                     ctx.start = pos
                 ctx.fold(line, pos + 2)
-                scan.contexts.append(_Context(comsub=True))
+                scan.open_context(_Context(comsub=True))
                 out.append(line[pos : pos + 2])
                 pos += 2
                 continue
@@ -1361,14 +1369,14 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
                     # `x=( … )`: one assignment word, in which every element
                     # may carry a subscript - `[k]=v` included.
                     ctx.fold(line, pos + 1)
-                    scan.contexts.append(_Context(comsub=True, compound=True))
+                    scan.open_context(_Context(comsub=True, compound=True))
                 else:
                     # A subshell: its own commands, its own `)`. The outer
                     # context is reset here, so after the `)` it is at command
                     # position - which is where `case a in (a) b[0]=1` needs it.
                     ctx.end_word(line, pos)
                     ctx.operator()
-                    scan.contexts.append(_Context())
+                    scan.open_context(_Context())
                 out.append(char)
                 pos += 1
                 continue
@@ -1459,11 +1467,15 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
         elif char == "#" and not frames and not ctx.prefix and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
             # `#` is ordinary inside every frame - `${#x}`, `${x#pre}` - so the
             # comment branch must not abandon the scan mid-expansion. An open
-            # word rules it out for the same reason: `ctx.prefix` means text is
-            # already folded into the word, so `echo $(date)#x` and a `\`-continued
-            # `a\<newline>#x` are single words bash reads `#` inside. Breaking
-            # there abandons the rest of the line, and with it a `$(` that would
-            # have moved the body's start past the commands in between.
+            # word rules it out too, for its own reason: `ctx.prefix` means text
+            # is already folded into this word, so `echo $(date)#x` and a
+            # `\`-continued `a\<newline>#x` are single words bash reads `#` inside.
+            # `prefix` and not `ctx.start`, which is set for every character that
+            # reaches here; and not `ctx.word()`, which is empty right after a
+            # redirection operator, where bash really does comment (`cat 2>#f`).
+            # The cost of using `prefix` is that a lone operator can be the folded
+            # text - `cat >\<newline>#f` reads `#f` as a word - which is a shape
+            # bash rejects outright, so it can invent an opener but not hide one.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
@@ -1482,7 +1494,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
                 pos += 1
             delimiter, pos = _read_delimiter(line, pos)
             openers.append((delimiter, strips_tabs, opener_at))
-            opener_depths.append(len(scan.contexts))
+            opener_serials.append(scan.contexts[-1].serial)
             out.append(f"<<{'-' if strips_tabs else ''}{_HEREDOC_PLACEHOLDER}")
         else:
             out.append(char)
@@ -1498,15 +1510,15 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
         ctx.fold(line, len(line))
         ctx.prefix += "\n"  # inside a quote or expansion the word continues, newline and all
 
-    if openers and (continued or frames or min(opener_depths) < len(scan.contexts)):
+    if openers and (continued or frames or scan.contexts[-1].serial > min(opener_serials)):
         # A trailing `\`, a quote or expansion still open, or a `$(` opened
         # after an opener and not yet closed, means this line does not finish
         # the command, so bash starts the body after a later line. Consuming it
         # from the next one would delete the commands between.
-        # The shallowest opener decides, not the first: in
-        # `$(cat <<'B') ; cat <<'C' $(echo` the `$(cat …)` closes before `C`, so
-        # the first opener's depth matches the line's final depth while `C` is
-        # still inside the unclosed `$(echo`.
+        # The test is identity, not depth: `$(cat <<'A') ; $(echo` closes one
+        # substitution and opens another at the same depth, so a depth
+        # comparison sees nothing while the line plainly does not end. A later
+        # serial still open is exactly `something opened after an opener`.
         why = "trailing backslash" if continued else "unclosed " + (frames[-1] if frames else "$(")
         raise ParseError(f"Heredoc opener on a line that continues ({why}); the body's start is unknown")
 
