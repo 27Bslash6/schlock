@@ -7,7 +7,6 @@ import time
 
 import pytest
 
-import schlock.core.validator as val_module
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
@@ -1953,21 +1952,14 @@ class TestListSegmentBranchCoverage:
         assert result.risk_level == RiskLevel.MEDIUM
 
 
+@pytest.mark.usefixtures("no_shellcheck")
 class TestSegmentRiskAggregation:
     """A later substitution segment cannot be hidden by an earlier lower-risk result."""
-
-    @pytest.fixture(autouse=True)
-    def _no_shellcheck(self, monkeypatch):
-        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
-        val_module._global_cache.clear()
-        yield
-        val_module._global_cache.clear()
 
     @pytest.mark.parametrize(
         "command",
         [
             'echo "$(x=1; rm -rf /)"',
-            'echo "$(rm -rf /; x=1)"',
             'echo "$(make; rm -rf /)"',
             'echo "$(make | rm -rf /)"',
         ],

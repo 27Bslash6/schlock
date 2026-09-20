@@ -694,6 +694,7 @@ rules:
         assert any(r.name == "schlock_config_write" for r in engine.rules)
 
 
+@pytest.mark.usefixtures("no_shellcheck")
 class TestHeredocSurroundings:
     """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
 
@@ -706,16 +707,6 @@ class TestHeredocSurroundings:
     off, because a cross-check like "same as without the heredoc" moves in step
     with the code under test and would survive the bug coming back.
     """
-
-    @pytest.fixture(autouse=True)
-    def _no_shellcheck(self, monkeypatch):
-        """Pin verdicts to the rules, not to whether ShellCheck is installed."""
-        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
-        val_module._global_cache.clear()
-        yield
-        # Verdicts computed with ShellCheck off must not leak into later tests
-        # that validate the same string with it on.
-        val_module._global_cache.clear()
 
     @pytest.mark.parametrize(
         "command,description",

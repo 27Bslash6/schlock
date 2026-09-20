@@ -19,7 +19,7 @@ This prevents bypass attacks that defeat regex-only detection:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -1414,12 +1414,13 @@ class SubstitutionValidator:
 
         Each segment is wrapped as its own substitution and run through the full
         ``validate_substitution`` pipeline at the SAME depth (decomposition, not nesting). The
-        whole is allowed only if every segment is allowed; the combined risk is the max over
-        segments and it is whitelisted only if every segment is. The whole rendered text is then
-        re-checked against the YAML rules to catch cross-segment patterns.
+        whole is allowed only if every segment is allowed; its risk and message come from the
+        highest-risk segment (first wins ties), and it is whitelisted only if every segment is.
+        The whole rendered text is then re-checked against the YAML rules to catch cross-segment
+        patterns.
 
-        Fail-closed: a segment we cannot turn into a substitution node (e.g. a compound
-        ``{ … }``/``( … )``/``if`` segment) blocks the whole substitution.
+        Fail-closed: a segment we cannot turn into a substitution node blocks the whole
+        substitution.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
@@ -1448,23 +1449,18 @@ class SubstitutionValidator:
             rule_match = self.rule_engine.match_command(sub_node.inner_command)
             if rule_match and rule_match.matched:
                 amplified_risk = self._amplify_risk(rule_match.risk_level)
-                if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-                    cross_segment_result = SubstitutionValidationResult(
+                if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH) and (
+                    worst_result is None or worst_result.risk_level < RiskLevel.BLOCKED
+                ):
+                    worst_result = SubstitutionValidationResult(
                         allowed=False,
                         risk_level=RiskLevel.BLOCKED,
                         message=f"Inner command blocked: {rule_match.message}",
                         inner_results=inner_results,
                     )
-                    if worst_result is None or cross_segment_result.risk_level > worst_result.risk_level:
-                        worst_result = cross_segment_result
 
         if worst_result is not None and not worst_result.allowed:
-            return SubstitutionValidationResult(
-                allowed=False,
-                risk_level=worst_result.risk_level,
-                message=worst_result.message,
-                inner_results=inner_results,
-            )
+            return replace(worst_result, inner_results=inner_results)
 
         return SubstitutionValidationResult(
             allowed=True,
