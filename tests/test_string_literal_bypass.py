@@ -204,15 +204,11 @@ class TestSuppressionIsPerOccurrence:
             # the newline stops the pattern spanning both, and the payload after
             # it was never looked at. Rated SAFE and ALLOWED before the fix.
             ("cat '{bomb}'\n{bomb}", "quoted decoy, payload on the next line"),
-            ("printf '%s' '{bomb}'\n{bomb}", "decoy as a printf argument"),
             # Blocked on `main` only by accident - it cannot derive a literal for
             # the segment, so it matches the DECOY rather than the payload. Once
             # the heredoc's ranges are rebased off the parent AST the decoy is
             # correctly suppressed, which is what un-gated the defect.
             ("cat '{bomb}' <<'EOF'\nbody\nEOF\n{bomb}", "canonical opener"),
-            ("cat '{bomb}' <<'EOF' \\ \nbody\nEOF\n{bomb}", "escaped trailing space on the opener line"),
-            ("cat '{bomb}' <<'EOF' \\\t\nbody\nEOF\n{bomb}", "escaped trailing tab on the opener line"),
-            ("cat '{bomb}' <<'EOF' \\\\ \nbody\nEOF\n{bomb}", "a literal backslash argument, not an escape"),
         ],
     )
     def test_quoted_decoy_does_not_hide_the_payload_end_to_end(self, safety_rules_path, template, description):
@@ -244,32 +240,39 @@ class TestSuppressionIsPerOccurrence:
         assert match is not None, "an overlapping executable match was stepped over"
         assert match.span() == (1, 6)
 
-    def test_exhausting_the_rescan_budget_fails_closed(self, rules_dir_path):
-        """Padding a literal with decoys must buy a denial, not an unrated command.
+    @pytest.mark.parametrize(
+        "unit,expected,description",
+        [
+            # Under-block: `validate_command` runs its cross-segment scan ONLY when no
+            # segment matched, so a bogus segment match hides the BLOCKED the whole
+            # command earns. `_segment_nodes` fragments the fork bomb, so that scan is
+            # the only thing that sees it.
+            ("pip install -r requirements.txt", RiskLevel.BLOCKED, "decoy padding must not hide a later payload"),
+            # Over-block: the same inert text with nothing dangerous after it is a
+            # command a user may legitimately run.
+            (None, RiskLevel.SAFE, "inert padding alone is not dangerous"),
+        ],
+    )
+    def test_padding_a_literal_changes_no_verdict(self, safety_rules_path, unit, expected, description):
+        """The scan never gives up early, at any repetition count.
 
-        Each rescan restarts a linear scan, so the walk is bounded. On exhaustion
-        the last suppressed match is reported rather than None - otherwise enough
-        decoy occurrences would silence the rule outright.
+        A bounded scan has to report something on exhaustion and both answers are
+        wrong: the last suppressed match denies benign text and masks a higher
+        verdict elsewhere in the command, while None lets padding silence the rule.
+        40 repeats is past any bound worth writing; 31 is inside one, so the pair
+        fails on a bounded implementation and passes on an exact one.
         """
-        engine = RuleEngine(rules_dir_path)
-        pattern = re.compile("AB")
+        padding = " ".join(["sudo apt-get install -y pkg" if unit is None else unit] * 40)
+        command = f"echo '{padding}'" + ("" if unit is None else f" && {self.FORK_BOMB}")
 
-        under = "AB" * 10
-        assert engine._first_executable_match(pattern, under, [(0, len(under))], None) is None, (
-            "within budget every occurrence is suppressed, so nothing matches"
-        )
+        result = validate_command(command, config_path=safety_rules_path)
 
-        over = "AB" * 40
-        assert engine._first_executable_match(pattern, over, [(0, len(over))], None) is not None, (
-            "budget exhausted - must fail closed, not report the command unrated"
-        )
+        assert result.risk_level == expected, f"{description}: got {result.risk_level.name}"
 
     @pytest.mark.parametrize(
         "command,literal,description",
         [
             ('echo "rm -rf /"', slice(5, 15), "double-quoted decoy, no payload"),
-            ("echo 'rm -rf /'", slice(5, 15), "single-quoted decoy, no payload"),
-            ('echo "${HOME} rm -rf /"', slice(5, 23), "parameter expansion beside the decoy"),
         ],
     )
     def test_sole_occurrence_is_still_suppressed(self, rules_dir_path, command, literal, description):

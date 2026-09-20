@@ -18,16 +18,6 @@ from schlock.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
-# How many suppressed matches of one pattern to scan past before giving up.
-# Each rescan restarts a linear scan, so an unbounded loop lets a long quoted
-# literal full of decoy matches scale the cost of the hook, which runs on every
-# command. Far more than any real command needs -- the decoy shapes this
-# exists for need one -- and exhausting the budget fails closed, so padding
-# buys a denial rather than an unrated command. Measured: lowering this to 8
-# changed nothing, so the bound is insurance against a pathological input, not
-# a throughput knob.
-_MAX_SUPPRESSED_RESCANS = 32
-
 
 class RiskLevel(Enum):
     """Risk levels for command validation.
@@ -684,7 +674,7 @@ class RuleEngine:
 
             >>> # With AST context to avoid false positives
             >>> match = engine.match_command('echo "rm -rf /"', string_literals=[(6, 15)])
-            >>> # Pattern match at position 11-18 is inside string literal, ignored
+            >>> # The match at 6-11 is inside the string literal (6, 15), so it is ignored
         """
         # Whitelist override
         if self.is_whitelisted(command):
@@ -739,15 +729,29 @@ class RuleEngine:
 
         SECURITY CRITICAL: keep scanning past a suppressed match. Stopping at the
         first one lets an inert decoy hide a real hit from the SAME pattern --
-        `env -u \'cat ~/.ssh/identity;\' head ~/.ssh/id_ed25519` is one segment, so
-        the quoted text and the actual read compete for a single search.
+        `cat \':(){ :|:& };:\'` followed by a newline and the same fork bomb unquoted
+        rated SAFE, because the quoted decoy consumed the rule\'s only search.
+        Pick the example carefully: a rule with two patterns matching at different
+        offsets (`rm -rf /`) hides the leak, because its second pattern catches the
+        payload anyway.
 
         Advances by one character rather than to match.end() so a later match that
         overlaps the suppressed one is still found.
+
+        The scan is EXACT - it never gives up early. A bound here looks like cheap
+        insurance and is not: reporting anything other than "first executable match,
+        or none" on exhaustion is wrong in one direction or the other. Reporting the
+        last suppressed match denies benign text (a quoted doc listing 32 `sudo`
+        lines) AND under-blocks, because `validate_command` only runs its
+        cross-segment scan when no segment matched, so a bogus segment match hides
+        a `BLOCKED` the whole command would have earned. Returning None instead just
+        lets padding silence the rule. Measured, the bound bought ~1%: on a 229 KB
+        padded command the loop is 13.1 s bounded vs 13.1 s unbounded, against 12.9 s
+        on a tree without this scan at all - the superlinearity is elsewhere.
+        Termination is structural: `pos` strictly increases every iteration.
         """
         pos = 0
-        suppressed: Optional[re.Match] = None
-        for _ in range(_MAX_SUPPRESSED_RESCANS):
+        while True:
             match = pattern.search(command, pos)
             if match is None:
                 return None
@@ -755,12 +759,7 @@ class RuleEngine:
             in_heredoc = bool(heredoc_ranges) and self._is_in_non_shell_heredoc(match, heredoc_ranges)
             if not (in_literal or in_heredoc):
                 return match
-            suppressed = match
             pos = match.start() + 1
-        # Budget exhausted. Padding a literal with decoy matches is the only way
-        # to get here, so fail CLOSED: report the last suppressed match rather
-        # than letting the padding buy an unrated command.
-        return suppressed
 
     def _is_in_string_literal(self, match: re.Match, string_literals: list[tuple]) -> bool:
         """Check if a regex match falls within a quoted string literal.
