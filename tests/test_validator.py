@@ -1181,6 +1181,12 @@ class TestHeredocSurroundings:
             ('a["]"<<b ]=1', [], "a quoted `]` does not close a subscript"),
             ("a[${x:-]}<<b ]=1", [], "a `]` inside `${…}` does not close a subscript"),
             ('echo "`date`" ; cat <<c', ["c"], "a backtick closes its own frame, it does not reopen it"),
+            # A `#` is a comment only where a word could start. These ran real
+            # bash: the `[]` row's canary after the delimiter ran, the others' was
+            # swallowed as a body.
+            ("cat <<'A' $(date)#x <<b", ["A", "b"], "a word resumes after a `$(…)`, so a `#` glued to it is text"),
+            ("x=(1 2)#y <<c", ["c"], "…and after a compound assignment's `)` too"),
+            ("( echo )#c <<b", [], "but a subshell's `)` ends a command, so there `#` really is a comment"),
         ],
     )
     def test_expansion_boundaries_match_bash(self, line, delimiters, description):
@@ -1224,6 +1230,41 @@ class TestHeredocSurroundings:
         """Same rule as an unclosed quote: the body's first line is unknown, so deny."""
         with pytest.raises(ParseError, match="line that continues"):
             val_module._neuter_heredocs("cat <<'EOF' ${x:-\n}\nhello\nEOF")
+
+    def test_a_hash_inside_an_open_word_does_not_end_the_scan(self):
+        """`echo a\\<newline>#x` is the single word `a#x`, so the `<<'A'` after it opens a heredoc.
+
+        Verified against bash: the body is swallowed, so a canary in it never
+        runs. Reading the `#` as a comment abandoned the rest of the line and
+        left the body behind to be parsed as the commands bash does not run.
+        """
+        neutered, _ = val_module._neuter_heredocs("cat <<'Z'\nzz\nZ\necho a\\\n#x <<'A'\nrm -rf /\nA")
+
+        assert neutered == "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho a\\\n#x <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            (
+                "cat <<'A' $(date)#x $(echo\nrm -rf /\nA\n)",
+                "a `#` glued to a closed `$(…)` is word text, and hides the `$(` after it",
+            ),
+            (
+                "$(cat <<'B') ; cat <<'C' $(echo\nrm -rf /\nB\nC\n)",
+                "the first opener's depth matches the line's final depth, but `C` is inside the unclosed `$(`",
+            ),
+        ],
+    )
+    def test_an_opener_inside_an_unclosed_substitution_fails_closed(self, command, description):
+        """Bash starts the body after the `)`, so every line before it is a command it runs.
+
+        Consuming the body from the next line instead deletes `rm -rf /` before
+        any rule sees it. Pinned on the refusal rather than on the verdict:
+        both shapes denied before the fix too, on bashlex rejecting the
+        leftover, so a `BLOCKED` assertion would discriminate nothing.
+        """
+        with pytest.raises(ParseError, match="line that continues"):
+            val_module._neuter_heredocs(command)
 
     @pytest.mark.parametrize(
         "shell,description",

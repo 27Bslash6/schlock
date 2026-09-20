@@ -1456,9 +1456,14 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             ctx.glob = True  # a glob character; no later `[` in this word is a subscript either
             out.append(char)
             pos += 1
-        elif char == "#" and not frames and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+        elif char == "#" and not frames and not ctx.prefix and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
             # `#` is ordinary inside every frame - `${#x}`, `${x#pre}` - so the
-            # comment branch must not abandon the scan mid-expansion.
+            # comment branch must not abandon the scan mid-expansion. An open
+            # word rules it out for the same reason: `ctx.prefix` means text is
+            # already folded into the word, so `echo $(date)#x` and a `\`-continued
+            # `a\<newline>#x` are single words bash reads `#` inside. Breaking
+            # there abandons the rest of the line, and with it a `$(` that would
+            # have moved the body's start past the commands in between.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
@@ -1493,11 +1498,15 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
         ctx.fold(line, len(line))
         ctx.prefix += "\n"  # inside a quote or expansion the word continues, newline and all
 
-    if openers and (continued or frames or opener_depths[0] < len(scan.contexts)):
+    if openers and (continued or frames or min(opener_depths) < len(scan.contexts)):
         # A trailing `\`, a quote or expansion still open, or a `$(` opened
-        # after the opener and not yet closed, means this line does not finish
+        # after an opener and not yet closed, means this line does not finish
         # the command, so bash starts the body after a later line. Consuming it
         # from the next one would delete the commands between.
+        # The shallowest opener decides, not the first: in
+        # `$(cat <<'B') ; cat <<'C' $(echo` the `$(cat …)` closes before `C`, so
+        # the first opener's depth matches the line's final depth while `C` is
+        # still inside the unclosed `$(echo`.
         why = "trailing backslash" if continued else "unclosed " + (frames[-1] if frames else "$(")
         raise ParseError(f"Heredoc opener on a line that continues ({why}); the body's start is unknown")
 
