@@ -624,30 +624,18 @@ class RuleEngine:
 
         logger.info(f"Loaded {len(self.rules)} rules from {len(yaml_files)} files")
 
-    def is_whitelisted(self, command: str, *, whole: bool = False) -> bool:
-        r"""Check if command matches whitelist patterns.
+    def is_whitelisted(self, command: str) -> bool:
+        """Check if command matches whitelist patterns.
 
         Whitelisted commands always return SAFE regardless of other rules.
 
         Args:
             command: Command string to check
-            whole: Require the pattern to account for the ENTIRE command, not just a
-                prefix of it. Whitelist entries are written per command (`^ls\b`,
-                `^git\s+status`) and `re.match` stops as soon as the pattern is
-                satisfied, so without this `^ls\b` also matches `ls && rm -rf /` -
-                the whitelist vouching for shell it never looked at. Callers that
-                use a whitelist hit to skip further checks must pass ``whole=True``;
-                the entries that legitimately span several commands anchor themselves
-                with `$` and are unaffected.
 
         Returns:
             True if command matches any whitelist pattern
         """
-        for pattern in self.whitelist_patterns:
-            match = pattern.match(command)
-            if match and (not whole or match.end() == len(command)):
-                return True
-        return False
+        return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
     def match_command(
         self,

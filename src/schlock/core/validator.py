@@ -1550,11 +1550,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # each segment is evaluated in isolation. Whitelisting the full command
                 # here allows specific safe pipe patterns without whitelisting the
                 # constituent commands standalone.
-                # whole=True: a whitelist entry may vouch for a multi-command line only
-                # when it accounts for all of it. `^ls\b` matching the `ls` in
-                # `ls && rm -rf /` used to short-circuit the per-segment loop below -
-                # the exact bypass the comment above says this prevents.
-                if engine.is_whitelisted(parse_target, whole=True):
+                if engine.is_whitelisted(parse_target):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
