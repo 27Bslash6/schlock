@@ -166,16 +166,19 @@ rules:
   - name: single_delete
     description: Deleting files without backup
     risk_level: MEDIUM
-    # After `rm` and one blank, either a second blank or a flag run then a target.
-    # A second blank is a whitespace-led filename: the parser rebuilds `"rm" ' -f'`
-    # as `rm  -f`, indistinguishable from a flag with no target, and the file ` -f`
-    # really is deleted, so the ambiguity rates MEDIUM (LAB-4360, LAB-4428).
-    # `(?=\s+\S)` is what keeps a blank-only operand (`rm  `) SAFE: without it the
-    # `\s` branch would accept it. `(?:-\S*\s+)*` is linear ONLY because of the
-    # mandatory literal `-`: it pins each iteration to a fixed position. Drop it
-    # and `(?:\S*\s+)*` backtracks exponentially (146ms at 20 blanks). Disjoint
-    # `\S`/`\s` classes do not buy linearity on their own.
-    patterns: ['^rm(?=\s+\S)\s(?:\s|(?:-\S*\s+)*[^-\s])']
+    # After `rm` and one blank: a run of dash-led flags, each followed by exactly
+    # one blank, then a target, which is anything that is not a dash-led token: a
+    # non-dash char (a blank included) or a bare `-` (a filename to GNU rm). The
+    # parser joins words with a single space, so two consecutive blanks anywhere
+    # can only be a whitespace-led filename: `"rm" ' -f'` rebuilds as `rm  -f` and
+    # `"rm" -f ' -f'` as `rm -f  -f`, both indistinguishable from a flag with no
+    # target, and both delete. The ambiguity takes the higher rating at every
+    # position (LAB-4360, LAB-4428). `(?=\s+\S)` keeps a blank-only operand (`rm  `)
+    # SAFE; the blank target would accept it otherwise. Linear because each flag
+    # iteration ends in exactly one `\s`, so a run splits one way only. The earlier
+    # `^rm\s+(?:\S*\s+)*[^-\s]` shape, with a `\s+` separator and no blank target,
+    # was exponential (146ms at 20 blanks). Keep the single `\s`.
+    patterns: ['^rm(?=\s+\S)\s(?:-\S*\s)*(?:[^-]|-(?!\S))']
     alternatives: ["Backup first"]
 
   - name: git_push
