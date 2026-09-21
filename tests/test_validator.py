@@ -954,6 +954,23 @@ class TestHeredocSurroundings:
         assert result.allowed is True, f"{description}: {result.message}"
         assert result.exit_code == 0, description
 
+    @pytest.mark.parametrize("head", ["tee", "rm"])
+    @pytest.mark.parametrize("blank", [" ", "\t"], ids=["space", "tab"])
+    def test_escaped_blank_on_the_opener_line_is_not_an_operand(self, safety_rules_path, head, blank):
+        r"""`tee<<EOF > out \ ` hands tee a one-blank argument, not a file to truncate.
+
+        The restored blank (LAB-4126) reconstructs the segment to `tee  `, and
+        the file-destruction rules read the second blank as the filename,
+        rating a command that writes `ls` to a file HIGH (LAB-4360). Pinned
+        against the same command without the blank rather than to a level, so
+        a later change to the control's own verdict cannot leave this stale.
+        """
+        with_blank = validate_command(f"echo hi && {head}<<EOF > out \\{blank}\nls\nEOF", config_path=safety_rules_path)
+        without = validate_command(f"echo hi && {head}<<EOF > out\nls\nEOF", config_path=safety_rules_path)
+
+        assert with_blank.risk_level == without.risk_level, with_blank.message
+        assert with_blank.matched_rules == without.matched_rules
+
     def test_rewrite_replaces_the_body_and_the_delimiter(self):
         """The rewrite keeps structure and discards content, whatever the body's size.
 
@@ -1008,6 +1025,20 @@ class TestHeredocSurroundings:
         segments = bash_parser.extract_command_segments(neutered, bash_parser.parse(neutered))
 
         assert [val_module._HEREDOC_REDIRECT_RE.sub("", segment) for segment in segments] == expected
+
+    def test_shed_leaves_a_surviving_body_in_place(self):
+        r"""The trailing branch takes the terminator, not the body in front of it.
+
+        Nothing reaches the shed with a body today - _neuter_heredocs blanks
+        every one - so a `bash`-headed case above cannot cover this. The blob
+        _close_heredocs appends carries two newlines with the body between
+        them; the branch is written to take the LAST one, and the `\s*` inside
+        it is then zero-width. Pinned directly so a body-preserving rewrite
+        finds the guard already holding.
+        """
+        stripped = val_module._HEREDOC_REDIRECT_RE.sub("", "bash <<SCHLOCK_HEREDOC\necho hi\nSCHLOCK_HEREDOC")
+
+        assert stripped == "bash\necho hi"
 
     def test_shed_does_not_delete_a_caller_written_placeholder(self, safety_rules_path):
         """The placeholder is a fixed, published string, so a command may contain it.

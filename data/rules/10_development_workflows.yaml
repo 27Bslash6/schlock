@@ -166,7 +166,7 @@ rules:
   - name: single_delete
     description: Deleting files without backup
     risk_level: MEDIUM
-    patterns: ['^rm\s+[^-]']
+    patterns: ['^rm\s+[^-\s]']
     alternatives: ["Backup first"]
 
   - name: git_push

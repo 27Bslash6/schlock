@@ -6,7 +6,9 @@ This test suite ensures EVERY pattern in safety_rules.yaml has:
 - Edge cases and variations
 """
 
-from schlock.core.rules import RiskLevel
+import pytest
+
+from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import validate_command
 
 
@@ -399,10 +401,19 @@ class TestMediumPatternCoverage:
             "rm file.txt",
             "rm /tmp/test.log",
             "rm data.json",
+            # Several blanks before the target are still one target.
+            "rm   data.json",
         ]
         for cmd in commands:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.MEDIUM, f"Single delete not MEDIUM: {cmd}"
+
+    @pytest.mark.parametrize("reconstructed", ["rm  ", "rm \t"], ids=["space", "tab"])
+    def test_single_delete_needs_a_non_blank_target(self, safety_rules_path, reconstructed):
+        r"""`rm<<EOF > out \ ` reconstructs to `rm  `; bare whitespace is not a file (LAB-4360)."""
+        match = RuleEngine(safety_rules_path).match_command(reconstructed)
+
+        assert match.risk_level == RiskLevel.SAFE, match.message
 
     def test_git_operations_patterns(self, safety_rules_path):
         """Test git push/merge/rebase pattern matching."""

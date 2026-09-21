@@ -6,7 +6,7 @@ including disk destruction, filesystem manipulation, and permission attacks.
 
 import pytest
 
-from schlock.core.rules import RiskLevel
+from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import validate_command
 
 
@@ -541,6 +541,8 @@ class TestP0FileTruncation:
             "echo -n > file.log",
             "printf '' > data.log",
             "cat input | tee output.log",
+            # Several blanks before the operand are still one operand.
+            "tee   output.log",
         ],
     )
     def test_file_truncation_blocked(self, safety_rules_path, command):
@@ -558,6 +560,25 @@ class TestP0FileTruncation:
         """Append operations should be allowed."""
         result = validate_command("echo 'data' >> file.log", config_path=safety_rules_path)
         assert result.allowed
+
+    @pytest.mark.parametrize(
+        "reconstructed",
+        ["tee  ", "tee \t", ">  ", "> \t"],
+        ids=["tee space", "tee tab", "redirect space", "redirect tab"],
+    )
+    def test_blank_operand_is_not_a_filename(self, safety_rules_path, reconstructed):
+        r"""Bare whitespace after the head is no file to truncate.
+
+        `tee<<EOF > out \ ` hands tee a one-blank argument, and the segment
+        reconstructs to `tee  ` - the same text as `tee` with trailing blanks.
+        The rule used to read the second blank as the filename and rate a
+        command that writes `ls` to a file HIGH (LAB-4360). The operand has to
+        begin with a non-blank character; the redirect spelling is tightened
+        the same way for parity.
+        """
+        match = RuleEngine(safety_rules_path).match_command(reconstructed)
+
+        assert match.risk_level == RiskLevel.SAFE, match.message
 
 
 class TestP0NetworkServiceExposure:
