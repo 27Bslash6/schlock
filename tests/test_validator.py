@@ -52,6 +52,19 @@ class TestValidator:
         if not should_allow:
             assert result.exit_code == 1
 
+    @pytest.mark.parametrize("blank", [" ", "\t"], ids=["space", "tab"])
+    def test_escaped_blank_between_segments_keeps_quote_context(self, safety_rules_path, monkeypatch, blank):
+        r"""A segment ending in an escaped blank still parses, so its quoted text stays inert.
+
+        Stripping the segment used to leave `echo 'rm -rf /' \`, which parses
+        nowhere; the rule engine then saw the quoted `rm -rf /` as bare text.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        result = validate_command(f"echo 'rm -rf /' \\{blank}; ls", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.SAFE, result.message
+        assert result.allowed is True
+
     def test_validate_with_alternatives(self, safety_rules_path):
         """Alternatives populated for blocked commands."""
         result = validate_command("rm -rf /", config_path=safety_rules_path)
@@ -697,6 +710,9 @@ rules:
 class TestHeredocSurroundings:
     """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
 
+    Also covers the LAB-1732 seam: segments close their own heredocs now, so the
+    shed below has to account for the terminator as well as the redirection.
+
     bashlex cannot parse a quoted heredoc delimiter, so these commands take the
     `_validate_heredoc_command` fallback. It used to check the first word against
     the whitelist and return, leaving every command after the terminator - and
@@ -759,6 +775,15 @@ class TestHeredocSurroundings:
             # nor by carrying a literal `<<` argument.
             ("ls << 'X'\nX\nchmod -R 777 / << 'Y'\nY", "the dangerous command owns the second heredoc"),
             ("ls << 'X'\nX\nchmod -R 777 / \"<<\"", "a literal `<<` argument does not hide a segment"),
+            # An escaped blank ending the opener line is a one-blank argument, not
+            # a continuation. Stripping the segment used to leave a dangling
+            # `ls \` that parses nowhere, denying the benign spelling; the fix
+            # must not also lose sight of what follows the terminator (LAB-4126).
+            ("ls <<'EOF' \\ \nx\nEOF\nrm -rf /", "escaped trailing space on the opener line, rm after"),
+            ("ls <<'EOF' \\\t\nx\nEOF\nrm -rf /", "escaped trailing tab on the opener line, rm after"),
+            # Pinned with the danger after the opener: `rm -rf / <<'EOF' \ ` is
+            # denied on the base command alone and never reaches the fallback.
+            ("chmod -R 777 <<'EOF' / \\ \nx\nEOF", "the dangerous command itself ends in an escaped space"),
         ],
     )
     def test_dangerous_command_around_heredoc_is_blocked(self, safety_rules_path, command, description):
@@ -912,6 +937,13 @@ class TestHeredocSurroundings:
             ("cat <<'A' > f1\nx\nA\ncat <<'B' > f2\ny\nB", RiskLevel.LOW, "two files written in one call"),
             ("python3 << 'EOF'\nprint(1)\nEOF", RiskLevel.LOW, "python heredoc"),
             ("ssh host << 'EOF'\nuptime\nEOF", RiskLevel.LOW, "ssh heredoc"),
+            # `\ ` and `\<tab>` at the end of the opener line: bash hands the
+            # command a one-blank argument. Same verdict as without it (LAB-4126).
+            ("cat <<'EOF' \\ \nhello\nEOF", RiskLevel.LOW, "escaped trailing space on the opener line"),
+            ("cat <<'EOF' \\\t\nhello\nEOF", RiskLevel.LOW, "escaped trailing tab on the opener line"),
+            ("ls <<'EOF' \\ \nx\nEOF", RiskLevel.SAFE, "escaped trailing space, whitelisted head"),
+            ("cat <<'EOF' \\\\ \nhello\nEOF", RiskLevel.LOW, "a literal backslash argument is not an escape"),
+            ("cat \\ <<'EOF'\nhello\nEOF", RiskLevel.LOW, "escaped space in front of the redirection"),
         ],
     )
     def test_legitimate_heredoc_keeps_its_verdict(self, safety_rules_path, command, expected_risk, description):
@@ -944,6 +976,55 @@ class TestHeredocSurroundings:
         """
         with pytest.raises(ParseError):
             val_module._neuter_heredocs("echo hello")
+
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            ("cat <<'EOF'\nhello\nEOF", ["cat"]),
+            # A redirect after the opener must survive; only the heredoc goes.
+            ("cat <<'EOF' > out.txt\nhello\nEOF", ["cat > out.txt"]),
+            # The dangerous command survives the shed intact, so it still reaches
+            # validate_command as itself (its verdict is pinned separately).
+            ("chmod -R 777 / <<'Y'\nx\nY", ["chmod -R 777 /"]),
+            ("ls <<'EOF'\nx\nEOF\nrm -rf /", ["ls", "rm -rf /"]),
+            ("cat <<'A' <<'B'\n1\nA\n2\nB", ["cat"]),
+            # Inside a compound the placeholder body carries one newline, not two.
+            ("for f in a b; do cat <<'EOF'\nx\nEOF\ndone", ["cat"]),
+            ("cat <<-'EOF'\n\tx\n\tEOF\necho ok", ["cat", "echo ok"]),
+        ],
+    )
+    def test_segment_sheds_the_whole_rewritten_heredoc(self, command, expected):
+        """A segment carries its heredoc body (LAB-1732), so shedding the
+        redirection alone leaves the placeholder terminator stuck on the end.
+
+        This is the seam between the two fixes: `_escalate_past_heredoc` feeds
+        candidates to `validate_command`, and `cat\n\nSCHLOCK_HEREDOC` is not
+        the command anyone meant to validate. The verdict often survives the
+        mistake, which is exactly why the shape is pinned here rather than a
+        risk level somewhere downstream.
+        """
+        neutered, _ = val_module._neuter_heredocs(command)
+        bash_parser = parser.BashCommandParser()
+        segments = bash_parser.extract_command_segments(neutered, bash_parser.parse(neutered))
+
+        assert [val_module._HEREDOC_REDIRECT_RE.sub("", segment) for segment in segments] == expected
+
+    def test_shed_does_not_delete_a_caller_written_placeholder(self, safety_rules_path):
+        """The placeholder is a fixed, published string, so a command may contain it.
+
+        Spliced across line continuations, `rm \\<nl>SCHLOCK_HEREDOC\\<nl> -rf /`
+        is a single command to bash. Deleting that token mid-segment would rejoin
+        `rm` to `-rf /` with the run the rules match on torn apart, so the shed is
+        anchored to the end of the segment - the only place _close_heredocs ever
+        puts one. The whitelisted `ls` head and the quoted delimiter are load
+        bearing: together they are what routes this through the fallback.
+        """
+        command = "ls <<'Q'\nx\nQ\nrm \\\nSCHLOCK_HEREDOC\\\n -rf /"
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED, result.message
+        assert result.allowed is False
 
     def test_escalation_does_not_revalidate_an_unchanged_command(self, safety_rules_path, monkeypatch):
         """A rewrite that changed nothing would re-enter this fallback forever.
