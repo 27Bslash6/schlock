@@ -556,6 +556,13 @@ class TestAQuotedOperandIsStillAnOperand:
             "cut -d= -f2 .env.example # don't edit\nexport KUBECONFIG=~/.kube/config",
             # No separator crossed at all -- only whitespace.
             "head -20 build.log  # it's the .npmrc problem",
+            # TWO apostrophes, on DIFFERENT lines, pairing as one quoted span so
+            # the RUN (not the tail) crosses the line break between them. The
+            # run's single-quoted branch will not open on a quote inside a word,
+            # which is what tells `we're` from `cat 'a b'`.
+            "sort -u hosts.txt # we're deduping\n# don't edit ~/.kube/config",
+            "head -20 build.log  # it's noisy\necho done  # don't forget ~/.npmrc",
+            "cut -c1-80 log.txt # user's notes\n# isn't ~/.ssh/id_ed25519 the key",
             "nl README.md  # we don't commit ~/.npmrc",
             "cut -c1-80 log.txt  # user's ~/.kube/config is fine",
             'head -5 log.txt  # size is 5" wide ~/.npmrc',
