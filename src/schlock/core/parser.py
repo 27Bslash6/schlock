@@ -341,12 +341,12 @@ class CommandSegment(NamedTuple):
     """
 
     text: str
-    string_literals: list[tuple]
-    heredoc_ranges: list[tuple]
+    string_literals: list[tuple[int, int]]
+    heredoc_ranges: list[tuple[int, int, bool]]
+    # The segment's own node in the PARENT AST. Its word spans index the whole
+    # command, not `text` - see validator._match_original_and_reconstructed's
+    # `quote_source`, which is the reason this is handed back at all.
     node: Any
-    """The segment's own node in the PARENT AST. Its word spans index the whole
-    command, not `text` - see validator._match_original_and_reconstructed's
-    `quote_source`, which is the reason this is handed back at all."""
 
 
 class BashCommandParser:
@@ -659,6 +659,9 @@ class BashCommandParser:
         """
         start, end = node.pos
         if start >= len(command) or end > len(command):
+            # Dropping a segment means nothing validates it, which is the
+            # fail-OPEN direction - so it must not happen silently.
+            logger.warning("Segment span (%d, %d) outside command of length %d; segment not validated", start, end, len(command))
             return None
         raw = command[start:end]
         text = raw.strip()
@@ -679,6 +682,7 @@ class BashCommandParser:
         if (len(text) - len(text.rstrip("\\"))) % 2:
             text += " "
         if not text:
+            logger.warning("Segment span (%d, %d) is blank after stripping; segment not validated", start, end)
             return None
         return text, start + (len(raw) - len(raw.lstrip()))
 
@@ -704,7 +708,7 @@ class BashCommandParser:
         """
         return [segment.text for segment in self.extract_command_segments_with_literals(command, ast_nodes)]
 
-    def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[tuple[str, list[tuple], Any]]:
+    def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[CommandSegment]:
         """Segments, their quoted-string ranges, and their own AST node — from ONE parse.
 
         PERF/SECURITY: the segment loop in `validate_command` used to re-parse
