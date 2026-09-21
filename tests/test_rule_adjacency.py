@@ -467,6 +467,84 @@ class TestCredentialRulesDoNotOverReach:
         assert verdict(command, rules_dir_path).allowed, command
 
 
+class TestAQuotedOperandIsStillAnOperand:
+    """A credential path is routinely written INSIDE a quoted word, and the
+    reader-to-path span has to be able to stop there.
+
+    Its four branches all consume WHOLE words -- a quoted branch demands its
+    closing quote -- so the run alone could only ever end BETWEEN words. One
+    quote character round the operand therefore hid the path from every one of
+    these rules: `cat "$HOME/.ssh/id_ed25519"` rated SAFE with no matched rule,
+    while the identical unquoted read was BLOCKED.
+
+    `main` denied all of these, because the `.{0,200}` these branches replaced
+    crossed a quote without caring. That makes it LOST protection, not an
+    unclosed hole, and it is why the span now carries an unterminated tail.
+    """
+
+    # Every credential path this file owns, in the spellings bash accepts
+    # for the same read. `~` is NOT expanded inside quotes, so the quoted tilde
+    # forms are inert in a real shell -- `$HOME` and an absolute path are the
+    # spellings that actually reach the secret, and both are pinned here.
+    QUOTED_READS = [
+        'cat "$HOME/.ssh/id_ed25519"',
+        "cat '/home/u/.ssh/id_ed25519'",
+        'nl "$HOME/.ssh/id_rsa"',
+        'sed -n 1p "$HOME/.ssh/identity"',
+        'base64 "$HOME/.ssh/id_ecdsa"',
+        'cat "/home/u/.kube/config"',
+        'cat "$HOME/.npmrc"',
+        'cat "$HOME/.netrc"',
+        "cat '$HOME/.git-credentials'",
+        'cat "$HOME/.pypirc"',
+        'jq . "$HOME/.docker/config.json"',
+        'cat "$HOME/.aws/credentials"',
+        'cat "$HOME/.ssh/config"',
+        # The quote need not wrap the whole word.
+        'cat ~/".ssh/id_ed25519"',
+        "cat \"$HOME\"'/.ssh/id_rsa'",
+        # An unterminated quote is what bash itself is left holding on a
+        # continuation line; the read is real either way.
+        'cat "$HOME/.ssh/id_ed25519',
+        # An escaped quote INSIDE the credential word. The tail carries the same
+        # escape branch as the run above it for exactly this, and the asymmetry
+        # would be a one-character bypass: a plain `"[^"]*` tail ends at the
+        # ESCAPED quote and dies before the path. Note the paths -- `id_rsa` and
+        # `.aws/credentials` are covered by sibling rules whatever the span does,
+        # so they pin nothing here and only these spellings kill the mutant.
+        'cat "$HOME/a\\"b/.ssh/id_ed25519"',
+        'cat "x\\"y/.kube/config"',
+        'head "a\\"b/.npmrc"',
+        # The span still has to get PAST earlier operands to reach this one.
+        'cat "a b" "$HOME/.ssh/id_rsa"',
+        "cat 'a b' \"$HOME/.ssh/id_rsa\"",
+        'cat a\\ b "$HOME/.ssh/id_rsa"',
+        'cat "a\nb" "$HOME/.ssh/id_rsa"',
+        'cat "a\\"b" "$HOME/.ssh/id_rsa"',
+        'cat -- "$HOME/.ssh/id_rsa"',
+    ]
+
+    @pytest.mark.parametrize("command", QUOTED_READS)
+    def test_a_quoted_credential_operand_is_blocked(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The tail starts at a real quote and its interior stops at the
+            # matching close, so it cannot be used to walk over a separator that
+            # sits OUTSIDE quotes. `ls` is not a reader and emits no contents.
+            'cat "x" ; ls ~/.kube/config',
+            "cat 'x' ; ls ~/.npmrc",
+            'cat "x" && ls ~/.netrc',
+            'cat "x" | ls ~/.pypirc',
+        ],
+    )
+    def test_the_tail_does_not_walk_past_a_real_separator(self, command, rules_dir_path):
+        """Reaching into a quote must not also mean reaching across a `;`."""
+        assert verdict(command, rules_dir_path).allowed, command
+
+
 class TestTheBoundaryDoesNotUnrateARealFile:
     """The other side of the boundary above, and the load-bearing one.
 
@@ -806,6 +884,24 @@ class TestKeyNamesAndPublicKeys:
         """Reader-dependent verdicts on the same file are the defect this ticket
         exists to remove, so the legacy cat-only rule gets the same exclusion."""
         assert verdict(f"{reader} {path}", rules_dir_path).allowed
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The guard ended at `(?:\s|$)`, so a closing quote where it wanted
+            # whitespace disarmed it and a PUBLIC key became a hard deny. `main`
+            # denies all of these; nothing but the quote distinguishes them from
+            # the allowed spellings above.
+            'cat "~/.ssh/id_rsa.pub"',
+            "cat '~/.ssh/id_rsa.pub'",
+            'nl "$HOME/.ssh/id_ed25519.pub"',
+            "base64 '/home/u/.ssh/id_ecdsa.pub'",
+        ],
+    )
+    def test_a_quoted_public_key_is_allowed_too(self, command, rules_dir_path):
+        """BLOCKED is unrelaxable by every preset, so a false positive here is
+        not a nuisance -- it is an everyday command no user can get back."""
+        assert verdict(command, rules_dir_path).allowed, command
 
     @pytest.mark.parametrize(
         "command",
