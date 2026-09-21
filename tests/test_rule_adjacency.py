@@ -21,7 +21,9 @@ because BLOCKED is unrelaxable by every preset and the guard denied `vim ~/.npmr
 are pinned here so the idea cannot come back unmeasured.
 """
 
+import re
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -500,12 +502,13 @@ class TestAQuotedOperandIsStillAnOperand:
         'jq . "$HOME/.docker/config.json"',
         'cat "$HOME/.aws/credentials"',
         'cat "$HOME/.ssh/config"',
-        # The quote need not wrap the whole word.
-        'cat ~/".ssh/id_ed25519"',
-        "cat \"$HOME\"'/.ssh/id_rsa'",
-        # An unterminated quote is what bash itself is left holding on a
-        # continuation line; the read is real either way.
-        'cat "$HOME/.ssh/id_ed25519',
+        # The quote need not wrap the whole word. Both spellings below are
+        # SAFE at the PR head, so they discriminate -- the earlier pair here
+        # did not: `cat ~/".ssh/id_ed25519"` is rescued by the validator's
+        # reconstruction pass, and `"$HOME"'/.ssh/id_rsa'` is owned by
+        # `credential_exposure` whatever the span does.
+        "nl \"$HOME\"'/.kube/config'",
+        'cat ~/".npmrc"',
         # An escaped quote INSIDE the credential word. The tail carries the same
         # escape branch as the run above it for exactly this, and the asymmetry
         # would be a one-character bypass: a plain `"[^"]*` tail ends at the
@@ -516,12 +519,15 @@ class TestAQuotedOperandIsStillAnOperand:
         'cat "x\\"y/.kube/config"',
         'head "a\\"b/.npmrc"',
         # The span still has to get PAST earlier operands to reach this one.
-        'cat "a b" "$HOME/.ssh/id_rsa"',
-        "cat 'a b' \"$HOME/.ssh/id_rsa\"",
-        'cat a\\ b "$HOME/.ssh/id_rsa"',
-        'cat "a\nb" "$HOME/.ssh/id_rsa"',
-        'cat "a\\"b" "$HOME/.ssh/id_rsa"',
-        'cat -- "$HOME/.ssh/id_rsa"',
+        # `id_ed25519`, NOT `id_rsa`: the legacy `credential_exposure` pattern
+        # matches `id_rsa` with its own `.{0,200}` run, so an `id_rsa` case here
+        # stays BLOCKED however badly the span is broken and pins nothing.
+        'cat "a b" "$HOME/.ssh/id_ed25519"',
+        "cat 'a b' \"$HOME/.ssh/id_ed25519\"",
+        'cat a\\ b "$HOME/.ssh/id_ed25519"',
+        'cat "a\nb" "$HOME/.ssh/id_ed25519"',
+        'cat "a\\"b" "$HOME/.ssh/id_ed25519"',
+        'cat -- "$HOME/.ssh/id_ed25519"',
     ]
 
     @pytest.mark.parametrize("command", QUOTED_READS)
@@ -587,6 +593,26 @@ class TestAQuotedOperandIsStillAnOperand:
     @pytest.mark.parametrize(
         "command",
         [
+            # Reaching into a quoted operand also reaches a quoted `.pub`, and
+            # the guard has to survive the trip: these are PUBLIC keys and were
+            # hard denials on `main`, where the guard's `(?:\s|$)` never fired
+            # because a quote sat where it wanted whitespace.
+            'cat "~/.ssh/id_rsa.pub"',
+            "cat '~/.ssh/id_rsa.pub'",
+            'nl "$HOME/.ssh/id_ed25519.pub"',
+            "base64 '/home/u/.ssh/id_ecdsa.pub'",
+        ],
+    )
+    def test_a_quoted_public_key_is_allowed(self, command, rules_dir_path):
+        """The guard ends at `["']?(?:\\s|$)` -- an optional quote that must
+        STILL be followed by whitespace or end. Dropping the `(?:\\s|$)` and
+        accepting a bare quote is what let `.pub''` disarm it mid-brace, which
+        the test above pins."""
+        assert verdict(command, rules_dir_path).allowed, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             # A `.pub` appended inside a brace expansion disarms the guard for a
             # DIFFERENT expanded word: this is `~/.ssh/id_rsa` plus `~/.ssh/.pub`,
             # and `cat` prints the private key. Pinned because an earlier cut of
@@ -603,6 +629,25 @@ class TestAQuotedOperandIsStillAnOperand:
         disables the validator's reconstruction rescue and leaves the pattern as
         the only cover."""
         assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
+
+
+class TestTheSharedSpanIsEditedInEveryCopy:
+    """The reader-to-path span is one design repeated verbatim in three
+    patterns, and this file's history is of a partial edit to it landing
+    silently. Only one of the three is reachable by most single-pattern
+    mutations, so the suite alone cannot see a copy drifting.
+
+    This asserts the three are byte-identical rather than asserting any
+    behaviour, which is the cheap half of the problem and the half that keeps
+    recurring.
+    """
+
+    def test_all_three_copies_are_byte_identical(self, rules_dir_path):
+        text = (Path(rules_dir_path) / "03_credential_theft.yaml").read_text()
+        # the run plus its unterminated tail, up to the credential alternation
+        spans = re.findall(r"\(\?:\\\\\[\\s\\S\].*?\)\?", text)
+        assert len(spans) == 3, f"expected 3 copies of the span, found {len(spans)}"
+        assert len(set(spans)) == 1, "the three copies of the span have drifted apart"
 
 
 class TestTheBoundaryDoesNotUnrateARealFile:
