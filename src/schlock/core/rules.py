@@ -745,9 +745,10 @@ class RuleEngine:
         lines) AND under-blocks, because `validate_command` only runs its
         cross-segment scan when no segment matched, so a bogus segment match hides
         a `BLOCKED` the whole command would have earned. Returning None instead just
-        lets padding silence the rule. Measured, the bound bought ~1%: on a 229 KB
-        padded command the loop is 13.1 s bounded vs 13.1 s unbounded, against 12.9 s
-        on a tree without this scan at all - the superlinearity is elsewhere.
+        lets padding silence the rule. Measured on the pre-merge tree the bound
+        bought ~1%; the absolute cost has moved since, so the durable figure is the
+        ratio, not the seconds - this scan is a rounding error against a
+        superlinearity that is pre-existing and lives elsewhere.
         Termination is structural: `pos` strictly increases every iteration.
         """
         pos = 0

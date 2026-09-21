@@ -4,6 +4,10 @@ Regression test to ensure that pattern matches are only ignored if the
 ENTIRE match (both start AND end) falls within a string literal.
 
 Also tests FIX 2: Empty quoted string range bug fix.
+
+LAB-4321: suppression is per-occurrence - a suppressed decoy must not disable
+its rule for the rest of the command.
+LAB-1732: a quoted token must not disable the quote-stripped reconstructed pass.
 """
 
 import re
@@ -255,10 +259,12 @@ class TestSuppressionIsPerOccurrence:
             # the newline stops the pattern spanning both, and the payload after
             # it was never looked at. Rated SAFE and ALLOWED before the fix.
             ("cat '{bomb}'\n{bomb}", "quoted decoy, payload on the next line"),
-            # Blocked on `main` only by accident - it cannot derive a literal for
-            # the segment, so it matches the DECOY rather than the payload. Once
-            # the heredoc's ranges are rebased off the parent AST the decoy is
-            # correctly suppressed, which is what un-gated the defect.
+            # LIVE on `main` today, rated LOW and ALLOWED. It was BLOCKED at the
+            # merge-base only by accident - `main` could not derive a literal for
+            # the segment, so it matched the DECOY rather than the payload. Then
+            # LAB-1732 taught the parser that quoted data IS data, correctly
+            # suppressed the decoy, and un-gated this defect on `main` itself.
+            # The per-occurrence scan is now the only thing reaching the payload.
             ("cat '{bomb}' <<'EOF'\nbody\nEOF\n{bomb}", "canonical opener"),
         ],
     )
@@ -310,8 +316,14 @@ class TestSuppressionIsPerOccurrence:
         A bounded scan has to report something on exhaustion and both answers are
         wrong: the last suppressed match denies benign text and masks a higher
         verdict elsewhere in the command, while None lets padding silence the rule.
-        40 repeats is past any bound worth writing; 31 is inside one, so the pair
-        fails on a bounded implementation and passes on an exact one.
+        40 repeats is past any bound worth writing.
+
+        These rows pin the FIRST answer only. A bound returning None survives them:
+        the padded `pip` patterns do exhaust, but `fork_bomb` matches on its first
+        iteration, so None silences only the LOW/MEDIUM pip rules and never moves
+        the BLOCKED verdict. Pinning the None direction needs a command whose sole
+        dangerous match is itself preceded by a suppressed one - filed separately,
+        not added here: new coverage does not belong in a conflict resolution.
         """
         padding = " ".join(["sudo apt-get install -y pkg" if unit is None else unit] * 40)
         command = f"echo '{padding}'" + ("" if unit is None else f" && {self.FORK_BOMB}")
