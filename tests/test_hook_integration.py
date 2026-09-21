@@ -31,6 +31,7 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
+from schlock.core.parser import MAX_COMMAND_SIZE
 from schlock.integrations.commit_filter import CommitMessageFilter
 
 
@@ -545,3 +546,20 @@ class TestUnscannableMessageHookHandling:
         assert block_calls, "expected a block audit entry on validation error"
         joined = " ".join(block_calls[-1].kwargs["violations"]).lower()
         assert "unscannable" in joined  # warn detection survives the error-deny path
+
+
+class TestSizeCeilingAtHook:
+    """An over-ceiling command reaches the hook as a deny verdict, not a swallowed error (LAB-4363)."""
+
+    def test_over_ceiling_command_denied(self):
+        command = "echo hello && " * (MAX_COMMAND_SIZE // 14 + 1)
+        assert len(command) > MAX_COMMAND_SIZE
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+
+        out = response["hookSpecificOutput"]
+        assert out["permissionDecision"] == "deny"
+        assert "BLOCKED:" in out["permissionDecisionReason"]
+        assert "exceeds" in out["permissionDecisionReason"]
+        assert str(MAX_COMMAND_SIZE) in out["permissionDecisionReason"]
+        assert "Validation error" not in out["permissionDecisionReason"]
+        assert "Risk Level: BLOCKED" in out["permissionDecisionReason"]

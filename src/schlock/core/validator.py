@@ -23,7 +23,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser
+from .parser import MAX_COMMAND_SIZE, WRAPPER_COMMANDS, BashCommandParser
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidator
 
@@ -1317,6 +1317,17 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         >>> print(result.exit_code)  # 1
     """
     try:
+        # Step 0: Size ceiling, before the cache hashes the input and before any parse or rule
+        # pass. Fail closed: deny and say why. Not cached — a denial this cheap gains nothing.
+        if len(command) > MAX_COMMAND_SIZE:
+            return ValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=(f"BLOCKED: Command size {len(command)} characters exceeds the {MAX_COMMAND_SIZE} character limit"),
+                alternatives=["Split the command into smaller steps or move the payload into a file"],
+                exit_code=1,
+            )
+
         # Step 1: Check cache
         cached = _global_cache.get(command)
         if cached is not None:

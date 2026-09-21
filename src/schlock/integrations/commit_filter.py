@@ -39,10 +39,9 @@ from typing import Any, Optional
 import bashlex
 import bashlex.errors
 
-logger = logging.getLogger(__name__)
+from schlock.core.parser import MAX_COMMAND_SIZE  # shared ceiling; this module stays fail-open
 
-# Size limit to prevent DoS via huge commands (64KB is generous for commit messages)
-MAX_COMMAND_SIZE = 64 * 1024
+logger = logging.getLogger(__name__)
 
 # git GLOBAL options that consume the FOLLOWING word as a value, in separate-word form (issue
 # #82). When one precedes the subcommand (e.g. `git -C <path> commit`), the next token is its

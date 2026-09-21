@@ -17,6 +17,14 @@ from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
 
+# Input-size ceiling, in characters, for anything that hands a command to bashlex. Parse + rule
+# matching cost ~64 ms/KB (linear, no fast path) and Claude Code PreToolUse hooks FAIL OPEN on
+# timeout, so an unbounded input is a bypass class, not a slowdown. validate_command enforces it
+# fail-CLOSED (deny); commit_filter reads the same number but stays fail-open locally, by design
+# (docs/specs/2026-07-21-native-parser-migration.md §5). Lives here, not in validator, because
+# integrations.commit_filter imports it and validator -> integrations -> commit_filter is a cycle.
+MAX_COMMAND_SIZE = 64 * 1024
+
 
 # Each AND-OR list operator and the `simple_list1` production its `$( … )` close should reduce
 # through (discovered by table-walk, never by hardcoded index). The 4-symbol AND_AND/OR_OR rules

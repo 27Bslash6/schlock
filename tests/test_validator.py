@@ -3,6 +3,8 @@
 Also includes FIX 5: matched_rules field population test.
 """
 
+import time
+
 import pytest
 
 import schlock.core.validator as val_module
@@ -1052,3 +1054,69 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+def _over_ceiling(shape: str) -> str:
+    """Grow one of the three measured shapes (LAB-4363) just past MAX_COMMAND_SIZE."""
+    builders = {
+        "echo_chain": lambda n: " && ".join(["echo hello"] * n),
+        "assign_lines": lambda n: "\n".join(f"x{i}=1" for i in range(n)) + "\nls",
+        "arith_shift": lambda n: "(( 1<<b ))\n" * n + "ls",
+    }
+    n = 1000
+    while len(cmd := builders[shape](n)) <= val_module.MAX_COMMAND_SIZE:
+        n *= 2
+    return cmd
+
+
+class TestSizeCeiling:
+    """validate_command denies over-ceiling input before parsing it (LAB-4363).
+
+    Parse + rules cost ~64 ms/KB and PreToolUse hooks fail open on timeout, so the ceiling is a
+    security bound, not a nicety. Fail-closed here; commit_filter's copy of the same constant
+    stays fail-open by design.
+    """
+
+    @pytest.mark.parametrize("shape", ["echo_chain", "assign_lines", "arith_shift"])
+    def test_over_ceiling_denied_naming_size_and_limit(self, safety_rules_path, shape):
+        cmd = _over_ceiling(shape)
+        result = validate_command(cmd, config_path=safety_rules_path)
+        assert not result.allowed
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.exit_code == 1
+        assert result.error is None  # a verdict, not an internal failure
+        assert str(len(cmd)) in result.message
+        assert str(val_module.MAX_COMMAND_SIZE) in result.message
+
+    def test_boundary_is_strictly_greater_than(self, safety_rules_path, monkeypatch):
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 8)
+        at_limit = validate_command("ls -la -h", config_path=safety_rules_path)  # 9 > 8
+        assert not at_limit.allowed
+        assert "exceeds" in at_limit.message
+        under = validate_command("ls -la -", config_path=safety_rules_path)  # 8, not over
+        assert "exceeds" not in under.message
+
+    def test_guard_runs_before_cache_parser_and_rules(self, safety_rules_path, monkeypatch):
+        cmd = _over_ceiling("echo_chain")
+        # A poisoned cache entry must not win: the guard sits in front of the lookup.
+        val_module._global_cache.set(cmd, ValidationResult(allowed=True, risk_level=RiskLevel.SAFE, message="poisoned"))
+        for name in ("_get_parser", "_get_rule_engine", "_check_special_cases"):
+            monkeypatch.setattr(val_module, name, lambda *a, _n=name, **k: pytest.fail(f"{_n} reached on over-ceiling input"))
+        result = validate_command(cmd, config_path=safety_rules_path)
+        assert not result.allowed
+        assert "exceeds" in result.message
+        val_module._global_cache.clear()
+
+    def test_over_ceiling_is_not_cached(self, safety_rules_path):
+        cmd = _over_ceiling("assign_lines")
+        validate_command(cmd, config_path=safety_rules_path)
+        assert val_module._global_cache.get(cmd) is None
+
+    @pytest.mark.slow
+    def test_one_megabyte_is_constant_time(self, safety_rules_path):
+        cmd = "echo hello && " * (1024 * 1024 // 14)
+        start = time.perf_counter()
+        result = validate_command(cmd, config_path=safety_rules_path)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        assert not result.allowed
+        assert elapsed_ms < 50, f"over-ceiling denial took {elapsed_ms:.1f} ms"
