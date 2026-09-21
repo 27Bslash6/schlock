@@ -147,9 +147,9 @@ def _parse_all_substitution_units(
 
     Fail closed by construction: a unit that does not parse raises exactly as it does today; a
     body with nothing to parse (stock bashlex handed back the bare ``'\n'`` string for ``` ` ` ```
-    and crashed on ``.pos``), a unit ending on a token that is not a newline, ``)`` or EOF, and a
-    ``$( )`` or ``<( )`` body that runs out before its ``)`` all raise ``ParsingError``, so they take
-    the normal deny path.
+    and crashed on ``.pos``), a unit ending on a token that is neither a newline nor the body's own
+    closer (``)`` for ``$( )`` and ``<( )``, EOF for backticks), and a ``$( )`` or ``<( )`` body that
+    runs out before its ``)`` all raise ``ParsingError``, so they take the normal deny path.
     """
     tok = parserobj.tok
     if tokenizerargs is None:
@@ -165,24 +165,19 @@ def _parse_all_substitution_units(
 
     newline_type = bashlex.tokenizer.tokentype.NEWLINE
     eof_type = bashlex.tokenizer.tokentype.EOF
-    unit_end_types = (eof_type, bashlex.tokenizer.tokentype.RIGHT_PAREN)
-    # ``_parsedolparen`` names ``)`` as the closer of a ``$( )`` / ``<( )`` body; a backtick body has
-    # no closer and legitimately ends at EOF.
+    # ``_parsedolparen`` passes ``)`` as ``eoftoken`` for a ``$( )`` / ``<( )`` body; the backtick branch passes none.
     closer: Any = tokenizerargs.get("eoftoken")
+    body_end_type = closer.ttype if closer is not None else eof_type
     string = base[sindex:]
     parts: list[Any] = []
     offset = 0
 
     def body_ended(token: Any) -> bool:
-        """True at the closing ``)`` or, for a backtick body, at its end.
-
-        The word delimiter promised the ``)`` is in the body, so running out of input first means
-        the two scanners disagreed about where the body ends. Handing back the units parsed so far
-        would repeat the LAB-4114 shape - a prefix rated in place of the whole - so deny instead.
-        """
+        """A body ends only at its own closer. EOF inside a ``$( )`` body means the word delimiter and
+        the unit tokenizer disagreed about where it ends: deny rather than rate the prefix (LAB-4114)."""
         if closer is not None and token.ttype is eof_type:
             raise bashlex.errors.ParsingError(f"unexpected EOF while looking for matching {closer.value!r}", string, len(string))
-        return token.ttype in unit_end_types
+        return token.ttype is body_end_type
 
     while True:
         # ``_parser`` pops ``parserstate`` out of the dict it is given and the tokenizer mutates
@@ -201,7 +196,7 @@ def _parse_all_substitution_units(
 
         terminator: Any = unit.tok._current_token
         if body_ended(terminator):
-            break  # the unit ended at the closing ``)`` or at the end of a backtick body
+            break  # the unit ended at its ``)``; EOF never lands here (yacc reads it as $end), only at the peek below
         if terminator.ttype is not newline_type:
             # Only a newline, ``)`` or EOF can end an ``inputunit``. Anything else means the grammar
             # moved under us; handing back the prefix would silently drop the rest of the body.

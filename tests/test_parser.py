@@ -676,6 +676,9 @@ class TestMultilineSubstitutionCorrection:
             "echo $(echo ok\n",
             "echo <(echo ok\n",
             "echo `echo ok\n",
+            # A backtick body ends only at EOF: a stray ``)`` is bash's syntax error, not an end.
+            "echo `echo a\n)echo b`",
+            "echo `echo a)`",
         ],
     )
     def test_malformed_bodies_still_rejected(self, parser, command):
@@ -697,9 +700,8 @@ class TestMultilineSubstitutionCorrection:
         """A ``$( )`` body handed over without its ``)`` must deny, never return the units it could parse.
 
         Unreachable from ``parse()``: the word delimiter refuses an unterminated ``$(`` before the
-        unit loop runs (pinned above). If the two scanners ever disagree about where a body ends,
-        handing back a prefix would repeat the LAB-4114 shape, so the loop fails closed instead.
-        The same text is a complete two-unit body for backticks, which have no closer.
+        unit loop runs (pinned above). The same text is a complete two-unit body for backticks,
+        which have no closer.
         """
         outer = bashlex.parser._parser("echo x")
         closer = bashlex.tokenizer.token(bashlex.tokenizer.tokentype.RIGHT_PAREN, ")")
