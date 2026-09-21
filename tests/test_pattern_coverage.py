@@ -401,6 +401,8 @@ class TestMediumPatternCoverage:
             "rm data.json",
             # Several blanks before the target are still one target.
             "rm   data.json",
+            # `' -f'` is a filename, not a flag; the real target follows it (LAB-4360).
+            "\"rm\" ' -f' important.db",
         ]
         for cmd in commands:
             result = validate_command(cmd, config_path=safety_rules_path)

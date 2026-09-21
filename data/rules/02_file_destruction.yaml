@@ -46,7 +46,7 @@ rules:
   - name: file_truncation
     description: File truncation can instantly destroy data
     risk_level: HIGH
-    patterns: ["^\\s*>\\s+(?!/dev/null)[^|&;\\s][^|&;]{0,199}", ":\\s*>\\s+(?!/dev/null)[^|&;\\s][^|&;]{0,199}", "\\btrue\\s+>\\s+(?!/dev/null)[^|&;\\s][^|&;]{0,199}", "\\btruncate\\s+.{0,100}(-s|--size)\\s*0", "\\becho\\s+-n\\s+>\\s+(?!/dev/null)[^|&;\\s][^|&;]{0,199}", "\\bprintf\\s+[\"']\\s*[\"']?\\s*>\\s+(?!/dev/null)[^|&;\\s][^|&;]{0,199}", "\\btee\\s+(?!.{0,50}-a)(?!/dev/null)[^|&;\\s][^|&;]{0,199}"]
+    patterns: ["^\\s*>\\s+(?!/dev/null)(?!\\s*$)[^|&;]{1,200}", ":\\s*>\\s+(?!/dev/null)(?!\\s*$)[^|&;]{1,200}", "\\btrue\\s+>\\s+(?!/dev/null)(?!\\s*$)[^|&;]{1,200}", "\\btruncate\\s+.{0,100}(-s|--size)\\s*0", "\\becho\\s+-n\\s+>\\s+(?!/dev/null)(?!\\s*$)[^|&;]{1,200}", "\\bprintf\\s+[\"']\\s*[\"']?\\s*>\\s+(?!/dev/null)(?!\\s*$)[^|&;]{1,200}", "\\btee\\s+(?!.{0,50}-a)(?!/dev/null)(?!\\s*$)[^|&;]{1,200}"]
     alternatives: ["Use proper log rotation", "Backup before truncating", "Use >> for append"]
 
   - name: vcs_directory_deletion
