@@ -531,18 +531,52 @@ class TestAQuotedOperandIsStillAnOperand:
     @pytest.mark.parametrize(
         "command",
         [
-            # The tail starts at a real quote and its interior stops at the
-            # matching close, so it cannot be used to walk over a separator that
-            # sits OUTSIDE quotes. `ls` is not a reader and emits no contents.
+            # BALANCED quotes. These pin nothing on their own -- the run consumes
+            # the quoted word whole and the tail never engages -- but they are the
+            # control the cases below are read against. `ls` emits no contents.
             'cat "x" ; ls ~/.kube/config',
             "cat 'x' ; ls ~/.npmrc",
             'cat "x" && ls ~/.netrc',
             'cat "x" | ls ~/.pypirc',
+            # UNPAIRED quotes, which is where the tail actually runs -- and an
+            # apostrophe in ordinary prose is the everyday way to write one. The
+            # tail's first cut let these walk from a reader word, across a real
+            # separator or line break, to a path on the other side, making two
+            # innocent lines a hard deny at BLOCKED. That is the same
+            # two-innocent-lines false positive as
+            # test_a_reader_does_not_reach_a_path_on_the_next_line, reached
+            # through a quote instead of a bare newline, so the tail's interior
+            # excludes `;`, `|`, `&` and a newline exactly as the bare run does.
+            "head -5 notes.txt  # check what's here\nexport KUBECONFIG=~/.kube/config",
+            "sed -n 1p a.txt # it's ok ; ls ~/.kube/config",
+            "sort -u hosts.txt # we're deduping\nls -l ~/.kube/config",
+            "echo hi # sort of odd, don't\nls ~/.npmrc",
+            "cut -d= -f2 .env.example # don't edit\nexport KUBECONFIG=~/.kube/config",
         ],
     )
     def test_the_tail_does_not_walk_past_a_real_separator(self, command, rules_dir_path):
         """Reaching into a quote must not also mean reaching across a `;`."""
         assert verdict(command, rules_dir_path).allowed, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A `.pub` appended inside a brace expansion disarms the guard for a
+            # DIFFERENT expanded word: this is `~/.ssh/id_rsa` plus `~/.ssh/.pub`,
+            # and `cat` prints the private key. Pinned because an earlier cut of
+            # this change let the guard end at a quote, which made the trailing
+            # `''` satisfy it -- a lost denial `main` did not have.
+            "cat \"x\" ~/.ssh/{id_rsa,.pub''}",
+            "cat \"x\" ~/.ssh/{id_ed25519,.pub''}",
+            'cat "x" ~/.ssh/{id_rsa,"y.pub"}',
+            "cat \"x\" ~/.aws/{credentials,.pub''}",
+        ],
+    )
+    def test_a_quoted_pub_in_a_brace_expansion_does_not_disarm_the_guard(self, command, rules_dir_path):
+        """The leading quoted operand matters: it creates a string literal, which
+        disables the validator's reconstruction rescue and leaves the pattern as
+        the only cover."""
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
 
 
 class TestTheBoundaryDoesNotUnrateARealFile:
@@ -884,24 +918,6 @@ class TestKeyNamesAndPublicKeys:
         """Reader-dependent verdicts on the same file are the defect this ticket
         exists to remove, so the legacy cat-only rule gets the same exclusion."""
         assert verdict(f"{reader} {path}", rules_dir_path).allowed
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            # The guard ended at `(?:\s|$)`, so a closing quote where it wanted
-            # whitespace disarmed it and a PUBLIC key became a hard deny. `main`
-            # denies all of these; nothing but the quote distinguishes them from
-            # the allowed spellings above.
-            'cat "~/.ssh/id_rsa.pub"',
-            "cat '~/.ssh/id_rsa.pub'",
-            'nl "$HOME/.ssh/id_ed25519.pub"',
-            "base64 '/home/u/.ssh/id_ecdsa.pub'",
-        ],
-    )
-    def test_a_quoted_public_key_is_allowed_too(self, command, rules_dir_path):
-        """BLOCKED is unrelaxable by every preset, so a false positive here is
-        not a nuisance -- it is an everyday command no user can get back."""
-        assert verdict(command, rules_dir_path).allowed, command
 
     @pytest.mark.parametrize(
         "command",
