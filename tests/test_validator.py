@@ -956,14 +956,18 @@ class TestHeredocSurroundings:
 
     @pytest.mark.parametrize("head", ["tee", "rm"])
     @pytest.mark.parametrize("blank", [" ", "\t"], ids=["space", "tab"])
-    def test_escaped_blank_on_the_opener_line_is_not_an_operand(self, safety_rules_path, head, blank):
-        r"""`tee<<EOF > out \ ` hands tee a one-blank argument, not a file to truncate.
+    def test_escaped_blank_on_the_opener_line_is_not_read_as_a_filename(self, safety_rules_path, head, blank):
+        r"""`tee<<EOF > out \ ` hands tee a one-blank argument; reconstructed, it is bare whitespace.
 
-        The restored blank (LAB-4126) reconstructs the segment to `tee  `, and
-        the file-destruction rules read the second blank as the filename,
-        rating a command that writes `ls` to a file HIGH (LAB-4360). Pinned
-        against the same command without the blank rather than to a level, so
-        a later change to the control's own verdict cannot leave this stale.
+        extract_command_segments keeps the escaped blank (LAB-4126) and
+        _close_heredocs re-attaches the heredoc so the segment parses; argv then
+        joins to `tee  `, the same text as `tee` with trailing blanks, and the
+        file-destruction rules read the second blank as the filename - HIGH for
+        a command that writes `ls` to a file (LAB-4360). The delimiter is
+        unquoted on purpose: quoted, the command takes the escalation path,
+        where the control's own `tee > out` is already HIGH and the comparison
+        could not discriminate. Pinned against the control rather than to a
+        level, so a later change to the control's verdict cannot leave this stale.
         """
         with_blank = validate_command(f"echo hi && {head}<<EOF > out \\{blank}\nls\nEOF", config_path=safety_rules_path)
         without = validate_command(f"echo hi && {head}<<EOF > out\nls\nEOF", config_path=safety_rules_path)
@@ -1027,14 +1031,13 @@ class TestHeredocSurroundings:
         assert [val_module._HEREDOC_REDIRECT_RE.sub("", segment) for segment in segments] == expected
 
     def test_shed_leaves_a_surviving_body_in_place(self):
-        r"""The trailing branch takes the terminator, not the body in front of it.
+        r"""The trailing branch cannot begin before the terminator's own newline.
 
         Nothing reaches the shed with a body today - _neuter_heredocs blanks
-        every one - so a `bash`-headed case above cannot cover this. The blob
-        _close_heredocs appends carries two newlines with the body between
-        them; the branch is written to take the LAST one, and the `\s*` inside
-        it is then zero-width. Pinned directly so a body-preserving rewrite
-        finds the guard already holding.
+        every one - so no case above covers this. The blob _close_heredocs
+        appends is `\n<body>\n<terminator>`; the branch's `\s*` cannot cross a
+        non-blank body, so the match starts at the last newline and the body
+        stays. A blank-only body is consumed with it, which loses no shell.
         """
         stripped = val_module._HEREDOC_REDIRECT_RE.sub("", "bash <<SCHLOCK_HEREDOC\necho hi\nSCHLOCK_HEREDOC")
 

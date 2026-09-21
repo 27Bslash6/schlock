@@ -561,20 +561,13 @@ class TestP0FileTruncation:
         result = validate_command("echo 'data' >> file.log", config_path=safety_rules_path)
         assert result.allowed
 
-    @pytest.mark.parametrize(
-        "reconstructed",
-        ["tee  ", "tee \t", ">  ", "> \t"],
-        ids=["tee space", "tee tab", "redirect space", "redirect tab"],
-    )
+    @pytest.mark.parametrize("reconstructed", ["tee  ", ">  ", ": >  ", "true >  ", "echo -n >  ", "printf '' >  "])
     def test_blank_operand_is_not_a_filename(self, safety_rules_path, reconstructed):
-        r"""Bare whitespace after the head is no file to truncate.
+        r"""Every operand in this rule begins with a non-blank character.
 
-        `tee<<EOF > out \ ` hands tee a one-blank argument, and the segment
-        reconstructs to `tee  ` - the same text as `tee` with trailing blanks.
-        The rule used to read the second blank as the filename and rate a
-        command that writes `ls` to a file HIGH (LAB-4360). The operand has to
-        begin with a non-blank character; the redirect spelling is tightened
-        the same way for parity.
+        A one-blank argument reconstructs to bare whitespace (`tee \ ` becomes
+        `tee  `), which the rule read as the filename (LAB-4360). The end-to-end
+        shape is pinned in test_validator.py; this pins the rule itself.
         """
         match = RuleEngine(safety_rules_path).match_command(reconstructed)
 

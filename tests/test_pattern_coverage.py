@@ -6,8 +6,6 @@ This test suite ensures EVERY pattern in safety_rules.yaml has:
 - Edge cases and variations
 """
 
-import pytest
-
 from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import validate_command
 
@@ -408,10 +406,9 @@ class TestMediumPatternCoverage:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.MEDIUM, f"Single delete not MEDIUM: {cmd}"
 
-    @pytest.mark.parametrize("reconstructed", ["rm  ", "rm \t"], ids=["space", "tab"])
-    def test_single_delete_needs_a_non_blank_target(self, safety_rules_path, reconstructed):
+    def test_single_delete_needs_a_non_blank_target(self, safety_rules_path):
         r"""`rm<<EOF > out \ ` reconstructs to `rm  `; bare whitespace is not a file (LAB-4360)."""
-        match = RuleEngine(safety_rules_path).match_command(reconstructed)
+        match = RuleEngine(safety_rules_path).match_command("rm  ")
 
         assert match.risk_level == RiskLevel.SAFE, match.message
 
