@@ -166,7 +166,11 @@ rules:
   - name: single_delete
     description: Deleting files without backup
     risk_level: MEDIUM
-    patterns: ['^rm(?=\s+\S)\s+[^-]']
+    # Flags may precede the target (`rm -f data.db`); `(?:-\S*\s+)*` skips them and is
+    # linear because `\S*` and `\s+` cannot share a character. The `(?=\s+\S)` guard
+    # keeps a blank-only operand SAFE (LAB-4360); `[^-\s]` keeps a trailing flag with
+    # no target (`rm  -f`) SAFE too (LAB-4428).
+    patterns: ['^rm(?=\s+\S)\s+(?:-\S*\s+)*[^-\s]']
     alternatives: ["Backup first"]
 
   - name: git_push

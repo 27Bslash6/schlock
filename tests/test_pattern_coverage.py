@@ -404,10 +404,27 @@ class TestMediumPatternCoverage:
             # `' -f'` is a filename, not a flag; the real target follows it (LAB-4360).
             "\"rm\" ' -f' important.db",
             '"rm" "\\n-f" important.db',
+            # Flags before the target are still a single delete (LAB-4428).
+            "rm -f data.db",
+            "rm -- data.db",
+            "rm -v data.db",
+            "rm -i data.db",
         ]
         for cmd in commands:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.MEDIUM, f"Single delete not MEDIUM: {cmd}"
+            assert "single_delete" in result.matched_rules, f"single_delete not matched: {cmd}"
+
+    def test_flagged_single_delete_keeps_recursive_verdicts(self, safety_rules_path):
+        """single_delete now also matches `rm -rf ...`; precedence must keep the higher level."""
+        assert validate_command("rm -rf dir", config_path=safety_rules_path).risk_level == RiskLevel.HIGH
+        assert validate_command("rm -rf /", config_path=safety_rules_path).risk_level == RiskLevel.BLOCKED
+
+    def test_single_delete_flag_without_target_is_safe(self, safety_rules_path):
+        """`rm  -f` deletes nothing: a trailing flag is not a filename (LAB-4428; rated MEDIUM before)."""
+        match = RuleEngine(safety_rules_path).match_command("rm  -f")
+
+        assert match.risk_level == RiskLevel.SAFE, match.message
 
     def test_single_delete_needs_a_non_blank_target(self, safety_rules_path):
         r"""`rm<<EOF > out \ ` reconstructs to `rm  `; bare whitespace is not a file (LAB-4360)."""
