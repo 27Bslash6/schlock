@@ -122,6 +122,35 @@ class TestBashCommandParser:
         dangers = parser.has_dangerous_constructs(ast)
         assert dangers == []  # No blanket blocking
 
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            # cat's body is inert text. Carrying it would make ~60 rule patterns
+            # backtrack over an everyday file write for nothing.
+            ("cat <<EOF | grep foo\nhello\nEOF", ["cat <<EOF\n\nEOF", "grep foo"]),
+            # A shell's body is source code: drop it and `bash <<EOF | tee log`
+            # hides an rm -rf / from every pass.
+            ("bash <<EOF | tee log\nrm -rf /\nEOF", ["bash <<EOF\nrm -rf /\nEOF", "tee log"]),
+            ("/bin/bash <<EOF | x\nrm -rf /\nEOF", ["/bin/bash <<EOF\nrm -rf /\nEOF", "x"]),
+            # Each heredoc is closed in opener order.
+            ("cat <<A <<B | x\n1\nA\n2\nB", ["cat <<A <<B\n\nA\n\nB", "x"]),
+            ("cat <<-EOF | x\n\tq\n\tEOF", ["cat <<-EOF\n\nEOF", "x"]),
+            # A redirect after the opener belongs to the command, not the heredoc.
+            ("cat <<EOF > out.txt\nsecret\nEOF", ["cat <<EOF > out.txt\n\nEOF"]),
+            # CRLF: the slice is stripped of its trailing \r, so the terminator
+            # must be too or the segment never re-parses and fails closed on a
+            # command bash runs happily.
+            ("cat <<EOF\r\nhello\r\nEOF\r\necho ok", ["cat <<EOF\n\nEOF", "echo ok"]),
+        ],
+    )
+    def test_extract_command_segments_closes_heredocs(self, parser, command, expected):
+        """A heredoc body lives past its command's span, so the bare slice does
+        not re-parse - and a segment with no AST loses literal suppression and
+        the quote-stripped pass. Each segment is closed with a terminator, and
+        carries its body only when a shell would execute it.
+        """
+        assert parser.extract_command_segments(command, parser.parse(command)) == expected
+
 
 class TestDangerousPipelineDetection:
     """Test suite for _detect_dangerous_pipelines AST analysis."""
