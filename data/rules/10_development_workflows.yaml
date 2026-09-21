@@ -166,11 +166,16 @@ rules:
   - name: single_delete
     description: Deleting files without backup
     risk_level: MEDIUM
-    # Flags may precede the target (`rm -f data.db`); `(?:-\S*\s+)*` skips them and is
-    # linear because `\S*` and `\s+` cannot share a character. The `(?=\s+\S)` guard
-    # keeps a blank-only operand SAFE (LAB-4360); `[^-\s]` keeps a trailing flag with
-    # no target (`rm  -f`) SAFE too (LAB-4428).
-    patterns: ['^rm(?=\s+\S)\s+(?:-\S*\s+)*[^-\s]']
+    # After `rm` and one blank, either a second blank or a flag run then a target.
+    # A second blank is a whitespace-led filename: the parser rebuilds `"rm" ' -f'`
+    # as `rm  -f`, indistinguishable from a flag with no target, and the file ` -f`
+    # really is deleted, so the ambiguity rates MEDIUM (LAB-4360, LAB-4428).
+    # `(?=\s+\S)` is what keeps a blank-only operand (`rm  `) SAFE: without it the
+    # `\s` branch would accept it. `(?:-\S*\s+)*` is linear ONLY because of the
+    # mandatory literal `-`: it pins each iteration to a fixed position. Drop it
+    # and `(?:\S*\s+)*` backtracks exponentially (146ms at 20 blanks). Disjoint
+    # `\S`/`\s` classes do not buy linearity on their own.
+    patterns: ['^rm(?=\s+\S)\s(?:\s|(?:-\S*\s+)*[^-\s])']
     alternatives: ["Backup first"]
 
   - name: git_push
