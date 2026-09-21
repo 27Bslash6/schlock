@@ -1156,6 +1156,8 @@ class TestHeredocSurroundings:
             ("x=( foo a[1<<b]=1 )", [], "inside a compound assignment every word may carry a subscript"),
             ("x=( [1<<b]=1 )", [], "…a bare `[k]=v` included"),
             ("declare -A m=( [k<<ZZ ]=1 )", [], "…whatever precedes the assignment"),
+            ("x=(case) ; cat <<c", ["c"], "a compound assignment holds words, so `case` in one is not the keyword"),
+            ("types=(case esac if) ; cat <<c", ["c"], "…however many reserved words it holds"),
             ("coproc { a[1<<b]=1; }", [], "a reserved word after `coproc` is a reserved word"),
             ("coproc NAME { a[1<<b]=1; }", [], "…and so is one after `coproc NAME`"),
             ("coproc NAME if a[1<<b]=1; then :; fi", [], "…whichever it is"),
@@ -1172,6 +1174,7 @@ class TestHeredocSurroundings:
             ("<(true) y[1<<b]", ["b]"], "a process substitution as the first word is the command"),
             ("> f <(true) y[1<<b]", ["b]"], "…also after a redirection"),
             ("case a in (a) b[1<<c]=1;; esac", [], "a case pattern's closing `)` starts a command"),
+            ("echo $(grep case f) ; cat <<c", ["c"], "past command position `case` is an argument, not the keyword"),
             ("if true;then a[1<<b]=1;fi", [], "a reserved word glued to the operator before it still counts"),
             ("x;if a[1<<b]=1; then :; fi", [], "…whichever operator it is glued to"),
             ("echo ${x:-;a[1 }; cat <<c", ["c"], "inside an expansion `;` starts no command, so `a[` is text"),
@@ -1181,6 +1184,8 @@ class TestHeredocSurroundings:
             ('a["]"<<b ]=1', [], "a quoted `]` does not close a subscript"),
             ("a[${x:-]}<<b ]=1", [], "a `]` inside `${…}` does not close a subscript"),
             ('echo "`date`" ; cat <<c', ["c"], "a backtick closes its own frame, it does not reopen it"),
+            ("x=`ls | sort` y[1<<b]=1", [], "an operator inside a backtick is the backtick's, so the word is one assignment"),
+            ("echo `ls | sort` y[1<<b]", ["b]"], "…but the word after one still follows `echo` into command-name position"),
             # A `#` is a comment only where a word could start. These ran real
             # bash: the `[]` row's canary after the delimiter ran, the others' was
             # swallowed as a body.
@@ -1339,7 +1344,7 @@ class TestHeredocSurroundings:
             ("cat <<'E' <(echo\nrm -rf /\nE\n)", "line that continues"),
             ("cat <<'E' $(echo\nrm -rf /\nE\n)", "line that continues"),
             ("echo $(case a in a) :;; esac) y[1<<E]=1\ncat <<'E2'\nE]=1\nrm -rf /\nE2", "`case`"),
-            ("x=( <<'E' )\nrm -rf /\nE", "compound assignment"),
+            ("x=( <<'E' )\nrm -rf /\nE", "`<` inside a compound assignment"),
             ("(( $(case a in a) :;; esac) + 1<<b ))\nrm -rf /\nb", "`case`"),
             ("(( $(cat <<E\n)\nE) + 1<<b ))\nrm -rf /\nb", "heredoc"),
         ],
@@ -1414,6 +1419,88 @@ class TestHeredocSurroundings:
         """
         with pytest.raises(ParseError, match="`case`"):
             val_module._DoubleParen("(( $(case a in a) :;; esac) ))").is_arithmetic(0)
+
+    @pytest.mark.parametrize(
+        "element",
+        [
+            "a ; cat",
+            "a | cat",
+            "a & cat",  # control operators
+            "a >b",
+            "a <b",
+            "a 2>&1",
+            "a >&2",
+            "a <<<z",
+            ">b",  # redirections
+            "(a)",
+            "a ((1))",  # a nested pair
+        ],
+    )
+    def test_shell_a_compound_assignment_cannot_hold_fails_closed(self, element):
+        """`x=( a >b ) cat <<'E'`: bash abandons the line and runs the NEXT one.
+
+        Unlike the unclosed-pair rows, bash does not refuse the whole command
+        here. It reports `syntax error near unexpected token` for line 1 and
+        then executes line 2 - which is exactly the text the heredoc body would
+        have been read from, so scanning on deletes it and the payload lands in
+        a body bash never creates. Every row ran real bash: each printed the
+        syntax error, then ran the following line, and exited 0.
+
+        A compound assignment holds words, `[k]=v`, quotes, expansions and
+        process substitutions; `test_expansion_boundaries_match_bash` pins those
+        still scanning. Anything else belongs here.
+        """
+        with pytest.raises(ParseError, match="compound assignment"):
+            val_module._neuter_heredocs(f"x=( {element} ) cat <<'E'\nrm -rf /\nE")
+
+    @pytest.mark.parametrize(
+        "element",
+        ["$(echo z)", "<(echo z)", ">(cat)", "`echo z`", "`ls | sort`", '"a;b"', "a[0]=1", "${v}"],
+    )
+    def test_what_a_compound_assignment_may_hold_still_scans(self, element):
+        """The other half of the guard: bash runs each of these, so it must not refuse.
+
+        `<(…)` and `>(…)` matter most - they begin with the same `<`/`>` the
+        redirection rows above are refused for, and a guard that keyed on the
+        character alone would deny them.
+        """
+        neutered, base = val_module._neuter_heredocs(f"x=( {element} ) cat <<'E'\ninert\nE\nrm -rf /")
+
+        assert base == f"x=( {element} ) cat"
+        assert "rm -rf /" in neutered
+
+    def test_a_backtick_does_not_reset_the_word_around_it(self):
+        """`x=`ls | sort` y[1<<b]=1` is ONE assignment word, so `y[` is a subscript.
+
+        Bash runs the line and opens no heredoc (canary: the next line ran, and
+        `b]=1` reported `command not found` - it is a command, not a terminator).
+        Reading the `|` against the enclosing context instead reset command
+        position, `y[` stopped being a subscript, `b]=1` became a delimiter, and
+        the line after it was deleted as that phantom body - with no compound
+        assignment anywhere. Pinned on the neutered text because the deletion,
+        not the verdict, is the damage: `_escalate_past_heredoc` never sees what
+        is already gone.
+        """
+        neutered, _ = val_module._neuter_heredocs("ls <<'A'\nz\nA\nx=`ls | sort` y[1<<b]=1\nrm -rf /")
+
+        assert "rm -rf /" in neutered
+
+    def test_an_unclosed_backtick_names_the_backtick(self):
+        """A refusal that named `$(` for a backtick sends the reader to the wrong construct."""
+        with pytest.raises(ParseError, match="unclosed `"):
+            val_module._neuter_heredocs("cat <<'A'\nz\nA\nx=`echo\nrm -rf /")
+
+    def test_a_substitution_inside_a_compound_assignment_still_refuses_case(self):
+        """`x=( $(case …) )`: the carve-out for `x=( … )` does not reach the `$(…)` in it.
+
+        Bash runs this one - it is a conservative deny, the same one
+        `echo $(case …)` already gets, because the pattern's `)` cannot be told
+        from the substitution's closer. What it pins is the boundary: a
+        compound assignment holds words and so needs no refusal, while a `$(`
+        opened inside one is shell again and still does.
+        """
+        with pytest.raises(ParseError, match="`case`"):
+            val_module._neuter_heredocs("x=( $(case a in a) :;; esac) )\ncat <<'E'\nrm -rf /\nE")
 
     def test_a_long_word_with_many_brackets_is_scanned_in_linear_time(self):
         """Once a `[` in a word is a glob character, no later `[` in it is asked again.

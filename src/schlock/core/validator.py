@@ -1116,6 +1116,14 @@ def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str
     return None
 
 
+def _open_context_name(scan: "_ScanState") -> str:
+    """What the innermost still-open command context is, for a refusal message.
+
+    Naming the wrong construct sends the reader to the wrong part of the line.
+    """
+    return "`" if scan.contexts[-1].backtick else "$("
+
+
 def _is_word_boundary(line: str, pos: int) -> bool:
     """True when the character at ``pos`` ends a top-level word.
 
@@ -1176,6 +1184,7 @@ class _Context:
 
     comsub: bool = False
     compound: bool = False
+    backtick: bool = False
     serial: int = 0
     state: str = _FRESH
     target_pending: bool = False
@@ -1204,9 +1213,21 @@ class _Context:
         word = self.word(line, pos)
         if self.target_pending:
             self.target_pending = False  # a redirection's target is neither a command nor an assignment
-        elif word == "case" and self.comsub and self.state != _LOST:
+        elif word == "case" and self.comsub and not self.compound and self.state != _LOST:
             # A pattern's `)` would be read as this context's closer. The
-            # matcher for `((` refuses the same shape for the same reason.
+            # matcher for `((` refuses that shape for the same reason, though
+            # no longer on the same terms: it stops at any `case` a word could
+            # start, so it still refuses the compound case carved out here and
+            # over-blocks `(( $(x=(case a in a); echo ${#x[@]}) ))`, which bash
+            # evaluates to 4. Fail-closed and one construct over; not widened
+            # to match from here.
+            # `not self.compound` because `comsub` says only that the outer word
+            # resumes after the `)`, which `x=( … )` also does - and inside one
+            # there are no commands, so no patterns: bash reads
+            # `x=(case a in a) echo;; esac)` as a syntax error, not a `case`.
+            # Without the guard `x=(case)` and `types=(case esac if)` refuse
+            # valid shell. A `$(case …)` nested in one opens its own
+            # non-compound context, so this still refuses that.
             raise ParseError("`case` inside `$(…)`; its patterns' `)` cannot be told from the closer")
         else:
             self.state, self.target_pending = _command_state_after(self.state, word)
@@ -1331,6 +1352,23 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
         ctx = scan.contexts[-1]
 
         if not frames:
+            if ctx.compound and char in "(<>;|&" and not (char in "<>" and line.startswith("(", pos + 1)):
+                # A compound assignment holds words, `[k]=v`, quotes, expansions
+                # and process substitutions - nothing else. Every other
+                # construct is a syntax error there, and the two syntax errors
+                # bash can raise do not behave alike. A *compound-assignment*
+                # error abandons only this line and RUNS THE NEXT (`x=( a >b )`
+                # followed by `echo RAN` prints RAN), which is exactly the text
+                # a heredoc body would otherwise be read from: `x=(a ; cat)
+                # cat <<'E'` really does execute the line after `E`, and
+                # scanning on deletes it as a body. A *main-parser* error aborts
+                # the script instead (`echo x=(a)` exits 2, running nothing
+                # after), which is why the `(` that opens this context needs no
+                # command-position gate. One guard rather than one per arm:
+                # `(`, `((`, a redirection and `;|&` are each dispatched
+                # separately below, and the three the old `case` refusal did not
+                # happen to cover were the ones that deleted payload.
+                raise ParseError(f"`{char}` inside a compound assignment; bash skips the line and runs the next")
             # Word and command-context bookkeeping, before the lexical dispatch.
             if line.startswith("((", pos) and dparen.is_arithmetic(at + pos):
                 # `(( 1<<b ))` is a left shift, on this line or a later one. No
@@ -1355,6 +1393,28 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
                 scan.open_context(_Context(comsub=True))
                 out.append(line[pos : pos + 2])
                 pos += 2
+                continue
+            if char == "`":
+                # A top-level backtick is shell again, exactly like `$(…)`, and
+                # `_expansion_frame_at` deliberately does not frame it so the
+                # heredocs inside it stay findable. It had no context of its
+                # own, so its contents were read against the *enclosing* one and
+                # an operator inside it reset the outer command position that
+                # was not its to reset. That invents an opener:
+                # `x=`ls | sort` y[1<<b]=1` is one assignment word to bash, which
+                # runs the line and opens no heredoc, while this read `b]=1` as a
+                # delimiter and deleted the next line as its body. One character
+                # both opens and closes, so the open context decides which.
+                if ctx.backtick:
+                    scan.contexts.pop()
+                    scan.contexts[-1].start = pos  # the outer word resumes, as after a `$(…)`
+                else:
+                    if ctx.start is None:
+                        ctx.start = pos
+                    ctx.fold(line, pos + 1)
+                    scan.open_context(_Context(comsub=True, backtick=True))
+                out.append(char)
+                pos += 1
                 continue
             if char == ")" and len(scan.contexts) > 1:
                 ctx.end_word(line, pos)
@@ -1482,10 +1542,6 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
         elif line.startswith("<<", pos) and not frames:
-            if ctx.compound:
-                # Bash rejects the line and runs the next one; a body read from
-                # there would hide it.
-                raise ParseError("Heredoc inside a compound assignment; bash rejects the line and runs what follows")
             opener_at = pos
             pos += 2
             strips_tabs = line.startswith("-", pos)
@@ -1519,7 +1575,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
         # substitution and opens another at the same depth, so a depth
         # comparison sees nothing while the line plainly does not end. A later
         # serial still open is exactly `something opened after an opener`.
-        why = "trailing backslash" if continued else "unclosed " + (frames[-1] if frames else "$(")
+        why = "trailing backslash" if continued else "unclosed " + (frames[-1] if frames else _open_context_name(scan))
         raise ParseError(f"Heredoc opener on a line that continues ({why}); the body's start is unknown")
 
     return "".join(out), openers
@@ -1592,7 +1648,7 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
         # An unclosed quote, expansion, `((`, subscript or `$(` at the end is
         # a syntax error to bash - it runs nothing - and a reading this lexer
         # cannot vouch for either way.
-        unclosed = scan.frames[-1] if scan.frames else "$("
+        unclosed = scan.frames[-1] if scan.frames else _open_context_name(scan)
         raise ParseError(f"Command ends inside an unclosed {unclosed}; bash would run none of it")
     if base_command is None:
         raise ParseError("No heredoc opener found in a command bashlex rejected as a heredoc")
@@ -1726,7 +1782,12 @@ def _escalate_past_heredoc(
     coupling traded for milliseconds on a path that is already the slow one.
 
     Escalation only ever raises risk. That is what keeps a legitimate heredoc's
-    existing verdict intact, and it bounds a misread rewrite to a false positive.
+    existing verdict intact, and it bounds a misread body *end* to a false
+    positive. It does not bound a misread body *start*: text swallowed into a
+    body is gone from ``neutered`` before this runs, so there is nothing left
+    to escalate on and the verdict stays at ``result``'s floor. Monotonicity is
+    a property of the text this sees, and a phantom opener is exactly the text
+    it does not.
 
     Returns ``result``, or the worst verdict among the commands around it.
     """
