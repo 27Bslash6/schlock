@@ -710,6 +710,9 @@ rules:
 class TestHeredocSurroundings:
     """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
 
+    Also covers the LAB-1732 seam: segments close their own heredocs now, so the
+    shed below has to account for the terminator as well as the redirection.
+
     bashlex cannot parse a quoted heredoc delimiter, so these commands take the
     `_validate_heredoc_command` fallback. It used to check the first word against
     the whitelist and return, leaving every command after the terminator - and
@@ -951,6 +954,29 @@ class TestHeredocSurroundings:
         assert result.allowed is True, f"{description}: {result.message}"
         assert result.exit_code == 0, description
 
+    @pytest.mark.parametrize("head", ["tee", "rm"])
+    @pytest.mark.parametrize("blank", [" ", "\t"], ids=["space", "tab"])
+    def test_escaped_blank_on_the_opener_line_is_not_read_as_a_filename(self, safety_rules_path, head, blank):
+        r"""`tee<<EOF > out \ ` hands tee a one-blank argument; reconstructed, it is bare whitespace.
+
+        extract_command_segments keeps the escaped blank (LAB-4126) and
+        _close_heredocs re-attaches the heredoc so the segment parses; argv then
+        joins to `tee  `, the same text as `tee` with trailing blanks, and the
+        file-destruction rules read the second blank as the filename - HIGH for
+        a command that writes `ls` to a file (LAB-4360). The delimiter is
+        unquoted on purpose: quoted, the command takes the escalation path,
+        where the shed re-validates the raw segment `tee \ ` and its backslash
+        is a non-blank character - that path rates like raw text, on base and
+        here alike, and is not this ticket's shape. Pinned against the control
+        rather than to a level, so a later change to the control's verdict
+        cannot leave this stale.
+        """
+        with_blank = validate_command(f"echo hi && {head}<<EOF > out \\{blank}\nls\nEOF", config_path=safety_rules_path)
+        without = validate_command(f"echo hi && {head}<<EOF > out\nls\nEOF", config_path=safety_rules_path)
+
+        assert with_blank.risk_level == without.risk_level, with_blank.message
+        assert with_blank.matched_rules == without.matched_rules
+
     def test_rewrite_replaces_the_body_and_the_delimiter(self):
         """The rewrite keeps structure and discards content, whatever the body's size.
 
@@ -973,6 +999,68 @@ class TestHeredocSurroundings:
         """
         with pytest.raises(ParseError):
             val_module._neuter_heredocs("echo hello")
+
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            ("cat <<'EOF'\nhello\nEOF", ["cat"]),
+            # A redirect after the opener must survive; only the heredoc goes.
+            ("cat <<'EOF' > out.txt\nhello\nEOF", ["cat > out.txt"]),
+            # The dangerous command survives the shed intact, so it still reaches
+            # validate_command as itself (its verdict is pinned separately).
+            ("chmod -R 777 / <<'Y'\nx\nY", ["chmod -R 777 /"]),
+            ("ls <<'EOF'\nx\nEOF\nrm -rf /", ["ls", "rm -rf /"]),
+            ("cat <<'A' <<'B'\n1\nA\n2\nB", ["cat"]),
+            # Inside a compound the placeholder body carries one newline, not two.
+            ("for f in a b; do cat <<'EOF'\nx\nEOF\ndone", ["cat"]),
+            ("cat <<-'EOF'\n\tx\n\tEOF\necho ok", ["cat", "echo ok"]),
+        ],
+    )
+    def test_segment_sheds_the_whole_rewritten_heredoc(self, command, expected):
+        """A segment carries its heredoc body (LAB-1732), so shedding the
+        redirection alone leaves the placeholder terminator stuck on the end.
+
+        This is the seam between the two fixes: `_escalate_past_heredoc` feeds
+        candidates to `validate_command`, and `cat\n\nSCHLOCK_HEREDOC` is not
+        the command anyone meant to validate. The verdict often survives the
+        mistake, which is exactly why the shape is pinned here rather than a
+        risk level somewhere downstream.
+        """
+        neutered, _ = val_module._neuter_heredocs(command)
+        bash_parser = parser.BashCommandParser()
+        segments = bash_parser.extract_command_segments(neutered, bash_parser.parse(neutered))
+
+        assert [val_module._HEREDOC_REDIRECT_RE.sub("", segment) for segment in segments] == expected
+
+    def test_shed_leaves_a_surviving_body_in_place(self):
+        r"""The trailing branch cannot begin before the terminator's own newline.
+
+        Nothing reaches the shed with a body today - _neuter_heredocs blanks
+        every one - so no case above covers this. The blob _close_heredocs
+        appends is `\n<body>\n<terminator>`; the branch's `\s*` cannot cross a
+        non-blank body, so the match starts at the last newline and the body
+        stays. A blank-only body is consumed with it, which loses no shell.
+        """
+        stripped = val_module._HEREDOC_REDIRECT_RE.sub("", "bash <<SCHLOCK_HEREDOC\necho hi\nSCHLOCK_HEREDOC")
+
+        assert stripped == "bash\necho hi"
+
+    def test_shed_does_not_delete_a_caller_written_placeholder(self, safety_rules_path):
+        """The placeholder is a fixed, published string, so a command may contain it.
+
+        Spliced across line continuations, `rm \\<nl>SCHLOCK_HEREDOC\\<nl> -rf /`
+        is a single command to bash. Deleting that token mid-segment would rejoin
+        `rm` to `-rf /` with the run the rules match on torn apart, so the shed is
+        anchored to the end of the segment - the only place _close_heredocs ever
+        puts one. The whitelisted `ls` head and the quoted delimiter are load
+        bearing: together they are what routes this through the fallback.
+        """
+        command = "ls <<'Q'\nx\nQ\nrm \\\nSCHLOCK_HEREDOC\\\n -rf /"
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED, result.message
+        assert result.allowed is False
 
     def test_escalation_does_not_revalidate_an_unchanged_command(self, safety_rules_path, monkeypatch):
         """A rewrite that changed nothing would re-enter this fallback forever.
