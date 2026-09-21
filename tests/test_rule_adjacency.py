@@ -539,24 +539,50 @@ class TestAQuotedOperandIsStillAnOperand:
             'cat "x" && ls ~/.netrc',
             'cat "x" | ls ~/.pypirc',
             # UNPAIRED quotes, which is where the tail actually runs -- and an
-            # apostrophe in ordinary prose is the everyday way to write one. The
-            # tail's first cut let these walk from a reader word, across a real
-            # separator or line break, to a path on the other side, making two
-            # innocent lines a hard deny at BLOCKED. That is the same
-            # two-innocent-lines false positive as
-            # test_a_reader_does_not_reach_a_path_on_the_next_line, reached
-            # through a quote instead of a bare newline, so the tail's interior
-            # excludes `;`, `|`, `&` and a newline exactly as the bare run does.
+            # apostrophe in ordinary prose is the everyday way to write one.
+            # `it's` opens the tail; what stops it reaching a path further along
+            # is that its interior excludes WHITESPACE, because a shell word has
+            # none unquoted and staying inside one word is the tail's whole job.
+            #
+            # Two earlier cuts got this wrong in instructive ways. The first let
+            # the interior cross anything, so these were hard denials at BLOCKED
+            # on commands that read nothing. The second excluded only `;`, `|`,
+            # `&` and a newline -- which covers the cases that happen to cross a
+            # separator and MISSES `# it's the .npmrc problem`, which crosses
+            # none. Both spellings are pinned here so neither cut can return.
             "head -5 notes.txt  # check what's here\nexport KUBECONFIG=~/.kube/config",
             "sed -n 1p a.txt # it's ok ; ls ~/.kube/config",
             "sort -u hosts.txt # we're deduping\nls -l ~/.kube/config",
             "echo hi # sort of odd, don't\nls ~/.npmrc",
             "cut -d= -f2 .env.example # don't edit\nexport KUBECONFIG=~/.kube/config",
+            # No separator crossed at all -- only whitespace.
+            "head -20 build.log  # it's the .npmrc problem",
+            "nl README.md  # we don't commit ~/.npmrc",
+            "cut -c1-80 log.txt  # user's ~/.kube/config is fine",
+            'head -5 log.txt  # size is 5" wide ~/.npmrc',
         ],
     )
-    def test_the_tail_does_not_walk_past_a_real_separator(self, command, rules_dir_path):
-        """Reaching into a quote must not also mean reaching across a `;`."""
+    def test_the_tail_stays_inside_one_shell_word(self, command, rules_dir_path):
+        """A stray apostrophe must not turn a reader plus a later path into a deny."""
         assert verdict(command, rules_dir_path).allowed, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # `&` inside `"..."` can never be a separator, and these are ordinary
+            # directory names. Excluding it from the tail cost every one of them
+            # a denial `main` had.
+            'cat "$HOME/R&D/.kube/config"',
+            'cat "$HOME/Dev&Ops/.npmrc"',
+            'nl "$HOME/Q&A/.netrc"',
+            # The tail is bounded as ReDoS insurance, not as a coverage limit.
+            # At 200 this deep absolute path went unrated while `main` denied it.
+            'cat "/' + "d" * 199 + '/.ssh/id_ed25519"',
+            'cat "/' + "d" * 600 + '/.kube/config"',
+        ],
+    )
+    def test_the_tail_reaches_a_realistic_path(self, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
 
     @pytest.mark.parametrize(
         "command",
