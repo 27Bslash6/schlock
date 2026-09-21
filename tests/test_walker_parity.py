@@ -407,34 +407,52 @@ class TestParseOnce:
         """
         parser = BashCommandParser()
         ast = parser.parse(command)
-        for segment, literals in parser.extract_command_segments_with_literals(command, ast):
+        for segment, literals, _node in parser.extract_command_segments_with_literals(command, ast):
             expected = parser.extract_string_literals(segment, parser.parse(segment))
             assert literals == expected, f"segment {segment!r}"
 
-    def test_heredoc_segment_gains_the_literal_suppression_it_should_have_had(self):
-        """The one deliberate verdict change in the parse-once switch.
+    def test_heredoc_segment_keeps_its_literal_suppression(self):
+        """A heredoc segment's literals come from the parent AST, not a re-parse.
 
-        A heredoc segment cannot be parsed standalone (its body sits outside the
-        segment span), so the old per-segment re-parse threw, fell back to NO
-        literals, and matched `rm -rf /` inside a quoted argument — a false
-        positive. Parent-derived ranges make the suppression consistent with
-        every other segment. `cat "rm -rf /"` passes that string as a FILENAME;
-        nothing executes it, so dropping the match is the correct direction.
+        The segment span stops at the `<<EOF`, so a bare slice used to throw on
+        re-parse and fall back to NO literals - matching `rm -rf /` inside a
+        quoted argument, which `cat` only ever opens as a FILENAME. _close_heredocs
+        (LAB-1732) has since made such a segment parseable standalone, so the two
+        routes now agree; deriving from the parent reaches the same answer without
+        the second parse, and the blob _close_heredocs appends lands PAST every
+        range, which is what stops it shifting them.
         """
         parser = BashCommandParser()
         command = 'ls; cat "rm -rf /" <<EOF\nbody\nEOF\n'
         heredoc_segments = [
             (text, literals)
-            for text, literals in parser.extract_command_segments_with_literals(command, parser.parse(command))
+            for text, literals, _node in parser.extract_command_segments_with_literals(command, parser.parse(command))
             if "<<" in text
         ]
-        assert heredoc_segments == [('cat "rm -rf /" <<EOF', [(5, 13)])]
-        with pytest.raises(Exception, match="."):  # noqa: B017,PT011 - bashlex's own error type varies
-            parser.parse(heredoc_segments[0][0])
+        assert heredoc_segments == [('cat "rm -rf /" <<EOF\n\nEOF', [(5, 13)])]
+        text, literals = heredoc_segments[0]
+        assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
+        assert parser.extract_string_literals(text, parser.parse(text)) == literals
+
+    def test_a_segment_never_carries_a_non_shell_heredoc_body(self):
+        """Why the segment loop passes no heredoc_ranges.
+
+        Those ranges exist to stop rule patterns matching inside a NON-shell
+        heredoc body. _close_heredocs brings a body back only for a shell - whose
+        body is code, and deliberately not suppressed - and stands an empty line
+        in for every other command, so no segment ever holds a body for them to
+        suppress. Deriving them would mean tracking where the appended blob
+        landed; this pins the premise that lets the segment loop skip it instead.
+        """
+        parser = BashCommandParser()
+        inert = "cat <<EOF | grep x\nrm -rf /\nEOF\n"
+        assert parser.extract_command_segments(inert, parser.parse(inert)) == ["cat <<EOF\n\nEOF", "grep x"]
+        code = "bash <<EOF | tee log\nrm -rf /\nEOF\n"
+        assert parser.extract_command_segments(code, parser.parse(code)) == ["bash <<EOF\nrm -rf /\nEOF", "tee log"]
 
     def test_segment_text_is_unchanged_by_the_refactor(self):
         parser = BashCommandParser()
         command = "ls | rm -rf / && echo done"
         ast = parser.parse(command)
         with_literals = parser.extract_command_segments_with_literals(command, ast)
-        assert [text for text, _literals in with_literals] == parser.extract_command_segments(command, ast)
+        assert [text for text, _lits, _node in with_literals] == parser.extract_command_segments(command, ast)

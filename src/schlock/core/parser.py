@@ -123,6 +123,12 @@ _apply_andor_substitution_correction()
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
 # those run a *named* command, not stdin-as-program, and are covered by the download->shell
 # and wrapper-command checks.
+# A heredoc body is inert text to `cat` and source code to `bash`, which decides
+# both whether its matches are suppressed (extract_heredoc_ranges) and whether a
+# segment has to carry it (extract_command_segments). One set, so the two answers
+# cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
+_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish"})
+
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
         "bash",
@@ -525,6 +531,39 @@ class BashCommandParser:
 
         return results
 
+    @staticmethod
+    def _close_heredocs(segment: str, node: Any) -> str:
+        """Re-attach this command's heredocs so the segment parses on its own.
+
+        bashlex hangs a heredoc body off the redirect node, PAST the command's
+        span, so the bare slice ends at a `<<EOF` whose body never arrives. It
+        then fails to re-parse, and a segment with no AST loses both literal
+        suppression and the quote-stripped pass - which is how
+        `echo hi && "chmod" 777 /etc/shadow <<EOF` scored SAFE.
+
+        Only a shell's body comes back with it. `cat`'s body is inert text that
+        the rule patterns would scan for nothing, and they backtrack over it:
+        an everyday `cat <<EOF > file` with a 1000-line body cost seconds on a
+        hook that runs before every bash call. `bash`'s body is source code,
+        and dropping it would let `bash <<EOF | tee log` hide an `rm -rf /`.
+
+        The terminator is always bashlex's own delimiter word, stripped exactly
+        as the slice was, so a CRLF opener cannot desync from its terminator and
+        fail closed on a legitimate command.
+        """
+        cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
+        executes_body = cmd_name in _HEREDOC_SHELL_COMMANDS
+
+        for part in node.parts:
+            heredoc = getattr(part, "heredoc", None)
+            if heredoc is None:
+                continue
+            # bashlex's value is the body followed by its terminator line.
+            body, _, _ = heredoc.value.rpartition("\n")
+            segment += f"\n{body if executes_body else ''}\n{part.output.word.strip()}"
+
+        return segment
+
     def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
         """Collect the AST nodes that each form one independently-validated segment."""
         nodes: list[Any] = []
@@ -623,73 +662,60 @@ class BashCommandParser:
             >>> parser.extract_command_segments("ls | rm -rf / && echo done", ast)
             ['ls', 'rm -rf /', 'echo done']
         """
-        return [text for text, _literals in self.extract_command_segments_with_literals(command, ast_nodes)]
+        return [text for text, _lits, _node in self.extract_command_segments_with_literals(command, ast_nodes)]
 
-    def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[tuple[str, list[tuple]]]:
-        """Segments plus their quoted-string ranges, derived from ONE parse.
+    def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[tuple[str, list[tuple], Any]]:
+        """Segments, their quoted-string ranges, and their own AST node — from ONE parse.
 
         PERF/SECURITY: the segment loop in `validate_command` used to re-parse
-        every segment just to recover its string-literal ranges — N+1 parses per
-        command, which under the native tier (spec §3.2) is N+1 subprocess spawns
-        on a hook that runs before every bash call. Each segment is a slice of
-        `command`, so its word positions are already in the parent AST: walk the
-        segment's own sub-tree and rebase the offsets instead.
+        every segment — for its string-literal ranges, and since LAB-1732 for the
+        quote-stripped reconstructed pass too. That is N+1 parses per command,
+        which under the native tier (spec §3.2) is N+1 subprocess spawns on a hook
+        that runs before every bash call. A segment is a slice of `command`, so its
+        words already sit in the parent AST: rebase the offsets, and hand the
+        segment's own node back so the reconstructed pass can read that segment's
+        quoting straight out of `command` (see
+        validator._match_original_and_reconstructed). Deriving rather than
+        re-parsing also removes the failure mode the re-parse had to fail closed
+        on — a segment that would not parse standalone no longer exists.
 
         Args:
             command: Original command string
             ast_nodes: List of AST nodes from parse() of the WHOLE command
 
         Returns:
-            List of (segment_text, string_literal_ranges), the ranges relative to
-            segment_text. These match a standalone re-parse of the segment
-            everywhere the segment is independently parseable; where it is not
-            (a heredoc redirect, whose body lies outside the segment span) the
-            old code fell back to NO literals, so a quoted argument there now
-            correctly stops suppressing — see tests/test_walker_parity.py.
+            List of (segment_text, string_literal_ranges, segment_node), the ranges
+            relative to segment_text. segment_text carries its heredoc back
+            (_close_heredocs); that blob is appended AFTER the ranges are rebased,
+            at the end of the text, so it cannot shift them.
         """
-        results: list[tuple[str, list[tuple]]] = []
+        results: list[tuple[str, list[tuple], Any]] = []
         for node in self._segment_nodes(ast_nodes):
             located = self._locate_segment(command, node)
             if located is None:
                 continue
             text, base = located
             end = base + len(text)
-            results.append(
-                (
-                    text,
-                    [
-                        (start - base, stop - base)
-                        for start, stop in self.extract_string_literals(command, [node])
-                        # Guard, not a live branch: a literal outside the span has
-                        # no segment-relative expression. Dropping one only costs
-                        # a false-positive suppression, never a missed match.
-                        if start >= base and stop <= end
-                    ],
-                )
-            )
+            literals = [
+                (start - base, stop - base)
+                for start, stop in self.extract_string_literals(command, [node])
+                # Guard, not a live branch: a literal outside the span has
+                # no segment-relative expression. Dropping one only costs
+                # a false-positive suppression, never a missed match.
+                if start >= base and stop <= end
+            ]
+            results.append((self._close_heredocs(text, node), literals, node))
         return results
 
-    def reconstruct_command(self, ast_nodes: list[Any]) -> str:
-        """Reconstruct command from AST word nodes.
-
-        SECURITY CRITICAL: Bashlex unescapes special characters during parsing.
-        For example, 'rm\\ -rf\\ /' becomes word 'rm -rf /'.
-        This reconstruction enables pattern matching against the ACTUAL command
-        that will be executed, not the escaped input string.
-
-        Args:
-            ast_nodes: List of bashlex AST nodes from parse()
+    def _collect_words(self, ast_nodes: list[Any]) -> list[tuple[str, Optional[tuple]]]:
+        """Collect the word parts that make up the reconstructed command.
 
         Returns:
-            Reconstructed command string with escapes resolved
-
-        Example:
-            >>> parser = BashCommandParser()
-            >>> ast = parser.parse("rm\\\\ -rf\\\\ /")
-            >>> parser.reconstruct_command(ast)
-            'rm -rf /'
+            List of (word_text, original_span) tuples in reconstruction order.
+            original_span is the node's (start, end) offsets in the source
+            command, or None when the node carries no position.
         """
-        words = []
+        words: list[tuple[str, Optional[tuple]]] = []
 
         def visit(node):
             """Recursively visit AST nodes to extract words."""
@@ -698,7 +724,7 @@ class BashCommandParser:
                 if node.kind == "command" and hasattr(node, "parts"):
                     for part in node.parts:
                         if hasattr(part, "word"):
-                            words.append(part.word)
+                            words.append((part.word, getattr(part, "pos", None)))
                     return  # Don't recurse further into this command
 
                 # Recursively visit child nodes for other structures
@@ -714,7 +740,117 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
 
-        return " ".join(words)
+        return words
+
+    def reconstruct_command(self, ast_nodes: list[Any]) -> str:
+        """Reconstruct command from AST word nodes.
+
+        No production caller - the live validation pass uses
+        reconstruct_command_with_suppression_ranges, which produces the same
+        string plus the ranges the rule engine needs. Kept for the
+        native-parser differential oracle; harden the other one.
+
+        Args:
+            ast_nodes: List of bashlex AST nodes from parse()
+
+        Returns:
+            Reconstructed command string with escapes resolved
+
+        Example:
+            >>> parser = BashCommandParser()
+            >>> ast = parser.parse("rm\\\\ -rf\\\\ /")
+            >>> parser.reconstruct_command(ast)
+            'rm -rf /'
+        """
+        return " ".join(word for word, _ in self._collect_words(ast_nodes))
+
+    def reconstruct_command_with_suppression_ranges(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
+        """Reconstruct the command AND rebase its suppression ranges onto it.
+
+        SECURITY CRITICAL (LAB-1732): the reconstructed pass is the only defence
+        that catches a dangerous command whose name is quoted - bash runs
+        `"chmod" 777 /etc/shadow` exactly as `chmod 777 /etc/shadow`. That pass
+        used to be skipped whenever the command held any quoted token at all,
+        because reconstruction strips quote characters and so invalidates every
+        offset computed against the original string. Skipping traded a
+        false-positive class for an under-block class, the wrong direction for a
+        fail-closed validator. Rebasing keeps both properties: the pass always
+        runs, and matches living wholly inside quoted data stay suppressed.
+
+        Rebasing works because suppression needs a match to sit ENTIRELY inside
+        one range (RuleEngine._is_in_string_literal). Which words earn a range
+        is decided by _quoting_is_load_bearing - read that first.
+
+        Args:
+            command: Original command string (needed for quote detection)
+            ast_nodes: List of bashlex AST nodes from parse()
+
+        Returns:
+            (reconstructed_command, suppression_ranges).
+
+            NOT the same shape as extract_string_literals, though both feed the
+            same `string_literals=` argument, so passing one where the other
+            belongs misaligns suppression silently. These offsets index the
+            RECONSTRUCTED string, cover the whole word plus its joining space,
+            and are omitted entirely for words whose quotes do no work.
+
+        Example:
+            >>> parser = BashCommandParser()
+            >>> ast = parser.parse('echo "rm -rf /"')
+            >>> parser.reconstruct_command_with_suppression_ranges('echo "rm -rf /"', ast)
+            ('echo rm -rf /', [(5, 14)])
+        """
+        words = self._collect_words(ast_nodes)
+        ranges = []
+        offset = 0
+
+        for word, span in words:
+            if span is not None and self._quoting_is_load_bearing(command, word, span):
+                # Absorb the following joining space. In the source that offset
+                # held the closing quote, a character no rule pattern can cross;
+                # reconstruction turns it into whitespace, which patterns ending
+                # in `(\s|$)` will happily consume - without this the match ends
+                # one character past the range and escapes suppression. Adding it
+                # unconditionally is safe: for the final word the range then ends
+                # at len(reconstructed) + 1, which no match end can reach.
+                ranges.append((offset, offset + len(word) + 1))
+            offset += len(word) + 1  # +1 for the joining space
+
+        return " ".join(word for word, _ in words), ranges
+
+    def _quoting_is_load_bearing(self, command: str, word: str, span: tuple) -> bool:
+        """Whether a word's quotes do real work, rather than just hiding it.
+
+        SECURITY CRITICAL: this is the whole of LAB-1732. Quotes suppress a rule
+        match only when they are what makes the text a single inert argument -
+        `echo "rm -rf /"` passes one word to echo, and without the quotes it
+        would not. A quoted BARE TOKEN is different: bash runs `"mkfs.ext4"`
+        exactly as `mkfs.ext4`, so the quotes change nothing about execution and
+        exist only to keep the name out of the reconstructed string. Suppressing
+        there is the bypass, because a name-only pattern (`\bmkfs\b`) sits
+        entirely inside that one word and so is swallowed whole.
+
+        Asking "is the quoting load-bearing" rather than "is this the command
+        name" is what covers the exec-wrapper forms - `timeout 5 "mkfs.ext4" …`,
+        `env FOO=1 "mkfs.ext4" …`, `nice/command/nohup/setsid "mkfs.ext4" …` -
+        where bash executes a word that is NOT in command-name position.
+        """
+        if not word or not self._is_quoted_span(command, span):
+            return False
+        # Shell-significant characters are the ones quoting actually protects.
+        return any(char in word for char in " \t\n;|&<>()$`*?[]#~!\\'\"")
+
+    @staticmethod
+    def _is_quoted_span(command: str, span: tuple) -> bool:
+        """Whether the source text at ``span`` is wrapped in matching quotes.
+
+        Shared with extract_string_literals so both derive "is this token a
+        quoted literal" from one rule.
+        """
+        start, end = span
+        if start >= len(command) or end > len(command) or end - start < 2:
+            return False
+        return (command[start] == '"' and command[end - 1] == '"') or (command[start] == "'" and command[end - 1] == "'")
 
     def extract_heredoc_ranges(self, command: str, ast_nodes: list[Any]) -> list[tuple]:
         """Extract heredoc content ranges that should NOT be pattern matched.
@@ -731,7 +867,6 @@ class BashCommandParser:
             is_shell=True means the heredoc will be executed by a shell.
         """
         heredoc_ranges = []
-        shell_commands = {"bash", "sh", "zsh", "ksh", "dash", "ash", "fish"}
 
         def visit(node, parent_cmd=None):
             """Recursively visit AST nodes to find heredocs."""
@@ -749,7 +884,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in shell_commands if parent_cmd else False
+                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -794,16 +929,11 @@ class BashCommandParser:
             if hasattr(node, "kind"):
                 # Look for word nodes that are quoted strings
                 if node.kind == "word" and hasattr(node, "pos"):
-                    start, end = node.pos
-                    # Check if the position in the original command has quotes
-                    if start < len(command) and end <= len(command):
-                        if (command[start] == '"' and command[end - 1] == '"') or (
-                            command[start] == "'" and command[end - 1] == "'"
-                        ):
-                            # Record the position INSIDE the quotes (exclude quote chars)
-                            # Only append valid ranges (empty strings would create invalid ranges)
-                            if start + 1 <= end - 1:
-                                string_literals.append((start + 1, end - 1))
+                    # Record the position INSIDE the quotes (exclude quote chars).
+                    # _is_quoted_span's own `end - start < 2` check rules out the
+                    # empty-quote span that would invert this range.
+                    if self._is_quoted_span(command, node.pos):
+                        string_literals.append((node.pos[0] + 1, node.pos[1] - 1))
 
                 # Recursively visit child nodes
                 for attr in ["parts", "command", "list", "pipe", "compound"]:
