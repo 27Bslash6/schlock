@@ -978,7 +978,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
 
 def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting it hides the state machine
     line: str, quote: str
-) -> tuple[str, list[tuple[str, bool, int]], str]:
+) -> tuple[str, list[tuple[str, bool, int, int]], str]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted* `<<` opens a heredoc. Bash reads `echo "x << y"` and
@@ -990,13 +990,14 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
 
     ``quote`` carries the quote character left open by the previous line, since a
     string spanning lines means the next line is not shell to be scanned. Returns
-    ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener order, open
-    quote)``; each ``offset`` is where its `<<` sits, which is the only honest
-    source for "what command owns this heredoc" - a second regex looking for the
-    first `<<` would find the quoted ones this deliberately skipped.
+    ``(rewritten line, [(delimiter, strips_tabs, start, end)] in opener order, open
+    quote)``; ``start`` is where its `<<` sits, which is the only honest source for
+    "what command owns this heredoc" - a second regex looking for the first `<<`
+    would find the quoted ones this deliberately skipped. ``end`` is just past the
+    delimiter word, so a caller can splice the opener without re-lexing it.
     """
     out: list[str] = []
-    openers: list[tuple[str, bool, int]] = []
+    openers: list[tuple[str, bool, int, int]] = []
     continued = False
     pos = 0
 
@@ -1042,7 +1043,7 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
             while pos < len(line) and line[pos] in " \t":
                 pos += 1
             delimiter, pos = _read_delimiter(line, pos)
-            openers.append((delimiter, strips_tabs, opener_at))
+            openers.append((delimiter, strips_tabs, opener_at, pos))
             out.append(f"<<{'-' if strips_tabs else ''}{_HEREDOC_PLACEHOLDER}")
         else:
             out.append(char)
@@ -1055,6 +1056,112 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
         raise ParseError("Heredoc opener on a line that continues; the body's start is unknown")
 
     return "".join(out), openers, quote
+
+
+# A delimiter that can be written bare: no blank, no metacharacter, nothing that
+# would re-cut the opener line once the quotes come off. `<<'A;B'` is a legal
+# heredoc whose quote-removed delimiter is not a bare word, and emitting `<<A;B`
+# would start a second command out of thin air - the same hazard that made
+# _neuter_heredocs invent a placeholder rather than reuse the real delimiter.
+_BARE_DELIMITER_RE = re.compile(r"\A[\w.+-]+\Z")
+
+
+def _normalise_heredoc_delimiters(command: str) -> str:
+    """Rewrite `<<'EOF'` to `<<EOF ` so bashlex ends the body where bash does.
+
+    bashlex takes the delimiter *as written*, quotes and all, so `<<'EOF'` ends at a
+    line reading `'EOF'` while bash ends at one reading `EOF`. Both halves of
+    LAB-3094 are that one disagreement:
+
+    - no literal `'EOF'` line exists, so bashlex raises and the command detours into
+      the permissive fallback, which discards the body - a shell heredoc's *program*
+      - and scores the head alone (`bash <<'EOF'` / `rm -rf /` came back LOW);
+    - a literal `'EOF'` line does exist, so bashlex parses but files every real
+      command between the two boundaries as inert body text (`cat <<'EOF'` with a
+      bare `EOF` line, then `rm -rf /`, came back SAFE - bash runs the `rm`).
+
+    Normalising up front puts both back on the main path, where the delimiter means
+    what bash means by it, and `extract_heredoc_ranges` already knows a shell
+    consumer's body is code rather than text. That is also what makes the fallback
+    unreachable for a well-formed heredoc, which is the point: it is the permissive
+    path, and nothing well-formed should need it.
+
+    The rewrite is LENGTH-PRESERVING - the delimiter loses its quotes and the opener
+    is padded back out with blanks. Callers parse the result but keep matching the
+    original, and the offsets `extract_heredoc_ranges` / `extract_string_literals`
+    hand back are applied to that original (rules.py `_is_in_non_shell_heredoc`), so
+    a byte has to mean the same thing in both strings. Shortening the opener would
+    slide every suppression range left by two and silently point them at the wrong
+    text.
+
+    Stripping quotes reads the body as expanding when bash would not, which only ever
+    over-approximates danger: a quoted body is inert, an unquoted one is not, so the
+    error direction is a false positive rather than a miss. Measured on the unquoted
+    twins, it costs nothing in practice - `cat <<EOF` scores SAFE with a `$(rm -rf /)`
+    body today, since a non-shell heredoc's content is suppressed either way.
+    (Whether that suppression is itself too generous is LAB-2756, not this.)
+
+    Only opener lines are scanned and bodies are copied verbatim: a `<<` inside a
+    body is data, not a heredoc.
+
+    Returns the command unchanged when any opener cannot be rewritten - a delimiter
+    that is not a bare word, a body with no terminator, an opener on a continued
+    line. Those keep exactly the route they have now: bashlex rejects them and the
+    fallback decides, failing closed where it cannot read them.
+    """
+    if "<<" not in command:
+        return command
+
+    lines = command.split("\n")
+    out: list[str] = []
+    quote = ""
+    index = 0
+    changed = False
+
+    try:
+        while index < len(lines):
+            line = lines[index]
+            _, openers, quote = _rewrite_openers(line, quote)
+            index += 1
+
+            if openers:
+                pieces: list[str] = []
+                cursor = 0
+                for delimiter, strips_tabs, start, end in openers:
+                    if not _BARE_DELIMITER_RE.match(delimiter):
+                        return command
+                    opener = f"<<{'-' if strips_tabs else ''}{delimiter}"
+                    if len(opener) > end - start:
+                        # Quote removal only ever shortens, so this is unreachable for a
+                        # bare-word delimiter; keep the guard rather than trust that.
+                        return command
+                    pieces.append(line[cursor:start])
+                    pieces.append(opener.ljust(end - start))
+                    changed = changed or opener.ljust(end - start) != line[start:end]
+                    cursor = end
+                pieces.append(line[cursor:])
+                line = "".join(pieces)
+
+            out.append(line)
+
+            # Bodies are consumed in opener order, exactly as _neuter_heredocs does it,
+            # and for the same reason: the delimiter comparison has to match bash's or a
+            # body line gets mistaken for the terminator. Nothing in a body is rewritten.
+            for delimiter, strips_tabs, _, _ in openers:
+                while index < len(lines):
+                    body = lines[index]
+                    out.append(body)
+                    index += 1
+                    if (body.lstrip("\t") if strips_tabs else body) == delimiter:
+                        break
+                else:
+                    # No terminator: where the body ends is unknown, so which text is
+                    # shell is unknown. Hand it back untouched and let the fallback deny.
+                    return command
+    except ParseError:
+        return command
+
+    return "\n".join(out) if changed else command
 
 
 def _neuter_heredocs(command: str) -> tuple[str, str]:
@@ -1101,7 +1208,7 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
         # Bodies are consumed in opener order. `<<-` strips leading tabs from the
         # terminator line as well as the body, so the comparison has to match
         # bash's or a body line would be mistaken for the terminator.
-        for delimiter, strips_tabs, _ in openers:
+        for delimiter, strips_tabs, _, _ in openers:
             # One placeholder line stands in for the entire body. It cannot be
             # dropped altogether: bashlex rejects an empty heredoc inside a
             # compound statement, which would deny every `for … do
@@ -1342,14 +1449,19 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
 
         # Step 4: Parse command and extract AST context
         parser = _get_parser()
+        # bashlex ends a heredoc at the delimiter as written, bash at the delimiter with
+        # its quotes removed. Reconciling the two before parsing is what keeps a quoted
+        # delimiter on this path at all - and the rewrite is length-preserving precisely
+        # so the offsets below still address `command` (LAB-3094).
+        parse_target = _normalise_heredoc_delimiters(command)
         try:
-            ast = parser.parse(command)
+            ast = parser.parse(parse_target)
             # Extract string literals for context-aware matching
-            string_literals = parser.extract_string_literals(command, ast)
+            string_literals = parser.extract_string_literals(parse_target, ast)
 
             # Extract heredoc ranges - matches inside non-shell heredocs should be ignored
             # 'cat << EOF' just outputs text, 'bash << EOF' executes it
-            heredoc_ranges = parser.extract_heredoc_ranges(command, ast)
+            heredoc_ranges = parser.extract_heredoc_ranges(parse_target, ast)
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
@@ -1422,7 +1534,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # SECURITY CRITICAL: Extract and validate each command segment independently
             # This prevents bypass via piping/chaining dangerous commands after whitelisted ones
             # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
-            segments = parser.extract_command_segments(command, ast)
+            # `parse_target`, not `command`: these segments are sliced at positions from
+            # `ast` and then re-parsed individually, so a segment cut out of the original
+            # would carry a quoted heredoc delimiter bashlex rejects (LAB-3094).
+            segments = parser.extract_command_segments(parse_target, ast)
 
             # Track all matched rules for audit logging (used when multiple segments)
             all_matched_rules = []
@@ -1435,7 +1550,11 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # each segment is evaluated in isolation. Whitelisting the full command
                 # here allows specific safe pipe patterns without whitelisting the
                 # constituent commands standalone.
-                if engine.is_whitelisted(command):
+                # whole=True: a whitelist entry may vouch for a multi-command line only
+                # when it accounts for all of it. `^ls\b` matching the `ls` in
+                # `ls && rm -rf /` used to short-circuit the per-segment loop below -
+                # the exact bypass the comment above says this prevents.
+                if engine.is_whitelisted(parse_target, whole=True):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -1495,7 +1614,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         alternatives=highest_match.alternatives,
                     )
                 else:
-                    match = engine.match_command(command, string_literals=string_literals)
+                    match = engine.match_command(parse_target, string_literals=string_literals)
                     all_matched_rules = []
             else:
                 # Single segment - validate both original and reconstructed command
@@ -1504,7 +1623,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 match = _match_original_and_reconstructed(
                     engine,
                     parser,
-                    command,
+                    parse_target,
                     ast,
                     string_literals=string_literals,
                     heredoc_ranges=heredoc_ranges,
