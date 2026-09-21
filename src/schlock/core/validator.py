@@ -1063,7 +1063,13 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
 # heredoc whose quote-removed delimiter is not a bare word, and emitting `<<A;B`
 # would start a second command out of thin air - the same hazard that made
 # _neuter_heredocs invent a placeholder rather than reuse the real delimiter.
-_BARE_DELIMITER_RE = re.compile(r"\A[\w.+-]+\Z")
+#
+# The leading character is excluded separately because the hazard there is
+# RE-LEXING, not metacharacters: `-` is a perfectly legal first character of a
+# delimiter (`<<'-q'` ends at a line reading `-q`), but emitting it bare gives
+# `<<-q`, which bash reads as the `<<-` operator plus delimiter `q`. The body then
+# ends at the wrong line and the commands in between are filed as inert text.
+_BARE_DELIMITER_RE = re.compile(r"\A[\w.+][\w.+-]*\Z")
 
 
 def _normalise_heredoc_delimiters(command: str) -> str:
@@ -1718,7 +1724,11 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         shellcheck_elevated = False
         security_findings: list = []  # Initialize for type checker
         if is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
-            findings = run_shellcheck(command)
+            # `parse_target`, not `command`: ShellCheck cannot read an interior-quoted
+            # delimiter (`<<'E'OF`) any more than bashlex can, and answers with SC1044
+            # parse noise instead of findings - silently emptying this whole tier for
+            # the commands normalisation exists to rescue (LAB-3094).
+            findings = run_shellcheck(parse_target)
             security_findings = get_security_findings(findings)
             if security_findings:
                 # Elevate to BLOCKED if ShellCheck found security issues

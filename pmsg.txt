@@ -1,0 +1,30 @@
+fix(validator): close two under-blocks the panel found in the rewrite
+
+Both were deny-to-allow against main, and both were this ticket's own defect
+class reintroduced by its own fix.
+
+1. A delimiter starting with "-" survived the bare-word check, so "<<'-q'" was
+   re-emitted as "<<-q" -- which bash and bashlex both re-lex as the "<<-"
+   operator plus delimiter "q". The body then ended at a line reading "q"
+   instead of "-q", and every command in between was filed as inert heredoc
+   text: a live "curl ... | sh" after the real terminator scored SAFE, against
+   BLOCKED on main. The rewrite has to survive RE-LEXING, not just quote
+   removal, so the first character is now excluded separately from the rest.
+
+2. ShellCheck is a second consumer of the parsed form and reads delimiters too.
+   It cannot parse an interior-quoted delimiter ("<<'E'OF") any more than
+   bashlex can -- it answers with SC1044 parse noise instead of findings, so
+   the entire ShellCheck tier went silently empty for exactly the commands
+   normalisation exists to rescue. On main these reached ShellCheck through the
+   fallback's neutered form, so "cat <<'E'OF ... rm -fr /lib" went BLOCKED to
+   SAFE. It now gets the normalised command like every other consumer.
+
+Regression guards for both; the two end-to-end ones fail on the pre-fix tree.
+The ShellCheck guard deliberately runs without the no-shellcheck fixture.
+
+Not applied, with reasons: passing heredoc_ranges to the multi-segment
+no-match fallback (the rangeless scan is the only net for bashlex-vs-bash
+divergence -- measured previously as 64 write-then-run shapes and 24
+stdin-executing owners going BLOCKED to SAFE), and blanking a non-shell body
+before matching (measured at 12x SLOWER, not faster -- the unbounded rule
+patterns backtrack over homogeneous whitespace runs).
