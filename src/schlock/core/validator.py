@@ -1072,6 +1072,59 @@ def _rewrite_openers(  # noqa: PLR0912 - one branch per lexical state; splitting
 _BARE_DELIMITER_RE = re.compile(r"\A[\w.+][\w.+-]*\Z")
 
 
+def _blank_body_line(line: str) -> str:
+    """Replace a quoted heredoc body line with inert filler of the same length.
+
+    A quoted delimiter makes the body LITERAL: bash neither expands it nor joins its
+    continued lines. Take the quotes off and both of those turn back on, and each one
+    is a live under-block (LAB-3094, found by cross-family review of the first fix):
+
+    - `x\\` on a body line joins onto the NEXT line once unquoted, so a terminator
+      sitting there stops being one. The body then runs to some later terminator and
+      swallows whatever real shell lay between - a `curl … | sh` scored SAFE.
+    - `${` alone is literal text quoted, and an unterminated expansion unquoted. That
+      is a PARSE error to ShellCheck (SC1009/SC1073/SC1072), which are discarded as
+      non-security findings - so the whole ShellCheck tier went silently dark and a
+      `rm -fr /lib` after the terminator stopped being caught.
+
+    So the rewrite may fix the delimiter's SPELLING, but it must not let the body be
+    re-interpreted. Filler keeps the one property bashlex needs from a body - its
+    length and line count, so every offset and boundary still lands where it did -
+    while carrying nothing that can expand, continue a line, or fail to parse.
+
+    The body is not lost: a shell consumer's real body is validated as code from the
+    original command, via the ranges this preserves (see validate_command). For a
+    non-shell consumer the body is inert text that `_is_in_non_shell_heredoc` would
+    have suppressed from matching anyway.
+    """
+    return "x" * len(line)
+
+
+def _shell_heredoc_bodies(command: str, parse_target: str, heredoc_ranges: list[tuple]) -> list[str]:
+    """The real text of every blanked heredoc body a shell will execute.
+
+    `bash <<'EOF'` hands its body to bash as a program, which is the same relationship
+    `bash -c "…"` has with its argument - so the body is routed to the same
+    shell-delegation merge, and inherits its depth cap and worst-verdict-wins rule
+    rather than growing a second one.
+
+    Only bodies this module blanked are returned, and they are read from the ORIGINAL
+    command: the filler is what keeps the outer parse honest (see `_blank_body_line`),
+    and this is what stops that filler costing us the body's contents. An unquoted
+    heredoc is never blanked, so its body reaches the rules the way it always did and
+    must not be validated twice.
+
+    The blanked-ness test is a direct comparison rather than a flag threaded down from
+    the rewrite, because the ranges come back from bashlex and only the text can say
+    whether a given range is one this module rewrote.
+    """
+    return [
+        command[start:end]
+        for start, end, is_shell in heredoc_ranges
+        if is_shell and parse_target[start:end] != command[start:end] and command[start:end].strip()
+    ]
+
+
 def _normalise_heredoc_delimiters(command: str) -> str:
     """Rewrite `<<'EOF'` to `<<EOF ` so bashlex ends the body where bash does.
 
@@ -1100,15 +1153,14 @@ def _normalise_heredoc_delimiters(command: str) -> str:
     slide every suppression range left by two and silently point them at the wrong
     text.
 
-    Stripping quotes reads the body as expanding when bash would not, which only ever
-    over-approximates danger: a quoted body is inert, an unquoted one is not, so the
-    error direction is a false positive rather than a miss. Measured on the unquoted
-    twins, it costs nothing in practice - `cat <<EOF` scores SAFE with a `$(rm -rf /)`
-    body today, since a non-shell heredoc's content is suppressed either way.
-    (Whether that suppression is itself too generous is LAB-2756, not this.)
+    A quoted delimiter also makes the BODY literal, and that does NOT survive quote
+    removal - an earlier version of this claimed the error direction could only be a
+    false positive, and cross-family review refuted it with two live under-blocks. So
+    a quoted heredoc's body is replaced with inert filler of the same length and line
+    count rather than carried verbatim; `_blank_body_line` documents both failures.
+    An unquoted delimiter changes nothing at all here, so that path is untouched.
 
-    Only opener lines are scanned and bodies are copied verbatim: a `<<` inside a
-    body is data, not a heredoc.
+    Only opener lines are scanned: a `<<` inside a body is data, not a heredoc.
 
     Returns the command unchanged when any opener cannot be rewritten - a delimiter
     that is not a bare word, a body with no terminator, an opener on a continued
@@ -1130,6 +1182,9 @@ def _normalise_heredoc_delimiters(command: str) -> str:
             _, openers, quote = _rewrite_openers(line, quote)
             index += 1
 
+            # Per opener: was the delimiter actually quoted? That decides whether the
+            # BODY changes meaning under the rewrite, which is the whole hazard below.
+            was_quoted: list[bool] = []
             if openers:
                 pieces: list[str] = []
                 cursor = 0
@@ -1141,9 +1196,11 @@ def _normalise_heredoc_delimiters(command: str) -> str:
                         # Quote removal only ever shortens, so this is unreachable for a
                         # bare-word delimiter; keep the guard rather than trust that.
                         return command
+                    padded = opener.ljust(end - start)
                     pieces.append(line[cursor:start])
-                    pieces.append(opener.ljust(end - start))
-                    changed = changed or opener.ljust(end - start) != line[start:end]
+                    pieces.append(padded)
+                    was_quoted.append(padded != line[start:end])
+                    changed = changed or padded != line[start:end]
                     cursor = end
                 pieces.append(line[cursor:])
                 line = "".join(pieces)
@@ -1152,14 +1209,15 @@ def _normalise_heredoc_delimiters(command: str) -> str:
 
             # Bodies are consumed in opener order, exactly as _neuter_heredocs does it,
             # and for the same reason: the delimiter comparison has to match bash's or a
-            # body line gets mistaken for the terminator. Nothing in a body is rewritten.
-            for delimiter, strips_tabs, _, _ in openers:
+            # body line gets mistaken for the terminator.
+            for (delimiter, strips_tabs, _, _), quoted in zip(openers, was_quoted):
                 while index < len(lines):
                     body = lines[index]
-                    out.append(body)
                     index += 1
                     if (body.lstrip("\t") if strips_tabs else body) == delimiter:
+                        out.append(body)  # terminator stays verbatim; bashlex ends here
                         break
+                    out.append(_blank_body_line(body) if quoted else body)
                 else:
                     # No terminator: where the body ends is unknown, so which text is
                     # shell is unknown. Hand it back untouched and let the fallback deny.
@@ -1687,6 +1745,11 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
         payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
+        # A shell heredoc's body is delegated code too: `bash <<'EOF'` is `bash -c` with
+        # the program on stdin. It is blanked in `parse_target` so the outer parse cannot
+        # misread it, so this is where its real text gets validated (LAB-3094).
+        if match.risk_level < RiskLevel.BLOCKED:
+            payloads += _shell_heredoc_bodies(command, parse_target, heredoc_ranges)
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:

