@@ -421,6 +421,45 @@ _DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
 # not a hot path. Exceeding it fails closed. Pinned by test_depth_cap_fails_closed.
 MAX_SHELL_DELEGATION_DEPTH = 4
 
+# Ceiling on strings schlock DERIVES from an admitted command and re-validates: the heredoc
+# rewrite (_neuter_heredocs) and its segments, and delegated payloads. The rewrite inflates —
+# each heredoc gains the 15-char placeholder twice plus a blank body line — measured at worst
+# 4.62x on a 64 KiB input of minimal `: <<X` heredocs (303,104 chars), and re-neutering is
+# idempotent, so no admitted input reaches 8x. The bound is not for today's shapes; it is so a
+# future rewrite that DOES compound cannot turn an admitted 64 KiB into an unbounded parse.
+# Judging derived text by MAX_COMMAND_SIZE instead denied a 20 KB command for a 66 KB string
+# the caller never wrote (LAB-4363 panel).
+MAX_DERIVED_COMMAND_SIZE = 8 * MAX_COMMAND_SIZE
+
+
+def _over_size_ceiling(command: str, *, derived: bool) -> Optional[ValidationResult]:
+    """The fail-closed denial for text over its ceiling, or None when it fits.
+
+    ``derived`` selects the bound and, as importantly, the message: a caller told their command
+    is too large when the oversized string is schlock's own expansion of it is being lied to.
+    """
+    limit = MAX_DERIVED_COMMAND_SIZE if derived else MAX_COMMAND_SIZE
+    if len(command) <= limit:
+        return None
+    if derived:
+        message = (
+            f"Internal expansion of this command reached {len(command)} chars, over schlock's "
+            f"{limit} char bound for derived text (the command itself was within the "
+            f"{MAX_COMMAND_SIZE} char input limit)"
+        )
+        alternatives = ["Reduce the number of heredocs or nested shell invocations in one command"]
+    else:
+        message = f"Command exceeds size limit ({len(command)} > {limit} chars)"
+        alternatives = ["Split the command into smaller invocations"]
+    return ValidationResult(
+        allowed=False,
+        risk_level=RiskLevel.BLOCKED,
+        message=message,
+        alternatives=alternatives,
+        exit_code=1,
+    )
+
+
 # `watch`'s own options. Only these consume a following word; everything after the option run
 # belongs to the command. Getting this wrong over-approximates (an option value is prepended to
 # the program), which is the safe direction.
@@ -1128,6 +1167,8 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
 def _validate_heredoc_command(
     command: str,
     config_path: Optional[str] = None,
+    *,
+    _derived: bool = False,
 ) -> Optional[ValidationResult]:
     """Validate command containing heredoc that bashlex couldn't parse.
 
@@ -1150,6 +1191,11 @@ def _validate_heredoc_command(
     try:
         engine = _get_rule_engine(config_path)
         neutered, base_command = _neuter_heredocs(command)
+        # The rewrite is schlock's text, not the caller's: bound it as derived, before
+        # _escalate_past_heredoc parses it and re-validates it through the front door.
+        over = _over_size_ceiling(neutered, derived=True)
+        if over is not None:
+            return over
         base_result = _heredoc_base_result(engine, base_command)
         return _escalate_past_heredoc(engine, command, neutered, base_result, config_path)
     except ParseError as e:
@@ -1273,7 +1319,7 @@ def _escalate_past_heredoc(
     for candidate in candidates:
         if not candidate.strip():
             continue
-        candidate_result = validate_command(candidate, config_path)
+        candidate_result = validate_command(candidate, config_path, _derived=True)
         if candidate_result.risk_level.value > result.risk_level.value:
             result = replace(candidate_result, message=f"Alongside heredoc: {candidate_result.message}")
 
@@ -1285,13 +1331,15 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
     config_path: Optional[str] = None,
     *,
     _depth: int = 0,
+    _derived: bool = False,
 ) -> ValidationResult:
     """Validate command for safety.
 
     Main validation API. Orchestrates parsing, rule matching, and caching.
 
     Validation flow:
-    0. Refuse input over MAX_COMMAND_SIZE (fail-closed, O(1), before any parse)
+    0. Refuse input over its size ceiling (fail-closed, O(1), before any parse): MAX_COMMAND_SIZE
+       for what the caller submitted, MAX_DERIVED_COMMAND_SIZE for text schlock derived from it
     1. Check cache for previous result
     2. Validate input (empty check)
     3. Special case checks (git reset --hard, etc.)
@@ -1308,6 +1356,9 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         command: Bash command string to validate
         config_path: Optional path to rules file (for testing)
         _depth: Internal, keyword-only. Shell-delegation recursion depth; callers leave it at 0.
+        _derived: Internal, keyword-only. True when ``command`` is text schlock produced from an
+            admitted command (a heredoc rewrite or one of its segments), so the derived-text
+            ceiling applies, not the caller's. Callers leave it False.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -1320,17 +1371,16 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
     """
     try:
         # Step 0: Size ceiling. bashlex plus the rule pass cost tens of ms per KB, and Claude Code
-        # runs this hook before every Bash call with a fail-OPEN timeout, so an unbounded input is
-        # a bypass, not a slowdown. Deny (never skip, unlike commit_filter's local fail-open guard),
-        # before the cache lookup so a multi-MB string is never hashed or stored.
-        if len(command) > MAX_COMMAND_SIZE:
-            return ValidationResult(
-                allowed=False,
-                risk_level=RiskLevel.BLOCKED,
-                message=f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)",
-                alternatives=["Split the command into smaller invocations"],
-                exit_code=1,
-            )
+        # runs this hook before every Bash call with a fail-OPEN timeout, so unbounded input length
+        # is a bypass, not a slowdown. This bounds LENGTH only: rule patterns that are superlinear
+        # in the input still cost seconds well under the ceiling (LAB-3449), so the fail-open
+        # class is narrowed here, not closed. Deny (never skip, unlike commit_filter's local
+        # fail-open guard), before the cache lookup so a multi-MB string is never hashed or stored.
+        # Text schlock derived from an admitted command is judged by its own bound, with a
+        # message that says so: the caller never submitted that string.
+        over = _over_size_ceiling(command, derived=_depth > 0 or _derived)
+        if over is not None:
+            return over
 
         # Step 1: Check cache
         cached = _global_cache.get(command)
@@ -1416,7 +1466,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # e.g., python3 << 'EOF' ... EOF
             if "<<" in command and ("here-document" in str(e) or "heredoc" in str(e).lower()):
                 # Extract command before heredoc and validate that instead
-                heredoc_result = _validate_heredoc_command(command, config_path)
+                heredoc_result = _validate_heredoc_command(command, config_path, _derived=_depth > 0 or _derived)
                 if heredoc_result is not None:
                     return heredoc_result
             # Fall through to block if heredoc handling didn't work
