@@ -75,6 +75,42 @@ class TestStringLiteralBypassFix:
         )
 
 
+class TestEverySuppressionRangeIsConsulted:
+    """Pin that `_is_in_string_literal` consults EVERY suppression range.
+
+    The function folds its ranges with `any(...)`. Truncating that fold to the
+    first range (`string_literals[:1]`) survived the whole suite: no test had a
+    rule match sitting entirely inside a *second* literal. Over-block only, but
+    the next person to batch, sort or bisect that lookup gets no signal from the
+    suite if they get the multi-range case wrong - and a wrong bisect can drop
+    the wrong range in the under-block direction. Found by the LAB-4321 expert
+    panel (LAB-4325).
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Attack: the dangerous text is entirely inside the SECOND literal.
+            # Under the `[:1]` mutation only the first range is consulted, so
+            # the match escapes suppression and this scores BLOCKED.
+            'echo "hello there" "rm -rf /"',
+            # Control: same text, dangerous literal FIRST. The mutation leaves
+            # this verdict untouched, so the pair discriminates on *which*
+            # literal holds the match, not on whether suppression runs at all.
+            'echo "rm -rf /" "hello there"',
+        ],
+    )
+    def test_match_inside_any_literal_is_suppressed(self, safety_rules_path, command):
+        """Each case asserts its own absolute verdict - never attack == control."""
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            result = validate_command(command, config_path=safety_rules_path)
+
+        assert (result.allowed, result.risk_level) == (True, RiskLevel.SAFE), (
+            f"quoted data scored {result.risk_level} (allowed={result.allowed}, rules={result.matched_rules}) for {command!r}"
+        )
+
+
 class TestEmptyQuotedStringRangeFix:
     """Test FIX 2: Empty quoted string range bug.
 
