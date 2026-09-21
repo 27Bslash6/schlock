@@ -407,9 +407,9 @@ class TestParseOnce:
         """
         parser = BashCommandParser()
         ast = parser.parse(command)
-        for segment, literals, _node in parser.extract_command_segments_with_literals(command, ast):
-            expected = parser.extract_string_literals(segment, parser.parse(segment))
-            assert literals == expected, f"segment {segment!r}"
+        for segment in parser.extract_command_segments_with_literals(command, ast):
+            expected = parser.extract_string_literals(segment.text, parser.parse(segment.text))
+            assert segment.string_literals == expected, f"segment {segment.text!r}"
 
     def test_heredoc_segment_keeps_its_literal_suppression(self):
         """A heredoc segment's literals come from the parent AST, not a re-parse.
@@ -426,7 +426,7 @@ class TestParseOnce:
         command = 'ls; cat "rm -rf /" <<EOF\nbody\nEOF\n'
         heredoc_segments = [
             (text, literals)
-            for text, literals, _node in parser.extract_command_segments_with_literals(command, parser.parse(command))
+            for text, literals, _hd, _node in parser.extract_command_segments_with_literals(command, parser.parse(command))
             if "<<" in text
         ]
         assert heredoc_segments == [('cat "rm -rf /" <<EOF\n\nEOF', [(5, 13)])]
@@ -434,25 +434,63 @@ class TestParseOnce:
         assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
         assert parser.extract_string_literals(text, parser.parse(text)) == literals
 
-    def test_a_segment_never_carries_a_non_shell_heredoc_body(self):
-        """Why the segment loop passes no heredoc_ranges.
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x",
+            # Puts the heredoc-bearing segment at a NONZERO base, so the rebase
+            # is real arithmetic rather than an identity.
+            "echo lead && diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n)",
+            "echo ok; x=$(cat <<EOF\nrm -rf /\nEOF\n)",
+            # A nested SHELL body must keep is_shell through the rebase, or it
+            # would start suppressing code.
+            "echo ok; diff /dev/null <(bash <<EOF\nrm -rf /\nEOF\n)",
+        ],
+    )
+    def test_nested_heredoc_ranges_match_a_per_segment_reparse(self, command):
+        r"""A heredoc NESTED in a substitution rides inside the segment's own slice.
 
-        Those ranges exist to stop rule patterns matching inside a NON-shell
-        heredoc body. _close_heredocs brings a body back only for a shell - whose
-        body is code, and deliberately not suppressed - and stands an empty line
-        in for every other command, so no segment ever holds a body for them to
-        suppress. Deriving them would mean tracking where the appended blob
-        landed; this pins the premise that lets the segment loop skip it instead.
+                _segment_nodes stops at the outer command, whose span already covers
+                `<(cat <<EOF ... EOF)`, and _close_heredocs only ever reaches a command's
+                OWN redirects - so nothing else takes that body out, and `cat` merely
+                emits it while `diff` merely reads it. Assuming no segment could hold an
+                inert body is what hard-denied
+                `diff /dev/null <(cat <<EOF
+        rm -rf /
+        EOF)`: an over-block on a
+                legitimate text comparison, found in adversarial review of the main merge.
+
+                The body is INSIDE the span, so it rebases onto the segment exactly as the
+                literals do, and the per-segment re-parse stays deleted.
         """
         parser = BashCommandParser()
-        inert = "cat <<EOF | grep x\nrm -rf /\nEOF\n"
-        assert parser.extract_command_segments(inert, parser.parse(inert)) == ["cat <<EOF\n\nEOF", "grep x"]
+        for segment in parser.extract_command_segments_with_literals(command, parser.parse(command)):
+            expected = parser.extract_heredoc_ranges(segment.text, parser.parse(segment.text))
+            assert segment.heredoc_ranges == expected, f"segment {segment.text!r}"
+
+    def test_a_segments_own_heredoc_range_is_dropped_rather_than_rebased(self):
+        """The one place a derived range deliberately differs from a re-parsed one.
+
+        A command's own body sits PAST its span, and _close_heredocs re-appends it
+        at an offset the slice cannot describe, so _rebase drops it. Equivalent
+        either way: the only body it appends is a shell's, which `is_shell` keeps
+        matchable regardless, and every other command gets an empty line where its
+        body was, leaving nothing to suppress.
+        """
+        parser = BashCommandParser()
         code = "bash <<EOF | tee log\nrm -rf /\nEOF\n"
-        assert parser.extract_command_segments(code, parser.parse(code)) == ["bash <<EOF\nrm -rf /\nEOF", "tee log"]
+        shell = parser.extract_command_segments_with_literals(code, parser.parse(code))[0]
+        assert (shell.text, shell.heredoc_ranges) == ("bash <<EOF\nrm -rf /\nEOF", [])
+        # What was dropped is a body the matcher would not have suppressed anyway.
+        assert parser.extract_heredoc_ranges(shell.text, parser.parse(shell.text)) == [(11, 23, True)]
+
+        inert = "cat <<EOF | grep x\nrm -rf /\nEOF\n"
+        blank = parser.extract_command_segments_with_literals(inert, parser.parse(inert))[0]
+        assert (blank.text, blank.heredoc_ranges) == ("cat <<EOF\n\nEOF", [])
 
     def test_segment_text_is_unchanged_by_the_refactor(self):
         parser = BashCommandParser()
         command = "ls | rm -rf / && echo done"
         ast = parser.parse(command)
         with_literals = parser.extract_command_segments_with_literals(command, ast)
-        assert [text for text, _lits, _node in with_literals] == parser.extract_command_segments(command, ast)
+        assert [seg.text for seg in with_literals] == parser.extract_command_segments(command, ast)

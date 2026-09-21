@@ -640,6 +640,6 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     parser = parser_mod.BashCommandParser()
     command = "echo 'rm -rf /' \\ ; ls"
     pairs = parser.extract_command_segments_with_literals(command, parser.parse(command))
-    assert [(text, literals) for text, literals, _node in pairs] == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
-    text, literals, _node = pairs[0]
+    assert [(seg.text, seg.string_literals) for seg in pairs] == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
+    text, literals = pairs[0].text, pairs[0].string_literals
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]

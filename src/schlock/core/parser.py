@@ -8,7 +8,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import bashlex
 import bashlex.errors
@@ -331,6 +331,24 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     return True
 
 
+class CommandSegment(NamedTuple):
+    """One independently-validated command segment, wholly derived from ONE parse.
+
+    The two range lists have DIFFERENT shapes - `(start, stop)` for literals,
+    `(start, stop, is_shell)` for heredocs - and both feed suppression. Naming
+    them is what stops one being passed where the other belongs, which would
+    misalign suppression silently rather than raise.
+    """
+
+    text: str
+    string_literals: list[tuple]
+    heredoc_ranges: list[tuple]
+    node: Any
+    """The segment's own node in the PARENT AST. Its word spans index the whole
+    command, not `text` - see validator._match_original_and_reconstructed's
+    `quote_source`, which is the reason this is handed back at all."""
+
+
 class BashCommandParser:
     """Parse bash commands using bashlex AST analysis.
 
@@ -611,6 +629,28 @@ class BashCommandParser:
 
         return nodes
 
+    @staticmethod
+    def _rebase(ranges: list[tuple], base: int, end: int) -> list[tuple]:
+        """Move offsets from the whole command onto one segment, dropping any outside it.
+
+        Containment is not a formality, and it does different work per caller.
+
+        For string literals it is a guard: a literal outside the span has no
+        segment-relative expression, and dropping one costs only a false-positive
+        suppression, never a missed match.
+
+        For heredoc ranges it is the LIVE case, and both outcomes are load-bearing.
+        A heredoc nested in a substitution (`diff <(cat <<EOF ... EOF)`) sits INLINE
+        in the slice - _close_heredocs only ever reaches a command's own redirects,
+        so nothing else suppresses it, and `cat` merely emits that text. It is
+        inside the span, so it rebases and keeps suppressing. The segment's OWN
+        body sits PAST the span; _close_heredocs re-appends it at an offset this
+        slice cannot describe, so it is dropped - correct twice over, because the
+        only body it ever appends is a shell's, and a shell's body is code that
+        must stay matchable.
+        """
+        return [(start - base, stop - base, *rest) for start, stop, *rest in ranges if start >= base and stop <= end]
+
     def _locate_segment(self, command: str, node: Any) -> Optional[tuple[str, int]]:
         """Return (segment text, its start offset in `command`), or None if unusable.
 
@@ -662,7 +702,7 @@ class BashCommandParser:
             >>> parser.extract_command_segments("ls | rm -rf / && echo done", ast)
             ['ls', 'rm -rf /', 'echo done']
         """
-        return [text for text, _lits, _node in self.extract_command_segments_with_literals(command, ast_nodes)]
+        return [segment.text for segment in self.extract_command_segments_with_literals(command, ast_nodes)]
 
     def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[tuple[str, list[tuple], Any]]:
         """Segments, their quoted-string ranges, and their own AST node — from ONE parse.
@@ -684,27 +724,28 @@ class BashCommandParser:
             ast_nodes: List of AST nodes from parse() of the WHOLE command
 
         Returns:
-            List of (segment_text, string_literal_ranges, segment_node), the ranges
-            relative to segment_text. segment_text carries its heredoc back
-            (_close_heredocs); that blob is appended AFTER the ranges are rebased,
-            at the end of the text, so it cannot shift them.
+            List of CommandSegment - text, its string-literal ranges, its heredoc
+            ranges, and its node - every field relative to `text` except the node.
+            Both range lists go through _rebase, which is where the rule for what
+            a segment may and may not suppress lives. `text` carries its heredoc
+            back (_close_heredocs); that blob is appended AFTER the ranges are
+            rebased, at the end of the text, so it cannot shift them.
         """
-        results: list[tuple[str, list[tuple], Any]] = []
+        results: list[CommandSegment] = []
         for node in self._segment_nodes(ast_nodes):
             located = self._locate_segment(command, node)
             if located is None:
                 continue
             text, base = located
             end = base + len(text)
-            literals = [
-                (start - base, stop - base)
-                for start, stop in self.extract_string_literals(command, [node])
-                # Guard, not a live branch: a literal outside the span has
-                # no segment-relative expression. Dropping one only costs
-                # a false-positive suppression, never a missed match.
-                if start >= base and stop <= end
-            ]
-            results.append((self._close_heredocs(text, node), literals, node))
+            results.append(
+                CommandSegment(
+                    text=self._close_heredocs(text, node),
+                    string_literals=self._rebase(self.extract_string_literals(command, [node]), base, end),
+                    heredoc_ranges=self._rebase(self.extract_heredoc_ranges(command, [node]), base, end),
+                    node=node,
+                )
+            )
         return results
 
     def _collect_words(self, ast_nodes: list[Any]) -> list[tuple[str, Optional[tuple]]]:

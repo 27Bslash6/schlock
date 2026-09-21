@@ -1435,13 +1435,13 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
             # Literal ranges come from the SAME parse — see the method's docstring
             # for why the per-segment re-parse had to go (spec §3.2 parse-once).
-            segments_with_literals = parser.extract_command_segments_with_literals(command, ast)
+            segments = parser.extract_command_segments_with_literals(command, ast)
 
             # Track all matched rules for audit logging (used when multiple segments)
             all_matched_rules = []
 
             # If we have multiple segments, validate each one
-            if len(segments_with_literals) > 1:
+            if len(segments) > 1:
                 # Full-command whitelist check before segment validation.
                 # Per-segment validation cannot detect safe multi-command patterns
                 # (e.g., "gh auth token | docker login ... --password-stdin") because
@@ -1464,27 +1464,21 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 highest_risk = RiskLevel.SAFE
                 highest_match = None
 
-                for segment, seg_literals, seg_node in segments_with_literals:
-                    # Parse-once (spec §3.2): no per-segment re-parse. The
-                    # segment's node is already in `ast`, so the reconstructed
-                    # quote-stripped pass - the LAB-1732 fix, which is what
-                    # catches a `"chmod" 777 /etc/shadow` segment - reads its
-                    # quoting straight out of `command`. There is no segment
-                    # parse left to fail, so the fail-closed branch that stood in
-                    # for one goes with it: literals and reconstruction now come
-                    # from a parse that already succeeded.
-                    #
-                    # No heredoc_ranges either. _close_heredocs carries a body
-                    # back only for a shell, whose body is deliberately NOT
-                    # suppressed, and stands an empty line in for every other -
-                    # so a segment never holds the non-shell heredoc body these
-                    # ranges exist to suppress.
+                for segment in segments:
+                    # Parse-once (spec §3.2): no per-segment re-parse. Every input
+                    # the matcher needs is derived from `ast` - the literal and
+                    # heredoc ranges by _rebase, the reconstruction from the
+                    # segment's own node, whose word spans still index `command`
+                    # and so are read against it via quote_source. There is no
+                    # segment parse left to fail, which is why the fail-closed
+                    # branch that stood in for one is gone rather than dropped.
                     seg_match = _match_original_and_reconstructed(
                         engine,
                         parser,
-                        segment,
-                        [seg_node],
-                        string_literals=seg_literals,
+                        segment.text,
+                        [segment.node],
+                        string_literals=segment.string_literals,
+                        heredoc_ranges=segment.heredoc_ranges,
                         quote_source=command,
                     )
 

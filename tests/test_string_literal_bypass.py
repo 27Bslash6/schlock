@@ -243,6 +243,12 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             # A shell's heredoc body is code. Was HIGH (body never reached the
             # segment); now matches the single-segment `bash <<EOF` verdict.
             ("bash <<EOF | tee log\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
+            # A heredoc NESTED in a substitution is not a direct redirect, so
+            # _close_heredocs never sees it and it rides inside the outer
+            # segment's slice as inert `cat` output that `diff` only reads.
+            # Its range has to be derived off the parent AST or this legitimate
+            # text comparison is hard-denied on system_destruction (LAB-912).
+            ("diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x", True, RiskLevel.MEDIUM),
         ],
     )
     def test_heredoc_segment_verdicts(self, safety_rules_path, command, expected_allowed, expected_risk):
