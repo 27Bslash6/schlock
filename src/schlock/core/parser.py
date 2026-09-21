@@ -127,7 +127,12 @@ _apply_andor_substitution_correction()
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
 # segment has to carry it (extract_command_segments). One set, so the two answers
 # cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
-_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish"})
+#
+# `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
+# bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
+# one disagree about one interpreter - `rbash <<< X` blocks while `rbash <<EOF` does
+# not - which is exactly the drift the paragraph above says cannot happen.
+_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash"})
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -313,7 +318,7 @@ def _first_command_node(node: Any) -> Optional[Any]:
     unlike a here-string's shared fd, which any command in the group may read (`_command_nodes`).
 
     Expressed via `_command_nodes` so the two security-critical traversals share ONE walk skeleton:
-    a future bashlex child-attr change cannot leave one of them silently under-scanning (panel MAJ).
+    a future bashlex child-attr change cannot leave one of them silently under-scanning (LAB-2768).
     """
     return next(iter(_command_nodes(node)), None)
 
