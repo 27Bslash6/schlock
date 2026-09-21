@@ -147,8 +147,9 @@ def _parse_all_substitution_units(
 
     Fail closed by construction: a unit that does not parse raises exactly as it does today; a
     body with nothing to parse (stock bashlex handed back the bare ``'\n'`` string for ``` ` ` ```
-    and crashed on ``.pos``) and a unit ending on a token that is not a newline, ``)`` or EOF
-    both raise ``ParsingError``, so they take the normal deny path.
+    and crashed on ``.pos``), a unit ending on a token that is not a newline, ``)`` or EOF, and a
+    ``$( )`` or ``<( )`` body that runs out before its ``)`` all raise ``ParsingError``, so they take
+    the normal deny path.
     """
     tok = parserobj.tok
     if tokenizerargs is None:
@@ -163,10 +164,26 @@ def _parse_all_substitution_units(
         limit -= 1
 
     newline_type = bashlex.tokenizer.tokentype.NEWLINE
-    unit_end_types = (bashlex.tokenizer.tokentype.EOF, bashlex.tokenizer.tokentype.RIGHT_PAREN)
+    eof_type = bashlex.tokenizer.tokentype.EOF
+    unit_end_types = (eof_type, bashlex.tokenizer.tokentype.RIGHT_PAREN)
+    # ``_parsedolparen`` names ``)`` as the closer of a ``$( )`` / ``<( )`` body; a backtick body has
+    # no closer and legitimately ends at EOF.
+    closer: Any = tokenizerargs.get("eoftoken")
     string = base[sindex:]
     parts: list[Any] = []
     offset = 0
+
+    def body_ended(token: Any) -> bool:
+        """True at the closing ``)`` or, for a backtick body, at its end.
+
+        The word delimiter promised the ``)`` is in the body, so running out of input first means
+        the two scanners disagreed about where the body ends. Handing back the units parsed so far
+        would repeat the LAB-4114 shape - a prefix rated in place of the whole - so deny instead.
+        """
+        if closer is not None and token.ttype is eof_type:
+            raise bashlex.errors.ParsingError(f"unexpected EOF while looking for matching {closer.value!r}", string, len(string))
+        return token.ttype in unit_end_types
+
     while True:
         # ``_parser`` pops ``parserstate`` out of the dict it is given and the tokenizer mutates
         # the state as it runs, so every unit gets its own copy of both.
@@ -183,8 +200,8 @@ def _parse_all_substitution_units(
         parts.extend(node.parts if node.kind == "list" else [node])
 
         terminator: Any = unit.tok._current_token
-        if terminator.ttype in unit_end_types:
-            break  # the unit ended at the closing ``)`` or at the end of the body
+        if body_ended(terminator):
+            break  # the unit ended at the closing ``)`` or at the end of a backtick body
         if terminator.ttype is not newline_type:
             # Only a newline, ``)`` or EOF can end an ``inputunit``. Anything else means the grammar
             # moved under us; handing back the prefix would silently drop the rest of the body.
@@ -200,7 +217,7 @@ def _parse_all_substitution_units(
         following: Any = unit.tok.token()
         while following.ttype is newline_type:
             following = unit.tok.token()
-        if following.ttype in unit_end_types:
+        if body_ended(following):
             break
         # ``a;\nb`` already carries its separator; mirror ``p_list1`` and never emit two in a row.
         if parts[-1].kind != "operator":

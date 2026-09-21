@@ -672,6 +672,10 @@ class TestMultilineSubstitutionCorrection:
             "echo $()",
             "echo $(\n)",
             "echo $(\n# only a comment\n)",
+            # Unterminated bodies: the tokenizer refuses the word before the unit loop ever runs.
+            "echo $(echo ok\n",
+            "echo <(echo ok\n",
+            "echo `echo ok\n",
         ],
     )
     def test_malformed_bodies_still_rejected(self, parser, command):
@@ -689,6 +693,24 @@ class TestMultilineSubstitutionCorrection:
             parser.parse("echo ` `")
         assert isinstance(excinfo.value.original_error, bashlex.errors.ParsingError)
 
+    def test_a_paren_body_that_runs_out_is_rejected(self):
+        """A ``$( )`` body handed over without its ``)`` must deny, never return the units it could parse.
+
+        Unreachable from ``parse()``: the word delimiter refuses an unterminated ``$(`` before the
+        unit loop runs (pinned above). If the two scanners ever disagree about where a body ends,
+        handing back a prefix would repeat the LAB-4114 shape, so the loop fails closed instead.
+        The same text is a complete two-unit body for backticks, which have no closer.
+        """
+        outer = bashlex.parser._parser("echo x")
+        closer = bashlex.tokenizer.token(bashlex.tokenizer.tokentype.RIGHT_PAREN, ")")
+        with pytest.raises(bashlex.errors.ParsingError, match=r"matching '\)'"):
+            parser_mod._parse_all_substitution_units(
+                outer, "echo a\necho b\n", 0, {"eoftoken": closer, "parserstate": outer.parserstate}
+            )
+        node, end = parser_mod._parse_all_substitution_units(outer, "echo a\necho b\n", 0)
+        assert node.kind == "list"
+        assert end == len("echo a\necho b")
+
     @pytest.mark.parametrize(
         "command,span,body_kind,body_span",
         [
@@ -700,6 +722,9 @@ class TestMultilineSubstitutionCorrection:
             ('echo "$(a)$(b)"', (6, 10), "command", (8, 9)),
             ('echo "$(echo a )"', (6, 15), "command", (8, 14)),
             ("echo $(a\n)", (5, 9), "command", (7, 8)),
+            # A heredoc body lies outside the node span, so stock bashlex reads the ``)`` as the
+            # byte after ``cat <<EOF``. Pre-existing and span-only: the tree still holds the redirect.
+            ("echo $(cat <<EOF\nx\nEOF\n)", (5, 17), "command", (7, 16)),
         ],
     )
     def test_one_unit_bodies_are_untouched(self, parser, command, span, body_kind, body_span):
