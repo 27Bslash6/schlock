@@ -16,6 +16,7 @@ from typing import Optional
 import yaml
 
 from schlock.exceptions import ConfigurationError, ParseError
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 from schlock.integrations.shellcheck import (
     get_security_findings,
     is_shellcheck_available,
@@ -1290,6 +1291,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
     Main validation API. Orchestrates parsing, rule matching, and caching.
 
     Validation flow:
+    0. Refuse input over MAX_COMMAND_SIZE (fail-closed, O(1), before any parse)
     1. Check cache for previous result
     2. Validate input (empty check)
     3. Special case checks (git reset --hard, etc.)
@@ -1317,6 +1319,19 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         >>> print(result.exit_code)  # 1
     """
     try:
+        # Step 0: Size ceiling. bashlex plus the rule pass cost tens of ms per KB, and Claude Code
+        # runs this hook before every Bash call with a fail-OPEN timeout, so an unbounded input is
+        # a bypass, not a slowdown. Deny (never skip, unlike commit_filter's local fail-open guard),
+        # before the cache lookup so a multi-MB string is never hashed or stored.
+        if len(command) > MAX_COMMAND_SIZE:
+            return ValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)",
+                alternatives=["Split the command into smaller invocations"],
+                exit_code=1,
+            )
+
         # Step 1: Check cache
         cached = _global_cache.get(command)
         if cached is not None:

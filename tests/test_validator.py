@@ -17,6 +17,7 @@ from schlock.core.validator import (
     validate_command,
 )
 from schlock.exceptions import ConfigurationError, ParseError
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 class TestValidator:
@@ -1052,3 +1053,57 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+class TestInputSizeCeiling:
+    """validate_command refuses oversized input before parsing it (LAB-4363).
+
+    Fail-closed, unlike commit_filter's skip on the same constant; the WHY is at Step 0 in validator.py.
+    """
+
+    OVER_CEILING = [
+        pytest.param(" && ".join(["echo hello"] * 6000), id="and-chained-echo"),
+        pytest.param("".join(f"x{i}=1\n" for i in range(9000)) + "ls", id="newline-assignments"),
+        pytest.param("(( 1<<b ))\n" * 7000 + "ls", id="arithmetic-shift"),
+    ]
+
+    @pytest.mark.parametrize("command", OVER_CEILING)
+    def test_oversized_command_is_denied_naming_size_and_limit(self, command):
+        assert len(command) > MAX_COMMAND_SIZE
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.error is None, "a verdict, not a validation error"
+        assert result.message == f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)"
+
+    def test_ceiling_is_exclusive(self, monkeypatch):
+        """Exactly MAX_COMMAND_SIZE chars still validates; one more is refused (same `>` as commit_filter)."""
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 32)
+        at_limit = "echo " + "a" * 27
+        assert len(at_limit) == 32
+
+        assert validate_command(at_limit).allowed is True
+        over = validate_command(at_limit + "a")
+        assert over.allowed is False
+        assert "33 > 32" in over.message
+
+    def test_oversized_input_is_refused_before_any_parse_and_never_cached(self, monkeypatch):
+        """1 MB must cost O(1): no parser, no rule engine, no special cases, no cache entry.
+
+        Counts work instead of timing it: a raised stub lands in the catch-all and sets `error`,
+        so `error is None` is the proof the guard ran first (wall-clock asserts flake on CI).
+        """
+
+        def unreachable(*_args, **_kwargs):
+            raise AssertionError("oversized input must be refused before this runs")
+
+        for name in ("_get_parser", "_get_rule_engine", "_check_special_cases"):
+            monkeypatch.setattr(val_module, name, unreachable)
+        command = "echo " + "a" * (1024 * 1024)
+
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.error is None, result.error
+        assert val_module._global_cache.get(command) is None
