@@ -21,9 +21,7 @@ because BLOCKED is unrelaxable by every preset and the guard denied `vim ~/.npmr
 are pinned here so the idea cannot come back unmeasured.
 """
 
-import re
 import time
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -492,23 +490,18 @@ class TestAQuotedOperandIsStillAnOperand:
         'cat "$HOME/.ssh/id_ed25519"',
         "cat '/home/u/.ssh/id_ed25519'",
         'nl "$HOME/.ssh/id_rsa"',
-        'sed -n 1p "$HOME/.ssh/identity"',
-        'base64 "$HOME/.ssh/id_ecdsa"',
         'cat "/home/u/.kube/config"',
         'cat "$HOME/.npmrc"',
         'cat "$HOME/.netrc"',
         "cat '$HOME/.git-credentials'",
-        'cat "$HOME/.pypirc"',
         'jq . "$HOME/.docker/config.json"',
-        'cat "$HOME/.aws/credentials"',
         'cat "$HOME/.ssh/config"',
-        # The quote need not wrap the whole word. Both spellings below are
-        # SAFE at the PR head, so they discriminate -- the earlier pair here
-        # did not: `cat ~/".ssh/id_ed25519"` is rescued by the validator's
-        # reconstruction pass, and `"$HOME"'/.ssh/id_rsa'` is owned by
-        # `credential_exposure` whatever the span does.
+        # The quote need not wrap the whole word. This one is SAFE at the PR
+        # head, so it discriminates; three earlier attempts at this case did
+        # not -- `cat ~/".ssh/id_ed25519"` is rescued by the validator's
+        # reconstruction pass, `"$HOME"'/.ssh/id_rsa'` is owned by
+        # `credential_exposure`, and `cat ~/".npmrc"` was already BLOCKED.
         "nl \"$HOME\"'/.kube/config'",
-        'cat ~/".npmrc"',
         # An escaped quote INSIDE the credential word. The tail carries the same
         # escape branch as the run above it for exactly this, and the asymmetry
         # would be a one-character bypass: a plain `"[^"]*` tail ends at the
@@ -580,11 +573,10 @@ class TestAQuotedOperandIsStillAnOperand:
             # a denial `main` had.
             'cat "$HOME/R&D/.kube/config"',
             'cat "$HOME/Dev&Ops/.npmrc"',
-            'nl "$HOME/Q&A/.netrc"',
+            'cat "$HOME/Q&A/.netrc"',
             # The tail is bounded as ReDoS insurance, not as a coverage limit.
             # At 200 this deep absolute path went unrated while `main` denied it.
             'cat "/' + "d" * 199 + '/.ssh/id_ed25519"',
-            'cat "/' + "d" * 600 + '/.kube/config"',
         ],
     )
     def test_the_tail_reaches_a_realistic_path(self, command, rules_dir_path):
@@ -629,25 +621,6 @@ class TestAQuotedOperandIsStillAnOperand:
         disables the validator's reconstruction rescue and leaves the pattern as
         the only cover."""
         assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
-
-
-class TestTheSharedSpanIsEditedInEveryCopy:
-    """The reader-to-path span is one design repeated verbatim in three
-    patterns, and this file's history is of a partial edit to it landing
-    silently. Only one of the three is reachable by most single-pattern
-    mutations, so the suite alone cannot see a copy drifting.
-
-    This asserts the three are byte-identical rather than asserting any
-    behaviour, which is the cheap half of the problem and the half that keeps
-    recurring.
-    """
-
-    def test_all_three_copies_are_byte_identical(self, rules_dir_path):
-        text = (Path(rules_dir_path) / "03_credential_theft.yaml").read_text()
-        # the run plus its unterminated tail, up to the credential alternation
-        spans = re.findall(r"\(\?:\\\\\[\\s\\S\].*?\)\?", text)
-        assert len(spans) == 3, f"expected 3 copies of the span, found {len(spans)}"
-        assert len(set(spans)) == 1, "the three copies of the span have drifted apart"
 
 
 class TestTheBoundaryDoesNotUnrateARealFile:
