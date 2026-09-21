@@ -548,6 +548,9 @@ class TestP0FileTruncation:
             # operand `' ;'` begins with a blank and a metacharacter (LAB-4360).
             "\"tee\" ' ;' important.db </dev/null",
             "\"tee\" ' |' important.db",
+            # An operand may begin with a literal newline; `$` under MULTILINE would
+            # end the line there and call the operand blank.
+            '"tee" "\\n;" important.db </dev/null',
         ],
     )
     def test_file_truncation_blocked(self, safety_rules_path, command):
@@ -568,14 +571,17 @@ class TestP0FileTruncation:
 
     @pytest.mark.parametrize("reconstructed", ["tee  ", ">  ", ": >  ", "true >  ", "echo -n >  ", "printf '' >  "])
     def test_blank_operand_is_not_a_filename(self, safety_rules_path, reconstructed):
-        r"""No operand in this rule is blank to the end of the line.
+        r"""No operand in this rule is blank to the end of the text.
 
         A one-blank argument reconstructs to bare whitespace (`tee \ ` becomes
-        `tee  `), which the rule read as the filename (LAB-4360). The guard is a
-        lookahead rather than a non-blank first-character class: that class also
-        refused an operand such as `' ;'`, and `"tee" ' ;' important.db` then hid
-        an ordinary later victim behind a disposable first operand. The
-        end-to-end shape is pinned in test_validator.py; this pins the rule.
+        `tee  `), which the rule read as the filename (LAB-4360). The guard is
+        `(?=\s+\S)` in front of the blank run, not a non-blank first-character
+        class: that class also refused an operand such as `' ;'`, and
+        `"tee" ' ;' important.db` then hid an ordinary later victim behind a
+        disposable first operand. It sits before the quantifier so the run is
+        scanned once, and it asks for a non-blank character anywhere after the
+        run - `$` would stop at the newline a quoted operand may begin with.
+        The end-to-end shape is pinned in test_validator.py; this pins the rule.
         """
         match = RuleEngine(safety_rules_path).match_command(reconstructed)
 

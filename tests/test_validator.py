@@ -965,9 +965,11 @@ class TestHeredocSurroundings:
         file-destruction rules read the second blank as the filename - HIGH for
         a command that writes `ls` to a file (LAB-4360). The delimiter is
         unquoted on purpose: quoted, the command takes the escalation path,
-        where the control's own `tee > out` is already HIGH and the comparison
-        could not discriminate. Pinned against the control rather than to a
-        level, so a later change to the control's verdict cannot leave this stale.
+        where the shed re-validates the raw segment `tee \ ` and its backslash
+        is a non-blank character - that path rates like raw text, on base and
+        here alike, and is not this ticket's shape. Pinned against the control
+        rather than to a level, so a later change to the control's verdict
+        cannot leave this stale.
         """
         with_blank = validate_command(f"echo hi && {head}<<EOF > out \\{blank}\nls\nEOF", config_path=safety_rules_path)
         without = validate_command(f"echo hi && {head}<<EOF > out\nls\nEOF", config_path=safety_rules_path)
