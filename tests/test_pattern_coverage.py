@@ -412,6 +412,12 @@ class TestMediumPatternCoverage:
             # Separator is any whitespace, not only a space.
             "rm\t-f\tdata.db",
             "rm -f\ndata.db",
+            # `--` ends option parsing, so the token after it is a target however
+            # many dashes it leads with (LAB-4470). Both reach the rule only when the
+            # flag run gives the `--` back; the second pins the give-back to any
+            # position in the run, not just the first.
+            "rm -- -file",
+            "rm -f -- -x",
             # Bare `-` is a filename to GNU rm, not a flag.
             "rm - x",
             "rm -",
@@ -435,8 +441,13 @@ class TestMediumPatternCoverage:
             assert "single_delete" in result.matched_rules, f"single_delete not matched: {cmd}"
 
     def test_single_delete_flags_without_target_are_safe(self, safety_rules_path):
-        """A flag run with nothing after it deletes nothing (LAB-4428)."""
-        for cmd in ["rm -f", "rm --", "rm -f -v", "rm --help"]:
+        """A flag run with nothing after it deletes nothing (LAB-4428).
+
+        The two trailing-blank rows are the only thing pinning the `\\S` in the `--`
+        branch: without it, `--\\s` alone matches and a bare option terminator reads
+        as a delete (LAB-4470).
+        """
+        for cmd in ["rm -f", "rm --", "rm -f -v", "rm --help", "rm -- ", "rm -f -- "]:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.SAFE, f"{cmd!r} rated {result.risk_level.name}: {result.matched_rules}"
 

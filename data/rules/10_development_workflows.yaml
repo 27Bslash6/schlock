@@ -168,8 +168,12 @@ rules:
     risk_level: MEDIUM
     # After `rm` and one blank: a run of dash-led flags, each followed by exactly
     # one blank, then a target, which is anything that is not a dash-led token: a
-    # non-dash char (a blank included) or a bare `-` (a filename to GNU rm). The
-    # parser joins words with a single space, so two consecutive blanks anywhere
+    # non-dash char (a blank included) or a bare `-` (a filename to GNU rm). A `--`
+    # is the exception: it ends option parsing, so the token after it is the target
+    # however many dashes it leads with — `rm -- -file` deletes `-file` (LAB-4470).
+    # Its branch is reached only when the greedy flag run gives the `--` back, so
+    # never make that run atomic or possessive.
+    # The parser joins words with a single space, so two consecutive blanks anywhere
     # can only be a whitespace-led filename: `"rm" ' -f'` rebuilds as `rm  -f` and
     # `"rm" -f ' -f'` as `rm -f  -f`, both indistinguishable from a flag with no
     # target, and both delete. The ambiguity takes the higher rating at every
@@ -178,7 +182,7 @@ rules:
     # iteration ends in exactly one `\s`, so a run splits one way only. The earlier
     # `^rm\s+(?:\S*\s+)*[^-\s]` shape, with a `\s+` separator and no blank target,
     # was exponential (146ms at 20 blanks). Keep the single `\s`.
-    patterns: ['^rm(?=\s+\S)\s(?:-\S*\s)*(?:[^-]|-(?!\S))']
+    patterns: ['^rm(?=\s+\S)\s(?:-\S*\s)*(?:[^-]|-(?!\S)|--\s\S)']
     alternatives: ["Backup first"]
 
   - name: git_push
