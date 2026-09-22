@@ -86,6 +86,13 @@ jobs:
       run: uvx semgrep@1.165.0 scan --config p/security-audit --config p/python
 
     - name: gitleaks
+      # v3.0.0 hard-exits 1 on any event outside push/pull_request/
+      # workflow_dispatch/schedule, so on a merge_group run it fails `security`
+      # and the queue ejects every pull request. Skipped rather than version-
+      # bumped: the action still does not accept the event upstream. Nothing is
+      # lost - this same commit's content was already scanned on the pull
+      # request, and main is scanned on push.
+      if: github.event_name != 'merge_group'
       uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
