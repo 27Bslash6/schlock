@@ -2459,8 +2459,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 error=str(unfollowable),
             )
         if neutered != command:
-            arithmetic_result = validate_command(neutered, config_path, _depth=_depth)
-            if _depth == 0:
+            arithmetic_result = validate_command(
+                neutered, config_path, _depth=_depth, _shellcheck=_shellcheck, _derived=_derived
+            )
+            if _depth == 0 and _shellcheck:
                 # Cached under what the user typed; the recursion cached the
                 # rewrite, which nobody will ever issue.
                 _global_cache.set(command, arithmetic_result)

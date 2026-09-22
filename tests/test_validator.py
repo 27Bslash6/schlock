@@ -2330,6 +2330,21 @@ class TestDerivedTextCeiling:
         assert "390" in result.message and "100" in result.message
         assert "Command exceeds size limit" not in result.message
 
+    def test_arithmetic_rewrite_of_derived_text_keeps_the_derived_bound(self, monkeypatch, safety_rules_path):
+        """Step 3b re-enters validate_command with the shift rewritten; the text is still derived.
+
+        _escalate_past_heredoc submits its candidates with _derived=True at depth 0, so the
+        re-entry is driven the same way. Same width in, same bound out.
+        """
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 40)
+        command = "(( 1<<b ))\nrm -rf /\nb\n# padding past the input ceiling"
+        assert len(command) > val_module.MAX_COMMAND_SIZE
+
+        result = validate_command(command, config_path=safety_rules_path, _derived=True)
+
+        assert "system_destruction" in result.matched_rules
+        assert "Command exceeds size limit" not in result.message
+
     def test_input_ceiling_message_reports_the_submitted_size(self):
         command = "echo hello && " * 6000
         message = validate_command(command).message
@@ -2631,6 +2646,23 @@ class TestArithmeticCommandShift:
         # AC-2: attributable. The payload was validated on its merits - this
         # fails if the deny comes from a parse error instead.
         assert "system_destruction" in result.matched_rules, description
+
+    def test_rewrite_honours_the_callers_shellcheck_flag(self, monkeypatch, safety_rules_path):
+        """A `_shellcheck=False` caller gets no spawn and no cache entry through the rewrite.
+
+        _escalate_past_heredoc validates its candidates with ShellCheck off because it
+        ShellChecks the rewrite whole (LAB-2780). The re-entry forwards that flag and keeps
+        the verdict out of the cache, like every other `_shellcheck=False` exit.
+        """
+        checked: list[str] = []
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: checked.append(command) or [])
+        command = "(( 1<<b ))\nls\nb"
+
+        validate_command(command, config_path=safety_rules_path, _shellcheck=False)
+
+        assert checked == []
+        assert val_module._global_cache.get(command) is None
 
     def test_a_different_payload_matches_its_own_rule(self, safety_rules_path):
         """Nothing here is special-cased to `rm -rf /`."""
