@@ -4,10 +4,13 @@
 # Version
 version: "1.0.0"
 
-# Policy for commit messages whose content is NOT in the command string (issue #76):
-# delivery via -F/--file (a file or stdin) or an unevaluated $(...)/backtick substitution.
-# Such content cannot be scanned before the command runs, so schlock cannot strip a Claude
-# trailer from it. This setting decides what happens when such a commit is detected:
+# Policy for commit messages whose content is NOT in the command string: -F/--file pointing at
+# a real file, a piped or interactive stdin (issue #76), an unevaluated $(...)/backtick
+# substitution, or more heredocs in one Bash call than the extractor's opener cap allows. Such
+# content cannot be scanned before the command runs, so schlock cannot strip a Claude trailer
+# from it. (A `-F -`/`--file -` fed by an in-command heredoc IS scannable — its bytes are in
+# the command string, however many other heredocs share the same Bash call.) This setting
+# decides what happens when unscannable content is detected:
 #   off   - silent pass-through (legacy behavior; the gap is invisible)
 #   warn  - allow the commit but tell the model the message was not scanned (DEFAULT)
 #   block - deny the commit; the message must be inlined with -m to be scannable

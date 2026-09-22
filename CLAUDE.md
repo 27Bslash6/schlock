@@ -17,6 +17,31 @@
 ## Critical Design Principles
 
 1. **Security is Non-Negotiable**: Bashlex AST parsing is security-critical. No regex shortcuts.
+   - **Approved exception — the quoted-heredoc fallback lexer.** bashlex rejects a quoted
+     heredoc delimiter (`<< 'EOF'`) outright, so for those commands there is no AST to walk
+     and the shell *around* the heredoc would otherwise never be validated (LAB-2765).
+     `_neuter_heredocs` / `_rewrite_openers` in `src/schlock/core/validator.py` recover it
+     with a hand-written lexer. This is the only sanctioned non-AST parsing path, and it holds
+     only while all four constraints do:
+     1. **Last resort** — reachable only from `_validate_heredoc_command`, after bashlex has
+        already raised a heredoc-shaped error. It never runs on a command bashlex can parse.
+     2. **No verdicts** — it decides *where heredoc bodies begin and end*, nothing else. The
+        recovered text is re-validated through `validate_command`'s front door, so rules,
+        segments, substitutions and dangerous-flag checks all still run on the AST.
+     3. **Fails closed on uncertainty** — an untokenizable delimiter, a missing terminator,
+        or a line that continues past an opener raises `ParseError`, which the caller turns
+        into `BLOCKED`. Note what this does *not* cover: the dangerous failure is not the
+        uncertain reading that raises, it is the confident wrong one that does not.
+     4. **Escalation is monotonic, which is not the same as safe** —
+        `_escalate_past_heredoc` can worsen a verdict and never improve one, so a misread
+        body *end* is bounded to a false positive. A misread body *start* is not: the
+        swallowed text is deleted from the rewrite before escalation ever sees it, leaving
+        the verdict pinned at the heredoc head's own floor. That asymmetry is why every
+        uncertain body-*start* reading must raise, and why changes here are pinned by
+        asserting the rewritten text still contains the payload rather than by asserting a
+        verdict.
+     Bash's tokenization is what it must match, so every behavioural change here is decided by
+     running real bash first and pinned by a test that names what bash did.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
