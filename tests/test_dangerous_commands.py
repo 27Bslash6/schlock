@@ -585,6 +585,15 @@ class TestSystemCredentialFileReads:
             'grep -E "a\\"b|root" /etc/shadow',
             # A backslash-escaped separator, unquoted.
             "grep -v \\; /etc/shadow",
+            # Command substitution terminates the segment with `)` or a
+            # backtick, neither of which is a shell separator. The last-operand
+            # lookahead is an ENUMERATION and these were missing from it.
+            "x=$(grep root /etc/shadow)",
+            "x=`grep root /etc/shadow`",
+            "(grep root /etc/shadow)",
+            "grep root /etc/shadow > /tmp/out",
+            "grep root /etc/shadow &",
+            "true && grep root /etc/shadow",
         ],
     )
     def test_exfiltration_shapes_are_rated(self, safety_rules_path, command):
