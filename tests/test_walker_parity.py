@@ -104,17 +104,26 @@ def bashlex_outputs(command: str) -> "dict[str, set] | None":
         return None
 
 
-def test_stdin_programs_corpus_entry_is_not_vacuous():
-    """`stdin_programs` must be non-empty on at least one corpus row (bashlex tier).
+#: Corpus rows this walker exists to exercise. Checked individually, not "any
+#: one of the corpus" — the `command`-kind and `compound`-kind sinks in
+#: `_here_string_program` are separate code paths, so a regression isolated to
+#: one would still leave the other producing a non-empty set and pass a
+#: corpus-wide vacuity check trivially (LAB-4686 expert-panel security finding).
+STDIN_PROGRAM_CORPUS_NAMES = ["here-string-stdin-program", "here-string-compound"]
 
-    Registering the walker in `walker_outputs` alone proves nothing if every
+
+@pytest.mark.parametrize("name", STDIN_PROGRAM_CORPUS_NAMES)
+def test_stdin_programs_corpus_entry_is_not_vacuous(name):
+    """`stdin_programs` must be non-empty on each dedicated here-string-program row (bashlex tier).
+
+    Registering the walker in `walker_outputs` alone proves nothing if a
     corpus `<<<` row yields `[]` — the superset gate would pass vacuously
     without ever exercising the new walker (LAB-4686).
     """
-    non_empty = [
-        entry["name"] for entry in CORPUS if (outputs := bashlex_outputs(entry["script"])) and outputs["stdin_programs"]
-    ]
-    assert non_empty, "no corpus entry produced a non-empty stdin_programs set"
+    command = next(entry["script"] for entry in CORPUS if entry["name"] == name)
+    outputs = bashlex_outputs(command)
+    assert outputs is not None, f"{name}: bashlex could not parse {command!r}"
+    assert outputs["stdin_programs"], f"{name}: produced an empty stdin_programs set"
 
 
 @needs_binary
