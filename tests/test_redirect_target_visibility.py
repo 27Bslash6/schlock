@@ -460,3 +460,53 @@ class TestHeredocSuppressionRequiresProvenance:
         reconstructed, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
         assert "mkfs" in reconstructed
         assert ranges == []
+
+
+class TestSuppressionRangeProvenanceIsPinned:
+    """The ownership test and the occurrence choice, pinned independently of any verdict.
+
+    Both of these are range-contract assertions rather than risk assertions: they hold
+    the suppression API to reporting a range it can actually justify. A verdict-level
+    test cannot see either defect, which is why both shipped green twice.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<MARKER\nMARKER\nMARKER_suffix_long",
+            "cat <<MARKER\nMARKER\necho MARKER_suffix_long",
+        ],
+    )
+    def test_a_word_that_owns_no_heredoc_is_never_suppressed(self, command):
+        """Kills the guard-removal mutant.
+
+        Without the ownership span test the window end goes NEGATIVE, and Python reads
+        a negative `end` as relative to the string's end rather than as an empty
+        interval — `"MARKER_suffix_long".rfind("MARKER", 0, -1)` is 0. The arithmetic
+        bound therefore does NOT subsume ownership, contrary to what the code's author
+        argued; only the span test rejects these.
+        """
+        parser = BashCommandParser()
+        _, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert ranges == []
+
+    @pytest.mark.parametrize("tail", ["'marker\nX'", "'marker\nXtail'"])
+    def test_an_ambiguous_occurrence_declines_rather_than_guesses(self, tail):
+        """Two copies of the body inside one owning word: the mapping is unestablished.
+
+        Quote resolution removes characters only before the real body here, so the
+        window legitimately spans both copies. The window shows an occurrence COULD be
+        the body, never that it IS — so nothing is suppressed, rather than a range
+        mis-attributed to the later copy.
+        """
+        parser = BashCommandParser()
+        command = "echo " + '""' * 30 + "$(cat <<X\nmarker\nX\n)" + tail
+        _, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert ranges == []
+
+    def test_an_unambiguous_body_is_still_suppressed(self):
+        """Declining on ambiguity must not disable the mechanism in the ordinary case."""
+        parser = BashCommandParser()
+        command = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
+        _, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert len(ranges) == 1

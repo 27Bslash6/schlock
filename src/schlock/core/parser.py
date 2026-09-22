@@ -1065,8 +1065,20 @@ class BashCommandParser:
         # shifts offsets, so the source offset alone cannot be reused, but it does
         # bound the answer: resolution only REMOVES characters, so the body sits at or
         # before its source offset, and no earlier than that offset minus everything
-        # resolution removed. An unlocatable body suppresses NOTHING; that costs a
-        # false positive, where the other direction costs this bug a third time.
+        # resolution removed.
+        #
+        # The ownership test is NOT redundant with that bound, however much it looks
+        # it. A non-owning word gives a negative window end, and Python reads a
+        # negative `end` as relative to the string's end rather than as an empty
+        # interval - `"MARKER_suffix_long".rfind("MARKER", 0, -1)` is 0, not -1. That
+        # is a real suppression on a word that owns nothing, and only the span test
+        # stops it (adversarial review, Helly R, after I argued the opposite).
+        #
+        # The window says an occurrence COULD be the body, never that it IS. Where it
+        # admits more than one, the mapping is unestablished and suppression is
+        # DECLINED rather than guessed - picking either end silently mis-attributes a
+        # range on a security-relevant API, and leaves the real body unsuppressed
+        # anyway. Declining costs at most a false positive; guessing costs provenance.
         inert_heredocs = [(s, e) for s, e, is_shell in self.extract_heredoc_ranges(command, ast_nodes) if not is_shell]
         ranges = []
         offset = 0
@@ -1076,11 +1088,21 @@ class BashCommandParser:
                 if span is None or not (span[0] <= start and end <= span[1]):
                     continue  # this word does not own that heredoc
                 body = command[start:end]
+                if not body:
+                    continue
                 highest = start - span[0]
                 resolved_away = max(0, (span[1] - span[0]) - len(word))
-                found = word.rfind(body, max(0, highest - resolved_away), highest + len(body)) if body else -1
-                if found >= 0:
-                    ranges.append((offset + found, offset + found + len(body)))
+                # No clamp on `high`: ownership above guarantees `highest >= 0`, so the
+                # negative-end wrap cannot arise here. Clamping anyway would give this
+                # hazard a second guard that no test can distinguish from the first,
+                # and an unfalsifiable guard is how the previous two defects survived
+                # review. One guard, pinned by a test.
+                low = max(0, highest - resolved_away)
+                high = highest + len(body)
+                found = word.find(body, low, high)
+                if found < 0 or word.find(body, found + 1, high) >= 0:
+                    continue  # unlocatable, or ambiguous - do not guess which copy is the body
+                ranges.append((offset + found, offset + found + len(body)))
             if span is not None and self._quoting_is_load_bearing(command, word, span):
                 # Absorb the following joining space. In the source that offset
                 # held the closing quote, a character no rule pattern can cross;
