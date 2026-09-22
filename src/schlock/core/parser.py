@@ -132,7 +132,13 @@ _apply_andor_substitution_correction()
 # bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
 # one disagree about one interpreter - `rbash <<< X` blocks while `rbash <<EOF` does
 # not - which is exactly the drift the paragraph above says cannot happen.
-_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash"})
+#
+# `csh`/`tcsh` are here for the same reason: like every Bourne-family shell, invoking
+# either with no program source (no `-c`, no script operand) makes it read and execute
+# its stdin as a command script - a heredoc or here-string included. LAB-2754 already
+# put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
+# the rbash drift with a different interpreter.
+_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -144,6 +150,8 @@ STDIN_EXEC_INTERPRETERS = frozenset(
         "ash",
         "fish",
         "rbash",  # restricted bash still execs its stdin; `rbash -c` is already in _SHELL_COMMANDS
+        "csh",  # execs stdin as a script like every other shell here; `csh -c` is in _SHELL_COMMANDS
+        "tcsh",  # same as csh - tcsh is its interactive superset, not a different stdin model
         "python",
         "python2",
         "python3",

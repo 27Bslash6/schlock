@@ -661,6 +661,12 @@ class TestHereStringPayloadExtraction:
         # rbash is in _SHELL_COMMANDS (the `-c` path caught it); the here-string surface must agree.
         assert self._extract('rbash <<< "rm -rf /"') == [("rbash", "rm -rf /")]
 
+    def test_csh_and_tcsh_read_stdin_as_program(self):
+        # LAB-4442: csh/tcsh are in _SHELL_COMMANDS (the `-c` path caught them); the here-string
+        # surface must agree, the same drift rbash had.
+        assert self._extract('csh <<< "rm -rf /"') == [("csh", "rm -rf /")]
+        assert self._extract('tcsh <<< "rm -rf /"') == [("tcsh", "rm -rf /")]
+
     def test_wrapped_shell_with_dash_c_is_not_a_stdin_program(self):
         # `timeout 5 bash -c "echo hi" <<< X`: bash runs the -c program; the here-string is inert.
         assert self._extract('timeout 5 bash -c "echo hi" <<< "rm -rf /"') == []
@@ -736,6 +742,9 @@ class TestHereStringDelegationEvasion:
             'if true; then bash; fi <<< "rm -rf /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
+            # LAB-4442: same drift as rbash, for csh/tcsh.
+            'csh <<< "rm -rf /"',
+            'tcsh <<< "rm -rf /"',
             # Decoys: a trailing here-string on another fd, and a wrapper operand that shares a
             # shell's basename. bash runs the stdin payload in every case (verified).
             'bash <<< "rm -rf /" 3<<< "ls"',
