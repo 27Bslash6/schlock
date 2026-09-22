@@ -2016,8 +2016,8 @@ def _escalate_past_heredoc(
     (`kubectl delete`). A payload a segment delegates to a shell (`bash -c …`)
     is re-entered with ShellCheck on by Step 5c, deliberately: ShellCheck never
     reads inside a `-c` string, so that re-entry is the payload's only check.
-    Being the only check, the spawn fails closed: a run with no verdict is
-    BLOCKED, not read as clean (LAB-4586).
+    Each of those spawns is the only ShellCheck its text gets, so each fails
+    closed: a run with no verdict is BLOCKED, not read as clean (LAB-4586).
 
     Escalation only ever raises risk. That is what keeps a legitimate heredoc's
     existing verdict intact, and it bounds a misread body *end* to a false
@@ -2067,7 +2067,10 @@ def _escalate_past_heredoc(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
                 message="Alongside heredoc: ShellCheck did not complete, so the shell around the heredoc is unchecked",
-                alternatives=["Run the commands after the heredoc as a separate, shorter Bash call"],
+                alternatives=[
+                    "Run the commands after the heredoc as a separate, shorter Bash call",
+                    "If every heredoc is refused, ShellCheck itself is failing: fix or uninstall it",
+                ],
                 exit_code=1,
                 matched_rules=[*result.matched_rules, "shellcheck:incomplete"],
             )
@@ -2430,11 +2433,29 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         shellcheck_elevated = False
         security_findings: list = []  # Initialize for type checker
         if _shellcheck and is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
-            # A run with no verdict (None) is read as clean HERE, for now: whether this
-            # top-level pass should fail closed like the heredoc pass does is an open
-            # policy question (LAB-4362), not decided by the change that made None visible.
-            findings = run_shellcheck(command) or []
-            security_findings = get_security_findings(findings)
+            findings = run_shellcheck(command)
+            if findings is None and _depth > 0:
+                # A payload re-entered from Step 5c (`bash -c "…"`) gets its only ShellCheck
+                # here - no outer spawn reads inside a `-c` string - so a run with no verdict
+                # is refused, as the heredoc spawn refuses it (LAB-4586). At depth 0 the same
+                # None is still read as clean: whether the top-level pass should fail closed
+                # is LAB-4362's open question, not decided here.
+                shellcheck_elevated = True
+                alternatives = ["Shorten the delegated payload or run it as its own Bash call"]
+                match = RuleMatch(
+                    matched=True,
+                    rule=SecurityRule(
+                        name="shellcheck:incomplete",
+                        description="ShellCheck gave no verdict on a shell-delegated payload",
+                        risk_level=RiskLevel.BLOCKED,
+                        patterns=[],
+                        alternatives=alternatives,
+                    ),
+                    risk_level=RiskLevel.BLOCKED,
+                    message="ShellCheck did not complete, so the payload is unchecked",
+                    alternatives=alternatives,
+                )
+            security_findings = get_security_findings(findings or [])
             if security_findings:
                 # Elevate to BLOCKED if ShellCheck found security issues
                 shellcheck_elevated = True

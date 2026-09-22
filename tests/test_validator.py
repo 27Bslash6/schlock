@@ -1059,10 +1059,8 @@ class TestHeredocSurroundings:
         The whitelisted head is pinned to one as well, not zero: both passes run
         with ShellCheck off, so neither can spawn whatever the head is, and the
         escalation's own spawn is the only ShellCheck the trailing commands get.
-
-        Pins the count and that the spawn saw the tail, not the exact rewrite:
-        what the spawn returns, and what the caller does with it, is pinned by
-        the tests below (LAB-4586), and an exact-text pin here cannot see either.
+        The exact text is pinned, not just the count: a spawn on the raw command
+        or on the last segment alone would also be one spawn ending in the tail.
         """
         checked: list[str] = []
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
@@ -1071,8 +1069,7 @@ class TestHeredocSurroundings:
 
         validate_command(f"{head} <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
 
-        assert len(checked) == 1
-        assert checked[0].endswith(tail)
+        assert checked == [f"{head} <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n{tail}"]
 
     @pytest.mark.parametrize("head", ["cat", "ls"])
     def test_shellcheck_still_reaches_the_shell_around_a_heredoc(self, safety_rules_path, monkeypatch, head):
@@ -1110,6 +1107,38 @@ class TestHeredocSurroundings:
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.matched_rules[-1] == "shellcheck:incomplete"
         assert "ShellCheck did not complete" in result.message
+
+    @pytest.mark.parametrize(
+        "command,expected_risk,expected_rule",
+        [
+            ("echo done", RiskLevel.SAFE, None),
+            ('bash -c "echo done"', RiskLevel.BLOCKED, "shell_delegated_payload"),
+            ("ls <<'EOF'\nx\nEOF\nbash -c \"echo done\"", RiskLevel.BLOCKED, "shell_delegated_payload"),
+        ],
+        ids=["top-level", "payload", "payload-behind-heredoc"],
+    )
+    def test_a_delegated_payload_fails_closed_on_no_verdict_and_the_top_level_does_not(
+        self, safety_rules_path, monkeypatch, command, expected_risk, expected_rule
+    ):
+        """Step 6 refuses a run with no verdict for a payload, and only for a payload.
+
+        A `bash -c "…"` payload is re-entered at depth 1 and its Step 6 spawn is
+        the only ShellCheck it gets, so reading None as clean there made
+        `bash -c '<slow payload>'` a bypass of the heredoc's own fail-closed spawn
+        (LAB-4586, panel). At depth 0 the same None is still read as clean: that
+        policy is LAB-4362's open question, pinned here so it can only change on
+        purpose.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: None if command == "echo done" else [])
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == expected_risk
+        assert result.allowed is (expected_risk != RiskLevel.BLOCKED)
+        if expected_rule is not None:
+            assert expected_rule in result.matched_rules
+            assert "ShellCheck did not complete" in result.message
 
     @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
     @pytest.mark.parametrize("padding", [0, 95, 100, 110])

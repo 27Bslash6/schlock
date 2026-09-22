@@ -311,6 +311,8 @@ class TestShellCheckErrorHandling:
 
         mock_result = MagicMock()
         mock_result.returncode = 2  # Error exit code
+        mock_result.stdout = ""
+        mock_result.stderr = "shellcheck: unrecognized option"
 
         with (
             patch.object(sc, "get_shellcheck_path", return_value="/usr/bin/shellcheck"),
@@ -322,22 +324,31 @@ class TestShellCheckErrorHandling:
         # Cleanup
         sc._circuit_breaker_failures.clear()
 
-    def test_empty_output(self):
-        """Test handling of empty stdout."""
+    @pytest.mark.parametrize("returncode", [0, 1, -9], ids=["exit0", "exit1", "sigkill"])
+    def test_empty_output_is_no_verdict(self, returncode):
+        """Empty stdout is not a clean run: `--format=json` prints `[]` when clean.
+
+        A ShellCheck killed by a signal (negative code) or crashed with exit 1
+        and nothing on stdout used to read as clean (LAB-4586, panel).
+        """
         from unittest.mock import MagicMock, patch  # noqa: PLC0415
 
         import schlock.integrations.shellcheck as sc  # noqa: PLC0415
 
+        sc._circuit_breaker_failures.clear()
         mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = ""  # Empty output
+        mock_result.returncode = returncode
+        mock_result.stdout = ""
+        mock_result.stderr = ""
 
         with (
             patch.object(sc, "get_shellcheck_path", return_value="/usr/bin/shellcheck"),
             patch("subprocess.run", return_value=mock_result),
         ):
             findings = sc.run_shellcheck("echo test")
-            assert findings == []
+
+        sc._circuit_breaker_failures.clear()
+        assert findings is None
 
     def test_output_size_limit(self):
         """Test handling of oversized output."""
@@ -363,11 +374,14 @@ class TestShellCheckErrorHandling:
         # Cleanup
         sc._circuit_breaker_failures.clear()
 
-    def test_findings_count_limit_spares_security_findings(self):
-        """The cap bounds inert findings only; a security finding past position 100 survives.
+    def test_no_finding_is_dropped_past_one_hundred(self):
+        """A security finding after 110 inert ones is still returned.
 
-        Capping the raw list first let 100 inert SC2034s push the SC2114 at the end off
-        the list, and the caller read the empty security filter as clean (LAB-4586).
+        A 100-finding cap applied before callers filter to security codes let
+        110 inert SC2034s push the SC2114 at the end off the list, and the caller
+        read the empty security filter as clean (LAB-4586). There is no cap now;
+        _MAX_OUTPUT_SIZE bounds the count. This pins that one is not re-added
+        ahead of the filter.
         """
         import json  # noqa: PLC0415
         from unittest.mock import MagicMock, patch  # noqa: PLC0415
@@ -376,7 +390,7 @@ class TestShellCheckErrorHandling:
 
         inert = [
             {"code": 2034, "level": "warning", "message": f"a{i} unused", "line": 1, "column": 1, "endLine": 1, "endColumn": 1}
-            for i in range(sc._MAX_FINDINGS_COUNT + 10)
+            for i in range(110)
         ]
         payload = {"code": 2114, "level": "warning", "message": "deletes", "line": 1, "column": 1, "endLine": 1, "endColumn": 1}
 
@@ -391,8 +405,8 @@ class TestShellCheckErrorHandling:
             findings = sc.run_shellcheck("echo test")
 
         assert findings is not None
+        assert len(findings) == 111
         assert [f.code for f in sc.get_security_findings(findings)] == [2114]
-        assert len(findings) == sc._MAX_FINDINGS_COUNT + 1
 
     def test_invalid_code_skipped(self):
         """Test findings with invalid codes are skipped."""
@@ -592,3 +606,27 @@ class TestShellCheckIntegration:
             findings, message = pre_tool_use.run_shellcheck_analysis("echo $HOME")
             assert len(findings) > 0
             assert "SC2086" in message
+
+    def test_hook_reads_no_verdict_as_no_findings(self):
+        """The hook's advisory pass keeps today's fail-open on a run with no verdict.
+
+        run_shellcheck returns None on timeout / oversize / open circuit (LAB-4586).
+        The validator's heredoc and payload spawns refuse that; this advisory layer
+        does not, and the choice is pinned here so it can only change on purpose.
+        """
+        import sys  # noqa: PLC0415 - Test isolation
+        from pathlib import Path  # noqa: PLC0415
+        from unittest.mock import patch  # noqa: PLC0415
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
+
+        import pre_tool_use  # noqa: PLC0415
+
+        enabled_config = {"enabled": True, "severity": "info", "security_only": True}
+
+        with (
+            patch.object(pre_tool_use, "get_shellcheck_config", return_value=enabled_config),
+            patch.object(pre_tool_use, "is_shellcheck_available", return_value=True),
+            patch.object(pre_tool_use, "run_shellcheck", return_value=None),
+        ):
+            assert pre_tool_use.run_shellcheck_analysis("echo hi") == ([], "")
