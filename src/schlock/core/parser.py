@@ -230,10 +230,8 @@ def _parse_all_substitution_units(
 # ``_parsedolparen`` (``$( )``, ``<( )``) and the backtick branch of ``_expandwordinternal`` both
 # reach ``_recursiveparse`` by module-global lookup, so one rebind covers all three spellings.
 # Assigning to a name bashlex no longer reads would install nothing and leave the truncating
-# parse live, so a bashlex that renamed it must fail this import rather than run. Note what
-# that buys: the hook imports this module at top level, so the failure is a traceback and exit 1
-# before any decision is written, and Claude Code treats a non-2 exit as a non-blocking error
-# and runs the command. Loud, not fail-closed - the hook's import-time posture is its own fix.
+# parse live, so a bashlex that renamed it must fail this import rather than run. What an
+# import failure means for the tool call is the hook's decision, made where it imports this module.
 if not hasattr(bashlex.subst, "_recursiveparse"):
     raise ImportError("bashlex.subst._recursiveparse is missing; the multi-line substitution correction cannot install")
 bashlex.subst._recursiveparse = _parse_all_substitution_units
