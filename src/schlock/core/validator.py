@@ -1576,7 +1576,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     openers: list[tuple[str, bool, int]] = []
     continued = False
     pos = 0
-    after_escape = -1  # index just past the last `\x` pair; the `#` branch reads it (LAB-4709)
+    after_escape = -1  # index just past the last `\x` pair; the `#` branch reads it
     opener_serials: list[int] = []
     if scan.contexts[-1].prefix:
         scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
@@ -1782,7 +1782,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             # `cat \ #x` is the one argument ` #x`, and the raw lookup at
             # `line[pos - 1]` cannot tell that escaped blank from a real one.
             # Read as a comment, the logical line ends early and the commands
-            # after it are handed to _neuter_heredocs as body text (LAB-4709).
+            # after it are handed to _neuter_heredocs as body text.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
