@@ -26,6 +26,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from schlock.core import validator
 from schlock.core.rules import RiskLevel
@@ -86,6 +87,8 @@ GIT_GLOBALS = [
     '-c user.name="Jane Doe"',  # same, double-quoted
     "-C ~/'my dir'",  # bare prefix + quoted suffix
     "-C . -c user.name=x --no-pager",  # several, mixed
+    "--namespace ns",  # long flag, separate value, no path
+    "--attr-source HEAD",  # long flag, separate tree-ish value
 ]
 
 
@@ -121,8 +124,10 @@ class TestGitGlobalFlagsDoNotDisplaceSubcommand:
         ("command", "rule"),
         [
             ("git push --force", "git_force_push"),
+            ("git push -f", "git_force_push"),
             ("git reset --hard", "git_hard_reset"),
             ("git add -A", "git_blanket_staging"),
+            ("git add .", "git_blanket_staging"),
         ],
     )
     def test_control_keeps_its_verdict(self, command, rule, rules_dir_path, clean_worktree):
@@ -1078,22 +1083,6 @@ class TestALeadingTerminatingOptionStopsTheRating:
         """
         assert verdict(command, rules_dir_path).risk_level == RiskLevel.SAFE
 
-    @pytest.mark.parametrize(
-        ("command", "rule"),
-        [
-            ("git push --force", "git_force_push"),
-            ("git push -f", "git_force_push"),
-            ("git reset --hard", "git_hard_reset"),
-            ("git add -A", "git_blanket_staging"),
-            ("git add .", "git_blanket_staging"),
-        ],
-    )
-    def test_the_bare_form_still_rates(self, command, rule, rules_dir_path, clean_worktree):
-        """The refusal must cost nothing when no terminating option is present."""
-        result = verdict(command, rules_dir_path)
-        assert result.risk_level == RiskLevel.HIGH
-        assert rule in result.matched_rules
-
 
 class TestTheRefusalIsNotReusableAsAnEvasion:
     """The reason this guard is pinned to position 1 and nowhere else.
@@ -1109,24 +1098,20 @@ class TestTheRefusalIsNotReusableAsAnEvasion:
 
     @pytest.mark.parametrize("option", VALUE_TAKING)
     @pytest.mark.parametrize("token", TERMINATING)
-    def test_a_terminating_token_in_a_value_slot_still_rates_force_push(self, option, token, rules_dir_path):
-        result = verdict(f"git {option} {token} push --force origin main", rules_dir_path)
+    @pytest.mark.parametrize(
+        ("subcommand", "rule"),
+        [
+            ("push --force origin main", "git_force_push"),
+            ("reset --hard HEAD~1", "git_hard_reset"),
+            ("add -A", "git_blanket_staging"),
+        ],
+    )
+    def test_a_terminating_token_in_a_value_slot_still_rates(
+        self, option, token, subcommand, rule, rules_dir_path, clean_worktree
+    ):
+        result = verdict(f"git {option} {token} {subcommand}", rules_dir_path)
         assert result.risk_level == RiskLevel.HIGH
-        assert "git_force_push" in result.matched_rules
-
-    @pytest.mark.parametrize("option", VALUE_TAKING)
-    @pytest.mark.parametrize("token", TERMINATING)
-    def test_a_terminating_token_in_a_value_slot_still_rates_hard_reset(self, option, token, rules_dir_path, clean_worktree):
-        result = verdict(f"git {option} {token} reset --hard HEAD~1", rules_dir_path)
-        assert result.risk_level == RiskLevel.HIGH
-        assert "git_hard_reset" in result.matched_rules
-
-    @pytest.mark.parametrize("option", VALUE_TAKING)
-    @pytest.mark.parametrize("token", TERMINATING)
-    def test_a_terminating_token_in_a_value_slot_still_rates_blanket_staging(self, option, token, rules_dir_path):
-        result = verdict(f"git {option} {token} add -A", rules_dir_path)
-        assert result.risk_level == RiskLevel.HIGH
-        assert "git_blanket_staging" in result.matched_rules
+        assert rule in result.matched_rules
 
     @pytest.mark.parametrize(
         "command",
@@ -1156,19 +1141,6 @@ class TestTheRefusalIsNotReusableAsAnEvasion:
         assert result.risk_level == RiskLevel.HIGH
         assert "git_force_push" in result.matched_rules
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "git --work-tree /tmp push --force origin main",
-            "git --namespace ns reset --hard HEAD~1",
-            "git -C /tmp push --force",
-            "git --git-dir /tmp/.git add -A",
-            "git --attr-source HEAD push --force",
-        ],
-    )
-    def test_an_ordinary_value_is_untouched(self, command, rules_dir_path, clean_worktree):
-        assert verdict(command, rules_dir_path).risk_level == RiskLevel.HIGH
-
 
 class TestTheTerminatingOptionAfterTheSubcommandIsARecordedResidual:
     """`git push --help` opens a man page and pushes nothing -- and still rates.
@@ -1176,6 +1148,10 @@ class TestTheTerminatingOptionAfterTheSubcommandIsARecordedResidual:
     Out of scope for LAB-4309, which fixes the LEADING position only. Pinned at
     its current verdict so the residual is a recorded fact rather than something
     rediscovered later, and so a future fix has to move it deliberately.
+
+    These are rule-engine verdicts: `clean_worktree` mocks the hard-reset
+    backstop, which on a dirty tree would make the `reset --hard` row BLOCKED
+    regardless of what these patterns say.
     """
 
     @pytest.mark.parametrize(
@@ -1199,6 +1175,12 @@ class TestTheOptionRunFragmentIsIdenticalEverywhere:
     partial edit -- fixing force-push and forgetting hard-reset -- would land
     green and leave half the rules holding the old shape. This fails loudly
     instead of silently.
+
+    The COUNT assertion carries most of the weight, and least obviously: a rule
+    that loses its option run entirely falls back to a bare `git rebase` match,
+    which no behaviour test above can see -- a leading terminating option is
+    SAFE against a naive pattern too -- and it takes the `{0,16}` ReDoS bound
+    with it.
     """
 
     # From `git` through the first `){0,16}`. Deliberately matches `git(?:` too,
@@ -1206,12 +1188,26 @@ class TestTheOptionRunFragmentIsIdenticalEverywhere:
     # hiding that copy from the scan.
     FRAGMENT = re.compile(r"git\(\?.*?\)\{0,16\}")
     REFUSAL = r"(?!\s+-(?:v|h|-version|-help)(?![^\s;|&]))"
+    # `git_merge` is the one git rule here carrying no option run. That is a known
+    # exclusion, not an oversight: the rule is owned by another open change. Bump
+    # this count when it gains the fragment.
     EXPECTED_COPIES = 8
 
     @pytest.fixture
     def fragments(self, data_dir):
-        raw = (data_dir / "rules" / "10_development_workflows.yaml").read_text(encoding="utf-8")
-        return self.FRAGMENT.findall(raw)
+        """Scan compiled patterns across the whole rules tree, not one file's text.
+
+        Raw text would count a fragment quoted in a comment -- and long
+        explanatory comments are this file's convention -- and reading a single
+        file would miss a ninth copy landing in another rules file.
+        """
+        found = []
+        for path in sorted((data_dir / "rules").glob("*.yaml")):
+            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            for rule in document.get("rules", []):
+                for pattern in rule.get("patterns", []):
+                    found.extend(self.FRAGMENT.findall(pattern))
+        return found
 
     def test_every_copy_is_present(self, fragments):
         assert len(fragments) == self.EXPECTED_COPIES
@@ -1219,6 +1215,10 @@ class TestTheOptionRunFragmentIsIdenticalEverywhere:
     def test_every_copy_is_byte_identical(self, fragments):
         assert len(set(fragments)) == 1, f"option run diverged across copies: {sorted(set(fragments))}"
 
-    def test_every_copy_carries_the_leading_refusal(self, fragments):
-        # YAML single-quoted scalars double an embedded quote; the refusal has none.
-        assert all(self.REFUSAL in f for f in fragments)
+    def test_every_copy_leads_with_the_refusal(self, fragments):
+        """Position, not merely presence.
+
+        The refusal moved INSIDE the option run is exactly the shape that was
+        shipped and reverted, and a containment check passes it happily.
+        """
+        assert all(f.startswith("git" + self.REFUSAL) for f in fragments)

@@ -44,10 +44,13 @@ rules:
     # `git --namespace -v reset --hard` (working tree overwritten). An
     # adjacent-token refusal hands the attacker a one-word disarm for each.
     #
-    # Deliberate residual: a terminating option anywhere AFTER position 1
-    # (`git -c k=v -v push --force`, `git push --help`) still rates. git does not
-    # run those either, so the verdict is an over-rating -- the safe direction,
-    # and the one this rule takes whenever it cannot tell.
+    # Deliberate residual: a terminating option after position 1 that git parses
+    # as an OPTION rather than as a value (`git -c k=v -v push --force`, and
+    # `git push --help` after the subcommand) still rates. git runs nothing there
+    # either, so the verdict is an over-rating -- the safe direction, and the one
+    # this rule takes whenever it cannot tell. Do NOT read that as licence to
+    # refuse the token further right: in a VALUE slot the same token is consumed
+    # as the value and the subcommand runs, which is the case above.
     patterns: ['git(?!\s+-(?:v|h|-version|-help)(?![^\s;|&]))(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+push[^;|&]{0,100}--force(?!-with-lease)', 'git(?!\s+-(?:v|h|-version|-help)(?![^\s;|&]))(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+push[^;|&]{0,100}\s-f(\s|$)']
     alternatives: ["Use --force-with-lease"]
 
