@@ -713,6 +713,36 @@ class TestMultilineSubstitutionCorrection:
         assert node.kind == "list"
         assert end == len("echo a\necho b")
 
+    def test_a_unit_ending_on_an_unexpected_token_is_rejected(self, monkeypatch):
+        """The guard on a unit terminator that is neither NEWLINE nor the closer denies, never breaks.
+
+        Unreachable from ``parse()`` with bashlex 0.18: ``inputunit`` only ever terminates on a
+        newline or ``$end``, and a stray ``;;``/``fi``/``}`` is a yacc syntax error inside the
+        unit's own parse (Mark S swept 200 seeded commands on LAB-4640: NEWLINE and RIGHT_PAREN
+        were the only terminators observed). Pinned directly, like its EOF sibling above, because
+        it is the docstring's advertised fail-closed property and a ``break`` in its place would
+        hand back the prefix - the LAB-4114 failure - the day the grammar moves.
+        """
+        outer = bashlex.parser._parser("echo x")
+
+        class FakeTok:
+            _current_token = bashlex.tokenizer.token(bashlex.tokenizer.tokentype.SEMI_SEMI, ";;", pos=(6, 8))
+            _shell_input_line_index = 8
+
+        class FakeUnit:
+            tok = FakeTok()
+
+            @staticmethod
+            def parse():
+                return bashlex.ast.node(kind="command", parts=[], pos=(0, 6))
+
+        monkeypatch.setattr(bashlex.parser, "_parser", lambda *_args, **_kwargs: FakeUnit())
+        closer = bashlex.tokenizer.token(bashlex.tokenizer.tokentype.RIGHT_PAREN, ")")
+        with pytest.raises(bashlex.errors.ParsingError, match=r"unexpected ';;' after substitution unit"):
+            parser_mod._parse_all_substitution_units(
+                outer, "echo a;; echo b)", 0, {"eoftoken": closer, "parserstate": outer.parserstate}
+            )
+
     @pytest.mark.parametrize(
         "command,span,body_kind,body_span",
         [

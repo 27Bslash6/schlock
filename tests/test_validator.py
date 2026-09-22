@@ -2766,3 +2766,52 @@ class TestHeredocTailInSubstitution:
         assert subs[0].ast_node.command.kind == "list"
         segments = [part for part in subs[0].ast_node.command.parts if part.kind != "operator"]
         assert [sub_validator._segment_base_command(part) for part in segments] == ["cat", "rm"]
+
+
+class TestNestedHeredocBodyIsNotYetWalked:
+    """Known-open on this branch, and STRONGER on `main`: a substitution inside a heredoc body that
+    is not the last unit of the enclosing substitution.
+
+    `main` never walked a heredoc body either. It caught these by accident: the body's node ended
+    at `<<EOF\n`, `_parsedolparen` saw no `)` at the end offset, and `_expandwordinternal`
+    re-scanned the heredoc text as word text, surfacing the inner `$( )` as a sibling node. The
+    unit loop consumes the body correctly, so the span reaches `)` and the re-scan never runs;
+    nothing walks the body in its place. The trigger is one more unit after the terminator - with
+    nothing after it (the control below) the accident still fires and the row is BLOCKED.
+
+    Each row runs `rm -rf /` in bash 5.3.9 (verified with a filesystem witness, not stdout: inside
+    a heredoc body a printed marker cannot tell "ran" from "was printed"). Every row is BLOCKED on
+    `main` at d9fec69 and SAFE here (LAB-4640, found by Mark S). Extraction from heredoc bodies is
+    `#181` (LAB-2756); composed with this branch all six go back to BLOCKED. Until it lands, this
+    branch must not merge alone, and these rows are strict xfail so the day #181 lands they fail
+    as XPASS and get promoted to plain pins rather than staying a silent regression note.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    KNOWN_OPEN = pytest.mark.xfail(
+        strict=True, reason="heredoc-body extraction is #181 (LAB-2756); BLOCKED on main, SAFE here until it lands"
+    )
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            pytest.param('echo "$(cat <<EOF\n$(rm -rf /)\nEOF\ntrue)"', "whitelisted unit after terminator", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\n$(rm -rf /)\nEOF\necho x)"', "echo after the terminator", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\n`rm -rf /`\nEOF\ntrue)"', "backquote payload in the body", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\nx$(rm -rf /)y\nEOF\ntrue)"', "payload mid-line in the body", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\n$(echo $(rm -rf /))\nEOF\ntrue)"', "double-nested payload", marks=KNOWN_OPEN),
+            pytest.param("cat <(cat <<EOF\n$(rm -rf /)\nEOF\ntrue)", "outer process substitution", marks=KNOWN_OPEN),
+            ('echo "$(cat <<EOF\n$(rm -rf /)\nEOF\n)"', "CONTROL: nothing after the terminator, still caught"),
+        ],
+    )
+    def test_payload_in_a_nested_heredoc_body_is_denied(self, safety_rules_path, command, description):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is False, f"{description}: {result.message}"
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert "Dangerous command in substitution: rm" in result.message, f"{description}: {result.message}"
