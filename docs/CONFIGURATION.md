@@ -101,7 +101,7 @@ Overrides are applied in this order (later wins):
 
 #### Security Constraints
 
-- **BLOCKED rules cannot be downgraded or disabled** — the only exception is the `allow_blocked_override` escape hatch below
+- **BLOCKED rules cannot be disabled.** Downgrading one has a single exception, the `allow_blocked_override` escape hatch below
 - **Whitelist patterns are user-level config only** — project-level config cannot define whitelist patterns (see below)
 - **`allow_blocked_override` is user-level config only** — a project-level occurrence is dropped with a warning (see below)
 - Invalid overrides log warnings and are skipped (graceful degradation)
@@ -119,10 +119,10 @@ rule_overrides:
     allow_blocked_override: true   # required, or the downgrade is refused
 ```
 
-- It is **user-level only**. In `.claude/hooks/schlock-config.yaml` the key is stripped at load time and logged as a warning, so a repo you clone cannot unlock a BLOCKED rule. The hatch rewrites the risk level *before* matching, so a project-level one would sidestep the BLOCKED floor entirely rather than be caught by it — same threat model as the whitelist restriction below.
+- It is **user-level only**, so a repo you clone cannot unlock a BLOCKED rule: in `.claude/hooks/schlock-config.yaml` the key is stripped at load time with a warning, and so is any `risk_level` that file sets on a rule *you* have hatched. The hatch rewrites the risk level before matching, so a project-level one would sidestep the BLOCKED floor rather than be caught by it.
 - It is **rule-level only** — `allow_blocked_override` in a `category_overrides` block does nothing.
 - It **never** applies to `self_protection` rules. Those are immutable with or without the hatch.
-- Every use logs a `SECURITY OVERRIDE` warning naming the rule and its new level. Downgrading a rule schlock ships as BLOCKED means you own the consequences.
+- Every use logs a `SECURITY OVERRIDE` warning naming the rule and its new level.
 
 ### Command Whitelist
 
