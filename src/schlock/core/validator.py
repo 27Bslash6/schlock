@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Module-level cache (shared across all validation calls)
 _global_cache = ValidationCache(max_size=1000)
-# Which ruleset produced the entries currently in _global_cache. Deliberately NOT
-# _global_rule_engine_path: that one records which engine is loaded, and is advanced by
-# call sites that never touch this cache (LAB-4602).
+# Which ruleset produced the entries currently in _global_cache. Deliberately not
+# _global_rule_engine_path: that records which engine is LOADED, and call sites that never
+# touch this cache advance it (LAB-4602).
 _global_cache_path: Optional[str] = None
 
 # Thread lock for RuleEngine and Parser caches
@@ -98,17 +98,12 @@ def _invalidate_on_ruleset_change(config_path: Optional[str] = None) -> None:
     _get_rule_engine() does reload on a path change, but it runs after the lookup has already
     returned the stale hit, so the same compare placed there never fires.
 
-    Clearing the verdict cache alone is NOT enough, and stopping there is the same mistake
-    LAB-2752 recorded - fixing the path the bug report names while a sibling consumer keeps
-    the old ruleset. _global_substitution_validator binds its engine once at construction and
-    ignores config_path forever after, so a cleared cache recomputes the verdict with the
-    PREVIOUS ruleset's engine for anything inside $(...), then stores that answer under the
-    new marker, where no later clear can reach it. `echo "$(cat ~/.kube/config | head)"`
-    validated under a ruleset without 03_credential_theft.yaml and then under the full one
-    returned SAFE, where the full ruleset alone returns BLOCKED. Dropping the singleton here
-    makes the next _get_substitution_validator() rebuild it against the new engine.
+    Clearing the verdict cache alone is not enough on its own: the substitution layer holds
+    its own ruleset-derived state. That is fixed where it lives, in _get_substitution_validator
+    - see its docstring - rather than by reaching across from here, so it also holds for
+    callers that never come through validate_command.
     """
-    global _global_cache_path, _global_substitution_validator  # noqa: PLW0603
+    global _global_cache_path  # noqa: PLW0603
 
     # Re-check under the lock: the caller's guard is deliberately unlocked (it runs before
     # every cache hit), so another thread may have switched the ruleset between that compare
@@ -125,7 +120,6 @@ def _invalidate_on_ruleset_change(config_path: Optional[str] = None) -> None:
         if _global_cache_path != config_path:
             _global_cache.clear()
             _global_cache_path = config_path
-            _global_substitution_validator = None
 
 
 def _get_parser() -> "BashCommandParser":
@@ -143,18 +137,28 @@ def _get_parser() -> "BashCommandParser":
 
 
 def _get_substitution_validator(config_path: Optional[str] = None) -> "SubstitutionValidator":
-    """Get cached SubstitutionValidator.
+    """Get a SubstitutionValidator bound to the CURRENT rule engine.
 
     PERF: SubstitutionValidator caches whitelist lookups.
     Thread-safe: Uses _cache_lock to prevent race conditions.
+
+    Rebuilds whenever the engine changes, not only on first use. This used to cache on
+    `is None` alone and ignore config_path forever after, so once the ruleset changed it
+    kept vouching with the PREVIOUS ruleset's engine - and this layer is whitelist-first
+    default-deny, so a stale whitelist admits commands the named ruleset denies
+    (`echo "$(cat ~/.kube/config | head)"` came back SAFE under a ruleset that blocks it).
+
+    Keyed on the engine OBJECT, not on a second config_path global: _get_rule_engine already
+    owns that decision, and an identity check cannot drift out of sync with it. It also
+    covers callers that reach this function directly rather than through validate_command -
+    tests/test_walker_parity.py does exactly that (LAB-4602).
     """
     global _global_substitution_validator  # noqa: PLW0603
 
     with _cache_lock:
-        if _global_substitution_validator is None:
-            parser = _get_parser()
-            engine = _get_rule_engine(config_path)
-            _global_substitution_validator = SubstitutionValidator(parser, engine)
+        engine = _get_rule_engine(config_path)
+        if _global_substitution_validator is None or _global_substitution_validator.rule_engine is not engine:
+            _global_substitution_validator = SubstitutionValidator(_get_parser(), engine)
         return _global_substitution_validator
 
 
@@ -2152,12 +2156,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             return over
 
         # Step 1: Check cache, after dropping any verdicts a different ruleset left behind.
-        # Must precede the lookup: _get_rule_engine's own path check (Step 5) is too late to
-        # save a hit that has already returned.
-        # The compare is inline rather than inside the helper because it guards every cached
-        # hit, and the call alone cost ~50ns of a ~410ns cached call; with it inline the
-        # benchmark is at parity with main. It is also the outer half of the helper's
-        # double-checked lock - keep it here, and keep it before the lookup.
+        # Inline rather than a plain call: this guards every cached hit and the call alone
+        # cost ~50ns of a ~410ns cached call, which is the whole margin against main. It is
+        # the outer half of the helper's double-checked lock, so it must stay before the
+        # lookup and must never be NARROWER than the helper's own compare.
         if _global_cache_path != config_path:
             _invalidate_on_ruleset_change(config_path)
         cached = _global_cache.get(command)

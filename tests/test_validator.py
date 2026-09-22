@@ -406,12 +406,18 @@ class TestCaching:
 
         # Advance the engine marker on its own, as tests and _get_substitution_validator do.
         val_module._get_rule_engine(no_cred)
-        assert val_module._global_rule_engine_path == no_cred
-        assert val_module._global_cache_path == rules_dir_path
+        engine_marker = val_module._global_rule_engine_path
+        cache_marker = val_module._global_cache_path
 
         result = validate_command(command, config_path=no_cred)
         assert result.risk_level == RiskLevel.SAFE
         assert result.matched_rules == []
+
+        # Captured above, asserted here on purpose: the verdict is the regression detector, so
+        # a failure should report the wrong verdict, not a private global. These two only
+        # explain WHY it would have been wrong - the engine marker moved, the cache's did not.
+        assert engine_marker == no_cred
+        assert cache_marker == rules_dir_path
 
     def test_validation_cache_invalidated_for_substitution_rules(self, tmp_path, rules_dir_path):
         """The substitution layer follows the named ruleset too, not just the top-level match.
