@@ -23,7 +23,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser
+from .parser import WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidator
 
@@ -888,6 +888,7 @@ def _match_original_and_reconstructed(
     string_literals: list[tuple],
     quote_source: str,
     heredoc_ranges: Optional[list[tuple]] = None,
+    use_whitelist: bool = True,
 ) -> RuleMatch:
     """Match `command` against the rules as written AND quote/escape-stripped.
 
@@ -927,9 +928,13 @@ def _match_original_and_reconstructed(
                       not a silent wrong answer. Only quote detection uses it; the
                       ranges returned are offsets into the reconstruction, which
                       is built from `ast_nodes` alone either way.
-        heredoc_ranges: Heredoc ranges for the original-form pass only: heredoc
-                        bodies never reach the reconstruction, since
-                        _collect_words walks `.word` parts alone.
+        heredoc_ranges: Heredoc ranges for the original-form pass only. Heredoc
+                        bodies still never reach either reconstruction, but since
+                        LAB-2760 the reason is narrower than "_collect_words walks
+                        `.word` parts alone": it now reads redirections too, and
+                        what saves the body is that bashlex parks it on
+                        `redirect.heredoc` while `_redirect_words` reads only
+                        `redirect.output`, which holds the delimiter.
 
     Returns:
         The higher-risk of the two matches.
@@ -940,13 +945,82 @@ def _match_original_and_reconstructed(
         heredoc_ranges=heredoc_ranges,
     )
 
-    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes)
-    if reconstructed and reconstructed != command:
-        recon_match = engine.match_command(reconstructed, string_literals=suppression_ranges)
-        if recon_match.risk_level > match.risk_level:
-            return recon_match
+    # Three forms, highest risk wins. The two reconstructions are NOT a before/after
+    # pair - each is the only form a whole family of rules can match (LAB-2760):
+    # `>\s*/dev/sd[a-z]` needs the redirect present, while rule 08's `[^>]{0,200}`
+    # and rule 03's `^\s*env\s*$` only match once it is gone.
+    seen = {command}
+    for form, ranges in (
+        parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes),
+        parser.reconstruct_without_redirects(quote_source, ast_nodes),
+    ):
+        if not form or form in seen:
+            continue
+        seen.add(form)
+        form_match = engine.match_command(form, string_literals=ranges, use_whitelist=use_whitelist)
+        if form_match.risk_level > match.risk_level:
+            match = form_match
 
     return match
+
+
+def _rule_risk_floor(
+    config_path: Optional[str],
+    parser: "BashCommandParser",
+    command: str,
+    ast_nodes: list[Any],
+    string_literals: list[tuple],
+    heredoc_ranges: list[tuple],
+) -> RuleMatch:
+    """What the rule passes make of `command`, as a floor for an early return.
+
+    SECURITY: the substitution check short-circuits `validate_command` BEFORE step 5
+    ever runs, and reported only the substitution's own risk - so a command the rules
+    call BLOCKED was demoted to the substitution verdict merely by containing a
+    non-whitelisted `$( )`. `mkfs.ext4 /dev/sda` was BLOCKED while
+    `mkfs.ext4 $(base64 -d f)` was HIGH, and `hooks/pre_tool_use.py` maps the
+    DECISION off `risk_level` alone, never off `allowed` - so under the permissive
+    preset that demotion is deny -> allow. Found by the LAB-2760 differential sweep;
+    pre-existing, and reachable without that ticket's changes.
+
+    Taking the max of the two analyses keeps the early return (deferring it would let
+    the whitelist branch further down turn a denied substitution into an ALLOW) while
+    removing its ability to under-report. Only the deny path pays for the extra pass.
+
+    It runs the FULL matcher, not a bare match_command: the reconstruction-only
+    detections (LAB-1732's quoted command name, LAB-2760's quoted redirect target)
+    are exactly the ones a substitution would otherwise mask - `"mkfs.ext4" /dev/sda`
+    is BLOCKED but `"mkfs.ext4" $(base64 -d f)` was HIGH. The whitelist is OFF for
+    the same reason validator.py's segment loop turns it off: it is prefix-based, so
+    one leading `ls` would vouch for the rest and hand the floor back its SAFE.
+
+    Returns the RuleMatch, not just a level, so the caller can name the rule that
+    actually set the verdict - a floor that reports BLOCKED with an empty
+    `matched_rules` tells the audit log about the substitution and nothing about the
+    disk write.
+
+    A broken rules file fails CLOSED here (BLOCKED), matching this module's posture
+    where the same error is raised on the main path. Nothing else is caught: this
+    runs inside validate_command's parse/ValueError handler, which already fails
+    closed, and swallowing exceptions in a floor would silently restore the
+    under-report it exists to prevent.
+    """
+    try:
+        return _match_original_and_reconstructed(
+            _get_rule_engine(config_path),
+            parser,
+            command,
+            ast_nodes,
+            string_literals=string_literals,
+            heredoc_ranges=heredoc_ranges,
+            quote_source=command,
+            use_whitelist=False,
+        )
+    except ConfigurationError:
+        logger.warning("rule-risk floor unavailable (rules failed to load); failing closed")
+        return RuleMatch(
+            matched=True, rule=None, risk_level=RiskLevel.BLOCKED, message="Rule engine unavailable", alternatives=[]
+        )
 
 
 # The rewrite emits its own delimiter rather than reusing the real one, which
@@ -2095,10 +2169,14 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             sub_results = sub_validator.validate_all_substitutions(ast)
             for sub_result in sub_results:
                 if not sub_result.allowed:
+                    floor = _rule_risk_floor(config_path, parser, command, ast, string_literals, heredoc_ranges)
+                    # The floor OUTRANKING the substitution means the rules found the
+                    # real danger and the substitution message would misname it.
+                    floor_wins = floor.risk_level > sub_result.risk_level
                     return ValidationResult(
                         allowed=False,
-                        risk_level=sub_result.risk_level,
-                        message=f"BLOCKED: {sub_result.message}",
+                        risk_level=max(sub_result.risk_level, floor.risk_level),
+                        message=(f"BLOCKED: {floor.message}" if floor_wins else f"BLOCKED: {sub_result.message}"),
                         alternatives=[
                             "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
                             "Run the command directly instead of using substitution",
@@ -2106,6 +2184,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         ],
                         exit_code=1,
                         error=None,
+                        matched_rules=[floor.rule.name] if floor_wins and floor.rule else [],
                     )
                 # Don't cache (substitution content may vary)
 
@@ -2205,6 +2284,33 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     if seg_match.risk_level > highest_risk:
                         highest_risk = seg_match.risk_level
                         highest_match = seg_match
+
+                # SECURITY (LAB-2760): a compound's redirections hang off the
+                # COMPOUND node, and _segment_nodes recurses past it into `.list`,
+                # so they belong to no segment and no per-segment reconstruction
+                # can carry them - `while true; do echo a; done > "/dev/sda"` was
+                # SAFE while the unquoted form was BLOCKED. The whole-command pass
+                # is the only one that sees them, so it runs ALWAYS, not just when
+                # no segment matched: `{ rm -f foo; echo a; } > "/dev/sda"` matches
+                # on a segment and would otherwise skip the fallback entirely.
+                # Whitelist OFF for the reason stated below - it is prefix-based,
+                # and this is a floor that can only raise.
+                if has_compound_redirects(ast):
+                    whole = _match_original_and_reconstructed(
+                        engine,
+                        parser,
+                        command,
+                        ast,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        quote_source=command,
+                        use_whitelist=False,
+                    )
+                    if whole.risk_level > highest_risk:
+                        highest_risk = whole.risk_level
+                        highest_match = whole
+                        if whole.matched and whole.rule:
+                            all_matched_rules.append(whole.rule.name)
 
                 # Use highest risk found, or SAFE if none
                 if highest_match:

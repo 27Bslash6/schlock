@@ -129,6 +129,26 @@ _apply_andor_substitution_correction()
 # cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
 _HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish"})
 
+# Redirection operators whose operand is DATA rather than a path, and so must stay
+# out of the reconstruction that _redirect_words feeds (LAB-2760).
+# `<<<` is the load-bearing entry: a here-string payload sits on `.output` and only
+# executes when the command is a shell, so emitting it unsuppressed would over-block
+# `cat <<< "rm -rf /"`, which merely prints text. Deciding shell-vs-data for that
+# operand is LAB-2768's job, not this one.
+# `<<`/`<<-` cost nothing to exclude and change no verdict either way - a heredoc
+# BODY lives on `.heredoc`, which _redirect_words never reads, so only the inert
+# delimiter token (`EOF`) is at stake. They are listed because a delimiter is data
+# by the same rule, not because anything depends on it: do NOT read this as "the
+# heredoc body would escape without them".
+_DATA_REDIRECT_OPERATORS = frozenset({"<<", "<<-", "<<<"})
+
+# Redirection operators that write a file exactly as a plainer operator does, but
+# whose spelling no path rule can read (LAB-2760): every disk/boot rule is
+# `>\s*/dev/[sh]d[a-z]`, and both `|` and `&` break that `\s*`. `>|` is `>` with
+# noclobber overridden - strictly more dangerous, never less - and bash itself
+# reads `>& word` as `&> word` when no fd is given.
+_OPERATOR_ALIASES = {">|": ">", ">&": "&>"}
+
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
         "bash",
@@ -329,6 +349,108 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
             continue
         saw_option = True
     return True
+
+
+def has_compound_redirects(ast_nodes: list[Any]) -> bool:
+    """Whether any node redirects at the COMPOUND level (`{ …; } > f`, `done > f`).
+
+    These are the redirections no segment can see: _segment_nodes recurses past the
+    compound into its `.list`, so the redirection belongs to none of the resulting
+    segments (LAB-2760). The multi-segment branch uses this to decide whether it
+    needs a whole-command pass at all - running that pass unconditionally is an
+    over-block, because a process-substitution word carries its heredoc body
+    VERBATIM into the reconstruction where no heredoc range suppresses it.
+    """
+
+    def visit(node) -> bool:
+        if not hasattr(node, "kind"):
+            return False
+        if getattr(node, "redirects", None):
+            return True
+        for attr in ("parts", "command", "list", "pipe", "compound"):
+            child = getattr(node, attr, None)
+            if isinstance(child, list):
+                if any(visit(item) for item in child):
+                    return True
+            elif child and visit(child):
+                return True
+        return False
+
+    return any(visit(node) for node in ast_nodes or [])
+
+
+def _redirect_words(node: Any) -> list[tuple[str, Optional[tuple]]]:
+    r"""One redirection, rendered as reconstruction words: operator, then target.
+
+    SECURITY (LAB-2760): a redirect target is never inert the way an argument can
+    be - the path IS the effect - so it is emitted with span ``None`` and can never
+    earn a suppression range (see _quoting_is_load_bearing, consulted only for a
+    non-None span). That is what makes `echo a > "/dev/sda"` classify as
+    `echo a > /dev/sda` rather than disappearing.
+
+    The cost of that choice is a hard match on a filename that itself contains rule
+    text (`git log > "notes about rm -rf / incident.md"`). Measured, it changes no
+    verdict: `extract_string_literals` does not descend into `redirect.output`
+    either, so the ORIGINAL-form pass already matches those unsuppressed. Fixing it
+    means teaching both passes at once, which is not this ticket.
+
+    The operator travels with the target, because every disk/boot rule is written
+    `>\s*/dev/[sh]d[a-z]` - matching on the redirection, not a bare path. The bare
+    target would reconstruct to `echo a /dev/sda` and still miss.
+
+    Spacing is REPRODUCED, never normalised. Reconstruction exists to resolve
+    quoting and escapes; re-spacing changes which rules match, and rule 04's
+    `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before `/dev/` - so emitting
+    `2>/dev/null` as `2> /dev/null` silently reclassifies `shred old.txt 2>/dev/null`
+    from log tampering to filesystem wiping. The fd is likewise glued back on
+    (`2>`, not `2` `>`) because bashlex splits it into `input`; that is fidelity,
+    not a defence against any particular rule.
+
+    Returns:
+        [] for a redirection with no path operand - a `<<`-family operator
+        (_DATA_REDIRECT_OPERATORS), or an fd-closing `2>&-`, whose `output` bashlex
+        leaves as a bare `-` string rather than a word or an fd.
+    """
+    operator: Optional[str] = getattr(node, "type", None)
+    if operator is None or operator in _DATA_REDIRECT_OPERATORS:
+        return []
+
+    fd = getattr(node, "input", None)
+    target = getattr(node, "output", None)
+
+    if isinstance(target, int):
+        # fd duplication (`2>&1`): no path, and the source glues it.
+        glued_fd = f"{fd}{operator}" if isinstance(fd, int) else operator
+        return [(f"{glued_fd}{target}", None)]
+
+    word: Optional[str] = getattr(target, "word", None)
+    if word is None:
+        # `2>&-` closes an fd - bashlex leaves `output` a bare `-` string.
+        return []
+
+    # Did the SOURCE glue the operator to its target? Computed from spans alone:
+    # the operator occupies its fd plus its own spelling, starting at the redirect
+    # node. Reconstruction resolves quoting and escapes and must NOT re-space,
+    # because rule 04's `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before
+    # `/dev/` - turning `2>/dev/null` into `2> /dev/null` reclassifies
+    # `shred old.txt 2>/dev/null` from log tampering to filesystem wiping.
+    redirect_pos, target_pos = getattr(node, "pos", None), getattr(target, "pos", None)
+    glued = bool(
+        redirect_pos
+        and target_pos
+        and target_pos[0] == redirect_pos[0] + (len(str(fd)) if isinstance(fd, int) else 0) + len(operator)
+    )
+
+    if operator == ">|" or (operator == ">&" and fd is None):
+        operator = _OPERATOR_ALIASES[operator]
+    if isinstance(fd, int):
+        operator = f"{fd}{operator}"
+
+    if glued:
+        # One token, so the joining space cannot open a gap the source did not have.
+        return [(f"{operator}{word}", None)]
+
+    return [(operator, None), (word, None)]
 
 
 class CommandSegment(NamedTuple):
@@ -752,8 +874,26 @@ class BashCommandParser:
             )
         return results
 
-    def _collect_words(self, ast_nodes: list[Any]) -> list[tuple[str, Optional[tuple]]]:
-        """Collect the word parts that make up the reconstructed command.
+    def _collect_words(self, ast_nodes: list[Any], include_redirects: bool = True) -> list[tuple[str, Optional[tuple]]]:
+        r"""Collect the word parts that make up the reconstructed command.
+
+        SECURITY (LAB-2760): redirections are collected too, via
+        _redirect_words. A `redirect` node carries no `.word`, so walking `.word`
+        parts alone dropped the target out of the reconstruction entirely - and
+        because the ORIGINAL-form pass matches `>\s*/dev/sd[a-z]` against text
+        that still holds the quote characters, two quote marks were enough to
+        hide a disk from both passes at once (`echo a > "/dev/sda"` was SAFE).
+
+        BOTH forms are needed, which is what `include_redirects` is for. A large
+        family of rules is written to STOP at a redirect on purpose - rule 08's
+        `(rm|mv|cp)\s+[^>]{0,200}/(etc|sys|...)/` excludes `>` by name "to avoid
+        matching through redirects like 2>/dev/null", and rule 03 anchors bare
+        `^\s*env\s*$`. Those rules were matching the redirect-FREE
+        reconstruction, so emitting the redirect INTO it silently un-matched them:
+        `fdisk 2>/dev/null /dev/sda` and `env > creds.txt` both went
+        BLOCKED -> allowed. The redirect-free form is therefore load-bearing in
+        its own right, not a legacy shape; _match_original_and_reconstructed runs
+        both and takes the higher risk.
 
         Returns:
             List of (word_text, original_span) tuples in reconstruction order.
@@ -770,6 +910,8 @@ class BashCommandParser:
                     for part in node.parts:
                         if hasattr(part, "word"):
                             words.append((part.word, getattr(part, "pos", None)))
+                        elif include_redirects and getattr(part, "kind", None) == "redirect":
+                            words.extend(_redirect_words(part))
                     return  # Don't recurse further into this command
 
                 # Recursively visit child nodes for other structures
@@ -781,6 +923,13 @@ class BashCommandParser:
                                 visit(item)
                         elif child:
                             visit(child)
+
+                # A compound (`{ ...; } > /dev/sda`, `done > /dev/sda`) hangs its
+                # redirections off `redirects`, never off `parts`, so the loop
+                # above cannot reach them. Source order puts them last.
+                if include_redirects:
+                    for redirect in getattr(node, "redirects", None) or []:
+                        words.extend(_redirect_words(redirect))
 
         for node in ast_nodes or []:
             visit(node)
@@ -808,6 +957,15 @@ class BashCommandParser:
             'rm -rf /'
         """
         return " ".join(word for word, _ in self._collect_words(ast_nodes))
+
+    def reconstruct_without_redirects(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
+        """The reconstruction as it stood before LAB-2760: words only, no redirections.
+
+        Kept as a SEPARATE pass rather than a migration step. See _collect_words -
+        rules that deliberately exclude `>` only match this form, so it has to keep
+        being matched alongside the redirect-bearing one.
+        """
+        return self._reconstruct(command, ast_nodes, include_redirects=False)
 
     def reconstruct_command_with_suppression_ranges(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
         """Reconstruct the command AND rebase its suppression ranges onto it.
@@ -845,7 +1003,11 @@ class BashCommandParser:
             >>> parser.reconstruct_command_with_suppression_ranges('echo "rm -rf /"', ast)
             ('echo rm -rf /', [(5, 14)])
         """
-        words = self._collect_words(ast_nodes)
+        return self._reconstruct(command, ast_nodes, include_redirects=True)
+
+    def _reconstruct(self, command: str, ast_nodes: list[Any], *, include_redirects: bool) -> tuple[str, list[tuple]]:
+        """Shared body of the two reconstruction passes."""
+        words = self._collect_words(ast_nodes, include_redirects=include_redirects)
         ranges = []
         offset = 0
 

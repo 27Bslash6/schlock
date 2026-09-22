@@ -1,0 +1,272 @@
+r"""Redirect targets reach the rule passes, so quoting one no longer hides it (LAB-2760).
+
+Two independent walkers used to skip `redirect` nodes. A redirect node carries no
+`.word` - its target hangs off `.output` - so `_collect_words` dropped the target
+out of the reconstruction and `echo a > "/dev/sda"` reconstructed to `echo a`. The
+original-form pass still saw the raw text, but every disk rule is written
+`>\s*/dev/[sh]d[a-z]`, which two quote characters defeat. Both passes blind at once,
+on a command that overwrites a disk.
+
+Three lessons from this ticket's own review are baked into how these tests are
+written, because each one hid a live bug behind a green suite:
+
+1. **Assert the RULE, not just the tier** (LAB-4270/4317). A verdict-only assertion
+   cannot tell "BLOCKED by the rule that should fire" from "BLOCKED by something
+   else", and the risk floor once returned BLOCKED with an empty `matched_rules`.
+2. **Pin ABSOLUTE values, never "same tier as the control"** (LAB-1584). A
+   tier-equality assertion survives a mutation that drops both sides together.
+3. **Pick the compound form with MORE than one segment.** The first draft of this
+   file tested `{ echo a; }`, the one compound that collapses to a single segment
+   and so takes the working path - it was green while `while`/`if` were still
+   wide open.
+
+ShellCheck is forced unavailable throughout: it is optional, and a defence that only
+holds when it happens to be installed is not a defence.
+"""
+
+from unittest.mock import patch
+
+import pytest
+
+from schlock.core.parser import BashCommandParser
+from schlock.core.rules import RiskLevel
+from schlock.core.validator import clear_caches, validate_command
+
+
+@pytest.fixture(autouse=True)
+def _no_shellcheck():
+    """Rule passes only - ShellCheck must not be able to mask a regression."""
+    clear_caches()
+    with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+        yield
+    clear_caches()
+
+
+def _verdict(command, rules):
+    """(risk_level, matched_rules) - the rule name is half the assertion."""
+    result = validate_command(command, config_path=rules)
+    return result.risk_level, tuple(result.matched_rules or ())
+
+
+def _risk(command, rules):
+    return validate_command(command, config_path=rules).risk_level
+
+
+class TestQuotedRedirectTargetIsVisible:
+    """AC-1: a quoted target classifies exactly as its unquoted control does."""
+
+    @pytest.mark.parametrize(
+        ("command", "control", "rule"),
+        [
+            ('echo a > "/dev/sda"', "echo a > /dev/sda", "disk_destruction_dd"),
+            ('printf x > "/boot/vmlinuz"', "printf x > /boot/vmlinuz", "disk_destruction_dd"),
+            ('cat x > "/dev/nvme0n1"', "cat x > /dev/nvme0n1", "disk_destruction_dd"),
+            ('echo a >> "/dev/sda"', "echo a >> /dev/sda", "disk_destruction_dd"),
+            ('echo a 2> "/dev/sda"', "echo a 2> /dev/sda", "disk_destruction_dd"),
+        ],
+    )
+    def test_quoted_target_is_blocked_by_the_same_rule(self, command, control, rule, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+        assert _verdict(control, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+
+
+class TestCompoundRedirectsAreReached:
+    """A compound hangs its redirections off `.redirects`, never off `.parts`.
+
+    `_segment_nodes` recurses PAST the compound into its `.list`, so the redirection
+    belongs to no segment and no per-segment reconstruction can carry it. Every form
+    below except `{ echo a; }` yields more than one segment, which is the path that
+    was still blind after the first fix.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'while true; do echo a; done > "/dev/sda"',
+            'if true; then echo a; fi > "/dev/sda"',
+            'for i in 1 2; do ls; echo a; done > "/dev/sda"',
+            '{ ls; echo a; } > "/dev/sda"',
+            '( ls; echo a ) > "/dev/sda"',
+            # A segment matching at a LOWER tier must not skip the whole-command pass.
+            '{ rm -f foo; echo a; } > "/dev/sda"',
+        ],
+    )
+    def test_quoted_compound_target_is_blocked(self, command, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ("disk_destruction_dd",))
+
+    @pytest.mark.parametrize(
+        "command",
+        ["if true; then ls -la; fi > out.txt", "if true; then git status; fi > out.txt"],
+    )
+    def test_ordinary_compound_redirect_is_untouched(self, command, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.SAFE, ())
+
+
+class TestRedirectFreeFormStillMatches:
+    """The redirect-FREE reconstruction is load-bearing in its own right.
+
+    A whole family of rules is written to STOP at a redirect on purpose - rule 08's
+    `(rm|mv|cp)\\s+[^>]{0,200}/(etc|...)/` excludes `>` by name "to avoid matching
+    through redirects like 2>/dev/null", and rule 03 anchors bare `^\\s*env\\s*$`.
+    Emitting the redirect INTO the reconstruction silently un-matched all of them:
+    every command here went BLOCKED -> allowed until both forms were matched.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("fdisk 2>/dev/null /dev/sda", "partition_manipulation"),
+            ("rm -rf 2>/dev/null /etc/foo", "protect_system_files"),
+            ("rm 2>&1 /sbin/init", "protect_system_files"),
+            ("cp 2>/dev/null a /boot/b", "protect_system_files"),
+            ("env > creds.txt", "environment_credential_extraction"),
+            ("printenv >> x", "environment_credential_extraction"),
+            ("export -p > x", "environment_credential_extraction"),
+            ("env 2>/dev/null", "environment_credential_extraction"),
+        ],
+    )
+    def test_rule_that_excludes_redirects_still_fires(self, command, rule, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+
+
+class TestSubstitutionUsedAsRedirectTarget:
+    """A substitution under a redirect target reaches SubstitutionValidator.
+
+    Emitting the target is NOT enough: bashlex keeps a process-substitution word
+    verbatim, quotes and all, so the regex pass reads `<("rm" -rf /)` and matches
+    nothing. The substitution walker has to descend into `output` - and into
+    `redirects`, or every compound form stays blind.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'cat < <("rm" -rf /)',
+            "echo a > \"$(r''m -rf /)\"",
+            "{ echo a; } > \"$(r''m -rf /)\"",
+            "( echo a ) > \"$(r''m -rf /)\"",
+            '{ echo a; } < <("rm" -rf /)',
+        ],
+    )
+    def test_obfuscated_substitution_target_is_blocked(self, command, safety_rules_path):
+        assert _risk(command, safety_rules_path) is RiskLevel.BLOCKED
+
+
+class TestOperatorSpellingsTheRulesCanRead:
+    """`>|` and word-target `>&` write a file exactly as `>` and `&>` do.
+
+    Every path rule is `>\\s*…`; both `|` and `&` interpose a character that breaks
+    the `\\s*`, so emitting `node.type` verbatim routed the target to the rules in a
+    spelling none of them could match.
+    """
+
+    @pytest.mark.parametrize("command", ["cat x >| /dev/sda", "echo a 2>| /dev/sda", "echo a >& /dev/sda"])
+    def test_aliased_operator_is_blocked(self, command, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ("disk_destruction_dd",))
+
+    @pytest.mark.parametrize("command", ["echo a >&2", "cmd 2>&-", "echo a >&-"])
+    def test_fd_duplication_and_close_stay_safe(self, command, safety_rules_path):
+        """An fd target is an int and `>&-` leaves `output` a bare `-`: neither is a path."""
+        assert _verdict(command, safety_rules_path) == (RiskLevel.SAFE, ())
+
+
+class TestSubstitutionVerdictCannotUndercutTheRules:
+    """A denied substitution must not LOWER the command's risk.
+
+    Pre-existing, found by this ticket's differential sweep: the substitution check
+    short-circuits before the rule pass and reported only its own risk, so any
+    non-whitelisted `$( )` demoted a BLOCKED command to HIGH. `hooks/pre_tool_use.py`
+    maps the decision off `risk_level` alone, so under the permissive preset that
+    demotion is deny -> allow.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("mkfs.ext4 $(base64 -d f)", "filesystem_format"),
+            # Reconstruction-only detections must reach the floor too.
+            ('"mkfs.ext4" $(base64 -d f)', "filesystem_format"),
+            ('echo $(base64 -d f) > "/dev/sda"', "disk_destruction_dd"),
+            # The floor runs with the whitelist OFF: it is prefix-based, so a leading
+            # `ls` would otherwise vouch for everything after it.
+            ("ls && mkfs.ext4 /dev/sda $(base64 -d f)", "filesystem_format"),
+        ],
+    )
+    def test_floor_raises_and_names_the_rule(self, command, rule, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+
+    def test_substitution_risk_survives_when_no_rule_is_louder(self, safety_rules_path):
+        """The floor raises; it must not flatten every substitution to BLOCKED."""
+        assert _risk("ls $(base64 -d f)", safety_rules_path) is RiskLevel.HIGH
+
+
+class TestOrdinaryRedirectsAreUnaffected:
+    """AC-2: absolute verdicts. The /dev/null carve-outs in particular must not move."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo x > /dev/null",
+            "cmd 2>/dev/null",
+            "cmd 2> /dev/null",
+            "cat a > out.txt",
+            'cat a > "my notes.txt"',
+            'git log > "release notes.md"',
+            "cmd >> out.log",
+            "cmd 2>&1",
+            "cmd &> /dev/null",
+        ],
+    )
+    def test_verdict_is_safe(self, command, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.SAFE, ())
+
+
+class TestSpacingIsReproducedNotNormalised:
+    """Reconstruction resolves quoting; it must not re-space.
+
+    Rule 04's `\\bshred\\s+.{0,100}\\s+/dev/` keys on whitespace before `/dev/`, so
+    rendering `2>/dev/null` as `2> /dev/null` reclassifies an ordinary stderr discard
+    as filesystem wiping. The rule set already disagrees with itself about the two
+    spellings; reconstruction must not drag the common one onto the over-blocking side.
+    """
+
+    def test_glued_stderr_discard_does_not_become_a_wipe(self, safety_rules_path):
+        assert _verdict("shred old.txt 2>/dev/null", safety_rules_path) == (RiskLevel.SAFE, ())
+        assert _verdict("shred /var/log/y 2>/dev/null", safety_rules_path) == (RiskLevel.HIGH, ("log_tampering",))
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("shred old.txt 2>/dev/null", "shred old.txt 2>/dev/null"),
+            ("shred old.txt 2> /dev/null", "shred old.txt 2> /dev/null"),
+            ('echo a > "/dev/sda"', "echo a > /dev/sda"),
+            ('echo a >"/dev/sda"', "echo a >/dev/sda"),
+            ("cmd 2>&1", "cmd 2>&1"),
+        ],
+    )
+    def test_reconstruction_reproduces_the_gap(self, command, expected):
+        parser = BashCommandParser()
+        reconstructed, _ = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert reconstructed == expected
+
+    def test_both_reconstructions_are_available(self):
+        """The two forms are a pair, not a migration step - each matches rules the other cannot."""
+        parser = BashCommandParser()
+        command = "fdisk 2>/dev/null /dev/sda"
+        ast = parser.parse(command)
+        assert parser.reconstruct_command_with_suppression_ranges(command, ast)[0] == "fdisk 2>/dev/null /dev/sda"
+        assert parser.reconstruct_without_redirects(command, ast)[0] == "fdisk /dev/sda"
+
+
+class TestDataOperandsStayOut:
+    """A `<<<` payload is data: it executes only when the command is a shell.
+
+    Emitting it unsuppressed would over-block `cat <<< "rm -rf /"`, which prints text.
+    Deciding shell-vs-data for that operand is LAB-2768's job, not this one.
+    """
+
+    def test_here_string_payload_is_not_promoted(self, safety_rules_path):
+        assert _risk('cat <<< "rm -rf /"', safety_rules_path) is RiskLevel.HIGH
+
+    def test_heredoc_body_stays_inert(self, safety_rules_path):
+        assert _risk("cat << EOF\nrm -rf /\nEOF", safety_rules_path) is RiskLevel.SAFE

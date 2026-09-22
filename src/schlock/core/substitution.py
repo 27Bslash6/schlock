@@ -846,8 +846,18 @@ class SubstitutionValidator:
                 substitutions.extend(self._substitutions_in_parameter(node, current_depth))
                 return
 
-            # Recurse into child nodes
-            for attr in ["parts", "command", "list", "pipe", "compound"]:
+            # Recurse into child nodes. `output` is the redirect target
+            # (LAB-2760/LAB-4114): bashlex parks the substitution in
+            # `cat < <("rm" -rf /)` under `redirect.output.parts`, so without it
+            # the inner command never reaches this validator and the regex pass -
+            # which sees the target's verbatim, still-quoted text - cannot read
+            # it either. An fd-duplication target is an int and has no `kind`,
+            # so it falls straight back out of visit(). `redirects` is the same
+            # target one level out: a COMPOUND (`{ …; } > "$(r''m -rf /)"`) hangs
+            # its redirections there and never in `parts`, so `output` alone
+            # reaches the simple-command form and misses every compound one.
+            # `heredoc` stays off the list: its body has its own mechanism.
+            for attr in ["parts", "command", "list", "pipe", "compound", "output", "redirects"]:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
