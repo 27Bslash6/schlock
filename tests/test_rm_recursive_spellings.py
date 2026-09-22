@@ -11,6 +11,9 @@ had no general rule.
 Every assertion is an absolute expected verdict with the rule named, never parity
 with a control, and ShellCheck is forced off: SC2114/SC2115 rate most of these on
 a machine that has ShellCheck installed, which is how the gap stayed hidden.
+The flag word is spelt several ways on purpose (`$'-rf'`, `{-rf,}`): bash hands rm
+the bare `-rf` from each, and a lookbehind that demanded a blank before the dash
+let them through.
 """
 
 import pytest
@@ -42,6 +45,7 @@ class TestRecursiveDeleteSpellings:
             "rm -Rf foo",
             "rm -fR foo",
             "rm -vRf foo",
+            "rm -IR foo",  # -I (prompt once) is uppercase too
             "rm --recursive foo",
             "rm --r foo",  # getopt_long accepts any unambiguous prefix
             # recursion behind another flag, lowercase included
@@ -51,10 +55,14 @@ class TestRecursiveDeleteSpellings:
             "rm -vfr foo",
             "rm -f  -r foo",
             "rm -v -f -r foo",
+            # the flag word quoted or brace-expanded: bash hands rm a bare -rf
+            "rm $'-rf' foo",
+            "rm {-rf,} foo",
             # GNU rm permutes arguments: a flag after the operand still recurses
             "rm foo -r",
             "rm foo -R",
             "rm foo bar --recursive",
+            "rm " + "a" * 250 + " -r",  # within the 300-char span
             # controls
             "rm -r foo",
             "rm -rf foo",
@@ -100,19 +108,32 @@ class TestSystemDestructionSpellings:
             "rm -R ~",
             "rm --recursive ~",
             "rm -Rf ~",
+            "rm -vfr /",  # two letters before the r
             # -r with no -f on a system target
             "rm -r /",
             "rm -r ~",
             "rm -r $HOME",
-            # the target with a trailing slash or a contents glob
+            # the target spelt with a trailing slash, a contents glob, or braces
             "rm -rf ~/",
             "rm -rf $HOME/",
             "rm -rf ~/*",
             "rm -rf $HOME/*",
-            # target first
+            "rm -rf ${HOME}",
+            'rm -rf "${HOME}"',
+            "rm -R ${HOME}/",
+            "rm -rf /*/",
+            # the flag word quoted or brace-expanded
+            "rm $'-rf' ~",
+            "rm {-rf,} ~",
+            "rm / $'-rf'",
+            # target first, and target behind other options (GNU rm permutes)
             "rm / -R",
             "rm ~ --recursive",
             "rm /* -Rf",
+            "rm / -vfr",
+            "rm -f ~ -r",
+            "rm -v / -rf",
+            "rm -i $HOME -R",
             # controls
             "rm -rf /",
             "rm -fr $HOME",
@@ -128,12 +149,17 @@ class TestSystemDestructionSpellings:
         [
             "rm -rf ~/.cache",
             "rm -rf $HOME/.cache",
+            "rm -rf ${HOME}/.cache",
             "rm -rf ~/*.log",
             "rm -rf ~user",
             "rm -rf /tmp/test",
+            "rm -rf /*/x",
             "rm -rf ./node_modules",
+            "rm -v a/ -rf",  # `/` inside an operand is not the root
             "rm --force /",  # not recursive: a directory is not removed
+            "rm / --force",
             "rm -f ~",
+            "rm -rf build\ncd ~",  # two commands; the span stops at the newline
         ],
     )
     def test_a_specific_or_non_recursive_target_is_not_blocked(self, safety_rules_path, command):
@@ -150,8 +176,12 @@ class TestHiddenGlobSpellings:
             "rm -R .*",
             "rm -fR foo .*",
             "rm -vRf foo .*",
+            "rm -vfr .*",
             "rm --recursive .*",
+            "rm $'-rf' .*",
             "rm .* foo -R",
+            "rm .* -vfr",
+            "rm .* --recursive",
             "rm -r foo .*",  # -f was required before
             # controls
             "rm -rf .*",
@@ -162,6 +192,12 @@ class TestHiddenGlobSpellings:
         risk, rules = verdict(command, safety_rules_path)
         assert (risk, "hidden_glob_destruction" in rules) == (RiskLevel.BLOCKED, True), (risk, rules)
 
+    @pytest.mark.parametrize("command", ["rm --force .* x", "rm .* --force"])
+    def test_a_long_option_with_r_inside_is_not_the_flag(self, safety_rules_path, command):
+        risk, rules = verdict(command, safety_rules_path)
+        assert "hidden_glob_destruction" not in rules, rules
+        assert risk < RiskLevel.BLOCKED, (risk, rules)
+
 
 class TestUnlink:
     @pytest.mark.parametrize(
@@ -171,59 +207,32 @@ class TestUnlink:
     def test_unlink_is_a_delete(self, safety_rules_path, command):
         assert verdict(command, safety_rules_path) == (RiskLevel.MEDIUM, ["unlink_delete"])
 
-    def test_bare_unlink_deletes_nothing(self, safety_rules_path):
-        risk, rules = verdict("unlink", safety_rules_path)
-        assert (risk, rules) == (RiskLevel.SAFE, [])
+    @pytest.mark.parametrize("command", ["unlink", "unlink "])
+    def test_bare_unlink_deletes_nothing(self, safety_rules_path, command):
+        assert verdict(command, safety_rules_path) == (RiskLevel.SAFE, [])
 
     @pytest.mark.parametrize(
         "command",
         ["unlink .claude/hooks/schlock-config.yaml", "unlink ~/.config/schlock/config.yaml"],
     )
     def test_self_protection_still_wins_over_the_general_rule(self, safety_rules_path, command):
-        assert verdict(command, safety_rules_path)[0] == RiskLevel.BLOCKED
+        # The validator's hardcoded self-protection check answers first ...
+        assert verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ["self_protection:config_write"])
 
-        # and at the rule layer alone, where both rules match the same text
+        # ... and at the rule layer alone, where both YAML rules match the same text, the BLOCKED one wins.
         match = RuleEngine(safety_rules_path).match_command(command)
         assert (match.risk_level, match.rule.name if match.rule else None) == (RiskLevel.BLOCKED, "schlock_config_delete")
 
 
-class TestRegexLayer:
-    """Each site reads the fragment on its own; a verdict alone cannot tell them apart."""
+class TestSeparatorClass:
+    """The recursive_delete span stops at `;` and at a newline.
 
-    @pytest.mark.parametrize(
-        ("rule", "text"),
-        [
-            ("recursive_delete", "rm -R x"),
-            ("recursive_delete", "rm --recursive x"),
-            ("recursive_delete", "rm -fr x"),
-            ("recursive_delete", "rm x -r"),
-            ("system_destruction", "rm -R /"),
-            ("system_destruction", "rm -r ~/"),
-            ("system_destruction", "rm ~ -R"),
-            ("hidden_glob_destruction", "rm -Rf .*"),
-            ("hidden_glob_destruction", "rm -R foo .*"),
-            ("hidden_glob_destruction", "rm .* foo -R"),
-            ("unlink_delete", "unlink x"),
-        ],
-    )
-    def test_pattern_matches(self, safety_rules_path, rule, text):
-        engine = RuleEngine(safety_rules_path)
-        assert any(p.search(text) for p in engine.compiled_patterns[rule]), f"{rule} missed {text!r}"
+    Regex layer only: the validator splits segments on both before any rule runs,
+    so a verdict cannot tell a span that crossed the separator from one that did not.
+    """
 
-    @pytest.mark.parametrize(
-        ("rule", "text"),
-        [
-            ("recursive_delete", "rm --force x"),
-            ("recursive_delete", "rm my-r-file"),
-            ("recursive_delete", "rm x; foo -r"),  # the span stops at a separator
-            ("recursive_delete", "rm x\n-r y"),  # and at a newline
-            ("system_destruction", "rm -R ~/.cache"),
-            ("system_destruction", "rm --force /"),
-            ("hidden_glob_destruction", "rm --force .* x"),
-            ("unlink_delete", "unlink"),
-        ],
-    )
-    def test_pattern_does_not_match(self, safety_rules_path, rule, text):
+    @pytest.mark.parametrize("text", ["rm x; foo -r", "rm x\n-r y"])
+    def test_span_does_not_cross_a_separator(self, safety_rules_path, text):
         engine = RuleEngine(safety_rules_path)
-        hit = [p.pattern for p in engine.compiled_patterns[rule] if p.search(text)]
-        assert not hit, f"{rule} matched {text!r}: {hit}"
+        hit = [p.pattern for p in engine.compiled_patterns["recursive_delete"] if p.search(text)]
+        assert not hit, f"recursive_delete crossed the separator in {text!r}: {hit}"

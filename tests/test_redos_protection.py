@@ -196,28 +196,41 @@ class TestRecursiveFlagPatternsAreLinear:
     r"""The rm rules that read the recursive flag stay linear on the shapes that hurt them.
 
     Regex layer, one rule at a time: the whole validator spends longer than these
-    budgets on other patterns for the same inputs. The `rm heads` row is the shape
-    that made the flag-run form `(?:-\S*\s+)*` quadratic (4.3 s at 8,000 heads):
-    `\brm` anchors inside every `x.rm`, and an unbounded run lets each head rescan
-    the tail; the bounded lazy span costs each head at most 100 steps. The blank
-    run is the shape a `\s+` head pays for: every blank it gives back re-runs the
-    span, 100 steps per blank on a bounded span and the whole tail on an unbounded
-    one; a single `\s` lets the span absorb the blanks in one pass. 500,000 blanks
-    so that the `\s+` form of a bounded-span rule (about 750 ms) fails this budget
-    while the `\s` form stays near 10 ms. hidden_glob_destruction keeps its
-    unbounded spans and is not on the heads row: it was quadratic there before this
-    change and still is.
+    budgets on other patterns for the same inputs. Each row names the construct it
+    pins and the form it rejects, measured in a fresh process:
+
+    - blank run: a `\s+` head gives blanks back one at a time and re-runs the span
+      each time. At 1,000,000 blanks the `\s+` form costs 600 ms (system_destruction)
+      and 4,300 ms (recursive_delete) against this budget; the `\s` form under 30 ms.
+    - letter run: `[a-zA-Z]*[rR]` had one way to match per `r` in the bundle, so a
+      tail that fails re-enters the token; hidden_glob_destruction cost 11.5 s on
+      40,000 `r`. The lookahead-then-`[a-zA-Z]+` form consumes the bundle once.
+    - rm heads: `\brm` anchors inside every `-x.rm`, and the unbounded flag-run form
+      `(?:-\S*\s+)*` let each head rescan the whole run: 4.3 s at 8,000 heads. The
+      bounded lazy span costs each head at most its bound. hidden_glob_destruction
+      is not on this row: its unbounded spans were quadratic there before this
+      change and still are.
     """
 
-    SHAPES = [
-        ("flag run", "rm " + "-f " * 10_000 + "x"),
-        ("blank run", "rm" + " " * 500_000),
-        ("unlink blanks", "unlink" + " " * 500_000),
+    RM_RULES = ["recursive_delete", "system_destruction", "hidden_glob_destruction"]
+    ROWS = [
+        *[
+            (rule, label, text)
+            for rule in RM_RULES
+            for label, text in (
+                ("flag run", "rm " + "-f " * 10_000 + "x"),
+                ("blank run", "rm" + " " * 1_000_000),
+                ("letter run", "rm x -" + "r" * 40_000),
+            )
+        ],
+        ("recursive_delete", "rm heads", "rm -f " + "-x.rm " * 8_000),
+        ("system_destruction", "rm heads", "rm -f " + "-x.rm " * 8_000),
+        ("unlink_delete", "flag run", "unlink " + "-f " * 10_000 + "x"),
+        ("unlink_delete", "blank run", "unlink" + " " * 1_000_000),
     ]
 
-    @pytest.mark.parametrize("rule", ["recursive_delete", "system_destruction", "hidden_glob_destruction", "unlink_delete"])
-    @pytest.mark.parametrize(("label", "text"), SHAPES, ids=[s[0] for s in SHAPES])
-    def test_flag_and_blank_runs_are_fast(self, safety_rules_path, rule, label, text):
+    @pytest.mark.parametrize(("rule", "label", "text"), ROWS, ids=[f"{rule}-{label}" for rule, label, _ in ROWS])
+    def test_adversarial_shape_is_fast(self, safety_rules_path, rule, label, text):
         engine = RuleEngine(safety_rules_path)
 
         start = time.perf_counter()
@@ -226,15 +239,3 @@ class TestRecursiveFlagPatternsAreLinear:
         elapsed = time.perf_counter() - start
 
         assert elapsed < 0.25, f"{rule} on {label} took {elapsed:.3f}s"
-
-    @pytest.mark.parametrize("rule", ["recursive_delete", "system_destruction"])
-    def test_rm_heads_are_linear(self, safety_rules_path, rule):
-        engine = RuleEngine(safety_rules_path)
-        text = "rm -f " + "x.rm " * 8_000
-
-        start = time.perf_counter()
-        for pattern in engine.compiled_patterns[rule]:
-            pattern.search(text)
-        elapsed = time.perf_counter() - start
-
-        assert elapsed < 0.25, f"{rule} on 8,000 rm heads took {elapsed:.3f}s"
