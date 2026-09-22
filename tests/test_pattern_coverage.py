@@ -441,13 +441,15 @@ class TestMediumPatternCoverage:
             assert "single_delete" in result.matched_rules, f"single_delete not matched: {cmd}"
 
     def test_single_delete_flags_without_target_are_safe(self, safety_rules_path):
-        """A flag run with nothing after it deletes nothing (LAB-4428).
+        """A flag run with nothing but blanks after it deletes nothing (LAB-4428, LAB-4470).
 
-        The two trailing-blank rows are the only thing pinning the `\\S` in the `--`
+        `rm -- ` and `rm -f -- ` are the only rows pinning the `\\S` in the `--`
         branch: without it, `--\\s` alone matches and a bare option terminator reads
-        as a delete (LAB-4470).
+        as a delete. `rm -f  ` pins the `(?=\\s*\\S)` after the flag run: the raw
+        text is not trimmed before matching, so it reaches the pattern as typed and
+        the blank target would take the trailing whitespace as a filename.
         """
-        for cmd in ["rm -f", "rm --", "rm -f -v", "rm --help", "rm -- ", "rm -f -- "]:
+        for cmd in ["rm -f", "rm --", "rm -f -v", "rm --help", "rm -- ", "rm -f -- ", "rm -f  "]:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.SAFE, f"{cmd!r} rated {result.risk_level.name}: {result.matched_rules}"
 
