@@ -5,7 +5,7 @@ This hook intercepts Bash tool calls in Claude Code and validates commands
 using the Core Safety Validation Engine before execution.
 
 Fail-Safe Behavior:
-- Any exception → deny decision
+- Any exception, including one raised while importing this module → deny decision
 - Missing command parameter → deny decision
 - Validation engine unavailable → deny decision
 - Unknown risk level → deny decision (fail-safe)
@@ -13,6 +13,9 @@ Fail-Safe Behavior:
 Hook Interface:
 - Input: JSON via stdin containing tool_name and tool_input
 - Output: JSON with hookSpecificOutput structure to stdout
+- A deny this hook cannot recover from prints that JSON *and* exits 2. Both halves matter:
+  exit 2 is the only outcome the harness will not let stdout override, and a non-2 exit
+  with empty stdout is read as a non-blocking error, which runs the command unchecked.
 """
 
 import json
@@ -22,26 +25,46 @@ import sys
 import time
 from pathlib import Path
 
-# Add vendored dependencies to path FIRST (pure Python packages)
-vendor_path = Path(__file__).parent.parent / ".claude-plugin" / "vendor"
-if vendor_path.exists():
-    sys.path.insert(0, str(vendor_path))
+# Everything in this block can fail before main() exists to catch it: an unreachable or
+# broken vendored dependency, a syntax error in a shipped module, an interpreter mismatch.
+# An uncaught failure here leaves stdout empty, which the harness reads as a non-blocking
+# error and runs the command unchecked, so deny instead. The handler may use only json and
+# sys (imported above) — everything else is what might have failed.
+try:
+    # Add vendored dependencies to path FIRST (pure Python packages)
+    vendor_path = Path(__file__).parent.parent / ".claude-plugin" / "vendor"
+    if vendor_path.exists():
+        sys.path.insert(0, str(vendor_path))
 
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+    # Add src to path for imports
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import yaml  # noqa: E402 - vendored dependency
+    import yaml  # noqa: E402 - vendored dependency
 
-from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
-from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
-from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
-from schlock.integrations.shellcheck import (  # noqa: E402
-    format_findings_message,
-    get_security_findings,
-    is_shellcheck_available,
-    run_shellcheck,
-)
-from schlock.setup.config_writer import DEFAULT_RISK_PRESET, RISK_PRESETS  # noqa: E402
+    from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
+    from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
+    from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
+    from schlock.integrations.shellcheck import (  # noqa: E402
+        format_findings_message,
+        get_security_findings,
+        is_shellcheck_available,
+        run_shellcheck,
+    )
+    from schlock.setup.config_writer import DEFAULT_RISK_PRESET, RISK_PRESETS  # noqa: E402
+except BaseException as exc:  # BaseException, not Exception: a dependency that exits on
+    # import raises SystemExit, and that must deny too rather than fall through silently.
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"BLOCKED: schlock failed to start: {type(exc).__name__}: {exc}",
+                }
+            }
+        )
+    )
+    sys.exit(2)
 
 # Configure logging to stderr
 logging.basicConfig(level=logging.INFO, format="[schlock-hook] %(levelname)s: %(message)s", stream=sys.stderr)
@@ -689,7 +712,7 @@ def main():
             }
         }
         print(json.dumps(error_result))
-        sys.exit(1)
+        sys.exit(2)
     except Exception as e:
         logger.error(f"Fatal error in main: {e}", exc_info=True)
         # Still output valid JSON even on fatal errors
@@ -701,7 +724,7 @@ def main():
             }
         }
         print(json.dumps(error_result))
-        sys.exit(1)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

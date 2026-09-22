@@ -12,6 +12,7 @@ Tests cover:
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -564,3 +565,95 @@ class TestUnscannableMessageHookHandling:
         assert block_calls, "expected a block audit entry on validation error"
         joined = " ".join(block_calls[-1].kwargs["violations"]).lower()
         assert "unscannable" in joined  # warn detection survives the error-deny path
+
+
+def _unimportable_shim(tmp_path, module, exc_type):
+    """Return a PYTHONPATH entry whose sitecustomize makes `module` raise on import.
+
+    A sys.meta_path finder rather than a shadowing file on PYTHONPATH: the hook
+    sys.path.insert(0)s its vendor and src directories, so a planted module loses to the
+    real one. meta_path runs ahead of sys.path entirely, so this works wherever the hook's
+    dependencies actually live.
+    """
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(
+        "import sys\n"
+        f"_NAME = {module!r}\n"
+        "class _Blocker:\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        '        if fullname == _NAME or fullname.startswith(_NAME + "."):\n'
+        f'            raise {exc_type}("schlock test: " + fullname + " is unimportable")\n'
+        "        return None\n"
+        "sys.meta_path.insert(0, _Blocker())\n",
+        encoding="utf-8",
+    )
+    return str(shim)
+
+
+class TestHookSubprocess:
+    """Run the hook the way Claude Code runs it: a real process, stdin, exit code, stdout.
+
+    Every other test in this file imports pre_tool_use, so none of them can observe a
+    failure that happens *while* importing it. That failure mode is the dangerous one: with
+    empty stdout the harness treats a non-2 exit as a non-blocking error and runs the
+    command anyway, so the hook has to emit its deny from the import guard and exit 2.
+    """
+
+    HOOK = Path(__file__).parent.parent / "hooks" / "pre_tool_use.py"
+
+    def _run(self, stdin_payload, env_extra=None):
+        return subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [sys.executable, str(self.HOOK)],
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **(env_extra or {})},
+            timeout=120,
+            check=False,
+        )
+
+    @staticmethod
+    def _bash(command):
+        return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+
+    @staticmethod
+    def _decision(proc):
+        """Parse the hook's stdout and assert it is a PreToolUse decision object."""
+        assert proc.stdout, f"no decision on stdout (rc={proc.returncode}, stderr tail: {proc.stderr[-400:]!r})"
+        output = json.loads(proc.stdout)["hookSpecificOutput"]
+        assert output["hookEventName"] == "PreToolUse"
+        return output
+
+    def test_benign_command_is_allowed(self):
+        """Happy path is unchanged: exit 0 and an allow decision."""
+        proc = self._run(self._bash("echo hello"))
+        assert proc.returncode == 0
+        assert self._decision(proc)["permissionDecision"] == "allow"
+
+    def test_destructive_command_is_denied(self):
+        """Ordinary deny path is unchanged: a decision on stdout, exit 0."""
+        proc = self._run(self._bash("rm -rf /"))
+        assert proc.returncode == 0
+        assert self._decision(proc)["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize(
+        ("module", "exc_type"),
+        [("yaml", "ModuleNotFoundError"), ("schlock", "RuntimeError")],
+        ids=["vendored-dep-unreachable", "package-raises-on-import"],
+    )
+    def test_import_failure_denies_and_exits_2(self, tmp_path, module, exc_type):
+        """A dependency the hook cannot import must still deny — not exit 1 with no decision."""
+        proc = self._run(self._bash("rm -rf /"), {"PYTHONPATH": _unimportable_shim(tmp_path, module, exc_type)})
+        assert proc.returncode == 2
+        output = self._decision(proc)
+        assert output["permissionDecision"] == "deny"
+        reason = output["permissionDecisionReason"]
+        assert exc_type in reason  # names what broke
+        assert module in reason  # names which module
+
+    def test_unparseable_stdin_denies_and_exits_2(self):
+        """The invalid-input deny also exits 2, so the block does not rest on stdout parsing."""
+        proc = self._run("this is not json")
+        assert proc.returncode == 2
+        assert self._decision(proc)["permissionDecision"] == "deny"
