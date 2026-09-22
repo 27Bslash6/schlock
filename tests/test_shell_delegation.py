@@ -26,18 +26,7 @@ from schlock.core.validator import (
     validate_command,
 )
 
-
-@pytest.fixture(autouse=True)
-def _no_shellcheck(monkeypatch):
-    """Pin verdicts to the rule/AST engine alone.
-
-    ShellCheck independently elevates some of these to BLOCKED, which would let a regression
-    hide on any machine that has it installed. AC-1 is specified with ShellCheck unavailable.
-    """
-    monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
-    clear_caches()
-    yield
-    clear_caches()
+pytestmark = pytest.mark.usefixtures("no_shellcheck")
 
 
 class TestDashCPayload:

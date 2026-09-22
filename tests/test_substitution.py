@@ -1952,6 +1952,34 @@ class TestListSegmentBranchCoverage:
         assert result.risk_level == RiskLevel.MEDIUM
 
 
+@pytest.mark.usefixtures("no_shellcheck")
+class TestSegmentRiskAggregation:
+    """A later substitution segment cannot be hidden by an earlier lower-risk result."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(x=1; rm -rf /)"',
+            'echo "$(make; rm -rf /)"',
+            'echo "$(make | rm -rf /)"',
+        ],
+    )
+    def test_later_blocked_segment_wins(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "Dangerous command in substitution: rm" in result.message
+
+    @pytest.mark.parametrize(
+        "command,expected_risk",
+        [
+            ('echo "$(cd foo; make)"', RiskLevel.HIGH),
+            ('echo "$(echo a; echo b)"', RiskLevel.SAFE),
+        ],
+    )
+    def test_benign_lists_keep_their_risk(self, command, expected_risk):
+        assert validate_command(command).risk_level == expected_risk
+
+
 class TestDownloaderUnderblock108:
     """#108: fetch/aria2c must classify like curl/wget (BLOCKED), not HIGH 'unknown command'."""
 
