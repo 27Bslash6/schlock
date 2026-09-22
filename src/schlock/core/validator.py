@@ -26,7 +26,7 @@ from schlock.integrations.shellcheck import (
 from .cache import ValidationCache
 from .parser import WRAPPER_COMMANDS, BashCommandParser
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
-from .substitution import SubstitutionValidator
+from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
 logger = logging.getLogger(__name__)
 
@@ -638,10 +638,13 @@ def _shell_delegated_payloads(
     `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
     <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
 
+    Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
+    are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
+    Step 5c re-entry as these payloads (LAB-2768).
+
     Deliberately NOT covered, each tracked separately: remote delegation (`ssh host "..."`,
-    a different trust domain); non-shell interpreters (`python3 -c`, `perl -e`) whose payload
-    is not bash and would be nonsense to re-validate as bash; and here-strings
-    (`bash <<< "..."`), which the AST hides on a redirect node. WRAPPER_COMMANDS is
+    a different trust domain) and non-shell interpreters (`python3 -c`, `perl -e`) whose
+    payload is not bash and would be nonsense to re-validate as bash. WRAPPER_COMMANDS is
     best-effort, not an exhaustive enumeration of every exec-passthrough binary.
 
     A first word that is neither a delegator nor a wrapper is never scanned, so
@@ -2140,7 +2143,29 @@ def _escalate_past_heredoc(
     return result
 
 
-def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
+def _substitution_denial(sub_result: SubstitutionValidationResult) -> ValidationResult:
+    """Render a substitution verdict as a ValidationResult.
+
+    The hook maps risk to the action, so only a genuine BLOCKED verdict may claim the word: an
+    amplified-HIGH one is shown as an "ask" prompt, and a prompt whose text reads "BLOCKED" tells
+    the user the opposite of the truth.
+    """
+    denied = sub_result.risk_level == RiskLevel.BLOCKED
+    return ValidationResult(
+        allowed=False,
+        risk_level=sub_result.risk_level,
+        message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
+        alternatives=[
+            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
+            "Run the command directly instead of using substitution",
+            "If this command is safe, request it be added to the whitelist",
+        ],
+        exit_code=1,
+        error=None,
+    )
+
+
+def validate_command(
     command: str,
     config_path: Optional[str] = None,
     *,
@@ -2148,7 +2173,47 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
     _shellcheck: bool = True,
     _derived: bool = False,
 ) -> ValidationResult:
-    """Validate command for safety.
+    """Validate a command for safety — the main validation API.
+
+    Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
+    denial too weak to have short-circuited it. The join lives HERE, outside the passes, because
+    a join made at any one pass is a join the passes added after it will miss: that is precisely
+    how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked back down to HIGH
+    merely by having a substitution appended. Whatever returns first, the worse verdict wins.
+
+    ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
+    :func:`_validate_command`.
+    """
+    deferred: list[SubstitutionValidationResult] = []
+    result = _validate_command(
+        command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
+    )
+    if not deferred:
+        return result
+    sub_denial = deferred[0]
+    # A denial always beats an allow, whatever their levels; between two denials the higher
+    # level wins, and a tie keeps the completed verdict because it carries the matched rules.
+    if result.allowed or sub_denial.risk_level > result.risk_level:
+        return _substitution_denial(sub_denial)
+    return result
+
+
+def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
+    command: str,
+    config_path: Optional[str] = None,
+    *,
+    _depth: int = 0,
+    _deferred: Optional[list[SubstitutionValidationResult]] = None,
+    _shellcheck: bool = True,
+    _derived: bool = False,
+) -> ValidationResult:
+    """Run every validation pass. Call :func:`validate_command` instead.
+
+    ``_deferred`` is an out-parameter: a substitution denial too weak to short-circuit is placed
+    there for the caller to join. It is a list rather than a return value so that every one of
+    this function's returns carries it without having to remember to.
+
+    Validate command for safety.
 
     Main validation API. Orchestrates parsing, rule matching, and caching.
 
@@ -2262,21 +2327,22 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
             sub_results = sub_validator.validate_all_substitutions(ast)
+
+            # Worst verdict wins, and the join is NOT made here. Returning a denial from this
+            # point skips every pass below it — the AST dangerous-flag pass (the only thing that
+            # sees quoted command names) and the multi-segment pass (the only thing that isolates
+            # a blocked segment). A weaker substitution verdict returned here therefore DOWNGRADED
+            # commands those passes deny outright. Consulting match_command() from here does not
+            # fix it: that helper is whitelist-gated, so a whitelisted first word makes it report
+            # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
+            # weaker is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
-                if not sub_result.allowed:
-                    return ValidationResult(
-                        allowed=False,
-                        risk_level=sub_result.risk_level,
-                        message=f"BLOCKED: {sub_result.message}",
-                        alternatives=[
-                            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
-                            "Run the command directly instead of using substitution",
-                            "If this command is safe, request it be added to the whitelist",
-                        ],
-                        exit_code=1,
-                        error=None,
-                    )
-                # Don't cache (substitution content may vary)
+                if sub_result.allowed:
+                    continue  # Don't cache (substitution content may vary)
+                if sub_result.risk_level == RiskLevel.BLOCKED:
+                    return _substitution_denial(sub_result)
+                if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
+                    _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection
             # Uses bashlex AST for BOTH command names AND arguments (no regex shortcuts)
@@ -2286,6 +2352,18 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             dangerous_check = _check_dangerous_command_flags(commands_with_args)
             if dangerous_check is not None:
                 return dangerous_check
+
+            # LAB-2768: here-strings (`bash <<< PROG`) execute PROG the same way `bash -c PROG`
+            # does, but the payload rides a redirect node the extractor above skips. Surface it
+            # here; only SHELL here-strings are re-validated as bash (a python/perl here-string is
+            # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
+            herestring_payloads = list(
+                dict.fromkeys(
+                    prog
+                    for name, prog in parser.extract_stdin_program_redirects(ast)
+                    if name in _SHELL_COMMANDS and prog.strip()
+                )
+            )
 
         except (ParseError, ValueError) as e:
             # Check if this is a heredoc parse failure (bashlex doesn't support quoted delimiters)
@@ -2343,7 +2421,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         error=None,
                         matched_rules=[],
                     )
-                    if _depth == 0 and _shellcheck:
+                    if _depth == 0 and _shellcheck and not _deferred:
                         _global_cache.set(command, result)
                     return result
 
@@ -2447,12 +2525,24 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
         # higher verdict, so no spelling of the wrapper scores below the bare payload.
-        # NOT a general guarantee: this runs after the multi-segment whitelist, so a
-        # whitelisted prefix still short-circuits it (LAB-2759). Deliberately NOT routed through
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a full-span
+        # whitelist match still short-circuits it (#146 closed the prefix case). Deliberately NOT routed through
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
-        payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
+        # `-c`/wrapper/`watch` payloads plus here-string (`<<<`) payloads (LAB-2768); a here-string
+        # re-enters validation identically to a `-c` payload, so `bash <<< "$CMD"` matches
+        # `bash -c "$CMD"` rather than fail-closing one spelling of the same delegation. Every
+        # payload below re-enters validation - and ShellCheck - once, so here-strings share the
+        # extractor's ceiling: without it n distinct `<<<` cost n unbounded re-entries while the
+        # `-c` spelling of the same command stopped at MAX_DELEGATOR_TOKENS, and a hook that
+        # outlives its timeout fails OPEN. Identical payloads collapse first, whichever spelling
+        # surfaced them.
+        payloads: list[str] = []
+        if match.risk_level < RiskLevel.BLOCKED:
+            if len(herestring_payloads) > MAX_DELEGATOR_TOKENS:
+                raise ValueError(f"Here-string re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
+            payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + herestring_payloads))
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
@@ -2561,7 +2651,9 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # reason: that verdict is weaker than the one a fresh call would produce for the key. The
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
-        if _depth == 0 and _shellcheck:
+        # Nor when a substitution denial is still owed a join: the cached entry would be the
+        # pre-join verdict, and the next identical command would hit it and skip the join.
+        if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)
 
         # Step 8: Return
