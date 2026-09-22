@@ -60,3 +60,7 @@ Thumbs.db
 .runtime/
 .logs/
 .beads/
+
+# agent scratch (differential trees, corpora)
+.scratch/
+.venv39/
