@@ -4,6 +4,7 @@ Also includes FIX 5: matched_rules field population test.
 """
 
 import re
+import shutil
 import sys
 import time
 
@@ -339,6 +340,128 @@ class TestCaching:
         assert first_engine is not second_engine
         assert first_path != second_path
         assert second_path == str(alt_config)
+
+    @staticmethod
+    def _ruleset_without_credential_rules(tmp_path, rules_dir_path):
+        """Copy of the shipped ruleset with the rule that catches ~/.kube/config removed."""
+        scratch = tmp_path / "rules_no_cred"
+        shutil.copytree(rules_dir_path, scratch)
+        (scratch / "03_credential_theft.yaml").unlink()
+        return str(scratch)
+
+    def test_validation_cache_invalidated_on_config_change(self, tmp_path, rules_dir_path):
+        """A command's verdict follows the ruleset it names, not whichever one ran first.
+
+        The validation cache keys on the command string alone, so before LAB-4602 the first
+        ruleset to validate a command owned that command's verdict for the rest of the
+        process - in either order, the second ruleset got the first one's answer.
+
+        Asserts matched_rules, not risk_level alone: the rule name is what a mutation run
+        reverts, and a level-only assertion stays green through the regression that removes
+        the rule.
+        """
+        no_cred = self._ruleset_without_credential_rules(tmp_path, rules_dir_path)
+        command = "cat ~/.kube/config"
+
+        def verdict(config_path):
+            return validate_command(command, config_path=config_path)
+
+        # Cold baselines: the two rulesets genuinely disagree about this command.
+        clear_caches()
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+        clear_caches()
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+
+        # full -> scratch: the second call must not inherit the first's BLOCKED.
+        clear_caches()
+        first, second = verdict(rules_dir_path), verdict(no_cred)
+        assert first.risk_level == RiskLevel.BLOCKED
+        assert "extended_credential_exposure" in first.matched_rules
+        assert second.risk_level == RiskLevel.SAFE
+        assert second.matched_rules == []
+
+        # scratch -> full: and the reverse order must not inherit SAFE.
+        clear_caches()
+        first, second = verdict(no_cred), verdict(rules_dir_path)
+        assert first.risk_level == RiskLevel.SAFE
+        assert first.matched_rules == []
+        assert second.risk_level == RiskLevel.BLOCKED
+        assert "extended_credential_exposure" in second.matched_rules
+
+    def test_validation_cache_tracks_its_own_ruleset(self, tmp_path, rules_dir_path):
+        """Loading an engine does not vouch for verdicts the cache computed under another.
+
+        _global_cache_path exists because _global_rule_engine_path answers a different
+        question - which engine is loaded, not which ruleset produced the cached verdicts.
+        Three call sites plus this suite advance the engine marker without touching the
+        cache, so reusing it as the invalidation key would report "same ruleset" here and
+        hand back the previous one's verdict. That is the original LAB-4602 bug, and this
+        test is what stops the fix being simplified back into it.
+        """
+        no_cred = self._ruleset_without_credential_rules(tmp_path, rules_dir_path)
+        command = "cat ~/.kube/config"
+
+        clear_caches()
+        assert validate_command(command, config_path=rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+        # Advance the engine marker on its own, as tests and _get_substitution_validator do.
+        val_module._get_rule_engine(no_cred)
+        engine_marker = val_module._global_rule_engine_path
+        cache_marker = val_module._global_cache_path
+
+        result = validate_command(command, config_path=no_cred)
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.matched_rules == []
+
+        # Captured above, asserted here on purpose: the verdict is the regression detector, so
+        # a failure should report the wrong verdict, not a private global. These two only
+        # explain WHY it would have been wrong - the engine marker moved, the cache's did not.
+        assert engine_marker == no_cred
+        assert cache_marker == rules_dir_path
+
+    def test_validation_cache_invalidated_for_substitution_rules(self, tmp_path, rules_dir_path):
+        """The substitution layer follows the named ruleset too, not just the top-level match.
+
+        Clearing the verdict cache alone was not enough: _global_substitution_validator binds
+        its engine once and ignores config_path forever after, so the recomputed verdict for
+        anything inside $(...) still came from the previous ruleset - and was then stored
+        under the NEW marker, where no later clear could reach it. That is the LAB-2752
+        sibling-path lesson repeating, and it made this command return SAFE under a ruleset
+        that blocks it.
+
+        matched_rules is empty on both sides here because the substitution path builds its
+        result from the sub-check rather than a top-level match, so risk_level is the only
+        discriminator this command offers; the rule-name assertion lives in
+        test_validation_cache_invalidated_on_config_change.
+        """
+        no_cred = self._ruleset_without_credential_rules(tmp_path, rules_dir_path)
+        command = 'echo "$(cat ~/.kube/config | head)"'
+
+        def verdict(config_path):
+            return validate_command(command, config_path=config_path)
+
+        # The two rulesets disagree about this command when each is asked cold.
+        clear_caches()
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+        clear_caches()
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+
+        # Neither order may borrow the other's answer.
+        clear_caches()
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+        clear_caches()
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+
+        # And a wrong verdict must not survive as a cache hit: this third call matches the
+        # marker, so nothing would ever clear it.
+        clear_caches()
+        verdict(no_cred)
+        verdict(rules_dir_path)
+        assert val_module._global_cache_path == rules_dir_path
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
 
 
 class TestRuleOverridesIntegration:
