@@ -121,6 +121,9 @@ whitelist:
 
 - Patterns are regex, matched against the start of the command string (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
+- For a **chained** command (`a; b`, `a && b`, `a | b`), a prefix match is not enough: each
+  segment is validated on its own unless a pattern spans the *entire* command. `^ls\b`
+  allows `ls -la`, but `ls; rm -rf /` is still BLOCKED on the `rm`
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
@@ -140,7 +143,16 @@ whitelist:
 # BAD: Too broad — matches ALL gcloud commands including dangerous ones
 whitelist:
   - ^gcloud
+
+# BAD: anchored but greedy — ".*" swallows "; rm -rf /", so the pattern spans
+# "npm run build; rm -rf /" end to end and whitelists the whole chain
+whitelist:
+  - ^npm\s+run\s+.*$
 ```
+
+`$` alone does not make a pattern safe for chained commands. A pattern that must span a whole command has to spell out the characters it accepts (e.g. `[\w./:-]+`) rather than use `.*` or `\S+`, which match `;`, `&`, `|` and `${IFS}` happily.
+
+Spelling out separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..` and `host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf` and `gh auth token` entries in `00_whitelist.yaml` show the shape.
 
 Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
 
@@ -247,8 +259,17 @@ The blocker scans the **command string**. Some git forms deliver the commit mess
 *outside* the command, so there is nothing in the command to scan (issue #76):
 
 - `git commit -F <file>` / `git commit --file=<file>` — message lives in a file
-- `git commit -F -` and heredocs — message arrives on stdin at execution time
+- `git commit -F -` fed by a **piped** or **interactive** stdin — the bytes live in a prior
+  pipe segment or are typed at execution time, not in the command string
 - `git commit -m "$(cat file)"` / backticks — the substitution is not expanded yet
+- more than `_MAX_HEREDOC_OPENERS` heredocs in one Bash call — refuses to guess rather than
+  scan unboundedly (a documented cap, not a delivery form)
+
+`git commit -F -` / `--file -` fed by an **in-command heredoc** (`git commit -F- <<EOF`) is
+different: its bytes ARE in the command string, so it is scanned like any other message,
+regardless of how many other heredocs (a `gh pr create --body-file -` in the same Bash call,
+a leading `cat <<DATA`, …) share the call — each heredoc body is bound to its own `<<` opener
+in source order.
 
 Because a `PreToolUse` hook runs **before** the command executes, this content does not exist
 where the hook can see it. The `unscannable_message_action` setting decides what happens when

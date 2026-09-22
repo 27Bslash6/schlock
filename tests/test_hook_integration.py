@@ -34,6 +34,21 @@ from schlock import RiskLevel, ValidationResult
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Point config resolution at an empty dir so tests assert the shipped default preset.
+
+    map_risk_to_status() reads pre_tool_use._risk_tolerance, a singleton cached (once per
+    process) from the project config (cwd-relative) or $HOME/.config/schlock/config.yaml.
+    Without isolating cwd, $HOME, and the cache, these tests pass or fail based on whatever
+    preset happens to be installed on the machine running them instead of the code under test.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(pre_tool_use, "_validator_initialized", False)
+    monkeypatch.setattr(pre_tool_use, "_risk_tolerance", None)
+
+
 class TestStatusMapping:
     """Test risk level to status mapping."""
 
@@ -187,9 +202,6 @@ class TestValidatorSingleton:
 
     def test_singleton_reuse(self):
         """Verify validator is initialized once and reused."""
-        # Reset singleton state
-        pre_tool_use._validator_initialized = False
-
         # First call initializes
         result1 = get_validator()
         assert result1 is True
@@ -202,9 +214,6 @@ class TestValidatorSingleton:
 
     def test_initialization_error_handling(self):
         """Verify validator initialization succeeds without errors."""
-        # Reset singleton
-        pre_tool_use._validator_initialized = False
-
         # get_validator should succeed (it just sets a flag, actual validation happens via validate_command)
         result = get_validator()
         assert result is True
