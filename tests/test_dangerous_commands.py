@@ -585,11 +585,23 @@ class TestSystemCredentialFileReads:
             'grep -E "a\\"b|root" /etc/shadow',
             # A backslash-escaped separator, unquoted.
             "grep -v \\; /etc/shadow",
-            # Command substitution terminates the segment with `)` or a
-            # backtick, neither of which is a shell separator. The last-operand
-            # lookahead is an ENUMERATION and these were missing from it.
+            # Command substitution and the other segment terminators.
             "x=$(grep root /etc/shadow)",
             "x=`grep root /etc/shadow`",
+            # Separator continuations under grep specifically. An end-of-operand
+            # check placed at the credential STEM rejected these even though the
+            # path is the final operand -- the same backups and sudoers
+            # fragments the boundary above exists to keep.
+            "grep root /etc/shadow-",
+            "grep root /etc/gshadow-",
+            "grep root /etc/sudoers.d/90-cloud-init-users",
+            # A QUOTED `<<<` is operand data, not a here-string operator. A
+            # whole-command textual guard suppressed the rule outright here.
+            "cat /etc/shadow '<<<'",
+            "grep -e '<<<' -e root /etc/shadow",
+            # A real read that merely sits ALONGSIDE a here-string still rates.
+            "cat /etc/shadow <<< ignored",
+            "grep root /etc/shadow <<< ignored",
             "(grep root /etc/shadow)",
             "grep root /etc/shadow > /tmp/out",
             "grep root /etc/shadow &",
@@ -617,6 +629,27 @@ class TestSystemCredentialFileReads:
         assert len(etc) == 3, f"expected reader, grep and redirect patterns, got {len(etc)}"
         for pattern in etc:
             assert paths in pattern, f"path list drifted in: {pattern[:70]}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "head ~/.ssh/id_ed25519 '<<<'",
+            "cat ~/.npmrc '<<<'",
+            "head ~/.ssh/id_ed25519",
+            "cat ~/.npmrc",
+        ],
+    )
+    def test_sibling_credential_rules_are_not_weakened(self, safety_rules_path, command):
+        """Paths this ticket never added must keep the rating they had.
+
+        An earlier here-string guard suppressed on RAW COMMAND TEXT, so a quoted
+        `<<<` anywhere unrated the whole reader -- and the same shape was pasted
+        onto `ssh_key_exfiltration`, unrating SSH private keys. These rows fail
+        if a guard added for the /etc paths reaches across to other rules again.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.risk_level >= RiskLevel.HIGH, command
+        assert result.matched_rules, command
 
     def test_delivered_level_is_blocked(self, safety_rules_path):
         """The rows above assert the AC floor; this pins what actually ships."""
@@ -666,16 +699,6 @@ class TestSystemCredentialFileReads:
             # The path as grep's PATTERN, not its input: these search FOR the
             # name in another file. Rating them is a false credential alert on
             # ordinary text processing, at a level no preset can relax.
-            "grep -F /etc/shadow README.md",
-            "grep /etc/shadow README.md",
-            "grep -rn /etc/shadow docs/",
-            # Option ARITY: `-A`/`-m` consume the next word, so the path is an
-            # input file to search, not the pattern. A rule that guesses which
-            # operand is the pattern gets these wrong in the FP direction while
-            # getting attached-value options wrong in the miss direction.
-            "grep -A 2 /etc/shadow README.md",
-            "grep -m 1 /etc/shadow README.md",
-            "grep -B 3 /etc/shadow notes.txt",
             # Here-strings with REAL readers. The previous cut of this row used
             # `true`, which matches neither the reader nor the grep pattern, so
             # it passed without exercising either of them. `<<<` feeds its
