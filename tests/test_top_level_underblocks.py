@@ -42,6 +42,9 @@ class TestDangerousGitConfigHelper:
     def test_askpass_is_dangerous(self):
         assert dangerous_git_config(["-c", "core.askPass=/tmp/evil", "clone", "u"]) is not None
 
+    def test_merge_tool_is_dangerous(self):
+        assert dangerous_git_config(["-c", "merge.tool=cat", "log"]) is not None
+
     # --- #97.5: boolean-valued execution keys are benign (select a built-in, name no program) ---
     def test_fsmonitor_boolean_true_is_safe(self):
         assert dangerous_git_config(["-c", "core.fsmonitor=true", "status"]) is None

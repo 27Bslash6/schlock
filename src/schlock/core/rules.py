@@ -637,20 +637,47 @@ class RuleEngine:
         """
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
+    def is_fully_whitelisted(self, command: str) -> bool:
+        """Check if a whitelist pattern spans the ENTIRE command.
+
+        Whitelist patterns are deliberately prefix matches (issue #66: match(),
+        not fullmatch(), so "^ls\\b" keeps covering "ls -la" when a user adds
+        flags). For a chained command a prefix is not enough — it would let the
+        "ls" in "ls; rm -rf /" vouch for the rm. Only a pattern whose match
+        reaches the end of the command (in practice a "$"-anchored entry such
+        as the gh-auth-token/docker-login pipeline) may whitelist a whole chain.
+
+        Args:
+            command: Command string to check
+
+        Returns:
+            True if a whitelist pattern matches from the start of the command
+            through to its end
+        """
+        # >= not ==: a pattern ending in \s* consumes trailing whitespace that rstrip()
+        # already discounted, so a legitimate span can overshoot.
+        end = len(command.rstrip())
+        return any(m.end() >= end for p in self.whitelist_patterns if (m := p.match(command)))
+
     def match_command(
         self,
         command: str,
         string_literals: Optional[list[tuple]] = None,
         heredoc_ranges: Optional[list[tuple]] = None,
+        use_whitelist: bool = True,
     ) -> RuleMatch:
         """Match command against all rules, return highest risk.
 
         Matching algorithm:
         1. Check whitelist first (returns SAFE if matched)
         2. Match against all rules, collect all matches
-        3. Skip matches that fall inside quoted string literals (AST context)
-        4. Skip matches inside non-shell heredocs (text, not executed)
+        3. Skip OCCURRENCES that fall inside quoted string literals (AST context)
+        4. Skip OCCURRENCES inside non-shell heredocs (text, not executed)
         5. Return highest risk level match
+
+        A pattern only fails to match when EVERY one of its occurrences is
+        suppressed - a quoted decoy does not excuse an unquoted occurrence
+        later in the same command (LAB-4321).
 
         Args:
             command: Command string to validate
@@ -658,6 +685,10 @@ class RuleEngine:
                            from AST analysis. Matches inside these ranges are ignored.
             heredoc_ranges: Optional list of (start, end, is_shell) tuples for heredocs.
                           Matches inside non-shell heredocs are ignored (just text).
+            use_whitelist: Consult the whitelist before matching rules. Pass False when
+                          the caller has already settled the whitelist question — the
+                          multi-segment path does, with the full-span
+                          is_fully_whitelisted() where this check is prefix-based.
 
         Returns:
             RuleMatch with highest risk level from all matching rules
@@ -670,10 +701,10 @@ class RuleEngine:
 
             >>> # With AST context to avoid false positives
             >>> match = engine.match_command('echo "rm -rf /"', string_literals=[(6, 15)])
-            >>> # Pattern match at position 11-18 is inside string literal, ignored
+            >>> # The match at 6-11 is inside the string literal (6, 15), so it is ignored
         """
         # Whitelist override
-        if self.is_whitelisted(command):
+        if use_whitelist and self.is_whitelisted(command):
             return RuleMatch(
                 matched=False,
                 rule=None,
@@ -689,18 +720,8 @@ class RuleEngine:
         for rule in self.rules:
             patterns = self.compiled_patterns.get(rule.name, [])
             for pattern in patterns:
-                match = pattern.search(command)
+                match = self._first_executable_match(pattern, command, string_literals, heredoc_ranges)
                 if match:
-                    # Check if match is inside a quoted string literal
-                    if string_literals and self._is_in_string_literal(match, string_literals):
-                        # Skip this match - it's in a quoted string that won't execute
-                        continue
-
-                    # Check if match is inside a non-shell heredoc (text, not executed)
-                    if heredoc_ranges and self._is_in_non_shell_heredoc(match, heredoc_ranges):
-                        # Skip this match - it's in heredoc content that won't execute
-                        continue
-
                     # Rule matched - check if higher risk than current
                     if rule.risk_level > highest_risk:
                         highest_risk = rule.risk_level
@@ -723,6 +744,49 @@ class RuleEngine:
             message="No security rules matched",
             alternatives=[],
         )
+
+    def _first_executable_match(
+        self,
+        pattern: "re.Pattern",
+        command: str,
+        string_literals: Optional[list[tuple]],
+        heredoc_ranges: Optional[list[tuple]],
+    ) -> Optional["re.Match"]:
+        """First match of `pattern` that is not inert text, or None.
+
+        SECURITY CRITICAL: keep scanning past a suppressed match. Stopping at the
+        first one lets an inert decoy hide a real hit from the SAME pattern --
+        `cat \':(){ :|:& };:\'` followed by a newline and the same fork bomb unquoted
+        rated SAFE, because the quoted decoy consumed the rule\'s only search.
+        Pick the example carefully: a rule with two patterns matching at different
+        offsets (`rm -rf /`) hides the leak, because its second pattern catches the
+        payload anyway.
+
+        Advances by one character rather than to match.end() so a later match that
+        overlaps the suppressed one is still found.
+
+        The scan is EXACT - it never gives up early. A bound here looks like cheap
+        insurance and is not: reporting anything other than "first executable match,
+        or none" on exhaustion is wrong in one direction or the other. Reporting the
+        last suppressed match denies benign text (a quoted doc listing 32 `sudo`
+        lines) AND under-blocks, because `validate_command` only runs its
+        cross-segment scan when no segment matched, so a bogus segment match hides
+        a `BLOCKED` the whole command would have earned. Returning None instead just
+        lets padding silence the rule. Measured, the bound bought ~1%: on a 229 KB
+        padded command the loop is 13.1 s bounded vs 13.1 s unbounded, against 12.9 s
+        on a tree without this scan at all - the superlinearity is elsewhere.
+        Termination is structural: `pos` strictly increases every iteration.
+        """
+        pos = 0
+        while True:
+            match = pattern.search(command, pos)
+            if match is None:
+                return None
+            in_literal = bool(string_literals) and self._is_in_string_literal(match, string_literals)
+            in_heredoc = bool(heredoc_ranges) and self._is_in_non_shell_heredoc(match, heredoc_ranges)
+            if not (in_literal or in_heredoc):
+                return match
+            pos = match.start() + 1
 
     def _is_in_string_literal(self, match: re.Match, string_literals: list[tuple]) -> bool:
         """Check if a regex match falls within a quoted string literal.
