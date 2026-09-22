@@ -1697,6 +1697,7 @@ class TestHeredocSurroundings:
             ("cat 2>#f <<b", [], "and after a redirection operator, where the word is open but `prefix` is not"),
             ("cat <<'A' \\ #x <<b", ["A", "b"], "an escaped blank is word text, so a `#` glued to it is text (LAB-4709)"),
             ("cat <<'A' #x <<b", ["A"], "…where after a real blank it is a comment"),
+            ("cat <<'A' \\\\ #x <<b", ["A"], "an escaped backslash ends one column early, so the blank after it is real"),
         ],
     )
     def test_expansion_boundaries_match_bash(self, line, delimiters, description):

@@ -1576,9 +1576,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     openers: list[tuple[str, bool, int]] = []
     continued = False
     pos = 0
-    # Where the last backslash escape ended. A `#` sitting exactly there follows
-    # an ESCAPED word character, which bash keeps inside the word (LAB-4709).
-    after_escape = -1
+    after_escape = -1  # index just past the last `\x` pair; the `#` branch reads it (LAB-4709)
     opener_serials: list[int] = []
     if scan.contexts[-1].prefix:
         scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
