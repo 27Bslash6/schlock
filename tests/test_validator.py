@@ -4,6 +4,8 @@ Also includes FIX 5: matched_rules field population test.
 """
 
 import re
+import shutil
+import sys
 import time
 
 import pytest
@@ -20,6 +22,8 @@ from schlock.core.validator import (
     validate_command,
 )
 from schlock.exceptions import ConfigurationError, ParseError
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
+from schlock.integrations.shellcheck import ShellCheckFinding, ShellCheckSeverity, is_shellcheck_available
 
 
 class TestValidator:
@@ -337,6 +341,128 @@ class TestCaching:
         assert first_engine is not second_engine
         assert first_path != second_path
         assert second_path == str(alt_config)
+
+    @staticmethod
+    def _ruleset_without_credential_rules(tmp_path, rules_dir_path):
+        """Copy of the shipped ruleset with the rule that catches ~/.kube/config removed."""
+        scratch = tmp_path / "rules_no_cred"
+        shutil.copytree(rules_dir_path, scratch)
+        (scratch / "03_credential_theft.yaml").unlink()
+        return str(scratch)
+
+    def test_validation_cache_invalidated_on_config_change(self, tmp_path, rules_dir_path):
+        """A command's verdict follows the ruleset it names, not whichever one ran first.
+
+        The validation cache keys on the command string alone, so before LAB-4602 the first
+        ruleset to validate a command owned that command's verdict for the rest of the
+        process - in either order, the second ruleset got the first one's answer.
+
+        Asserts matched_rules, not risk_level alone: the rule name is what a mutation run
+        reverts, and a level-only assertion stays green through the regression that removes
+        the rule.
+        """
+        no_cred = self._ruleset_without_credential_rules(tmp_path, rules_dir_path)
+        command = "cat ~/.kube/config"
+
+        def verdict(config_path):
+            return validate_command(command, config_path=config_path)
+
+        # Cold baselines: the two rulesets genuinely disagree about this command.
+        clear_caches()
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+        clear_caches()
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+
+        # full -> scratch: the second call must not inherit the first's BLOCKED.
+        clear_caches()
+        first, second = verdict(rules_dir_path), verdict(no_cred)
+        assert first.risk_level == RiskLevel.BLOCKED
+        assert "extended_credential_exposure" in first.matched_rules
+        assert second.risk_level == RiskLevel.SAFE
+        assert second.matched_rules == []
+
+        # scratch -> full: and the reverse order must not inherit SAFE.
+        clear_caches()
+        first, second = verdict(no_cred), verdict(rules_dir_path)
+        assert first.risk_level == RiskLevel.SAFE
+        assert first.matched_rules == []
+        assert second.risk_level == RiskLevel.BLOCKED
+        assert "extended_credential_exposure" in second.matched_rules
+
+    def test_validation_cache_tracks_its_own_ruleset(self, tmp_path, rules_dir_path):
+        """Loading an engine does not vouch for verdicts the cache computed under another.
+
+        _global_cache_path exists because _global_rule_engine_path answers a different
+        question - which engine is loaded, not which ruleset produced the cached verdicts.
+        Three call sites plus this suite advance the engine marker without touching the
+        cache, so reusing it as the invalidation key would report "same ruleset" here and
+        hand back the previous one's verdict. That is the original LAB-4602 bug, and this
+        test is what stops the fix being simplified back into it.
+        """
+        no_cred = self._ruleset_without_credential_rules(tmp_path, rules_dir_path)
+        command = "cat ~/.kube/config"
+
+        clear_caches()
+        assert validate_command(command, config_path=rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+        # Advance the engine marker on its own, as tests and _get_substitution_validator do.
+        val_module._get_rule_engine(no_cred)
+        engine_marker = val_module._global_rule_engine_path
+        cache_marker = val_module._global_cache_path
+
+        result = validate_command(command, config_path=no_cred)
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.matched_rules == []
+
+        # Captured above, asserted here on purpose: the verdict is the regression detector, so
+        # a failure should report the wrong verdict, not a private global. These two only
+        # explain WHY it would have been wrong - the engine marker moved, the cache's did not.
+        assert engine_marker == no_cred
+        assert cache_marker == rules_dir_path
+
+    def test_validation_cache_invalidated_for_substitution_rules(self, tmp_path, rules_dir_path):
+        """The substitution layer follows the named ruleset too, not just the top-level match.
+
+        Clearing the verdict cache alone was not enough: _global_substitution_validator binds
+        its engine once and ignores config_path forever after, so the recomputed verdict for
+        anything inside $(...) still came from the previous ruleset - and was then stored
+        under the NEW marker, where no later clear could reach it. That is the LAB-2752
+        sibling-path lesson repeating, and it made this command return SAFE under a ruleset
+        that blocks it.
+
+        matched_rules is empty on both sides here because the substitution path builds its
+        result from the sub-check rather than a top-level match, so risk_level is the only
+        discriminator this command offers; the rule-name assertion lives in
+        test_validation_cache_invalidated_on_config_change.
+        """
+        no_cred = self._ruleset_without_credential_rules(tmp_path, rules_dir_path)
+        command = 'echo "$(cat ~/.kube/config | head)"'
+
+        def verdict(config_path):
+            return validate_command(command, config_path=config_path)
+
+        # The two rulesets disagree about this command when each is asked cold.
+        clear_caches()
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+        clear_caches()
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+
+        # Neither order may borrow the other's answer.
+        clear_caches()
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+
+        clear_caches()
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
+        assert verdict(no_cred).risk_level == RiskLevel.SAFE
+
+        # And a wrong verdict must not survive as a cache hit: this third call matches the
+        # marker, so nothing would ever clear it.
+        clear_caches()
+        verdict(no_cred)
+        verdict(rules_dir_path)
+        assert val_module._global_cache_path == rules_dir_path
+        assert verdict(rules_dir_path).risk_level == RiskLevel.BLOCKED
 
 
 class TestRuleOverridesIntegration:
@@ -906,6 +1032,17 @@ whitelist:
         assert chained.risk_level == RiskLevel.BLOCKED
 
 
+_SC2114 = ShellCheckFinding(
+    code=2114,
+    level=ShellCheckSeverity.WARNING,
+    message="deletes a system directory",
+    line=1,
+    column=1,
+    end_line=1,
+    end_column=1,
+)
+
+
 class TestHeredocSurroundings:
     """LAB-2765: a whitelisted heredoc head must not vouch for what follows it.
 
@@ -1037,6 +1174,155 @@ class TestHeredocSurroundings:
         assert result.allowed is True
         assert result.message == "Alongside heredoc: Force push overwrites remote history"
 
+    @pytest.mark.parametrize("head", ["cat", "ls"])
+    def test_heredoc_costs_one_shellcheck_subprocess(self, safety_rules_path, monkeypatch, head):
+        """ShellCheck sees the whole rewrite exactly once, whatever the head.
+
+        ShellCheck is a subprocess per call. Re-entering the full pipeline per
+        segment spent N+2 of them for a heredoc followed by N commands (LAB-2780).
+        The whitelisted head is pinned to one as well, not zero: both passes run
+        with ShellCheck off, so neither can spawn whatever the head is, and the
+        escalation's own spawn is the only ShellCheck the trailing commands get.
+        The exact text is pinned, not just the count: a spawn on the raw command
+        or on the last segment alone would also be one spawn ending in the tail.
+        """
+        checked: list[str] = []
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: checked.append(command) or [])
+        tail = " && ".join(f"echo {i}" for i in range(20))
+
+        validate_command(f"{head} <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
+
+        assert checked == [f"{head} <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n{tail}"]
+
+    @pytest.mark.parametrize("head", ["cat", "ls"])
+    def test_shellcheck_still_reaches_the_shell_around_a_heredoc(self, safety_rules_path, monkeypatch, head):
+        """One ShellCheck spawn still elevates, behind a whitelisted head too.
+
+        `rm -r$''f /` matches `recursive_delete` at HIGH; only ShellCheck reads
+        the `$''` splice and raises it to BLOCKED. Behind `ls` no pass would
+        spawn ShellCheck on its own, so this pins the escalation's own spawn.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
+
+        result = validate_command(f"{head} <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.message == "Alongside heredoc: ShellCheck: deletes a system directory"
+        assert result.matched_rules[-1] == "shellcheck:SC2114"
+
+    @pytest.mark.parametrize("head", ["cat", "ls"])
+    def test_a_shellcheck_run_with_no_verdict_fails_closed_behind_a_heredoc(self, safety_rules_path, monkeypatch, head):
+        """A spawn that returns no verdict is refused, not read as clean.
+
+        run_shellcheck returns None on timeout, oversized output or an open
+        circuit. This spawn is the only ShellCheck the trailing commands get, so
+        None here means they are unchecked; reading it as [] made a slow input a
+        switch for the control (LAB-4586). The rule name is asserted, not just the
+        verdict, so an accidental deny cannot stand in for this one.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: None)
+
+        result = validate_command(f"{head} <<'EOF'\nx\nEOF\necho done", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules[-1] == "shellcheck:incomplete"
+        assert "ShellCheck did not complete" in result.message
+
+    @pytest.mark.parametrize(
+        "command,expected_risk,expected_rule",
+        [
+            ("echo done", RiskLevel.SAFE, None),
+            ('bash -c "echo done"', RiskLevel.BLOCKED, "shell_delegated_payload"),
+            ("ls <<'EOF'\nx\nEOF\nbash -c \"echo done\"", RiskLevel.BLOCKED, "shell_delegated_payload"),
+        ],
+        ids=["top-level", "payload", "payload-behind-heredoc"],
+    )
+    def test_a_delegated_payload_fails_closed_on_no_verdict_and_the_top_level_does_not(
+        self, safety_rules_path, monkeypatch, command, expected_risk, expected_rule
+    ):
+        """Step 6 refuses a run with no verdict for a payload, and only for a payload.
+
+        A `bash -c "…"` payload is re-entered at depth 1 and its Step 6 spawn is
+        the only ShellCheck it gets, so reading None as clean there made
+        `bash -c '<slow payload>'` a bypass of the heredoc's own fail-closed spawn
+        (LAB-4586, panel). At depth 0 the same None is still read as clean: that
+        policy is LAB-4362's open question, pinned here so it can only change on
+        purpose.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: None if command == "echo done" else [])
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == expected_risk
+        assert result.allowed is (expected_risk != RiskLevel.BLOCKED)
+        if expected_rule is not None:
+            assert expected_rule in result.matched_rules
+            assert "ShellCheck did not complete" in result.message
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize("padding", [0, 95, 100, 110])
+    def test_inert_padding_does_not_push_sc2114_past_the_finding_cap(self, safety_rules_path, monkeypatch, padding):
+        """Real ShellCheck: 110 unused-variable findings must not hide `rm -r$''f /usr`.
+
+        run_shellcheck capped findings at 100 before filtering to security codes,
+        so padding the command with inert `aN=1` assignments pushed SC2114 off the
+        list and the single heredoc spawn read the empty result as clean: 95
+        findings BLOCKED, 100 allowed (LAB-4586). Asserts the rule, not the verdict.
+        """
+        # The class fixture pins ShellCheck off; this test is about the real binary.
+        monkeypatch.setattr(val_module, "is_shellcheck_available", is_shellcheck_available)
+        pad = "".join(f"a{i}=1;" for i in range(padding))
+
+        result = validate_command(f"ls <<'ZZ'\nbody\nZZ\n{pad}rm -r$''f /usr", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "shellcheck:SC2114" in result.matched_rules
+
+    def test_a_delegated_payload_keeps_its_own_shellcheck(self, safety_rules_path, monkeypatch):
+        """Skipping ShellCheck for a segment must not skip it for the payload the segment runs.
+
+        ShellCheck never reads inside a `-c` string, so the payload's own
+        re-entry (Step 5c) is the only ShellCheck it gets. Threading
+        `_shellcheck` through that re-entry would drop this to HIGH.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -r$''f /" else [])
+
+        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -r$''f /\"", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "ShellCheck: deletes a system directory" in result.message
+
+    def test_a_verdict_without_shellcheck_is_not_cached(self, safety_rules_path, monkeypatch):
+        """A ShellCheck-less verdict must not answer for the same string later.
+
+        The cache is keyed on the command string alone. Behind a whitelisted head
+        the per-segment pass is the only one that sees `rm -r$''f /`, and it
+        sees it without ShellCheck; caching that HIGH would hand it to the next
+        top-level call, which ShellCheck should raise to BLOCKED.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
+
+        validate_command("ls <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
+        assert val_module._global_cache.get("rm -r$''f /") is None
+
+        result = validate_command("rm -r$''f /", config_path=safety_rules_path)
+        assert result.risk_level == RiskLevel.BLOCKED
+
+        # The Step 5 whitelist return has a cache write of its own. Pin it with a
+        # whole-command whitelist entry, which reaches Step 5 only by full-span match
+        # (is_fully_whitelisted, #146) - a prefix no longer gets there.
+        whitelisted = "gh auth token | docker login ghcr.io -u me --password-stdin"
+        validate_command(whitelisted, config_path=safety_rules_path, _shellcheck=False)
+        assert val_module._global_cache.get(whitelisted) is None
+
     @pytest.mark.parametrize(
         "command,expected_error",
         [
@@ -1142,6 +1428,12 @@ class TestHeredocSurroundings:
                 RiskLevel.LOW,
                 "a dangerous-looking quoted argument on the opener line",
             ),
+            # ... and the segments after the terminator get the same quote
+            # context. Matched without it, `echo "rm -rf /"` is a real `rm -rf /`
+            # and a hard BLOCK (LAB-2780). Behind a whitelisted head the
+            # per-segment pass is the only one that looks at the echo at all.
+            ("cat <<'EOF'\nx\nEOF\necho \"rm -rf /\"", RiskLevel.LOW, "a quoted dangerous command after the terminator"),
+            ("ls <<'EOF'\nx\nEOF\necho \"rm -rf /\"", RiskLevel.SAFE, "the same, behind a whitelisted head"),
             ("cat <<'EOF' | <<'X'\nx\nEOF\ny\nX", RiskLevel.LOW, "a segment that is only a redirection"),
             # Delimiter spellings whose quote removal has to happen across the
             # whole word: reading only the first quoted run gives `E`, and the
@@ -1916,13 +2208,12 @@ class TestHeredocSurroundings:
         seen = []
         real = val_module.validate_command
 
-        def spy(command, config_path=None):
+        def spy(command, config_path=None, **kwargs):
             seen.append(command)
-            return real(command, config_path)
+            return real(command, config_path, **kwargs)
 
         monkeypatch.setattr(val_module, "validate_command", spy)
         val_module._escalate_past_heredoc(
-            val_module._get_rule_engine(safety_rules_path),
             "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
             "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok",
             val_module.ValidationResult(allowed=True, risk_level=RiskLevel.LOW, message="base"),
@@ -1931,3 +2222,354 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+class TestInputSizeCeiling:
+    """validate_command refuses oversized input before parsing it (LAB-4363).
+
+    Fail-closed, unlike commit_filter's skip on the same constant; the WHY is at Step 0 in validator.py.
+    """
+
+    OVER_CEILING = [
+        pytest.param(" && ".join(["echo hello"] * 6000), id="and-chained-echo"),
+        pytest.param("".join(f"x{i}=1\n" for i in range(9000)) + "ls", id="newline-assignments"),
+        pytest.param("(( 1<<b ))\n" * 7000 + "ls", id="arithmetic-shift"),
+    ]
+
+    @pytest.mark.parametrize("command", OVER_CEILING)
+    def test_oversized_command_is_denied_naming_size_and_limit(self, command):
+        assert len(command) > MAX_COMMAND_SIZE
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.error is None, "a verdict, not a validation error"
+        assert result.message == f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)"
+
+    def test_ceiling_is_exclusive(self, monkeypatch):
+        """Exactly MAX_COMMAND_SIZE chars still validates; one more is refused (same `>` as commit_filter)."""
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 32)
+        at_limit = "echo " + "a" * 27
+        assert len(at_limit) == 32
+
+        assert validate_command(at_limit).allowed is True
+        over = validate_command(at_limit + "a")
+        assert over.allowed is False
+        assert "33 > 32" in over.message
+
+    def test_oversized_input_is_refused_before_any_parse_and_never_cached(self, monkeypatch):
+        """1 MB must cost O(1): no parser, no rule engine, no special cases, no cache entry.
+
+        Counts work instead of timing it: a raised stub lands in the catch-all and sets `error`,
+        so `error is None` is the proof the guard ran first (wall-clock asserts flake on CI).
+        """
+
+        def unreachable(*_args, **_kwargs):
+            raise AssertionError("oversized input must be refused before this runs")
+
+        for name in ("_get_parser", "_get_rule_engine", "_check_special_cases"):
+            monkeypatch.setattr(val_module, name, unreachable)
+        command = "echo " + "a" * (1024 * 1024)
+
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.error is None, result.error
+        assert val_module._global_cache.get(command) is None
+
+
+class TestDerivedTextCeiling:
+    """The input ceiling judges what the caller submitted, never schlock's rewrite of it (LAB-4363).
+
+    _neuter_heredocs inflates a quoted heredoc ~3.25x, and _escalate_past_heredoc re-validates the
+    result through the front door. Before this, a 20 KB command was denied for a 66 KB string it
+    never wrote. Derived text has its own bound (MAX_DERIVED_COMMAND_SIZE) and its own message.
+    Shapes here are constructed, not sampled: no harvested corpus contains rewrite inflation.
+    """
+
+    HEREDOC_LOW = "Heredoc command 'cat' allowed (content not validated)"
+
+    def test_rewrite_over_input_ceiling_keeps_the_verdict(self, monkeypatch):
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 200)
+        command = "cat <<'X'\nX\n" * 10
+        assert len(command) < 200 < len(val_module._neuter_heredocs(command)[0])
+
+        result = validate_command(command)
+
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.LOW
+        assert result.message == self.HEREDOC_LOW
+
+    def test_near_ceiling_heredoc_is_still_allowed(self):
+        """65,513 in, 65,540 after the rewrite: the first counterexample this pins."""
+        command = "cat <<'X'\nX\n#" + "x" * 65500
+        assert len(command) < MAX_COMMAND_SIZE < len(val_module._neuter_heredocs(command)[0])
+
+        result = validate_command(command)
+
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.LOW
+        assert result.message == self.HEREDOC_LOW
+
+    def test_derived_text_has_its_own_bound_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(val_module, "MAX_DERIVED_COMMAND_SIZE", 100)
+        monkeypatch.setattr(val_module, "_escalate_past_heredoc", lambda *a, **k: pytest.fail("rewrite parsed past its bound"))
+        command = "cat <<'X'\nX\n" * 10  # 120 in, 390 derived
+
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.error is None
+        assert "Internal expansion" in result.message
+        assert "390" in result.message and "100" in result.message
+        assert "Command exceeds size limit" not in result.message
+
+    def test_input_ceiling_message_reports_the_submitted_size(self):
+        command = "echo hello && " * 6000
+        message = validate_command(command).message
+        assert message == f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)"
+        assert "Internal expansion" not in message
+
+    def test_oversized_input_is_refused_before_the_cache_is_consulted(self, monkeypatch):
+        """Pins the stronger AC-2 promise: a 1 MB string is never even hashed for lookup."""
+
+        class NoCache:
+            def get(self, _key):
+                pytest.fail("cache consulted for over-ceiling input")
+
+            def set(self, _key, _value):
+                pytest.fail("cache written for over-ceiling input")
+
+        monkeypatch.setattr(val_module, "_global_cache", NoCache())
+        result = validate_command("echo " + "a" * (1024 * 1024))
+        assert result.allowed is False
+        assert result.error is None
+
+
+class TestParseFailureFailsClosed:
+    """LAB-3464: nothing bashlex could not read comes back allowed.
+
+    `validate_command`'s parse-error handler routes to the heredoc fallback when
+    the command contains `<<` *and* bashlex's message mentions a heredoc. `<<<`
+    satisfies the first half, and - by accident - `coproc bash <<< "rm -rf /"`
+    satisfies the second, because bashlex's error embeds a `RedirectNode` repr
+    containing `heredoc=None`. So at a508274 the fallback read the here-string
+    as a heredoc, extracted the pre-`<<` fragment `coproc bash <`, matched no
+    rule and returned LOW/allowed while bash ran the payload. `case`/`select`
+    spelled the same way denied, because bashlex blames those on something that
+    does not say "heredoc".
+
+    #148 closed it, downstream of that trigger. Two independent guards now stop
+    it, and they are at different layers rather than being one guard twice:
+
+    1. `_rewrite_openers` classifies `<<<` as a here-string, so no opener is
+       found and `_neuter_heredocs` raises.
+    2. `_WORD_END` contains `<`, so even with (1) removed `_read_delimiter`
+       reads an empty delimiter off the third angle and raises.
+
+    Both end in ParseError, and the fallback denies on ParseError. That matters
+    for reading the tests below: **the end-to-end cases do not pin (1)**, because
+    (2) holds them all up on its own - verified by deleting (1) and watching them
+    stay green. They pin the contract. The unit test is what pins the guards, and
+    it pins both, since either alone is load-bearing only until someone edits the
+    other.
+
+    Every exit from the parse-failure path is exercised here, which is the
+    ticket's AC-3 audit expressed as assertions rather than prose. AC-2 - real
+    heredocs keeping their verdicts - is `TestHeredocSurroundings`'s job above
+    and is not restated here; that class's cases already fail if this door is
+    closed too far.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """ShellCheck independently denies some of these; AC-1 is specified without it."""
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    @pytest.mark.parametrize(
+        "command,expected_reason,description",
+        [
+            # AC-1: the reported command, and the second spelling the ticket
+            # names. Both were `allowed=True LOW "Heredoc command 'coproc'
+            # allowed (content not validated)"` at a508274.
+            ('coproc bash <<< "rm -rf /"', "No heredoc opener found", "the reported command"),
+            ('coproc sh <<< "rm -rf /"', "No heredoc opener found", "a second shell, named in AC-1"),
+            ('coproc bash <<<"rm -rf /"', "No heredoc opener found", "no space after the here-string operator"),
+            ("coproc bash <<< 'a << b'", "No heredoc opener found", "a literal `<<` inside the here-string payload"),
+            # Also fail-open at a508274, and the worst verdict of the set: the
+            # whitelisted head vouched for the coproc after the terminator.
+            (
+                "ls <<'EOF'\nx\nEOF\ncoproc bash <<< 'rm -rf /'",
+                "Cannot determine what this heredoc runs: Unexpected parsing error",
+                "whitelisted head, coproc after the terminator",
+            ),
+            # An unparseable construct owning a *real* heredoc. The fallback
+            # rewrites the body away and re-validates; the rewrite is no more
+            # parseable than the original, so it denies.
+            (
+                "coproc bash <<'EOF'\nrm -rf /\nEOF",
+                "Cannot determine what this heredoc runs: Unexpected parsing error",
+                "unparseable head owning a quoted-delimiter heredoc",
+            ),
+            # Denied at a508274 too, but by a different exit (`Parse error`), so
+            # the routing for this spelling moved between a508274 and #148 while
+            # the verdict did not -- which is why it is not counted among the
+            # regressions. The reason pinned here is where it lands *now*.
+            ('coproc bash <<< "$(rm -rf /)"', "No heredoc opener found", "substitution payload, denied at both heads"),
+            # Controls. These never reach the fallback at all - bashlex blames
+            # them on something whose text lacks "heredoc", so the trigger's
+            # second half is false and the handler denies directly. All three
+            # were already BLOCKED at a508274; the report compared against `case`.
+            ('case x in y) bash;; esac <<< "rm -rf /"', "Parse error:", "case: denied before the fallback"),
+            ('select x in a; do bash; done <<< "rm -rf /"', "Parse error:", "select: denied before the fallback"),
+            ('coproc CO { bash; } <<< "rm -rf /"', "Parse error:", "named coprocess: denied before the fallback"),
+        ],
+    )
+    def test_unparseable_command_is_never_allowed(self, safety_rules_path, command, expected_reason, description):
+        """schlock is fail-closed by contract; an unreadable command is not vouched for.
+
+        The verdict alone does not pin the finding: these ten reach BLOCKED by three
+        different exits, and a routing change that moved a case between them would
+        leave every verdict assertion green. `expected_reason` names the exit, and
+        the three strings are mutually exclusive, so a case cannot drift silently.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False, f"{description}: {result.message}"
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.exit_code == 1, description
+        assert expected_reason in result.message, f"{description}: {result.message}"
+
+    def test_here_string_is_not_an_opener_at_either_guard(self):
+        """The two guards that close AC-1, each pinned where it lives.
+
+        Neither is pinned by the end-to-end cases, because each covers for the
+        other's removal. `_rewrite_openers` reading `<<<` as an opener would take
+        `"rm` as the delimiter; `_WORD_END` losing `<` would let the fallback
+        read a delimiter off the third angle. Either alone restores a base
+        command and with it the fail-open.
+        """
+        command = 'coproc bash <<< "rm -rf /"'
+        line, openers = val_module._rewrite_openers(command, val_module._ScanState(), 0, val_module._DoubleParen(command))
+
+        assert openers == []
+        assert line == command
+
+        # Guard 2, independent of the branch above: `<` ends a word, so a
+        # delimiter read off the third angle is empty rather than `"rm`. The
+        # set `_read_delimiter` consults is now `_WORD_START_AFTER`; the guard
+        # is the one this always pinned, only its name moved.
+        assert "<" in val_module._WORD_START_AFTER
+        with pytest.raises(ParseError, match="empty delimiter"):
+            val_module._read_delimiter('<<< "rm -rf /"', 2)
+
+        with pytest.raises(ParseError, match="No heredoc opener found"):
+            val_module._neuter_heredocs('coproc bash <<< "rm -rf /"')
+
+    def test_fallback_returning_none_denies(self, safety_rules_path, monkeypatch):
+        """The fallback's catch-all hands back `None`; the caller must not read that as a pass.
+
+        Reached when `_neuter_heredocs` fails for a reason other than an
+        unreadable heredoc. Nothing produces that today - the base command is
+        stripped and an empty one already raises - so it is forced rather than
+        provoked: an exit that only ever runs on an unforeseen bug is exactly
+        the one worth pinning fail-closed.
+        """
+
+        def boom(command):
+            raise RuntimeError("unforeseen")
+
+        monkeypatch.setattr(val_module, "_neuter_heredocs", boom)
+        result = validate_command("cat <<'EOF'\nx\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.message.startswith("Parse error:")
+
+    def test_recursion_limit_during_parsing_denies(self, safety_rules_path):
+        """bashlex recurses per nesting level, so a deep enough command exhausts the stack.
+
+        `RecursionError` is a `RuntimeError` and would miss the
+        `(ParseError, ValueError)` handler entirely - except that
+        `BashCommandParser.parse` wraps *every* exception into `ParseError`
+        first, so it arrives at the handler this class is about after all. The
+        message is asserted because that conversion is the whole finding: drop
+        it and this input silently changes which exit it leaves by.
+
+        The body is `echo hi`, not `rm -rf /`, so a rule match cannot supply the
+        denial the parse failure is supposed to.
+
+        The nesting is taken from the host's own limit rather than a fixed 300, so
+        the stack is exhausted on any interpreter instead of only on one whose limit
+        happens to sit above it. Lowering the limit instead would be the shorter
+        route, but `sys.setrecursionlimit` raises when the caller's stack is already
+        deeper than the new value, and under pytest that depth is not ours to know.
+        """
+        nesting = sys.getrecursionlimit()
+        deep = "$(" * nesting + "echo hi" + ")" * nesting
+
+        result = validate_command(deep, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.message.startswith("Parse error:")
+        # Without this the assertion above also passes for an ordinary ParseError,
+        # and the RecursionError-to-ParseError conversion the docstring is about
+        # could be dropped with the test still green.
+        assert "maximum recursion depth" in result.message
+
+    # --- documented residual (NOT a fix; pins current behaviour so a change is
+    # --- visible). LAB-3094, untouched by this ticket.
+    def test_discarded_heredoc_body_is_a_documented_residual(self, safety_rules_path):
+        """A quoted delimiter is the only thing reaching this fallback, and the rewrite drops bodies.
+
+        Dropping them is deliberate: a bare placeholder delimiter makes bash
+        expand the body, so keeping a literal `$(rm -rf /)` from a `<<'EOF'`
+        would turn inert text into a live substitution and deny safe commands.
+        The cost is that a body which *is* executable becomes invisible, and one
+        quote character decides it - each pair below is byte-identical to bash
+        apart from the delimiter's quotes.
+
+        Two consumers make the body executable, not one:
+          - a shell, which runs the body as its program;
+          - a redirection to a file that is then run, which is the same thing one
+            step later. The redirection alone is not enough - `cat <<EOF > s.sh`
+            with nothing running `s.sh` is allowed either way - so the pair below
+            carries the `bash s.sh` that makes the body reachable.
+
+        Asserted at its current value rather than skipped, so a LAB-3094 fix has
+        to come back through here and re-state the residual.
+        """
+        shell_consumer = validate_command("bash <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+        write_then_run = validate_command("cat <<'EOF' > s.sh\nrm -rf /\nEOF\nbash s.sh", config_path=safety_rules_path)
+
+        assert shell_consumer.allowed is True
+        assert write_then_run.allowed is True
+
+        # The unquoted twins parse, so their bodies are reachable by the rules
+        # and denied. That gap is the residual: same program, different quoting.
+        assert validate_command("bash <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is False
+        assert validate_command("cat <<EOF > s.sh\nrm -rf /\nEOF\nbash s.sh", config_path=safety_rules_path).allowed is False
+
+        # The boundary a fix must not cross: with no shell and no redirection,
+        # `cat` prints its body and is allowed on the merits. Denying this one
+        # would be over-reach from "the body is a program" to "the body looks
+        # dangerous", which is the LAB-402 failure mode.
+        assert validate_command("cat <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is True
+
+
+class TestCshTcshHeredocAgreesWithHereString:
+    """LAB-4442: csh/tcsh were in _SHELL_COMMANDS (the `-c` surface) but neither
+    _HEREDOC_SHELL_COMMANDS nor STDIN_EXEC_INTERPRETERS - the same drift rbash had before it
+    was added to all three. Pins the heredoc-spelling verdict to match `csh <<< ...` and the
+    `bash <<EOF` control above.
+    """
+
+    def test_csh_heredoc_is_blocked(self, safety_rules_path):
+        assert validate_command("csh <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is False
+
+    def test_tcsh_heredoc_is_blocked(self, safety_rules_path):
+        assert validate_command("tcsh <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is False
