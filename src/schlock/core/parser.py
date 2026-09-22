@@ -1047,24 +1047,38 @@ class BashCommandParser:
         # an unrelated `> out.txt` started rescoring inert `cat` input as an executed
         # command.
         #
-        # SECURITY: suppress the BODY, never the word that carries it. Containing an
-        # inert heredoc does not make a whole shell word inert - bash concatenates
-        # anything written after the closing paren into the SAME word, so
-        # `$(cat <<EOF … EOF)mk''fs /dev/sda` is one word whose tail is an executed
-        # command name. Suppressing the word swallowed that name and turned a BLOCKED
-        # command SAFE. Found by adversarial review (Helly R), whose first report this
-        # fix caused; the body is located by TEXT SEARCH rather than by offset
-        # arithmetic, because quote-stripping earlier in the word shifts every offset
-        # after it. If the body cannot be located the word is left UNSUPPRESSED: the
-        # cost of that is a false positive, and the cost of the other choice is this
-        # bug again.
-        inert_bodies = [command[s:e] for s, e, is_shell in self.extract_heredoc_ranges(command, ast_nodes) if not is_shell]
+        # SECURITY: suppress the BODY, never the word that carries it, and only in the
+        # word that actually OWNS it. Two separate mistakes were made here, each found
+        # by adversarial review (Helly R), each turning a BLOCKED command SAFE:
+        #
+        # 1. Containing an inert heredoc does not make a whole shell word inert. Bash
+        #    concatenates whatever follows the closing paren into the SAME word, so
+        #    `$(cat <<EOF … EOF)mk''fs …` is one word whose tail is an executed command
+        #    name; suppressing the word swallowed the name.
+        # 2. TEXT EQUALITY IS NOT PROVENANCE. Searching every word for the body's text
+        #    suppressed words that merely happened to contain it - an empty heredoc's
+        #    range is its own DELIMITER, so `mk''fs "mkfs" <<mkfs` suppressed the
+        #    executable name because the delimiter spelled the same thing.
+        #
+        # So ownership is a span test (is this heredoc inside this word's source?) and
+        # only the position within the owning word is a text search - quote resolution
+        # shifts offsets, so the source offset alone cannot be reused, but it does
+        # bound the answer: resolution only REMOVES characters, so the body sits at or
+        # before its source offset, and no earlier than that offset minus everything
+        # resolution removed. An unlocatable body suppresses NOTHING; that costs a
+        # false positive, where the other direction costs this bug a third time.
+        inert_heredocs = [(s, e) for s, e, is_shell in self.extract_heredoc_ranges(command, ast_nodes) if not is_shell]
         ranges = []
         offset = 0
 
         for word, span in words:
-            for body in inert_bodies:
-                found = word.find(body) if body else -1
+            for start, end in inert_heredocs:
+                if span is None or not (span[0] <= start and end <= span[1]):
+                    continue  # this word does not own that heredoc
+                body = command[start:end]
+                highest = start - span[0]
+                resolved_away = max(0, (span[1] - span[0]) - len(word))
+                found = word.rfind(body, max(0, highest - resolved_away), highest + len(body)) if body else -1
                 if found >= 0:
                     ranges.append((offset + found, offset + found + len(body)))
             if span is not None and self._quoting_is_load_bearing(command, word, span):

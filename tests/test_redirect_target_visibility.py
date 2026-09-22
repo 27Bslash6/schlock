@@ -422,3 +422,41 @@ class TestConcatenatedDollarQuoteForms:
         is visible rather than mistaken for coverage.
         """
         assert _risk("echo x > ''$'/dev/sda'", safety_rules_path) is RiskLevel.SAFE
+
+
+class TestHeredocSuppressionRequiresProvenance:
+    """Text equality is not provenance: a word must OWN the heredoc to be suppressed by it.
+
+    An empty heredoc's range is its own delimiter, so searching every word for the
+    body's text suppressed words that merely happened to spell the same thing —
+    `mk''fs "mkfs" <<mkfs` suppressed the executable name because the delimiter
+    matched it, while the heredoc belonged to a sibling redirect and not to that word
+    at all. Third fail-open in this area, and the reason ownership is now a span test
+    with the text search confined to the owning word.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("mk''fs \"mkfs\" <<mkfs\nmkfs\n", "filesystem_format"),
+            ("wi''pefs --all \"wipefs\" <<wipefs\nwipefs\n", "filesystem_wipe"),
+            ("mk''fs -L \"mkfs\" /dev/sda <<mkfs\nmkfs\n", "filesystem_format"),
+        ],
+    )
+    def test_delimiter_text_does_not_suppress_an_unrelated_word(self, command, rule, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+
+    def test_owning_word_is_still_suppressed(self):
+        """Provenance must not undo the suppression it is guarding — the owner still qualifies."""
+        parser = BashCommandParser()
+        command = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
+        _, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert ranges, "the substitution word owns its heredoc and must still suppress the body"
+
+    def test_sibling_redirect_heredoc_suppresses_nothing(self):
+        """A heredoc on a sibling redirect is owned by no word, so it grants no suppression."""
+        parser = BashCommandParser()
+        command = "mk''fs \"mkfs\" <<mkfs\nmkfs\n"
+        reconstructed, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert "mkfs" in reconstructed
+        assert ranges == []
