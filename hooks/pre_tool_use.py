@@ -4,8 +4,8 @@
 This hook intercepts Bash tool calls in Claude Code and validates commands
 using the Core Safety Validation Engine before execution.
 
-Fail-Safe Behavior:
-- Any exception, including one raised while importing this module → deny decision
+Fail-Safe Behavior (from the moment the interpreter has started and compiled this file):
+- Any exception, including one raised while importing this file's dependencies → deny
 - Missing command parameter → deny decision
 - Validation engine unavailable → deny decision
 - Unknown risk level → deny decision (fail-safe)
@@ -13,9 +13,11 @@ Fail-Safe Behavior:
 Hook Interface:
 - Input: JSON via stdin containing tool_name and tool_input
 - Output: JSON with hookSpecificOutput structure to stdout
-- A deny this hook cannot recover from prints that JSON *and* exits 2. Both halves matter:
-  exit 2 is the only outcome the harness will not let stdout override, and a non-2 exit
-  with empty stdout is read as a non-blocking error, which runs the command unchecked.
+- A decision — allow, ask or deny — exits 0, and the harness honours it from that JSON.
+  A failure that leaves no decision to make (a broken import, unparseable stdin, an
+  unexpected error) prints a deny *and* exits 2. Both halves matter: exit 2 is the only
+  outcome the harness will not let stdout override, and a non-zero non-2 exit with empty
+  stdout is read as a non-blocking error, which runs the command unchecked.
 """
 
 import json
@@ -28,8 +30,10 @@ from pathlib import Path
 # Everything in this block can fail before main() exists to catch it: an unreachable or
 # broken vendored dependency, a syntax error in a shipped module, an interpreter mismatch.
 # An uncaught failure here leaves stdout empty, which the harness reads as a non-blocking
-# error and runs the command unchecked, so deny instead. The handler may use only json and
-# sys (imported above) — everything else is what might have failed.
+# error and runs the command unchecked, so deny instead. The handler must touch nothing
+# bound inside this try, and nothing defined below it: `logger` is configured after the
+# block, so reaching for it here raises NameError inside the failure path and puts stdout
+# back to empty. json and sys are imported above, which is why it can use those.
 try:
     # Add vendored dependencies to path FIRST (pure Python packages)
     vendor_path = Path(__file__).parent.parent / ".claude-plugin" / "vendor"
@@ -53,17 +57,22 @@ try:
     from schlock.setup.config_writer import DEFAULT_RISK_PRESET, RISK_PRESETS  # noqa: E402
 except BaseException as exc:  # BaseException, not Exception: a dependency that exits on
     # import raises SystemExit, and that must deny too rather than fall through silently.
+    reason = f"BLOCKED: schlock failed to start: {type(exc).__name__}: {exc}"
     print(
         json.dumps(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason": f"BLOCKED: schlock failed to start: {type(exc).__name__}: {exc}",
+                    "permissionDecisionReason": reason,
                 }
             }
         )
     )
+    # Also on stderr: on exit 2 the harness falls back to stderr for the blocking message
+    # when it cannot read the JSON, and an unexplained block on every command is the kind
+    # users respond to by removing the hook.
+    print(reason, file=sys.stderr)
     sys.exit(2)
 
 # Configure logging to stderr

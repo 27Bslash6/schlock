@@ -603,7 +603,7 @@ class TestHookSubprocess:
     HOOK = Path(__file__).parent.parent / "hooks" / "pre_tool_use.py"
 
     def _run(self, stdin_payload, env_extra=None):
-        return subprocess.run(  # noqa: S603 - fixed argv, no shell
+        return subprocess.run(
             [sys.executable, str(self.HOOK)],
             input=stdin_payload,
             capture_output=True,
@@ -639,18 +639,24 @@ class TestHookSubprocess:
 
     @pytest.mark.parametrize(
         ("module", "exc_type"),
-        [("yaml", "ModuleNotFoundError"), ("schlock", "RuntimeError")],
-        ids=["vendored-dep-unreachable", "package-raises-on-import"],
+        [("yaml", "ModuleNotFoundError"), ("schlock", "SystemExit")],
+        ids=["vendored-dep-unreachable", "dependency-exits-on-import"],
     )
     def test_import_failure_denies_and_exits_2(self, tmp_path, module, exc_type):
-        """A dependency the hook cannot import must still deny — not exit 1 with no decision."""
+        """A dependency the hook cannot import must still deny — not exit 1 with no decision.
+
+        SystemExit is the param that pins `except BaseException`: it is not an Exception, so
+        narrowing the guard reopens the hole without a ModuleNotFoundError case noticing.
+        """
         proc = self._run(self._bash("rm -rf /"), {"PYTHONPATH": _unimportable_shim(tmp_path, module, exc_type)})
         assert proc.returncode == 2
         output = self._decision(proc)
         assert output["permissionDecision"] == "deny"
         reason = output["permissionDecisionReason"]
         assert exc_type in reason  # names what broke
-        assert module in reason  # names which module
+        # The shim's own marker, not the module name: "schlock" appears in the guard's fixed
+        # prefix, so asserting the name would pass on any unrelated import failure.
+        assert f"{module} is unimportable" in reason
 
     def test_unparseable_stdin_denies_and_exits_2(self):
         """The invalid-input deny also exits 2, so the block does not rest on stdout parsing."""
