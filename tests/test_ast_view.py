@@ -18,8 +18,10 @@ import json
 import pytest
 
 from schlock.core.ast_view import (
+    _CLAUSE_CHILDREN,
     BASHLEX_KINDS,
     BINARY_OPS,
+    EXPR_OPERANDS,
     MVDAN_NODE_MAP,
     AstView,
     UnmappedNodeError,
@@ -59,6 +61,21 @@ class TestMappingTableIsData:
             produced.add(separator)
         assert produced == BASHLEX_KINDS
         assert len(BASHLEX_KINDS) == 12
+
+    def test_clause_handlers_agree_with_the_node_map(self):
+        # The two tables hold the same contract from opposite ends, and drift
+        # produces a MISLEADING error: a key only in _CLAUSE_CHILDREN raises
+        # "malformed typed-JSON structure: KeyError" and blames the binary for a
+        # table bug. Pin them together (LAB-912 panel finding).
+        for node_type in _CLAUSE_CHILDREN:
+            assert MVDAN_NODE_MAP[node_type] == ("compound", "list"), node_type
+
+    def test_expression_operand_table_has_no_empty_rows(self):
+        # An empty tuple would make _expr_words return [] instead of raising —
+        # the silent-drop the fail-closed contract forbids. `Word` is the leaf and
+        # is handled before the lookup, so it must not appear here.
+        assert "Word" not in EXPR_OPERANDS
+        assert all(EXPR_OPERANDS.values())
 
     def test_pipe_is_not_pipeline(self):
         # `|`/`|&` build a `pipeline` whose separator kind is `pipe`;
@@ -441,17 +458,29 @@ class TestUnmappedRaises:
         assert issubclass(UnmappedNodeError, NativeBridgeError)
 
     @needs_binary
-    def test_if_clause_unmapped_for_now(self):
-        # IfClause is outside the 12-kind vocabulary — T2c decides its shape.
-        # Until then it must raise (→ bashlex tier), never silently map.
-        with pytest.raises(UnmappedNodeError, match="IfClause"):
-            view("if true; then a; fi")
+    def test_arithmetic_command_unmapped(self):
+        # `(( … ))` stays unmapped by choice, not by omission: bashlex parses it
+        # but calls the arithmetic body a COMMAND named after the expression, so
+        # a superset-preserving mapping would have to copy that misparse. It is
+        # not one of the 7 bashlex-failing constructs, so the fallback tier costs
+        # nothing here. See _clause_test and tests/test_walker_parity.py.
+        with pytest.raises(UnmappedNodeError, match="ArithmCmd"):
+            view("(( x++ ))")
+
+    @needs_binary
+    def test_coprocess_raises(self):
+        # `coproc` runs the command behind its own pipes — a shape bashlex has no
+        # node for. It arrives as a CoprocClause COMMAND, so the clause table is
+        # what rejects it (`Stmt.Coprocess` is the mksh `|&` spelling, which this
+        # bash-mode CLI never emits).
+        with pytest.raises(UnmappedNodeError, match="CoprocClause"):
+            view("coproc a { sleep 1; }")
 
     @needs_binary
     def test_negated_statement_raises(self):
-        # Dropping `!` would silently invert pipeline semantics; bashlex
-        # handles negation today, so route it to the fallback tier.
-        with pytest.raises(UnmappedNodeError, match="egated"):
+        # Dropping `!` would defeat substitution.py's deliberate fail-closed on a
+        # negated pipeline (`_is_valid_pipeline_topology`). See convert_stmt.
+        with pytest.raises(UnmappedNodeError, match="Negated"):
             view("! a")
 
     @needs_binary
