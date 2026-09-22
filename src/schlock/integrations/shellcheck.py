@@ -118,6 +118,32 @@ _MAX_OUTPUT_SIZE = 1_000_000  # 1MB max ShellCheck output
 _MAX_FINDINGS_COUNT = 100  # Maximum findings to process
 _MAX_MESSAGE_LENGTH = 500  # Maximum message field length
 
+# ShellCheck treats a comment whose content begins with the exact token
+# `shellcheck` as a directive (e.g. `# shellcheck disable=SC2114`) and honours it
+# even though bash ignores the comment line. The command under analysis is
+# attacker-controlled, so an embedded directive would switch this ShellCheck
+# control off (CWE-693). `_SHELLCHECK_DIRECTIVE` matches that keyword wherever it
+# follows a `#`, so `run_shellcheck` can disarm it before the spawn.
+#
+# Design notes, each verified against ShellCheck 0.11.0:
+#  - Rewrite the keyword IN PLACE (\g<1>shell_check), never delete to end-of-line:
+#    deleting would unbalance a `# shellcheck` sequence living INSIDE a string,
+#    turning it into a parse error that itself fails the check open. In-place
+#    rewrite keeps quoting balanced and only ever turns one inert comment into
+#    another, so over-matching the gap below is harmless. `shell_check` is a
+#    deliberate non-token: the underscore breaks ShellCheck's exact-token match
+#    (do NOT "fix" it back to `shellcheck` — that reopens the bypass; pinned by
+#    test_disarm_neutralises_directive_keyword).
+#  - The gap between `#` and the keyword is `[^\S\n]` (whitespace but not the
+#    newline that would end the comment) OR U+200B: ShellCheck honours the
+#    directive after a NBSP/EM-space/thin-space/etc. AND after a zero-width space,
+#    which is not Python whitespace. ASCII space/tab only would miss those.
+#  - Case-sensitive: ShellCheck only honours the lowercase token.
+# NOTE: a ShellCheck parse error (e.g. a bare CR in a comment) also suppresses
+# findings, but that is the "run_shellcheck returns [] read as clean" fail-open
+# class tracked separately (LAB-4586), not a directive this rewrite can neutralise.
+_SHELLCHECK_DIRECTIVE = re.compile(r"(#(?:[^\S\n]|\u200b)*)shellcheck")
+
 
 def _sanitize_message(message: str) -> str:
     """Sanitize ShellCheck message by removing control characters.
@@ -264,6 +290,12 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
         return []
 
     try:
+        # Disarm any attacker-supplied ShellCheck directive in the command text
+        # before the spawn so it cannot suppress a finding (CWE-693). See
+        # _SHELLCHECK_DIRECTIVE for why this rewrites in place instead of deleting.
+        # Scan a copy so `command` stays the real text for the timeout log below.
+        scan_input = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shell_check", command)
+
         # Run shellcheck with JSON output, reading from stdin
         result = subprocess.run(
             [
@@ -274,7 +306,7 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
                 "-",  # Read from stdin
             ],
             check=False,
-            input=command,
+            input=scan_input,
             capture_output=True,
             text=True,
             timeout=timeout,
