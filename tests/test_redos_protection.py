@@ -8,6 +8,7 @@ Fix: Replaced unbounded quantifiers with bounded ones (.{0,200}, [^x]{0,100}).
 """
 
 import time
+import timeit
 
 import pytest
 
@@ -110,6 +111,10 @@ class TestReDoSProtection:
             "chmod " + "+" * 1500 + "x file",  # Many plus signs
             "rm $(" + "x" * 500 + " rm /)",  # Long substitution
             ":(){" + " " * 1000 + ":|:&};:",  # Long fork bomb
+            # LAB-4466: dense repeats of the `/etc/` credential path anchor.
+            # Shares this class's MAX_VALIDATION_TIME rather than carrying its
+            # own constant; the linearity claim is the sibling ratio test's job.
+            "cat " + "/etc/" * 1600,
         ],
     )
     def test_all_pathological_inputs_fast(self, pathological_input):
@@ -190,3 +195,67 @@ class TestBoundedQuantifierEdgeCases:
             else:
                 # HIGH is allowed but should have high risk level
                 assert result.risk_level.value >= 3, f"Should be HIGH risk: {cmd}"
+
+
+class TestSystemCredentialPathAnchorDensity:
+    """LAB-4466: the `/etc/` path branch must stay LINEAR in anchor density.
+
+    The rule file's own note on this pattern says a probe that varies only
+    LENGTH cannot see the shape that matters here -- an earlier cut of the
+    same span was quadratic because the scan restarts from every position the
+    word walker can stop at, so cost tracks how many times the input repeats
+    the PATH ANCHOR, not how long it is.
+
+    The `/etc/` branch carries an optional prefix run, and a run behind a
+    walker is exactly the shape that went quadratic before. Measured at
+    authoring time: ~2.0x per doubling of anchor count (linear), against ~3.9x
+    for the pre-existing `.kube/` anchor, which is quadratic in base and head
+    alike and is tracked separately.
+
+    Mutation-checked rather than assumed: unbinding the prefix run takes the
+    ratio to 4.07 and fails this test, so the guard can actually fail. A perf
+    pin that cannot fail is worse than none.
+
+    This asserts the regex layer directly. End-to-end it would be invisible:
+    other patterns already cost far more on the same input.
+    """
+
+    def test_etc_anchor_density_is_linear(self, safety_rules_path):
+        # Take the compiled object the ENGINE built, not a local re.compile of
+        # the YAML string: the engine compiles with re.MULTILINE, so a
+        # hand-compile measures a regex that is not the one that ships. Select
+        # it by content -- a positional index silently measures the wrong
+        # pattern the day one is inserted above it.
+        engine = RuleEngine(safety_rules_path)
+        # `hexdump` appears only in the 30-verb reader alternation, and `/etc/`
+        # only in the branches this ticket added -- together they name exactly
+        # one pattern. An earlier selector here used `"<" not in p.pattern` and
+        # silently picked the grep pattern instead, because the reader carries a
+        # `(?<![A-Za-z0-9])` lookbehind; the test still passed, measuring the
+        # wrong regex. Assert the match is unique rather than taking the first.
+        candidates = [
+            p
+            for p in engine.compiled_patterns["extended_credential_exposure"]
+            if "hexdump" in p.pattern and "/etc/" in p.pattern
+        ]
+        assert len(candidates) == 1, f"selector matched {len(candidates)} patterns"
+        pattern = candidates[0]
+
+        small = "cat " + "/etc/" * 800
+        large = "cat " + "/etc/" * 1600
+        pattern.search("cat " + "/etc/" * 200)  # warm
+
+        # INTERLEAVED min-of-seven. Measuring all of one size and then all of
+        # the other lets load drift between the two halves land entirely in the
+        # ratio -- this test failed exactly once that way, inside a full-suite
+        # run, while passing alone. Alternating puts both sizes under the same
+        # conditions, and min discards the samples a scheduler spike touched.
+        best_small = best_large = float("inf")
+        for _ in range(7):
+            best_small = min(best_small, timeit.timeit(lambda: pattern.search(small), number=1))
+            best_large = min(best_large, timeit.timeit(lambda: pattern.search(large), number=1))
+
+        # Doubling the anchor count must roughly double the cost, not quadruple
+        # it. 3.0 sits clear of linear (~1.6) and of the measured quadratic
+        # mutant (~3.96), so it discriminates without flapping on a loaded box.
+        assert best_large / max(best_small, 1e-9) < 3.0
