@@ -211,7 +211,12 @@ hooks/ → integrations/ → core/ → external (bashlex, pyyaml)
 
 ## Performance Guidelines
 
-**Targets** are the budgets asserted in `tests/test_performance.py` (pytest-benchmark medians, enforced in CI).
+**Targets** are the budgets asserted in `tests/test_performance.py` (pytest-benchmark medians,
+enforced in CI). Calibrate them against medians measured on the **CI runner**, not on your own
+machine — it is the slowest one these run on and the only one that gates merges. Budgets set
+from a dev box left three of them below 1.0x there and turned `main` red on correct code. The
+job log prints the full median table; take the numbers from the slowest matrix leg and leave
+roughly 3x of headroom.
 
 **Cache design**:
 - Thread-safe LRU with OrderedDict

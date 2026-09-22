@@ -29,6 +29,7 @@ import pytest
 from schlock.core import validator
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import clear_caches, validate_command
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 @pytest.fixture(autouse=True)
@@ -757,17 +758,17 @@ class TestUnanchoredSearchStaysLinear:
     failed search gives up after a fixed number of options.
     """
 
-    # n is load-bearing, not arbitrary. The regression is quadratic and the fix is
-    # linear, so the gap between them GROWS with n -- and it has to outgrow the
-    # spread between the fastest and slowest machine that runs this, or no budget
-    # can tell a slow runner from a restored O(n^2). Measured on 3.9, bounded vs
-    # the same rules with the {0,16} option bound removed:
-    #     n= 512   0.44s vs  1.22s   2.8x   <- smaller than the ~3x runner spread
+    # n is load-bearing. The regression is quadratic and the fix is linear, so the
+    # gap between them grows with n while the spread between the machines running
+    # this does not -- and until the gap wins, no constant can tell a slow runner
+    # from a restored O(n^2). One dev box, 3.9, bounded vs the same rules with the
+    # {0,16} option bound removed:
+    #     n= 512   0.44s vs  1.22s   2.8x   <- under the ~3x CI/local spread
     #     n=1024   0.80s vs  3.80s   4.8x
     #     n=2048   1.36s vs 13.61s  10.0x
+    # The absolute times are that box's; the ratios are the part that transfers.
     # 512 is why the old 1.0s budget could both false-fail a correct run (CI
-    # measured 1.0013s) and let the unbounded mutant through. 2048 buys the
-    # separation a constant needs.
+    # measured 1.0013s) and let the unbounded mutant through.
     ADVERSARY = "git" + " -c user.name=x' y' -C git" * 2048 + " status"
 
     @pytest.mark.parametrize(
@@ -777,19 +778,25 @@ class TestUnanchoredSearchStaysLinear:
     def test_many_candidate_starts_stay_fast(self, operation, rules_dir_path, clean_worktree):
         """Every rule carrying the option group, not just the one that found it."""
         command = self.ADVERSARY.replace(" status", " " + operation)
+        # LAB-4363 refuses anything over MAX_COMMAND_SIZE before it reaches a rule,
+        # and n=2048 sits at ~53 KB of a 64 KB ceiling. Raise n past it and this
+        # would time a size refusal instead of a search, staying green whatever the
+        # patterns did -- the silent-guard failure this whole class is about.
+        assert len(command) < MAX_COMMAND_SIZE, f"adversary is {len(command)}B, past the pre-parse ceiling"
         start = time.perf_counter()
         verdict(command, rules_dir_path)
-        # Balanced on the machine that gates merges, not on whichever box ran it
-        # last. Scaling the 1.0013s CI measured at n=512 gives ~4.0s there for the
-        # linear implementation, against ~30s for the quadratic one: 2.5x of room
-        # below this budget, 3x of margin above it. A faster box only makes the
-        # check more lenient, and locally this class is `slow` and outside the
-        # default gate anyway. Costs the 3.9 leg ~24s.
+        # Verified by mutation, not by extrapolation: drop the {0,16} option bound
+        # from data/rules/10_development_workflows.yaml and this must go red. Under
+        # `pytest --cov` on 3.9, mutant 11.25-14.08s against bounded 1.45-1.60s.
+        # Re-run that when you change this number -- per-call overhead is a fixed
+        # ~0.36s on top of a term linear in n, so scaling either column in your head
+        # gets it wrong in both directions.
         #
-        # Verified by mutation rather than by argument: drop the {0,16} option
-        # bound from data/rules/10_development_workflows.yaml and all six cases
-        # must go red. Measured 11.25-14.08s mutant vs 1.45-1.60s bounded, under
-        # `pytest --cov` on 3.9. At the old n=512 the mutant passed.
+        # At the old n=512 the mutant passed, and so did both siblings:
+        # test_cost_grows_linearly_not_quadratically clears its own ceiling by 1.5%
+        # on it, so nothing here is a backstop for this case. CI runs this class on
+        # both matrix legs -- the workflow passes no `-m` deselect -- and only a
+        # local `-m "not slow"` skips it.
         assert time.perf_counter() - start < 10.0
 
     def test_cost_grows_linearly_not_quadratically(self, rules_dir_path):
