@@ -1103,6 +1103,23 @@ _OPENER_SCAN_RE = re.compile(r"[(\\]")
 _ARITH_SHIFT = "=="
 
 
+class _UnfollowableParenError(ParseError):
+    """The `((` reading could not be FOLLOWED, as opposed to provably not closing.
+
+    The difference decides a verdict. A pair that never closes is a bash syntax
+    error: bash runs none of the text, so an opener skipped for that reason
+    hides nothing. A pair this cannot follow - quoting nested deeper than the
+    interpreter recurses, a `case` or a heredoc inside a `$(…)` - says only that
+    schlock does not know, and bash may well evaluate the arithmetic and run the
+    lines after it. Skipping THAT is a bypass: `(( 1<<b + "${a:-…×500…}" ))`
+    followed by `rm -rf /` was allowed and rated SAFE while bash ran it, because
+    both causes arrived as one exception and were dropped alike.
+
+    Subclasses `ParseError` so every existing handler still catches it; only the
+    arithmetic guard, which must tell the two apart, looks for this type.
+    """
+
+
 class _DoubleParen:
     """Resolve each top-level `((` the way bash's parser does.
 
@@ -1148,7 +1165,7 @@ class _DoubleParen:
             try:
                 close = self._paren(pos + 1)
             except RecursionError:
-                raise ParseError("Quoting nested too deep inside `((` to follow") from None
+                raise _UnfollowableParenError("Quoting nested too deep inside `((` to follow") from None
         return self.text.startswith(")", close + 1)
 
     def command_level_openers(self) -> list[int]:
@@ -1251,12 +1268,14 @@ class _DoubleParen:
                 if found.start() > start + 1 and self.text[found.start() - 1] not in _COMMENT_START_AFTER:
                     continue  # mid-word: `echo a#b`, `test-case`
                 if hit == "case":
-                    raise ParseError("`case` inside `$(…)` inside `((`; its patterns' `)` cannot be told from the closer")
+                    raise _UnfollowableParenError(
+                        "`case` inside `$(…)` inside `((`; its patterns' `)` cannot be told from the closer"
+                    )
                 pos = self._stop(_NEWLINE_RE, pos, "`$(`").end()
             elif hit == "<<":
                 if self.text.startswith("<", pos):
                     continue  # a here-string is a word
-                raise ParseError("a heredoc inside `$(…)` inside `((`; the closing paren cannot be located")
+                raise _UnfollowableParenError("a heredoc inside `$(…)` inside `((`; the closing paren cannot be located")
             else:
                 pos = self._skip(hit, found.start(), pos)
 
@@ -1315,9 +1334,13 @@ def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tupl
     same text once per level. `(( (( (( … )) )) ))` is otherwise quadratic in
     the nesting depth, on a hook that runs before every Bash call.
 
-    An opener `_DoubleParen` will not vouch for is skipped, not guessed at.
-    Bash runs nothing when the pair never closes, so there is nothing hidden
-    behind it to un-hide.
+    Only an opener whose pair provably NEVER CLOSES is skipped: that is a bash
+    syntax error, bash runs none of the text, so nothing is hidden behind it.
+    An opener `_DoubleParen` cannot FOLLOW is a different answer and propagates
+    as `_UnfollowableParenError` - bash may evaluate that arithmetic and run the
+    lines after it, so dropping it is a bypass rather than a conservative skip.
+    This is the LAB-4270 lesson ("a missed opener only ever denies" is false)
+    in its third spelling; do not collapse the two arms back together.
     """
     regions: list[tuple[int, int]] = []
     collected_to = -1
@@ -1327,6 +1350,8 @@ def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tupl
         try:
             if not dparen.is_arithmetic(opener):
                 continue
+        except _UnfollowableParenError:
+            raise  # not knowing is not the same as knowing bash runs nothing
         except ParseError:
             continue
         closer = dparen.partners[opener + 1]
@@ -1354,11 +1379,17 @@ def _neuter_arithmetic_shifts(command: str) -> str:
     Only the shift is rewritten, not the arithmetic around it: an arithmetic
     subscript can carry a command substitution (`(( a[$(id)] ))`), and blanking
     the region would hide it from the substitution validator - trading this
-    fail-open for another one. Inside a region `_DoubleParen` vouches for, every
-    `<<` is a shift whatever it is nested in, because the one shell context that
-    could hold a real heredoc there - a `$(…)` - is a context it refuses to
-    vouch for. `<<<` is the exception: it is a here-string, and mangling it
-    would corrupt a command bash runs correctly.
+    fail-open for another one. `<<<` is the exception: it is a here-string, and
+    mangling it would corrupt a command bash runs correctly.
+
+    Inside a vouched region almost every `<<` is a shift, because the shell
+    context that could hold a real heredoc - a `$(…)` - is one `_DoubleParen`
+    refuses to vouch for. A BACKTICK is not: it re-lexes as shell and can hold a
+    real heredoc, but `_paren` skips it opaquely rather than refusing, so
+    `(( 1 + `cat <<Z … Z` ))` has its opener rewritten to `cat ==Z`. That is
+    deny-side - an inert body becomes a visible command - so it is a
+    false-positive risk rather than a bypass, and it is recorded here instead of
+    being claimed away.
     """
     # Bash removes `\<newline>` before it tokenizes anything, so `(\<newline>(`
     # is the same opener as `((`. Scan what bash scans - but hand the splice-free
@@ -2238,7 +2269,26 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # something, so a shift missed on the first pass gets no second pass and
         # stays hidden. Under-firing here is a live bypass, which is why
         # `command_level_openers` over-approximates rather than lexes.
-        neutered = _neuter_arithmetic_shifts(command)
+        try:
+            neutered = _neuter_arithmetic_shifts(command)
+        except _UnfollowableParenError as unfollowable:
+            # The `((` reading could not be followed, so whether the lines after
+            # it are a heredoc body or commands bash runs is unknown - and the
+            # bashlex reading below, which would decide it, is the one that is
+            # wrong about `((`. Deny, naming the construct: this is the one exit
+            # here that is a schlock decision rather than a rule match, and it
+            # says so.
+            return ValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"BLOCKED: {unfollowable}",
+                alternatives=[
+                    "Simplify the arithmetic command so its `))` can be located",
+                    "Run the commands after the arithmetic separately",
+                ],
+                exit_code=1,
+                error=str(unfollowable),
+            )
         if neutered != command:
             arithmetic_result = validate_command(neutered, config_path, _depth=_depth)
             if _depth == 0:

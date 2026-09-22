@@ -2232,6 +2232,60 @@ class TestArithmeticCommandShift:
         assert result.allowed is False, description
         assert "system_destruction" in result.matched_rules, description
 
+    @pytest.mark.parametrize(
+        "command,reason,description",
+        [
+            # Python stops recursing around 500 frames of `${…}`; below the
+            # cliff this denies on the rule, above it the opener used to be
+            # dropped and the verdict was `allowed=True SAFE` while bash ran
+            # `rm -rf /` (canary-verified, and bashlex parses this cleanly so
+            # nothing downstream caught it either).
+            (
+                '(( 1<<b + "' + "${a:-" * 600 + "x" + "}" * 600 + '" ))\nrm -rf /\nb',
+                "nested too deep",
+                "quoting nested past the recursion limit",
+            ),
+            ("(( 1<<b + $(case x in y) echo;; esac) ))\nrm -rf /\nb", "`case` inside", "a `case` inside `$(…)` inside `((`"),
+            ("(( 1<<b + $(cat <<Z\nq\nZ\n) ))\nrm -rf /\nb", "heredoc inside", "a heredoc inside `$(…)` inside `((`"),
+        ],
+    )
+    def test_a_pair_that_cannot_be_followed_denies_instead_of_being_skipped(
+        self, safety_rules_path, command, reason, description
+    ):
+        """Not knowing is not the same as knowing bash runs nothing.
+
+        An opener whose pair provably never closes is safe to skip - bash runs
+        none of that text. An opener the reader cannot FOLLOW says only that
+        schlock does not know, and bash may evaluate the arithmetic and run the
+        lines after it. Both arrived as one `ParseError` and were dropped alike,
+        which made every one of these a bypass.
+
+        The deny is asserted on its reason, not on `BLOCKED`: this is the one
+        exit in the guard that is a schlock decision rather than a rule match,
+        and AC-2 accepts it only because it names the construct. A bashlex parse
+        failure would also deny and would hide a regression.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False, description
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.error and reason in result.error, description
+        assert result.matched_rules == [], description
+
+    def test_below_the_recursion_cliff_the_payload_still_matches_its_rule(self, safety_rules_path):
+        """The deny above is a fallback, not the normal path - pin where the cliff is.
+
+        Without this, making the guard refuse every nested expansion would keep
+        the row above green while quietly turning a rule match into a refusal.
+        """
+        command = '(( 1<<b + "' + "${a:-" * 100 + "x" + "}" * 100 + '" ))\nrm -rf /\nb'
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "system_destruction" in result.matched_rules
+        assert result.error is None
+
     def test_an_opener_bash_comments_out_is_over_blocked_on_purpose(self, safety_rules_path):
         """The measured cost of not lexing: `# ((` with the `))` on a later line.
 
