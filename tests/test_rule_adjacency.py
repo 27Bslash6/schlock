@@ -29,6 +29,7 @@ import pytest
 from schlock.core import validator
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import clear_caches, validate_command
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 @pytest.fixture(autouse=True)
@@ -1041,5 +1042,49 @@ class TestDecoyPaddingIsScannedExactly:
     def test_a_modest_number_of_decoys_still_finds_the_real_read(self, rules_dir_path):
         command = "echo '" + ("od ~/.ssh/id_rsa " * 4) + "' ; nl ~/.ssh/id_ed25519"
         result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "ssh_key_exfiltration" in result.matched_rules
+
+    def test_padding_does_not_silence_the_rule_that_decides_the_verdict(self, rules_dir_path):
+        """The None direction, which no row above can see.
+
+        `test_padding_does_not_hide_a_cross_segment_block` lets `fork_bomb` decide,
+        and `fork_bomb` matches on iteration 1 with nothing suppressed in front of
+        it. Its padded `pip` patterns do exhaust, but they carry HIGH
+        (`pip_system`) and LOW (`pip_requirements`) -- both under BLOCKED, so
+        silencing them cannot move the verdict. `test_padding_does_not_deny_inert_text`
+        asserts a command is allowed, which no amount of silencing can fail. And
+        `test_a_modest_number_of_decoys_still_finds_the_real_read` pads with four
+        decoys, which reaches no cap at all; its `;` is a real separator, so the
+        payload lands in its own segment and that scan never walks past a decoy.
+
+        Here the scan that walks the padding is the only thing between the command
+        and its verdict. ONE `ssh_key_exfiltration` pattern matches both halves:
+        `~/.ssh/identity` inside the quoted `-u` operand, every occurrence
+        suppressed as inert text, then `~/.ssh/id_ed25519` outside it. The `;` are
+        quoted operand data, so this is ONE segment and one scan. `env -u NAME CMD`
+        execs CMD, so the trailing read is real -- an `echo` spelling gives the same
+        scan profile while reading nothing, and would pin a false positive instead.
+        `ssh_key_exfiltration` is the only rule that rates this at all, so a scan
+        that gives up and returns None leaves it SAFE.
+
+        THE PADDING IS SIZED OFF THE INPUT CEILING, NOT OFF A ROUND NUMBER. A row
+        with 40 decoys pins only "no bound at or below 40": a budget of 64, or a
+        byte cap (`if match.start() > 4096: return None`), passes it and still
+        under-blocks -- and a byte cap is the shape a fix for the reader pattern's
+        density cost would take. Filled to MAX_COMMAND_SIZE there is nowhere left
+        for a bound to sit, because `validate_command` refuses anything larger
+        before it parses.
+
+        One dependency worth knowing if this ever goes green for no reason: `env` is
+        in `WRAPPER_COMMANDS`, and shell-delegation re-entry harvests `-c` payload
+        strings only. If it ever harvested a wrapper's residual command vector, the
+        key would get a fresh decoy-free scan and this row would stop testing.
+        """
+        decoy = "cat ~/.ssh/identity; "
+        shape = "env -u '{}' head ~/.ssh/id_ed25519"
+        padded = shape.format(decoy * ((MAX_COMMAND_SIZE - len(shape.format(""))) // len(decoy)))
+        assert len(padded) <= MAX_COMMAND_SIZE
+        result = verdict(padded, rules_dir_path)
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ssh_key_exfiltration" in result.matched_rules
