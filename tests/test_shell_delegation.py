@@ -743,11 +743,8 @@ class TestHereStringDelegationEvasion:
             'flock ./bash sh <<< "rm -rf /"',
             'strace -o bash sh <<< "rm -rf /"',
             # Explicit stdin designators (_STDIN_PATHS, LAB-4696): bash/sh treat these path
-            # spellings of stdin as the program to run, same as no operand at all. Untested
-            # pre-fix - removing the `_STDIN_PATHS` branch alone drops these three to HIGH
-            # (allowed under permissive) while the suite stays green, because a designator
-            # that does not start with a dash is then read as the "leading positional before
-            # any option is a script file" exemption instead (verified against real bash).
+            # spellings of stdin as the program to run, same as no operand at all - untested
+            # pre-fix (verified against real bash).
             'bash /dev/stdin <<< "rm -rf /"',
             'sh /dev/fd/0 <<< "rm -rf /"',
             'bash /proc/self/fd/0 <<< "rm -rf /"',
