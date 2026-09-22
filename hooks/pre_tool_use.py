@@ -20,6 +20,7 @@ Hook Interface:
   stdout is read as a non-blocking error, which runs the command unchecked.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -34,46 +35,62 @@ from pathlib import Path
 # bound inside this try, and nothing defined below it: `logger` is configured after the
 # block, so reaching for it here raises NameError inside the failure path and puts stdout
 # back to empty. json and sys are imported above, which is why it can use those.
+#
+# Imports run with stdout pointed at stderr: a dependency that prints while importing would
+# otherwise land ahead of the decision and leave the harness unable to parse it. That covers
+# Python-level writes only — not an extension writing to fd 1, and not anything printed
+# before this file runs.
 try:
-    # Add vendored dependencies to path FIRST (pure Python packages)
-    vendor_path = Path(__file__).parent.parent / ".claude-plugin" / "vendor"
-    if vendor_path.exists():
-        sys.path.insert(0, str(vendor_path))
+    with contextlib.redirect_stdout(sys.stderr):
+        # Add vendored dependencies to path FIRST (pure Python packages)
+        vendor_path = Path(__file__).parent.parent / ".claude-plugin" / "vendor"
+        if vendor_path.exists():
+            sys.path.insert(0, str(vendor_path))
 
-    # Add src to path for imports
-    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        # Add src to path for imports
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-    import yaml  # noqa: E402 - vendored dependency
+        import yaml  # noqa: E402 - vendored dependency
 
-    from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
-    from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
-    from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
-    from schlock.integrations.shellcheck import (  # noqa: E402
-        format_findings_message,
-        get_security_findings,
-        is_shellcheck_available,
-        run_shellcheck,
-    )
-    from schlock.setup.config_writer import DEFAULT_RISK_PRESET, RISK_PRESETS  # noqa: E402
+        from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
+        from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
+        from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
+        from schlock.integrations.shellcheck import (  # noqa: E402
+            format_findings_message,
+            get_security_findings,
+            is_shellcheck_available,
+            run_shellcheck,
+        )
+        from schlock.setup.config_writer import DEFAULT_RISK_PRESET, RISK_PRESETS  # noqa: E402
 except BaseException as exc:  # BaseException, not Exception: a dependency that exits on
     # import raises SystemExit, and that must deny too rather than fall through silently.
-    reason = f"BLOCKED: schlock failed to start: {type(exc).__name__}: {exc}"
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
+    try:
+        # Rendering the exception is itself a failure path — __str__ is allowed to raise,
+        # and an unrenderable one used to take this handler down with it, back to the empty
+        # stdout and exit 1 this guard exists to prevent.
+        detail = f"{type(exc).__name__}: {exc}"
+    except BaseException:
+        detail = "an error whose text could not be rendered"
+    reason = f"BLOCKED: schlock failed to start: {detail}"
+    try:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    }
                 }
-            }
+            )
         )
-    )
-    # Also on stderr: on exit 2 the harness falls back to stderr for the blocking message
-    # when it cannot read the JSON, and an unexplained block on every command is the kind
-    # users respond to by removing the hook.
-    print(reason, file=sys.stderr)
-    sys.exit(2)
+        # Also on stderr: on exit 2 the harness falls back to stderr for the blocking
+        # message when it cannot read the JSON, and an unexplained block on every command
+        # is the kind users respond to by removing the hook.
+        print(reason, file=sys.stderr)
+    finally:
+        # Whatever failed while reporting, still exit 2 — it blocks on its own.
+        sys.exit(2)
 
 # Configure logging to stderr
 logging.basicConfig(level=logging.INFO, format="[schlock-hook] %(levelname)s: %(message)s", stream=sys.stderr)

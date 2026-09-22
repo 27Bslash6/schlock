@@ -567,18 +567,36 @@ class TestUnscannableMessageHookHandling:
         assert "unscannable" in joined  # warn detection survives the error-deny path
 
 
-def _unimportable_shim(tmp_path, module, exc_type):
+# Hostile dependencies, defined in the shim and raised by name. Both are legal Python that
+# a real broken dependency can produce, and both used to defeat the guard's failure handler.
+_UNRENDERABLE = (
+    'class BrokenText(BaseException):\n    def __str__(self):\n        raise RuntimeError("cannot render exception")\n'
+)
+_PRINTS_TO_STDOUT = (
+    "class NoisyError(ModuleNotFoundError):\n"
+    "    def __init__(self, *a):\n"
+    '        print("dependency-noise")\n'
+    "        super().__init__(*a)\n"
+)
+
+
+def _unimportable_shim(tmp_path, module, exc_type, prelude=""):
     """Return a PYTHONPATH entry whose sitecustomize makes `module` raise on import.
 
     A sys.meta_path finder rather than a shadowing file on PYTHONPATH: the hook
     sys.path.insert(0)s its vendor and src directories, so a planted module loses to the
     real one. meta_path runs ahead of sys.path entirely, so this works wherever the hook's
-    dependencies actually live.
+    dependencies actually live. It also shadows any platform sitecustomize, which is why the
+    tests assert the shim's own marker rather than trusting that the guard is what fired.
+
+    `prelude` defines an exception class for `exc_type` to name; without it, `exc_type` has
+    to be a builtin.
     """
     shim = tmp_path / "shim"
     shim.mkdir()
     (shim / "sitecustomize.py").write_text(
         "import sys\n"
+        f"{prelude}"
         f"_NAME = {module!r}\n"
         "class _Blocker:\n"
         "    def find_spec(self, fullname, path=None, target=None):\n"
@@ -638,17 +656,24 @@ class TestHookSubprocess:
         assert self._decision(proc)["permissionDecision"] == "deny"
 
     @pytest.mark.parametrize(
-        ("module", "exc_type"),
-        [("yaml", "ModuleNotFoundError"), ("schlock", "SystemExit")],
-        ids=["vendored-dep-unreachable", "dependency-exits-on-import"],
+        ("module", "exc_type", "prelude"),
+        [
+            ("yaml", "ModuleNotFoundError", ""),
+            ("schlock", "SystemExit", ""),
+            ("yaml", "NoisyError", _PRINTS_TO_STDOUT),
+        ],
+        ids=["vendored-dep-unreachable", "dependency-exits-on-import", "dependency-prints-on-import"],
     )
-    def test_import_failure_denies_and_exits_2(self, tmp_path, module, exc_type):
+    def test_import_failure_denies_and_exits_2(self, tmp_path, module, exc_type, prelude):
         """A dependency the hook cannot import must still deny — not exit 1 with no decision.
 
         SystemExit is the param that pins `except BaseException`: it is not an Exception, so
         narrowing the guard reopens the hole without a ModuleNotFoundError case noticing.
+        NoisyError pins that a dependency's own stdout cannot corrupt the decision — without
+        the redirect, `_decision` gets `dependency-noise\\n{...}` and fails to parse it.
         """
-        proc = self._run(self._bash("rm -rf /"), {"PYTHONPATH": _unimportable_shim(tmp_path, module, exc_type)})
+        shim = _unimportable_shim(tmp_path, module, exc_type, prelude)
+        proc = self._run(self._bash("rm -rf /"), {"PYTHONPATH": shim})
         assert proc.returncode == 2
         output = self._decision(proc)
         assert output["permissionDecision"] == "deny"
@@ -657,6 +682,20 @@ class TestHookSubprocess:
         # The shim's own marker, not the module name: "schlock" appears in the guard's fixed
         # prefix, so asserting the name would pass on any unrelated import failure.
         assert f"{module} is unimportable" in reason
+
+    def test_import_failure_denies_when_the_error_cannot_be_rendered(self, tmp_path):
+        """An exception whose __str__ raises must not take the failure handler down with it.
+
+        The handler interpolates the exception to build its reason, so an unrenderable one
+        used to raise *inside* the guard: exit 1, empty stdout — the fail-open this whole
+        guard exists to close, reachable through it.
+        """
+        shim = _unimportable_shim(tmp_path, "yaml", "BrokenText", _UNRENDERABLE)
+        proc = self._run(self._bash("rm -rf /"), {"PYTHONPATH": shim})
+        assert proc.returncode == 2
+        output = self._decision(proc)
+        assert output["permissionDecision"] == "deny"
+        assert "could not be rendered" in output["permissionDecisionReason"]
 
     def test_unparseable_stdin_denies_and_exits_2(self):
         """The invalid-input deny also exits 2, so the block does not rest on stdout parsing."""
