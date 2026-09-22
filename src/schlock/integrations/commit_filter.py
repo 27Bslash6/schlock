@@ -732,7 +732,7 @@ class CommitMessageFilter:
         unblanked in ``scan_chars`` after the quote pass — an O(1) test, so a line packed with
         quoted decoys costs one regex pass, not openers × quoted-spans. Returns
         ``(bindings, scan_text)`` where ``bindings`` is ``[(opener_start_pos, body, fd), ...]`` in
-        source order — ``fd`` from ``_heredoc_target_fd`` (0 unless explicitly numbered, e.g.
+        source order — ``fd`` from ``_redirect_target_fd`` (0 unless explicitly numbered, e.g.
         ``3<<B``) — and ``scan_text`` is ``command`` with every heredoc body, quoted span,
         escaped char and comment blanked to same-length spaces (offsets still line up with
         ``command``): the only text safe to scan for a real ``-F``/``--file`` flag, and in which
@@ -775,20 +775,22 @@ class CommitMessageFilter:
                     body_lines.append(test_line)  # `<<-` strips each body line's leading tabs, as bash and bashlex do
                     cursor = next_nl + 1
                 scan_chars[body_start:cursor] = " " * (cursor - body_start)
-                results.append((opener_pos, "\n".join(body_lines), self._heredoc_target_fd(command, opener_pos)))
+                results.append((opener_pos, "\n".join(body_lines), self._redirect_target_fd(command, opener_pos)))
             pos = cursor
         return results, "".join(scan_chars)
 
     @staticmethod
-    def _heredoc_target_fd(command: str, opener_start: int) -> int:
-        """The fd a `<<`/`<<-` heredoc opener at ``opener_start`` targets — the digit run
-        immediately preceding it with no separating whitespace (bash's ``[n]<<word`` syntax,
-        e.g. ``3<<B``), or 0 (stdin, the default unnumbered form) if there is none.
+    def _redirect_target_fd(command: str, redirect_start: int) -> int:
+        """The fd a redirect operator starting at ``redirect_start`` targets — the digit run
+        immediately preceding it with no separating whitespace (bash's ``[n]<word`` / ``[n]<<word``
+        syntax, e.g. ``3<<B``, ``2<&1``), or 0 (the default unnumbered form) if there is none.
+        Generic across redirect operators, not just heredoc openers: bash's digit-prefix rule
+        doesn't care which operator follows.
         """
-        j = opener_start
+        j = redirect_start
         while j > 0 and command[j - 1].isdigit():
             j -= 1
-        return int(command[j:opener_start]) if j < opener_start else 0
+        return int(command[j:redirect_start]) if j < redirect_start else 0
 
     @staticmethod
     def _strip_heredoc_terminator(value: str, delim: str) -> str:
@@ -922,17 +924,28 @@ class CommitMessageFilter:
         return own[-1][1]
 
     def _stdin_overridden_after(self, scan_text: str, opener_pos: int) -> bool:
-        """True if a later fd-0 redirect on ``opener_pos``'s logical line overrides its heredoc.
+        """True if a later fd-0 redirect on ``opener_pos``'s logical COMMAND overrides its heredoc.
 
         bash applies ALL fd-0 redirects left to right, not just repeated heredocs: a later plain
         redirect (``< /dev/null``, ``<&3``, a here-string ``<<< str``) silently discards this
         heredoc's body too (verified: ``bash -c "cat <<X < /dev/null\\n...\\nX"`` prints nothing).
-        Searches the opener's own logical line, after its own ``<<``/``<<-``, for such a redirect.
+        Searches after the opener's own ``<<``/``<<-``, up to the first command separator or the
+        end of the logical line (whichever comes first — a sibling command chained with ``;``/
+        ``|``/``&&`` on the SAME physical line owns its own redirects, not this heredoc's). A run
+        of ``<`` of length other than 2 is some other redirect operator (length 2 is just another
+        ``<<``/``<<-`` heredoc opener); it only overrides when it explicitly or implicitly targets
+        fd 0 — an unrelated ``2<&1``/``2<file`` on the same line must not be mistaken for one.
         """
         line_end = scan_text.find("\n", opener_pos)
         if line_end == -1:
             line_end = len(scan_text)
-        return any(len(m.group()) != 2 for m in self._REDIRECT_RUN_RE.finditer(scan_text, opener_pos + 2, line_end))
+        sep = self._COMMAND_SEPARATOR_RE.search(scan_text, opener_pos + 2, line_end)
+        if sep is not None:
+            line_end = sep.start()
+        return any(
+            len(m.group()) != 2 and self._redirect_target_fd(scan_text, m.start()) == 0
+            for m in self._REDIRECT_RUN_RE.finditer(scan_text, opener_pos + 2, line_end)
+        )
 
     # Explanation surfaced when an unscannable commit is warned/blocked. Unscannable always
     # means file/stdin delivery (-F/--file), so a single static message suffices.

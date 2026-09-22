@@ -1896,13 +1896,33 @@ class TestHeredocStdinExtraction:
         assert clean.message_delivery == "scannable"
         assert not clean.patterns_removed
 
+    def test_shape1_unrelated_fd_redirect_does_not_falsely_override(self):
+        # Panel-found (expert-panel-review, LAB-3904): the override check must be fd-0-aware, not
+        # "any non-`<<` run of `<`". A redirect on a DIFFERENT explicit fd (`2<&1`, `2<file`) never
+        # touches stdin, so it must not be mistaken for an override of the commit's own heredoc.
+        for suffix in ("2<&1", "2<file"):
+            cmd = f"git commit -F- <<'X' {suffix}\nGenerated with Claude Code\nX\n"
+            result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+            assert result.message_delivery == "scannable", suffix
+            assert result.patterns_removed, suffix
+
+    def test_shape1_sibling_command_redirect_does_not_falsely_override(self):
+        # Panel-found (expert-panel-review, LAB-3904): the override search must stop at a command
+        # separator on the same physical line — a sibling command chained with `;` owns its own
+        # redirects, they are not a later redirect on the heredoc opener's own command.
+        cmd = "git commit -F- <<'X'; echo hi < /dev/null\nGenerated with Claude Code\nX\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
     def test_shape2_quoted_stdin_target_binds_heredoc(self):
         # LAB-3904 shape 2: a quoted stdin target still reads stdin in real bash (verified:
         # `cat '-' <<'X'` prints the heredoc body) — the quote pass used to blank the whole span,
         # hiding the target from the flag scan and reporting unscannable even though the message
         # bytes are right there in the command. Covers a separate quoted value (`-F '-'`), a
-        # quoted attached short form (`"-F-"`), and a quoted `--file` value (`'/dev/stdin'`).
-        for flag in ("-F '-'", '"-F-"', "--file '/dev/stdin'"):
+        # quoted attached short form (`"-F-"`), a quoted attached long form (`"--file=-"`), and a
+        # quoted `--file` value (`'/dev/stdin'`).
+        for flag in ("-F '-'", '"-F-"', '"--file=-"', "--file '/dev/stdin'"):
             dirty = self._filter(self._ad_rules()).filter_commit_message(
                 f"git commit {flag} <<'X'\nGenerated with Claude Code\nX\n"
             )
