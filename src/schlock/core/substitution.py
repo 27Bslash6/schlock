@@ -4,7 +4,8 @@ This module provides AST-based detection and validation of command substitution
 $(cmd) and process substitution <(cmd) patterns.
 
 Security Model:
-1. WHITELIST FIRST - Known-safe commands (op, date, git, etc.) pass immediately
+1. WHITELIST FIRST - Known-safe base commands take the fast path, but every tier
+   still runs the YAML rules: a whitelist judges the base command, not the invocation
 2. AST STRUCTURAL CHECKS - Detect brace expansion, variable commands, etc.
 3. RECURSIVE VALIDATION - Full validation of inner commands with depth limit
 4. DEFAULT-DENY - Unknown commands in substitution context are blocked
@@ -99,7 +100,9 @@ SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         "sha256sum",
         "shasum",
         "cksum",
-        # Git (read-only operations - write ops would fail in substitution anyway)
+        # Git. A substitution EXECUTES what it expands, so write ops do NOT "fail in
+        # substitution anyway" — $(git push) really pushes. Whitelisting admits the base
+        # command only; the YAML rules judge the subcommand. See _check_inner_rules.
         "git",
         # Directory change (subshell-pure: only affects cwd inside the $() subshell, no exec).
         # Safe to whitelist now that $(cd … && …) parses; without it the canonical repro
@@ -154,11 +157,10 @@ SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
-# Commands that are conditionally safe inside substitution
-# These require subcommand-level analysis AND still go through YAML rules.
-# Unlike SAFE_SUBSTITUTION_COMMANDS (which bypass rules), contextual commands
-# preserve defense-in-depth: the YAML rule engine catches dangerous patterns
-# (e.g., kubectl_secrets_theft) that the subcommand allowlist alone would miss.
+# Commands that are conditionally safe inside substitution.
+# Every tier runs the YAML rules (_check_inner_rules); what this tier ADDS is
+# subcommand-level structural analysis in _has_dangerous_inner_structure(), for commands
+# whose safety is decided by the subcommand rather than by the base command.
 CONTEXTUAL_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
     {
         # kubectl: read-only subcommands safe, state-modifying subcommands dangerous
@@ -753,6 +755,108 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
     return None
 
 
+# A word whose leading run of non-whitespace contains '=' is structured: the program splits it
+# and reads the right-hand side, and only that side was ever quoted. See _is_opaque_argument.
+_STRUCTURED_WORD = re.compile(r"^\S*=")
+
+
+def _is_opaque_argument(part: Any) -> bool:
+    """Is this word ONE argument the command receives whole, with nothing to interpret inside?
+
+    Only such a word is data. The test is not "was it quoted" but "is it opaque", and the two
+    part company on exactly the shapes that bite:
+
+    * ``--extcmd='rm -rf /'`` survives word-splitting as one argv entry, yet only the VALUE was
+      quoted — git splits at the ``=`` and runs the right-hand side. Treating it as data made
+      the substitution path WEAKER than bare text for eight such flags. The top-level
+      :meth:`BashCommandParser.extract_string_literals` refuses a partially-quoted word for the
+      same reason; this keeps the two models agreeing.
+    * ``$(echo rm -rf /)`` inside a word holds whitespace with no quote anywhere — bashlex keeps
+      a nested substitution's source verbatim in ``.word``. It is code, and suppressing it would
+      silently disable this whole-text pass over every nested substitution.
+
+    Whitespace is still what proves the word arrived as one piece: shell word-splitting would
+    have torn it apart otherwise, whether it was held together by quotes or by backslashes.
+    """
+    word = getattr(part, "word", "")
+    if not any(char.isspace() for char in word):
+        return False
+    if _STRUCTURED_WORD.match(word):
+        return False
+    return not any(
+        getattr(child, "kind", None) in ("commandsubstitution", "processsubstitution")
+        for child in getattr(part, "parts", None) or []
+    )
+
+
+def _command_tokens(node: Any) -> list[tuple[str, bool]]:
+    """Words of one simple command as ``(text, is_data)`` pairs.
+
+    The first word is exempt whatever its shape: a quoted command name is still the command
+    being run, so ``$('rm -rf /' foo)`` must keep matching the rule it names.
+    """
+    parts = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
+    return [(part.word, index > 0 and _is_opaque_argument(part)) for index, part in enumerate(parts)]
+
+
+# Shapes that hand one of their own arguments to a shell. These take the command as a SEPARATE
+# word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD.
+_ARGUMENT_EXECUTING_FLAGS = frozenset(
+    {
+        "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
+        "--parent-filter", "--exec", "--extcmd", "--upload-pack", "--receive-pack",
+        "--to-cmd", "--cc-cmd", "--header-cmd", "--sendmail-cmd", "--access-hook",
+        "--authors-prog", "--compress-program", "--diff-program", "--pager",
+    }
+)  # fmt: skip
+# `-x` is paired with its subcommand rather than listed flat. It runs a command for `git rebase`
+# and `git difftool`, but `grep -x` matches whole lines, `diff -x` excludes a pattern and `ls -x`
+# sorts across — a flat entry is matched against every command and over-blocks all three.
+_ARGUMENT_EXECUTING_GIT = (
+    ("submodule", "foreach"),
+    ("bisect", "run"),
+    ("filter-branch",),
+    ("rebase", "-x"),
+    ("difftool", "-x"),
+)
+
+
+def _executes_an_argument(words: list[str]) -> bool:
+    """Does this command hand one of its own arguments to a shell?
+
+    Then NOTHING it receives is opaque data, however it was quoted, and the whole-text rule
+    pass has to see all of it. ``git`` is the case that matters: it is whitelisted per BASE
+    command, but its risk lives in the subcommand, and the structural guard enumerates only
+    ``-c KEY=VAL`` — so ``git submodule foreach 'rm -rf /'`` would otherwise have its payload
+    suppressed as an argument (LAB-4234).
+
+    Deliberately coarse: a match disables suppression for the whole rendered command, which
+    only ever costs a false positive on an exotic spelling, never a missed denial.
+    """
+    if any(word in _ARGUMENT_EXECUTING_FLAGS for word in words):
+        return True
+    return "git" in words and any(all(part in words for part in shape) for shape in _ARGUMENT_EXECUTING_GIT)
+
+
+def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, int]]]:
+    """Join tokens with single spaces; return the text and the spans holding opaque data.
+
+    Each span widens by one onto the separators that stand where the quoting used to.
+    Rules anchored with ``(\\s|$)`` consume the separator, and ``_is_in_string_literal``
+    demands the WHOLE match sit inside a span, so an unwidened span misses the suppression.
+    """
+    text = " ".join(token for token, _ in tokens)
+    if _executes_an_argument([token for token, _ in tokens]):
+        return text, []
+    ranges: list[tuple[int, int]] = []
+    position = 0
+    for token, is_data in tokens:
+        if is_data:
+            ranges.append((max(0, position - 1), min(len(text), position + len(token) + 1)))
+        position += len(token) + 1
+    return text, ranges
+
+
 @dataclass
 class SubstitutionNode:
     """Represents a command or process substitution in the AST."""
@@ -763,6 +867,8 @@ class SubstitutionNode:
     ast_node: Any  # The bashlex AST node
     nested_substitutions: list[SubstitutionNode] = field(default_factory=list)
     depth: int = 0  # Nesting depth
+    # Spans of inner_command that are quoted arguments, for the rule engine's string_literals.
+    literal_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 class _ListSegment:
@@ -775,6 +881,89 @@ class _ListSegment:
 
     def __init__(self, command: Any) -> None:
         self.command = command
+
+
+# Redirect operators that only ever READ. Everything else writes, truncates or opens for
+# write — including the ones an enumeration of write operators keeps missing (`>|` clobber,
+# `&>`/`&>>` all-streams, `<>` read-write). The guard below tests membership of THIS set and
+# treats the complement as a write, so a redirect operator nobody here has thought of fails
+# closed instead of sailing through.
+_READ_REDIRECT_TYPES = frozenset({"<", "<<", "<<-", "<<<", "<&"})
+
+
+def _is_write_redirect(part: Any) -> bool:
+    """True if this RedirectNode writes anywhere but /dev/null.
+
+    >/dev/null and 2>/dev/null DISCARD output — nothing is written, so the noise-suppression
+    idiom `$(ls dir 2>/dev/null | wc -l)` stays allowed. Any other target counts as a write,
+    including `>&2`, whose output is an int fd rather than a word. See #104.
+    """
+    if getattr(part, "kind", None) != "redirect":
+        return False
+    if getattr(part, "type", None) in _READ_REDIRECT_TYPES:
+        return False
+    return getattr(getattr(part, "output", None), "word", None) != "/dev/null"
+
+
+class _TrimmedList:
+    """A ListNode with its trailing terminator operator removed — see _strip_group_terminator."""
+
+    __slots__ = ("kind", "parts")
+
+    def __init__(self, parts: list[Any]) -> None:
+        self.kind = "list"
+        self.parts = parts
+
+
+def _strip_group_terminator(node: Any) -> Any:
+    """`{ a; b; }` -> `a; b`. The `;` before `}` is mandatory grouping syntax, so bashlex renders
+    a brace group as a ListNode ending in a terminator operator. That shape is a malformed list to
+    ``_is_valid_list_topology`` (which requires ending on a segment), so every brace group was
+    reported as a malformed AST — the exact message this function exists to avoid — while the
+    identical subshell `( a; b )` validated normally.
+
+    Peeling the terminator is not a relaxation of the topology rule: what remains is checked by
+    it unchanged, so `{ a; ; b; }` still fails closed. A single command is returned as itself;
+    anything longer is returned as a list for per-segment validation.
+    """
+    if getattr(node, "kind", None) != "list":
+        return node
+    parts = list(getattr(node, "parts", []))
+    if not parts or getattr(parts[-1], "kind", None) != "operator" or getattr(parts[-1], "op", None) not in (";", "&"):
+        return node
+    parts = parts[:-1]
+    if len(parts) == 1:
+        return parts[0]
+    return _TrimmedList(parts)
+
+
+def _unwrap_compound(node: Any) -> Any:
+    """Peel `( … )` / `{ …; }` wrappers off a substitution so the extractors see the real command.
+
+    bashlex models `$( (cmd) )` as a CompoundNode whose ``.list`` is
+    ``[ReservedwordNode('('), <cmd>, ReservedwordNode(')')]``. Every extractor in this module keys
+    off ``.command`` being a command/list/pipeline, so without unwrapping the substitution renders
+    to None, is dropped before any validation runs, and the inner command is never checked at all —
+    ``$( (rm -rf /) )`` read SAFE. Subshell/brace grouping changes nothing a validator cares about,
+    so the grouping is transparent: `$( ( X ) )` is validated exactly as `$( X )`.
+
+    NOT unwrapped — these keep their compound node and fail closed downstream: a compound whose
+    own redirections WRITE (`$( (ls) > f )`, a real side effect), and one holding anything but a
+    single command (`if`/`for`/`while`, whose branches this module cannot decompose). A read or a
+    discard (`$( (ls) 2>/dev/null )`) is inert, so it unwraps — refusing on *any* redirect made
+    grouping lose the /dev/null exemption that the same redirect gets on a bare command.
+    """
+    for _ in range(MAX_SUBSTITUTION_DEPTH):
+        cmd = getattr(node, "command", None)
+        if getattr(cmd, "kind", None) != "compound":
+            return node
+        if any(_is_write_redirect(r) for r in getattr(cmd, "redirects", None) or []):
+            return node  # a write on the group is a real side effect, not inert grouping
+        inner = [c for c in getattr(cmd, "list", None) or [] if getattr(c, "kind", None) != "reservedword"]
+        if len(inner) != 1 or getattr(inner[0], "kind", None) not in ("command", "list", "pipeline", "compound"):
+            return node
+        node = _ListSegment(_strip_group_terminator(inner[0]))
+    return node
 
 
 @dataclass
@@ -791,11 +980,6 @@ class SubstitutionValidationResult:
 
 class SubstitutionValidator:
     """Validates commands inside shell substitution constructs.
-
-    Uses a three-layer approach:
-    1. Whitelist check for known-safe commands (fast path)
-    2. AST structural checks for suspicious patterns
-    3. Recursive validation with depth limit
 
     Example:
         >>> validator = SubstitutionValidator(parser, rule_engine)
@@ -848,8 +1032,10 @@ class SubstitutionValidator:
                 substitutions.extend(self._substitutions_in_parameter(node, current_depth))
                 return
 
-            # Recurse into child nodes
-            for attr in ["parts", "command", "list", "pipe", "compound"]:
+            # Recurse into child nodes. "redirects"/"output" reach process substitutions used as
+            # redirection targets — `cat < <(git push)`, `echo x > >(cmd)` — which hang off
+            # RedirectNode.output and were otherwise never extracted, so no tier ever saw them.
+            for attr in ["parts", "command", "list", "pipe", "compound", "redirects", "output"]:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -949,30 +1135,34 @@ class SubstitutionValidator:
         Returns:
             SubstitutionNode or None if extraction fails
         """
-        inner_command = self._extract_inner_command_text(node)
+        node = _unwrap_compound(node)
+        inner_command, literal_ranges = self._extract_inner_command_text(node)
         # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
         # survive even when text rendering is partial (e.g. a compound segment renders to None).
         # Dropping it here would silently skip validation -> fail OPEN. Per-segment logic blocks
-        # the unrenderable segment instead. Non-list substitutions with no extractable command
-        # stay dropped (genuinely unparseable).
+        # the unrenderable segment instead. So does every other shape that renders to None: a
+        # compound that survived _unwrap_compound (an `if`, a write-redirecting subshell), and a
+        # command with no words at all (`$( > file )`, which bash still opens and truncates).
+        # Enumerating the kinds that may survive is what let those through — the node is kept
+        # whenever there IS one, and having no base command fails it closed in every tier below.
+        # Only a substitution with no command node at all is dropped (genuinely unparseable).
         #
-        # `compound` earns the same protection, and for the same reason. $({ curl evil; }) and
-        # $( ( curl evil ) ) render to None because a compound's first child is a reservedword
-        # with no `.parts`, so this guard dropped the WHOLE substitution and curl was never
-        # validated -> ALLOW, while the bare $(curl evil) BLOCKs. Retaining the node blocks
-        # through TWO mechanisms, and both must survive a refactor: a bashlex `{ … }` compound
-        # has no resolvable base_command (its first `.list` child is a reservedword with no
-        # `.parts`), so validate_substitution's final "Cannot determine command" branch denies
-        # it; a native clause compound ($(if true; then …; fi)) DOES resolve a base command,
-        # and when that command is whitelisted the block comes from
-        # _check_structural_and_nested -> _has_dangerous_inner_structure's "compound command
-        # in substitution" check instead.
+        # `compound` was the first kind to earn that protection, and for the same reason.
+        # $({ curl evil; }) and $( ( curl evil ) ) rendered to None because a compound's first
+        # child is a reservedword with no `.parts`, so an enumerating guard dropped the WHOLE
+        # substitution and curl was never validated -> ALLOW, while the bare $(curl evil) BLOCKs.
+        # _unwrap_compound now peels plain grouping before this point; a compound it leaves in
+        # place resolves NO base_command — a `{ … }`/`( … )` group leads with a reservedword that
+        # has no `.parts`, and a native clause ($(if …; fi)) leads with a keyword that
+        # _extract_base_command refuses — so validate_substitution's final "Cannot determine
+        # command" branch denies it (pinned by test_undecomposable_groups_fail_closed and
+        # TestClauseInsideSubstitution). _has_dangerous_inner_structure's "compound command in
+        # substitution" check is the backstop behind that, not reached today.
         # Found by the LAB-912 expert panel; the hole predates the native tier (bashlex emits
         # `compound` for `{ … }` too) and widened to every clause once T2c mapped
         # if/while/for/case/functions onto `compound`.
         cmd_node = getattr(node, "command", None)
-        keeps_structure = getattr(cmd_node, "kind", None) in ("list", "compound")
-        if not inner_command and not keeps_structure:
+        if not inner_command and cmd_node is None:
             return None
 
         base_command = self._extract_base_command(node)
@@ -993,77 +1183,77 @@ class SubstitutionValidator:
             ast_node=node,
             nested_substitutions=nested,
             depth=depth,
+            literal_ranges=literal_ranges,
         )
 
-    def _extract_inner_command_text(self, node: Any) -> str | None:  # noqa: PLR0911, PLR0912
-        """Extract the command text from inside a substitution.
+    def _extract_inner_command_text(self, node: Any) -> tuple[str | None, list[tuple[int, int]]]:  # noqa: PLR0911, PLR0912
+        """Extract the command text from inside a substitution, with its quoted-data spans.
+
+        The text is the shell's WORD view, so the quotes are gone and the spans are the only
+        thing left telling the rule engine which stretches of it are arguments rather than
+        code. Without them a whitelisted reader searching for a dangerous string matches the
+        very rule it is searching for, and the substitution amplifier turns an ordinary
+        recursive grep into a denial (LAB-4234).
 
         Args:
             node: The substitution AST node
 
         Returns:
-            Command string or None
+            ``(command string or None, quoted-data ranges into that string)``
         """
         if not hasattr(node, "command"):
-            return None
+            return None, []
 
         cmd_node = node.command
         if not cmd_node:
-            return None
+            return None, []
 
         # Handle pipeline: $(cmd1 | cmd2)
         if hasattr(cmd_node, "kind") and cmd_node.kind == "pipeline":
-            parts_text: list[str] = []
+            tokens: list[tuple[str, bool]] = []
             if hasattr(cmd_node, "parts"):
                 for part in cmd_node.parts:
                     if hasattr(part, "kind"):
                         if part.kind == "command" and hasattr(part, "parts"):
-                            cmd_words = [p.word for p in part.parts if hasattr(p, "word")]
-                            if cmd_words:
-                                parts_text.append(" ".join(cmd_words))
+                            tokens.extend(_command_tokens(part))
                         elif part.kind == "pipe":
-                            parts_text.append("|")
-            return " ".join(parts_text) if parts_text else None
+                            tokens.append(("|", False))
+            return _join_tokens(tokens) if tokens else (None, [])
 
         # Handle command list: $(cmd1; cmd2), $(cmd1 && cmd2), $(cmd1 | cmd2 || cmd3), ...
         # This text feeds the Layer-4 YAML rule match and the audit log, so it must render EVERY
         # segment faithfully. A segment that cannot be rendered returns None (fail closed) rather
         # than a truncated string that would hide a dropped pipeline/compound from the rule engine.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
-            parts_text = []
+            tokens = []
             if hasattr(cmd_node, "parts"):
                 for part in cmd_node.parts:
                     kind = getattr(part, "kind", None)
                     if kind == "operator":
                         if not hasattr(part, "op"):
-                            return None
-                        parts_text.append(part.op)
+                            return None, []
+                        tokens.append((part.op, False))
                         continue
-                    rendered = self._render_segment_text(part)
+                    rendered = self._render_segment_tokens(part)
                     if rendered is None:
-                        return None  # unrenderable segment -> fail closed
-                    parts_text.append(rendered)
-            return " ".join(parts_text) if parts_text else None
+                        return None, []  # unrenderable segment -> fail closed
+                    tokens.extend(rendered)
+            return _join_tokens(tokens) if tokens else (None, [])
 
         # Handle simple command: try to get from parts
-        words: list[str] = []
-        if hasattr(cmd_node, "parts"):
-            for part in cmd_node.parts:
-                if hasattr(part, "word"):
-                    words.append(part.word)
-
-        if words:
-            return " ".join(words)
+        tokens = _command_tokens(cmd_node)
+        if tokens:
+            return _join_tokens(tokens)
 
         # Fallback: try to get from list (compound commands)
         if hasattr(cmd_node, "list") and cmd_node.list:
             # For compound commands, return first command
             first = cmd_node.list[0] if cmd_node.list else None
-            if first and hasattr(first, "parts"):
-                words = [p.word for p in first.parts if hasattr(p, "word")]
-                return " ".join(words) if words else None
+            tokens = _command_tokens(first) if first else []
+            if tokens:
+                return _join_tokens(tokens)
 
-        return None
+        return None, []
 
     def _segment_base_command(self, node: Any) -> str | None:
         """First word of a list segment (a `command`, or the first command of a `pipeline`).
@@ -1087,33 +1277,35 @@ class SubstitutionValidator:
             return None
         return None
 
-    def _render_segment_text(self, node: Any) -> str | None:
-        """Render one list segment (command or pipeline) to faithful command text.
+    def _render_segment_tokens(self, node: Any) -> list[tuple[str, bool]] | None:
+        """Render one list segment (command or pipeline) to faithful command tokens.
 
         Returns None for anything that cannot be rendered verbatim (compound `{ … }`/`( … )`,
         a pipeline containing a reserved word like `!`, or an empty command). Callers treat None
         as fail-closed: the segment is still validated structurally via its AST node, but it never
         contributes a truncated string to the rule engine or audit log. Redirections are dropped
         from the text (they are detected structurally), matching the simple-command rendering.
+
+        Tokens rather than text, so the caller can join the whole list in one pass and get the
+        quoted-data spans at their final offsets (see :func:`_join_tokens`).
         """
         kind = getattr(node, "kind", None)
         if kind == "command":
-            words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
-            return " ".join(words) if words else None
+            return _command_tokens(node) or None
         if kind == "pipeline":
-            rendered: list[str] = []
+            rendered: list[tuple[str, bool]] = []
             for part in getattr(node, "parts", []):
                 part_kind = getattr(part, "kind", None)
                 if part_kind == "pipe":
-                    rendered.append("|")
+                    rendered.append(("|", False))
                 elif part_kind == "command":
-                    words = [p.word for p in getattr(part, "parts", []) if hasattr(p, "word")]
-                    if not words:
+                    tokens = _command_tokens(part)
+                    if not tokens:
                         return None
-                    rendered.append(" ".join(words))
+                    rendered.extend(tokens)
                 else:
                     return None  # reserved word / unexpected node -> fail closed
-            return " ".join(rendered) if rendered else None
+            return rendered or None
         return None  # compound or unknown segment -> cannot render faithfully
 
     def _extract_base_command(self, node: Any) -> str | None:  # noqa: PLR0911, PLR0912
@@ -1158,10 +1350,18 @@ class SubstitutionValidator:
             if hasattr(first_part, "word"):
                 return first_part.word
 
-        # Handle compound command (command list)
+        # Handle compound command (command list). A control-flow compound that survived
+        # _unwrap_compound ($(if …; fi), $(for …; done)) leads with a ReservedwordNode, whose
+        # .word is "if"/"for" — a keyword, not a command. Returning it made the tiers below judge
+        # a whole uninspectable branch as an unknown command (HIGH, allowed under permissive);
+        # returning None fails it closed instead.
         if hasattr(cmd_node, "list") and cmd_node.list:
             first = cmd_node.list[0]
+            if getattr(first, "kind", None) == "reservedword":
+                return None
             if hasattr(first, "parts") and first.parts:
+                if getattr(first.parts[0], "kind", None) == "reservedword":
+                    return None
                 first_part = first.parts[0]
                 if hasattr(first_part, "word"):
                     return first_part.word
@@ -1326,7 +1526,8 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             return True, "command chain in substitution"
 
-        # Compound command: $(if ...; then ...; fi) etc.
+        # Compound command: $(if ...; then ...; fi). A backstop — no base command means no
+        # whitelist hit, so this helper is not reached for one today.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "compound":
             return True, "compound command in substitution"
 
@@ -1334,16 +1535,9 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "parts"):
             args: list[str] = []
             for part in cmd_node.parts:
-                # Output redirection: $(echo x > file) or $(echo x >> file)
-                if hasattr(part, "kind") and part.kind == "redirect":
-                    if hasattr(part, "type") and part.type in (">", ">>", ">&"):
-                        # >/dev/null and 2>/dev/null DISCARD output — nothing is written, so the
-                        # common noise-suppression idiom $(ls dir 2>/dev/null | wc -l) stays
-                        # allowed. Any other target (including >&2, whose output is an int fd,
-                        # not a word) keeps the blunt no-writes-in-substitution block. See #104.
-                        target = getattr(getattr(part, "output", None), "word", None)
-                        if target != "/dev/null":
-                            return True, "output redirection in substitution"
+                # Any write redirection: $(echo x > file), $(… >| file), $(… &> file), $(… <> file)
+                if _is_write_redirect(part):
+                    return True, "output redirection in substitution"
 
                 # Collect arguments for dangerous pattern checks
                 if hasattr(part, "word"):
@@ -1531,6 +1725,7 @@ class SubstitutionValidator:
         inner_results: list[SubstitutionValidationResult] = []
         max_risk = RiskLevel.SAFE
         all_whitelisted = True
+        worst_denial: SubstitutionValidationResult | None = None
 
         for segment in segments:
             child = self._create_substitution_node(_ListSegment(segment), sub_node.substitution_type, depth)
@@ -1545,28 +1740,28 @@ class SubstitutionValidator:
             result = self.validate_substitution(child, depth)
             inner_results.append(result)
             if not result.allowed:
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=result.risk_level,
-                    message=result.message,
-                    inner_results=inner_results,
-                )
+                # Worst segment wins, not the first denied one. The level decides the action
+                # (HIGH -> ask, BLOCKED -> deny), so returning here reported `$( (a && rm -rf /) )`
+                # at the unknown-command level of `a` and never looked at the blacklisted `rm`.
+                if worst_denial is None or risk_order.index(result.risk_level) > risk_order.index(worst_denial.risk_level):
+                    worst_denial = result
+                continue
             if risk_order.index(result.risk_level) > risk_order.index(max_risk):
                 max_risk = result.risk_level
             all_whitelisted = all_whitelisted and result.whitelisted
 
+        if worst_denial is not None:
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=worst_denial.risk_level,
+                message=worst_denial.message,
+                inner_results=inner_results,
+            )
+
         # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
-        if sub_node.inner_command and self.rule_engine is not None:
-            rule_match = self.rule_engine.match_command(sub_node.inner_command)
-            if rule_match and rule_match.matched:
-                amplified_risk = self._amplify_risk(rule_match.risk_level)
-                if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-                    return SubstitutionValidationResult(
-                        allowed=False,
-                        risk_level=RiskLevel.BLOCKED,
-                        message=f"Inner command blocked: {rule_match.message}",
-                        inner_results=inner_results,
-                    )
+        blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
+        if blocked:
+            return blocked
 
         return SubstitutionValidationResult(
             allowed=True,
@@ -1616,9 +1811,16 @@ class SubstitutionValidator:
         if getattr(cmd_node, "kind", None) == "pipeline":
             return self._validate_pipeline_stages(sub_node, cmd_node, depth)
 
+        # INVARIANT: every path below that returns allowed=True must first pass
+        # _check_inner_rules(). Skipping it is what made a whitelisted command get a
+        # weaker check than an unrecognised one (LAB-4182).
+        #
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):
             blocked = self._check_structural_and_nested(sub_node, depth)
+            if blocked:
+                return blocked
+            blocked = self._check_inner_rules(sub_node)
             if blocked:
                 return blocked
             return SubstitutionValidationResult(
@@ -1629,26 +1831,16 @@ class SubstitutionValidator:
             )
 
         # Layer 1b: Contextual whitelist — commands with subcommand-dependent safety.
-        # Unlike the full whitelist, these STILL go through YAML rules (defense in depth).
+        # Adds subcommand structural analysis on top of the rules every tier runs.
         # e.g., kubectl: "get pods" is safe, but "get secrets -o json" is caught by YAML rules.
         if sub_node.base_command in CONTEXTUAL_SUBSTITUTION_COMMANDS:
             blocked = self._check_structural_and_nested(sub_node, depth)
             if blocked:
                 return blocked
 
-            # YAML rule check — defense in depth for contextual commands.
-            # This catches patterns like kubectl_secrets_theft, kubectl_rbac_manipulation
-            # that the structural checks alone would miss.
-            if sub_node.inner_command:
-                rule_match = self.rule_engine.match_command(sub_node.inner_command)
-                if rule_match and rule_match.matched:
-                    amplified_risk = self._amplify_risk(rule_match.risk_level)
-                    if amplified_risk in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-                        return SubstitutionValidationResult(
-                            allowed=False,
-                            risk_level=RiskLevel.BLOCKED,
-                            message=f"Inner command blocked: {rule_match.message}",
-                        )
+            blocked = self._check_inner_rules(sub_node)
+            if blocked:
+                return blocked
 
             # Passed structural checks AND YAML rules — safe in substitution
             return SubstitutionValidationResult(
@@ -1688,6 +1880,11 @@ class SubstitutionValidator:
                 )
 
         # Layer 4: Validate inner command against YAML rules
+        # NO literal_ranges here, deliberately: this tier judges commands the whitelist does not
+        # recognise, and "the quoted argument is data" is only true of a command we have vetted.
+        # An unknown binary may hand its argument straight to a shell — `ssh host 'rm -rf /'` is
+        # the plain case — so the tier that exists to fail closed must keep reading quoted text as
+        # code. Vetted readers get the suppression in _check_inner_rules instead.
         if sub_node.inner_command:
             rule_match = self.rule_engine.match_command(sub_node.inner_command)
             if rule_match and rule_match.matched:
@@ -1725,6 +1922,55 @@ class SubstitutionValidator:
             risk_level=RiskLevel.HIGH,
             message=f"Unknown command in substitution: {sub_node.base_command}. Add to whitelist if safe.",
             inner_results=inner_results,
+        )
+
+    def _check_inner_rules(
+        self,
+        sub_node: SubstitutionNode,
+        inner_results: list[SubstitutionValidationResult] | None = None,
+    ) -> SubstitutionValidationResult | None:
+        """Run the YAML rule engine over a substitution's inner command.
+
+        Defense in depth for every tier that would otherwise return allowed=True. Being on a
+        whitelist means the base command is safe to *name* in a substitution, not that every
+        invocation of it is: a whitelist is a base-command judgement, and base commands like
+        ``git`` and ``kubectl`` carry their real risk in the subcommand. Without this, a
+        whitelisted command got a weaker check than an unrecognised one (LAB-4182).
+
+        The returned risk is the rule's own level amplified by one, NOT a flat BLOCKED. The
+        hook maps risk to the action (HIGH -> ask, BLOCKED -> deny), so flattening turned a
+        MEDIUM rule into an un-promptable denial — a two-level jump the amplifier does not
+        claim, and enough over-blocking to make users switch schlock off.
+
+        The inner text is the parser's WORD view, so the quotes are gone by the time a rule
+        sees it and a reader searching for a dangerous string matches the string it is
+        searching for — ``grep -rn 'rm -rf' src/`` went from SAFE to an un-promptable BLOCKED,
+        a four-level jump on an ordinary recursive grep (LAB-4234). ``literal_ranges`` is what
+        tells the engine which stretches were quoted arguments. It is passed HERE and not at
+        Layer 4 because this tier only ever judges commands the whitelist vetted: their quoted
+        arguments really are data, whereas an unknown binary may hand its own straight to a
+        shell.
+
+        Returns:
+            A denial result if a rule matches at amplified HIGH or above, else None.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        if not sub_node.inner_command or self.rule_engine is None:
+            return None
+        rule_match = self.rule_engine.match_command(sub_node.inner_command, string_literals=sub_node.literal_ranges)
+        if not (rule_match and rule_match.matched):
+            return None
+        amplified_risk = self._amplify_risk(rule_match.risk_level)
+        if amplified_risk not in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+            return None
+        return SubstitutionValidationResult(
+            allowed=False,
+            risk_level=amplified_risk,
+            message=f"Inner command blocked: {rule_match.message}"
+            if amplified_risk == RiskLevel.BLOCKED
+            else f"Risky command in substitution: {rule_match.message}",
+            inner_results=inner_results or [],
         )
 
     def _amplify_risk(self, risk_level: RiskLevel) -> RiskLevel:

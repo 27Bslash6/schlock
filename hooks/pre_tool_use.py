@@ -171,7 +171,9 @@ def run_shellcheck_analysis(command: str) -> tuple[list, str]:
         return [], ""
 
     try:
-        findings = run_shellcheck(command, severity=config["severity"])
+        # None (no verdict) stays fail-open here, as before; the validator's heredoc
+        # pass is where an incomplete run is refused (LAB-4586).
+        findings = run_shellcheck(command, severity=config["severity"]) or []
 
         if config["security_only"]:
             findings = get_security_findings(findings)
