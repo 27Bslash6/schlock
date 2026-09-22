@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 #   "<>"  redirects. "ls -la > ~/.ssh/authorized_keys" is a whitelisted reader
 #         being used as an arbitrary-file writer; "ls <(curl ...|sh)" runs a
 #         second command the entry never mentioned.
+#   "\n"  separates commands. Every "\s" in a whitelist pattern matches a
+#         newline, so a "$"-anchored entry spans a string bash runs as SEVERAL
+#         commands: "chmod\n-R\n777\n/tmp/evil.sh" satisfies the /tmp chmod
+#         entry end to end, and the last line is an executable, not an operand.
+#         Because the span reaches "$" it also passes is_fully_whitelisted(),
+#         which is what short-circuits the whole multi-segment branch. Checked
+#         against command.rstrip() so one TRAILING newline still whitelists.
 #
 # Refusing the whitelist is NOT refusing the command. The whitelist is an
 # override that short-circuits to SAFE; declining it only sends the command to
@@ -41,7 +48,7 @@ logger = logging.getLogger(__name__)
 # Deliberately in the engine rather than in each YAML entry: the per-entry
 # version is this rule written once per pattern and re-written on every pattern
 # added, which is the failure this file has already had three tickets for.
-_WHITELIST_DISQUALIFIER = re.compile(r"\.\.|[<>]")
+_WHITELIST_DISQUALIFIER = re.compile(r"\.\.|[<>\n\r]")
 
 
 class RiskLevel(Enum):
@@ -513,6 +520,18 @@ class RuleEngine:
                 # No re.MULTILINE: whitelist uses match() which anchors at start.
                 # MULTILINE would change $ to match at line boundaries, not string end.
                 compiled = re.compile(pattern_str)
+                # is_whitelisted() refuses any command carrying a disqualifier before
+                # it ever consults a pattern, so an entry that describes one can never
+                # match and would otherwise fail silently - the user writes a whitelist
+                # rule for "psql db < schema.sql", sees it ignored, and has nothing to
+                # go on. Advisory, not fatal: the source is a regex, so "\.\." here is
+                # a literal ".." but a bare ".." is two wildcards and may be harmless.
+                if _WHITELIST_DISQUALIFIER.search(pattern_str):
+                    logger.warning(
+                        f"Whitelist pattern {pattern_str!r} describes '..', a redirection or a "
+                        f"newline; such commands are refused before patterns are consulted, so "
+                        f"this entry may never match."
+                    )
                 self.whitelist_patterns.append(compiled)
             except re.error as e:
                 raise ConfigurationError(
@@ -661,7 +680,7 @@ class RuleEngine:
             True if command matches any whitelist pattern, and carries neither
             ".." nor a redirection (see _WHITELIST_DISQUALIFIER)
         """
-        if _WHITELIST_DISQUALIFIER.search(command):
+        if _WHITELIST_DISQUALIFIER.search(command.rstrip()):
             return False
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
@@ -680,13 +699,17 @@ class RuleEngine:
 
         Returns:
             True if a whitelist pattern matches from the start of the command
-            through to its end
+            through to its end, and the command carries none of the
+            _WHITELIST_DISQUALIFIER constructs
         """
-        # Same disqualifiers as the prefix check. Today no shipped entry can span a
-        # command carrying one, so this guard is unreachable through the current
-        # data - which is exactly why it is here: the invariant belongs to the
-        # whitelist mechanism, not to the entries that happen to be in the YAML.
-        if _WHITELIST_DISQUALIFIER.search(command):
+        # Same disqualifiers as the prefix check, and live on shipped data in both
+        # directions: the gh-auth-token entry's "-u" charset admits dots, so
+        # "gh auth token | docker login ghcr.io -u .. --password-stdin" spans to
+        # "$" carrying "..", and every "\s" in a "$"-anchored entry matches a
+        # newline, so "chmod\n-R\n777\n/tmp/evil.sh" spans four bash commands.
+        # This method is the multi-segment short-circuit, so a span it accepts
+        # skips the per-segment loop entirely - the guard has to be here too.
+        if _WHITELIST_DISQUALIFIER.search(command.rstrip()):
             return False
         # >= not ==: a pattern ending in \s* consumes trailing whitespace that rstrip()
         # already discounted, so a legitimate span can overshoot.

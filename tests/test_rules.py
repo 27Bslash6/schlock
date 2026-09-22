@@ -959,6 +959,10 @@ class TestWhitelistClearsOnlyWhatItDescribes:
             "chmod -R 777 /tmp/build",
             "chmod 755 /tmp/.pytest_cache",  # a leading dot is a normal name, not traversal
             "chmod -R 700 /tmp/pytest-of-me/pytest-0/test_x",  # depth is deliberately uncapped
+            "chmod -R 777 /tmp/build/",  # same path as "/tmp/build"; clearing one and not the
+            "chmod 755 /tmp/x/",  # other would prompt for what the entry exists to allow
+            "chmod -R 777 /tmp/x/*",  # terminal bare glob, on the artifact-dir entry's terms
+            "chmod -R 777 /tmp/build /tmp/dist",  # several /tmp operands are still one command
         ],
     )
     def test_shipped_chmod_entries_still_admit_real_tmp_paths(self, chmod_tmp_patterns, command):
@@ -1042,3 +1046,59 @@ class TestWhitelistClearsOnlyWhatItDescribes:
         ):
             assert engine.is_whitelisted(command), command
             assert engine.match_command(command).risk_level == RiskLevel.SAFE, command
+
+
+class TestWhitelistRefusesCommandSeparators:
+    """LAB-4310 panel finding: every "\\s" in a whitelist pattern matches a NEWLINE.
+
+    So a "$"-anchored entry spans a string bash runs as several commands, and
+    because the span reaches "$" it satisfies is_fully_whitelisted() too - which
+    short-circuits validator.py's whole multi-segment branch to SAFE before a
+    single rule runs. Measured: "chmod\\n-R\\n777\\n/tmp/evil.sh" went
+    is_fully_whitelisted False -> True and HIGH -> SAFE when the "$" anchors were
+    added, with "/tmp/evil.sh" left as a command bash executes, not an operand.
+    """
+
+    @pytest.fixture
+    def shipped_engine(self, data_dir):
+        return RuleEngine.from_directory(data_dir / "rules")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod\n-R\n777\n/tmp/evil.sh",  # the regression the "$" anchor introduced
+            "chmod\n777\n/tmp/evil.sh",
+            "chmod -R\n777 /tmp/x",
+            "rm\n-rf\n.git/hooks",  # pre-existing, same cause, closed by the same guard
+            "chmod 755 /tmp/x\rrm -rf /",  # a bare CR is a separator to some readers
+        ],
+    )
+    def test_embedded_newline_refuses_both_whitelist_checks(self, shipped_engine, command):
+        """Reverting the "\\n\\r" half of _WHITELIST_DISQUALIFIER fails this test.
+
+        is_fully_whitelisted is asserted explicitly: it is the multi-segment
+        short-circuit, so it is the one that skips the per-segment loop.
+        """
+        assert not shipped_engine.is_whitelisted(command)
+        assert not shipped_engine.is_fully_whitelisted(command)
+
+    @pytest.mark.parametrize("command", ["git status\n", "ls -la\n", "chmod 755 /tmp/x\n"])
+    def test_one_trailing_newline_still_whitelists(self, shipped_engine, command):
+        """The guard reads command.rstrip(); dropping that rstrip fails this test.
+
+        A trailing newline is not a separator - there is no second command after
+        it - and tests/test_rules.py already pins "git status\\n" as fully
+        whitelisted. Refusing it would be a regression, not a fix.
+        """
+        assert shipped_engine.is_whitelisted(command)
+
+    def test_compile_warns_when_an_entry_can_never_match(self, tmp_path, caplog):
+        """A user whitelist entry describing a redirect is refused before patterns
+        are consulted, so it would silently never fire. Warn rather than fail
+        silently - the user has nothing else to go on."""
+        rules = tmp_path / "userwl.yaml"
+        rules.write_text("whitelist:\n  - '^psql\\s+mydb\\s+<\\s+schema\\.sql$'\nrules: []\n")
+        with caplog.at_level("WARNING"):
+            engine = RuleEngine(rules)
+        assert "may never match" in caplog.text
+        assert not engine.is_whitelisted("psql mydb < schema.sql")
