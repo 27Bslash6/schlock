@@ -126,14 +126,16 @@ _MAX_MESSAGE_LENGTH = 500  # Maximum message field length
 # follows a `#`, so `run_shellcheck` can disarm it before the spawn.
 #
 # Design notes, each verified against ShellCheck 0.11.0:
-#  - Rewrite the keyword IN PLACE (\g<1>shell_check), never delete to end-of-line:
+#  - Rewrite the keyword IN PLACE (\g<1>shellchecK), never delete to end-of-line:
 #    deleting would unbalance a `# shellcheck` sequence living INSIDE a string,
 #    turning it into a parse error that itself fails the check open. In-place
 #    rewrite keeps quoting balanced and only ever turns one inert comment into
-#    another, so over-matching the gap below is harmless. `shell_check` is a
-#    deliberate non-token: the underscore breaks ShellCheck's exact-token match
-#    (do NOT "fix" it back to `shellcheck` — that reopens the bypass; pinned by
-#    test_disarm_neutralises_directive_keyword).
+#    another, so over-matching the gap below is harmless. `shellchecK` is a
+#    deliberate non-token: the capital K breaks ShellCheck's case-sensitive
+#    exact-token match (do NOT "fix" it back to `shellcheck` — that reopens the
+#    bypass; pinned by test_disarm_neutralises_directive_keyword).
+#  - Same width as the original: the scan copy stays column-aligned with
+#    `command`, so a later finding on the same line reports its true column.
 #  - The gap between `#` and the keyword is `[^\S\n]` (whitespace but not the
 #    newline that would end the comment) OR U+200B: ShellCheck honours the
 #    directive after a NBSP/EM-space/thin-space/etc. AND after a zero-width space,
@@ -294,7 +296,7 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
         # before the spawn so it cannot suppress a finding (CWE-693). See
         # _SHELLCHECK_DIRECTIVE for why this rewrites in place instead of deleting.
         # Scan a copy so `command` stays the real text for the timeout log below.
-        scan_input = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shell_check", command)
+        scan_input = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shellchecK", command)
 
         # Run shellcheck with JSON output, reading from stdin
         result = subprocess.run(

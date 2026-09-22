@@ -166,21 +166,23 @@ class TestShellCheckDirectiveNeutralisation:
 
     def test_disarm_neutralises_directive_keyword(self):
         """The disarm rewrites the `shellcheck` token so it is no longer a directive."""
-        out = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shell_check", "# shellcheck disable=SC2114\ncmd")
+        original = "# shellcheck disable=SC2114\ncmd"
+        out = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shellchecK", original)
         assert "shellcheck" not in out
-        assert out == "# shell_check disable=SC2114\ncmd"
+        assert out == "# shellchecK disable=SC2114\ncmd"
+        assert len(out) == len(original)  # equal width -> ShellCheck columns still match `command`
 
     def test_disarm_leaves_non_directive_comment_byte_identical(self):
         """A comment that is not a shellcheck directive is passed through unchanged."""
         original = "# not a directive\ncmd"
-        assert _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shell_check", original) == original
+        assert _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shellchecK", original) == original
 
     def test_disarm_preserves_quote_balance(self):
         """Rewriting in place (not deleting to EOL) keeps a quoted string balanced."""
         original = "echo '# shellcheck disable=SC2114'; cmd"
-        out = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shell_check", original)
+        out = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shellchecK", original)
         assert out.count("'") == original.count("'")  # quotes intact -> no parse-error fail-open
-        assert out == "echo '# shell_check disable=SC2114'; cmd"
+        assert out == "echo '# shellchecK disable=SC2114'; cmd"
 
 
 class TestShellCheckFinding:
