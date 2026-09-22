@@ -97,6 +97,30 @@ class TestSecretScrubbing:
                 'curl -H "Authorization: Bearer sk-abc',
                 'curl -H "Authorization: Bearer ***REDACTED***',
             ),
+            (
+                """curl -H 'Authorization: Digest username='"u"', response='"RESPONSE_SECRET" https://x""",
+                """curl -H 'Authorization: Digest ***REDACTED***' https://x""",
+            ),
+            (
+                """curl -H 'Authorization: Basic '"dGVzdDpzZWNyZXQ=" https://x""",
+                """curl -H 'Authorization: Basic ***REDACTED***' https://x""",
+            ),
+            (
+                """curl -H "Authorization: Bearer "'sk-live-SECRET' -H 'X-Trace: y' https://x""",
+                """curl -H "Authorization: Bearer ***REDACTED***" -H 'X-Trace: y' https://x""",
+            ),
+            (
+                """curl -H Authorization:"Bearer "'sk-live-SECRET' https://x""",
+                """curl -H Authorization:"Bearer ***REDACTED***" https://x""",
+            ),
+            (
+                """curl -H 'Authorization: Basic '"dGVzdA==";rm -rf /tmp/x""",
+                """curl -H 'Authorization: Basic ***REDACTED***';rm -rf /tmp/x""",
+            ),
+            (
+                """echo "***REDACTED***"$HOME/keep.txt""",
+                """echo "***REDACTED***"$HOME/keep.txt""",
+            ),
         ],
         ids=[
             "digest",
@@ -107,11 +131,20 @@ class TestSecretScrubbing:
             "token-param-last",
             "bare-first-token",
             "cap-cut-quote",
+            "concatenated-segments",
+            "credential-in-next-segment",
+            "mixed-quote-styles",
+            "quote-after-colon-next-segment",
+            "operator-after-value-survives",
+            "literal-marker-is-not-an-anchor",
         ],
     )
     def test_authorization_credential_redacted(self, command, expected):
-        """Quoted: the credential runs to the closing quote (Digest/AWS4 carry the secret in a later parameter)
-        and the rest of the command survives. Bare: one token. Cap-cut: no closing quote, redact to end of line."""
+        """Quoted: the credential runs to the end of the shell WORD (Digest and AWS4 carry the secret in a
+        later parameter), and adjacent quote segments concatenate into that same word, so redaction crosses
+        them - but stops at an unquoted space or shell operator, so a chained command stays in the log. Bare:
+        one token. Cap-cut: no closing quote, redact to end of line. A marker the command merely contains is
+        not an anchor."""
         assert AuditLogger()._scrub_secrets(command) == expected
 
     def test_long_flag_password_redacted(self):

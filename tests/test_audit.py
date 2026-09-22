@@ -428,8 +428,9 @@ class TestAuditLoggerThreadSafety:
 
 class TestCommandLength:
     """The logged command is capped per entry: a short cap by default, the commit filter's own
-    bound for entries the filter judged, and every cut is marked. A flat 500-char cap dropped the
-    heredoc body of a `git commit -F -` that a root-cause later needed."""
+    bound for entries the filter judged, and every cut is marked. Both caps count bytes. The flat
+    500-character cap this replaced dropped the heredoc body of a `git commit -F -` that a
+    root-cause later needed."""
 
     @staticmethod
     def _log_and_read(log_file: Path, command: str, violations=None, **kwargs) -> dict:
@@ -445,8 +446,21 @@ class TestCommandLength:
         assert len(entry["command"]) == MAX_COMMAND_SIZE
         assert entry["command_truncated"] is True
 
+    def test_non_ascii_commit_command_is_bounded_in_bytes(self, tmp_path):
+        """The cap bounds BYTES, so a multi-byte command cannot log past it by counting characters.
+
+        40k CJK characters are 120 KB - under a character-counted 64 KiB cap, twice a byte-counted one.
+        The cut lands on a code-point boundary, so the entry is still decodable text.
+        """
+        command = "git commit -m '" + "中" * 40000 + "'"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
+        kept = len(entry["command"].encode("utf-8"))
+        assert MAX_COMMAND_SIZE - 4 < kept <= MAX_COMMAND_SIZE  # at the cap, not merely under it
+        assert entry["command_truncated"] is True
+        assert entry["command"].endswith("中")  # cut landed on a code point, not inside one
+
     def test_secret_past_short_cap_is_redacted_in_full_commit_entry(self, tmp_path):
-        """Redaction runs over the whole kept command, not just its first 500 chars."""
+        """Redaction runs over the whole kept command, not just its first 500 bytes."""
         command = "git commit -m '" + "x" * 600 + "' && curl 'https://x/?token=sk-live-abc123'"
         entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
         assert "***REDACTED***" in entry["command"]

@@ -51,7 +51,7 @@ from platformdirs import user_data_dir
 
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
-# Per-entry size cap on the logged command. Entries the commit filter judged keep the whole
+# Per-entry size cap on the logged command, in bytes. Entries the commit filter judged keep the whole
 # command up to the filter's own bound (MAX_COMMAND_SIZE, 64 KiB) so the log shows what the
 # filter saw - a `git commit -F - <<'EOF'` body lives past byte 500 and is the very part that
 # after-the-fact analysis needs. Everything else keeps this short cap.
@@ -120,11 +120,27 @@ class AuditLogger:
         # escaped characters and backslash-newline continuations. These run before the token=/secret= rule, whose
         # \S+ would otherwise eat a closing quote and shift the boundary onto the next argument.
         # Quote before the header - the curl form, -H "Authorization: Bearer x".
-        (re.compile(r"""(["'])(Authorization:\s*[\w-]+\s+)(?:\\[\s\S]|(?!\1|\\).)+""", re.I), r"\1\2***REDACTED***"),
+        (re.compile(r"""(["'])(Authorization:\s*[\w-]+\s+)(?:\\[\s\S]|(?!\1|\\).)*""", re.I), r"\1\2***REDACTED***"),
         # Quote after the colon - bash word concatenation and YAML in heredocs, Authorization:"Bearer x".
-        (re.compile(r"""(Authorization:\s*)(["'])([\w-]+\s+)(?:\\[\s\S]|(?!\2|\\).)+""", re.I), r"\1\2\3***REDACTED***"),
+        (re.compile(r"""(Authorization:\s*)(["'])([\w-]+\s+)(?:\\[\s\S]|(?!\2|\\).)*""", re.I), r"\1\2\3***REDACTED***"),
         # Bare header, no value boundary - one token. The lookbehind skips headers the quoted rules handled.
         (re.compile(r"""(?<!["'])(Authorization:\s*[\w-]+\s+)\S+""", re.I), r"\1***REDACTED***"),
+        # A quote ends a shell SEGMENT, not the value: adjacent segments concatenate into one argument, so
+        # `-H 'Authorization: Basic '"$SECRET"` carries the credential past the quote the rules above stop at.
+        # Consume whole segments after a header those rules already redacted, stopping at an unquoted space
+        # OR shell operator - an operator ends the word too, and eating it would hide `;rm -rf /` from the log.
+        # Anchored on the redacted header, never the marker alone, so a command that merely CONTAINS the
+        # marker keeps its text. Alternatives stay disjoint on their first character, so the scan is linear.
+        # ponytail: this now tracks quoting state in a regex. The next shape wants the bashlex word split the
+        # commit filter already does, not a fifth rule - see the redaction ceiling recorded on the ticket.
+        (
+            re.compile(
+                r"""(Authorization:\s*["']?[\w-]+\s+\*{3}REDACTED\*{3}["'])"""
+                r"""(?:'[^']*'?|"(?:\\[\s\S]|[^"\\])*"?|\\[\s\S]|[^\s'"\\;|&<>()])+""",
+                re.I,
+            ),
+            r"\1",
+        ),
         # password=VALUE, token=VALUE, api-key=VALUE, secret=VALUE
         (re.compile(r"(password|passwd|pwd|token|secret|api[-_]?key)=\S+", re.I), r"\1=***REDACTED***"),
         # --password VALUE, --token VALUE, --api-key VALUE
@@ -252,9 +268,17 @@ class AuditLogger:
 
         # Cap first (bounds the scrub regexes too), then scrub. A secret split by the cut either
         # still matches `token=\S+` on what remains or has lost its value entirely.
+        # Both caps bound BYTES, which is what a log line costs and what MAX_COMMAND_SIZE is named for - a
+        # 40k-character CJK command is 120 KB, near twice the 64 KiB budget, and a character count let all
+        # of it through. "surrogatepass" is load-bearing, not tidiness: this line sits OUTSIDE log_event's
+        # suppress, so a lone surrogate under a plain encode would raise out of a hook that must fail open.
+        # It is asymmetric - the decode drops a lone surrogate, and a code point split by the cut, only on
+        # the truncated path; an untruncated command is logged as-is.
         cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
-        command_truncated = len(command) > cap
-        scrubbed_command = self._scrub_secrets(command[:cap])
+        encoded = command.encode("utf-8", "surrogatepass")
+        command_truncated = len(encoded) > cap
+        kept = encoded[:cap].decode("utf-8", "ignore") if command_truncated else command
+        scrubbed_command = self._scrub_secrets(kept)
 
         event = AuditEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),
