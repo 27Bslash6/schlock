@@ -31,7 +31,22 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
-from schlock.integrations.commit_filter import CommitMessageFilter
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Point config resolution at an empty dir so tests assert the shipped default preset.
+
+    map_risk_to_status() reads pre_tool_use._risk_tolerance, a singleton cached (once per
+    process) from the project config (cwd-relative) or $HOME/.config/schlock/config.yaml.
+    Without isolating cwd, $HOME, and the cache, these tests pass or fail based on whatever
+    preset happens to be installed on the machine running them instead of the code under test.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(pre_tool_use, "_validator_initialized", False)
+    monkeypatch.setattr(pre_tool_use, "_risk_tolerance", None)
 
 
 class TestStatusMapping:
@@ -171,15 +186,22 @@ class TestHookHandler:
         # Should have an error reason
         assert "BLOCKED:" in response["hookSpecificOutput"]["permissionDecisionReason"]
 
+    def test_oversized_command_blocked_as_a_verdict(self):
+        """Over MAX_COMMAND_SIZE is denied through the BLOCKED path, not swallowed as an error (LAB-4363)."""
+        command = " && ".join(["echo hello"] * 6000)
+        assert len(command) > MAX_COMMAND_SIZE
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+
+        output = response["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert output["permissionDecisionReason"].startswith("BLOCKED: Command exceeds size limit")
+
 
 class TestValidatorSingleton:
     """Test validator singleton pattern."""
 
     def test_singleton_reuse(self):
         """Verify validator is initialized once and reused."""
-        # Reset singleton state
-        pre_tool_use._validator_initialized = False
-
         # First call initializes
         result1 = get_validator()
         assert result1 is True
@@ -192,9 +214,6 @@ class TestValidatorSingleton:
 
     def test_initialization_error_handling(self):
         """Verify validator initialization succeeds without errors."""
-        # Reset singleton
-        pre_tool_use._validator_initialized = False
-
         # get_validator should succeed (it just sets a flag, actual validation happens via validate_command)
         result = get_validator()
         assert result is True

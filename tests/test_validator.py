@@ -21,6 +21,7 @@ from schlock.core.validator import (
     validate_command,
 )
 from schlock.exceptions import ConfigurationError, ParseError
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 class TestValidator:
@@ -1921,9 +1922,9 @@ class TestHeredocSurroundings:
         seen = []
         real = val_module.validate_command
 
-        def spy(command, config_path=None):
+        def spy(command, config_path=None, **kwargs):
             seen.append(command)
-            return real(command, config_path)
+            return real(command, config_path, **kwargs)
 
         monkeypatch.setattr(val_module, "validate_command", spy)
         val_module._escalate_past_heredoc(
@@ -1936,6 +1937,317 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+class TestInputSizeCeiling:
+    """validate_command refuses oversized input before parsing it (LAB-4363).
+
+    Fail-closed, unlike commit_filter's skip on the same constant; the WHY is at Step 0 in validator.py.
+    """
+
+    OVER_CEILING = [
+        pytest.param(" && ".join(["echo hello"] * 6000), id="and-chained-echo"),
+        pytest.param("".join(f"x{i}=1\n" for i in range(9000)) + "ls", id="newline-assignments"),
+        pytest.param("(( 1<<b ))\n" * 7000 + "ls", id="arithmetic-shift"),
+    ]
+
+    @pytest.mark.parametrize("command", OVER_CEILING)
+    def test_oversized_command_is_denied_naming_size_and_limit(self, command):
+        assert len(command) > MAX_COMMAND_SIZE
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.error is None, "a verdict, not a validation error"
+        assert result.message == f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)"
+
+    def test_ceiling_is_exclusive(self, monkeypatch):
+        """Exactly MAX_COMMAND_SIZE chars still validates; one more is refused (same `>` as commit_filter)."""
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 32)
+        at_limit = "echo " + "a" * 27
+        assert len(at_limit) == 32
+
+        assert validate_command(at_limit).allowed is True
+        over = validate_command(at_limit + "a")
+        assert over.allowed is False
+        assert "33 > 32" in over.message
+
+    def test_oversized_input_is_refused_before_any_parse_and_never_cached(self, monkeypatch):
+        """1 MB must cost O(1): no parser, no rule engine, no special cases, no cache entry.
+
+        Counts work instead of timing it: a raised stub lands in the catch-all and sets `error`,
+        so `error is None` is the proof the guard ran first (wall-clock asserts flake on CI).
+        """
+
+        def unreachable(*_args, **_kwargs):
+            raise AssertionError("oversized input must be refused before this runs")
+
+        for name in ("_get_parser", "_get_rule_engine", "_check_special_cases"):
+            monkeypatch.setattr(val_module, name, unreachable)
+        command = "echo " + "a" * (1024 * 1024)
+
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.error is None, result.error
+        assert val_module._global_cache.get(command) is None
+
+
+class TestDerivedTextCeiling:
+    """The input ceiling judges what the caller submitted, never schlock's rewrite of it (LAB-4363).
+
+    _neuter_heredocs inflates a quoted heredoc ~3.25x, and _escalate_past_heredoc re-validates the
+    result through the front door. Before this, a 20 KB command was denied for a 66 KB string it
+    never wrote. Derived text has its own bound (MAX_DERIVED_COMMAND_SIZE) and its own message.
+    Shapes here are constructed, not sampled: no harvested corpus contains rewrite inflation.
+    """
+
+    HEREDOC_LOW = "Heredoc command 'cat' allowed (content not validated)"
+
+    def test_rewrite_over_input_ceiling_keeps_the_verdict(self, monkeypatch):
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 200)
+        command = "cat <<'X'\nX\n" * 10
+        assert len(command) < 200 < len(val_module._neuter_heredocs(command)[0])
+
+        result = validate_command(command)
+
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.LOW
+        assert result.message == self.HEREDOC_LOW
+
+    def test_near_ceiling_heredoc_is_still_allowed(self):
+        """65,513 in, 65,540 after the rewrite: the first counterexample this pins."""
+        command = "cat <<'X'\nX\n#" + "x" * 65500
+        assert len(command) < MAX_COMMAND_SIZE < len(val_module._neuter_heredocs(command)[0])
+
+        result = validate_command(command)
+
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.LOW
+        assert result.message == self.HEREDOC_LOW
+
+    def test_derived_text_has_its_own_bound_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(val_module, "MAX_DERIVED_COMMAND_SIZE", 100)
+        monkeypatch.setattr(val_module, "_escalate_past_heredoc", lambda *a, **k: pytest.fail("rewrite parsed past its bound"))
+        command = "cat <<'X'\nX\n" * 10  # 120 in, 390 derived
+
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.error is None
+        assert "Internal expansion" in result.message
+        assert "390" in result.message and "100" in result.message
+        assert "Command exceeds size limit" not in result.message
+
+    def test_input_ceiling_message_reports_the_submitted_size(self):
+        command = "echo hello && " * 6000
+        message = validate_command(command).message
+        assert message == f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)"
+        assert "Internal expansion" not in message
+
+    def test_oversized_input_is_refused_before_the_cache_is_consulted(self, monkeypatch):
+        """Pins the stronger AC-2 promise: a 1 MB string is never even hashed for lookup."""
+
+        class NoCache:
+            def get(self, _key):
+                pytest.fail("cache consulted for over-ceiling input")
+
+            def set(self, _key, _value):
+                pytest.fail("cache written for over-ceiling input")
+
+        monkeypatch.setattr(val_module, "_global_cache", NoCache())
+        result = validate_command("echo " + "a" * (1024 * 1024))
+        assert result.allowed is False
+        assert result.error is None
+
+
+class TestParseFailureFailsClosed:
+    """LAB-3464: nothing bashlex could not read comes back allowed.
+
+    `validate_command`'s parse-error handler routes to the heredoc fallback when
+    the command contains `<<` *and* bashlex's message mentions a heredoc. `<<<`
+    satisfies the first half, and - by accident - `coproc bash <<< "rm -rf /"`
+    satisfies the second, because bashlex's error embeds a `RedirectNode` repr
+    containing `heredoc=None`. So at a508274 the fallback read the here-string
+    as a heredoc, extracted the pre-`<<` fragment `coproc bash <`, matched no
+    rule and returned LOW/allowed while bash ran the payload. `case`/`select`
+    spelled the same way denied, because bashlex blames those on something that
+    does not say "heredoc".
+
+    #148 closed it, downstream of that trigger. Two independent guards now stop
+    it, and they are at different layers rather than being one guard twice:
+
+    1. `_rewrite_openers` classifies `<<<` as a here-string, so no opener is
+       found and `_neuter_heredocs` raises.
+    2. `_WORD_END` contains `<`, so even with (1) removed `_read_delimiter`
+       reads an empty delimiter off the third angle and raises.
+
+    Both end in ParseError, and the fallback denies on ParseError. That matters
+    for reading the tests below: **the end-to-end cases do not pin (1)**, because
+    (2) holds them all up on its own - verified by deleting (1) and watching them
+    stay green. They pin the contract. The unit test is what pins the guards, and
+    it pins both, since either alone is load-bearing only until someone edits the
+    other.
+
+    Every exit from the parse-failure path is exercised here, which is the
+    ticket's AC-3 audit expressed as assertions rather than prose. AC-2 - real
+    heredocs keeping their verdicts - is `TestHeredocSurroundings`'s job above
+    and is not restated here; that class's cases already fail if this door is
+    closed too far.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """ShellCheck independently denies some of these; AC-1 is specified without it."""
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # AC-1: the reported command, and the second spelling the ticket
+            # names. Both were `allowed=True LOW "Heredoc command 'coproc'
+            # allowed (content not validated)"` at a508274.
+            ('coproc bash <<< "rm -rf /"', "the reported command"),
+            ('coproc sh <<< "rm -rf /"', "a second shell, named in AC-1"),
+            ('coproc bash <<<"rm -rf /"', "no space after the here-string operator"),
+            ("coproc bash <<< 'a << b'", "a literal `<<` inside the here-string payload"),
+            # Also fail-open at a508274, and the worst verdict of the set: the
+            # whitelisted head vouched for the coproc after the terminator.
+            ("ls <<'EOF'\nx\nEOF\ncoproc bash <<< 'rm -rf /'", "whitelisted head, coproc after the terminator"),
+            # An unparseable construct owning a *real* heredoc. The fallback
+            # rewrites the body away and re-validates; the rewrite is no more
+            # parseable than the original, so it denies.
+            ("coproc bash <<'EOF'\nrm -rf /\nEOF", "unparseable head owning a quoted-delimiter heredoc"),
+            # Reaches the fallback like the cases above, but was already denied
+            # at a508274 - by the *other* exit, `Parse error`. So the routing
+            # for this spelling moved between a508274 and #148 while the verdict
+            # did not, which is why it is not counted among the regressions.
+            ('coproc bash <<< "$(rm -rf /)"', "substitution payload, denied at both heads"),
+            # Controls. These never reach the fallback at all - bashlex blames
+            # them on something whose text lacks "heredoc", so the trigger's
+            # second half is false and the handler denies directly. All three
+            # were already BLOCKED at a508274; the report compared against `case`.
+            ('case x in y) bash;; esac <<< "rm -rf /"', "case: denied before the fallback"),
+            ('select x in a; do bash; done <<< "rm -rf /"', "select: denied before the fallback"),
+            ('coproc CO { bash; } <<< "rm -rf /"', "named coprocess: denied before the fallback"),
+        ],
+    )
+    def test_unparseable_command_is_never_allowed(self, safety_rules_path, command, description):
+        """schlock is fail-closed by contract; an unreadable command is not vouched for."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False, f"{description}: {result.message}"
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.exit_code == 1, description
+
+    def test_here_string_is_not_an_opener_at_either_guard(self):
+        """The two guards that close AC-1, each pinned where it lives.
+
+        Neither is pinned by the end-to-end cases, because each covers for the
+        other's removal. `_rewrite_openers` reading `<<<` as an opener would take
+        `"rm` as the delimiter; `_WORD_END` losing `<` would let the fallback
+        read a delimiter off the third angle. Either alone restores a base
+        command and with it the fail-open.
+        """
+        command = 'coproc bash <<< "rm -rf /"'
+        line, openers = val_module._rewrite_openers(command, val_module._ScanState(), 0, val_module._DoubleParen(command))
+
+        assert openers == []
+        assert line == command
+
+        # Guard 2, independent of the branch above: `<` ends a word, so a
+        # delimiter read off the third angle is empty rather than `"rm`. The
+        # set `_read_delimiter` consults is now `_WORD_START_AFTER`; the guard
+        # is the one this always pinned, only its name moved.
+        assert "<" in val_module._WORD_START_AFTER
+        with pytest.raises(ParseError, match="empty delimiter"):
+            val_module._read_delimiter('<<< "rm -rf /"', 2)
+
+        with pytest.raises(ParseError, match="No heredoc opener found"):
+            val_module._neuter_heredocs('coproc bash <<< "rm -rf /"')
+
+    def test_fallback_returning_none_denies(self, safety_rules_path, monkeypatch):
+        """The fallback's catch-all hands back `None`; the caller must not read that as a pass.
+
+        Reached when `_neuter_heredocs` fails for a reason other than an
+        unreadable heredoc. Nothing produces that today - the base command is
+        stripped and an empty one already raises - so it is forced rather than
+        provoked: an exit that only ever runs on an unforeseen bug is exactly
+        the one worth pinning fail-closed.
+        """
+
+        def boom(command):
+            raise RuntimeError("unforeseen")
+
+        monkeypatch.setattr(val_module, "_neuter_heredocs", boom)
+        result = validate_command("cat <<'EOF'\nx\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.message.startswith("Parse error:")
+
+    def test_recursion_limit_during_parsing_denies(self, safety_rules_path):
+        """bashlex recurses per nesting level, so a deep enough command exhausts the stack.
+
+        `RecursionError` is a `RuntimeError` and would miss the
+        `(ParseError, ValueError)` handler entirely - except that
+        `BashCommandParser.parse` wraps *every* exception into `ParseError`
+        first, so it arrives at the handler this class is about after all. The
+        message is asserted because that conversion is the whole finding: drop
+        it and this input silently changes which exit it leaves by.
+
+        The body is `echo hi`, not `rm -rf /`, so a rule match cannot supply the
+        denial the parse failure is supposed to.
+        """
+        deep = "$(" * 300 + "echo hi" + ")" * 300
+
+        result = validate_command(deep, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.message.startswith("Parse error:")
+
+    # --- documented residual (NOT a fix; pins current behaviour so a change is
+    # --- visible). LAB-3094, untouched by this ticket.
+    def test_discarded_heredoc_body_is_a_documented_residual(self, safety_rules_path):
+        """A quoted delimiter is the only thing reaching this fallback, and the rewrite drops bodies.
+
+        Dropping them is deliberate: a bare placeholder delimiter makes bash
+        expand the body, so keeping a literal `$(rm -rf /)` from a `<<'EOF'`
+        would turn inert text into a live substitution and deny safe commands.
+        The cost is that a body which *is* executable becomes invisible, and one
+        quote character decides it - each pair below is byte-identical to bash
+        apart from the delimiter's quotes.
+
+        Two consumers make the body executable, not one:
+          - a shell, which runs the body as its program;
+          - a redirection to a file that is then run, which is the same thing one
+            step later. The redirection alone is not enough - `cat <<EOF > s.sh`
+            with nothing running `s.sh` is allowed either way - so the pair below
+            carries the `bash s.sh` that makes the body reachable.
+
+        Asserted at its current value rather than skipped, so a LAB-3094 fix has
+        to come back through here and re-state the residual.
+        """
+        shell_consumer = validate_command("bash <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+        write_then_run = validate_command("cat <<'EOF' > s.sh\nrm -rf /\nEOF\nbash s.sh", config_path=safety_rules_path)
+
+        assert shell_consumer.allowed is True
+        assert write_then_run.allowed is True
+
+        # The unquoted twins parse, so their bodies are reachable by the rules
+        # and denied. That gap is the residual: same program, different quoting.
+        assert validate_command("bash <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is False
+        assert validate_command("cat <<EOF > s.sh\nrm -rf /\nEOF\nbash s.sh", config_path=safety_rules_path).allowed is False
+
+        # The boundary a fix must not cross: with no shell and no redirection,
+        # `cat` prints its body and is allowed on the merits. Denying this one
+        # would be over-reach from "the body is a program" to "the body looks
+        # dangerous", which is the LAB-402 failure mode.
+        assert validate_command("cat <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is True
 
 
 def _regions(command: str) -> list[tuple[int, int]]:

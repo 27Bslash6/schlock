@@ -259,8 +259,17 @@ The blocker scans the **command string**. Some git forms deliver the commit mess
 *outside* the command, so there is nothing in the command to scan (issue #76):
 
 - `git commit -F <file>` / `git commit --file=<file>` — message lives in a file
-- `git commit -F -` and heredocs — message arrives on stdin at execution time
+- `git commit -F -` fed by a **piped** or **interactive** stdin — the bytes live in a prior
+  pipe segment or are typed at execution time, not in the command string
 - `git commit -m "$(cat file)"` / backticks — the substitution is not expanded yet
+- more than `_MAX_HEREDOC_OPENERS` heredocs in one Bash call — refuses to guess rather than
+  scan unboundedly (a documented cap, not a delivery form)
+
+`git commit -F -` / `--file -` fed by an **in-command heredoc** (`git commit -F- <<EOF`) is
+different: its bytes ARE in the command string, so it is scanned like any other message,
+regardless of how many other heredocs (a `gh pr create --body-file -` in the same Bash call,
+a leading `cat <<DATA`, …) share the call — each heredoc body is bound to its own `<<` opener
+in source order.
 
 Because a `PreToolUse` hook runs **before** the command executes, this content does not exist
 where the hook can see it. The `unscannable_message_action` setting decides what happens when
