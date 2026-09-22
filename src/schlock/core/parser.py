@@ -8,7 +8,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import bashlex
 import bashlex.errors
@@ -331,6 +331,24 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     return True
 
 
+class CommandSegment(NamedTuple):
+    """One independently-validated command segment, wholly derived from ONE parse.
+
+    The two range lists have DIFFERENT shapes - `(start, stop)` for literals,
+    `(start, stop, is_shell)` for heredocs - and both feed suppression. Naming
+    them is what stops one being passed where the other belongs, which would
+    misalign suppression silently rather than raise.
+    """
+
+    text: str
+    string_literals: list[tuple[int, int]]
+    heredoc_ranges: list[tuple[int, int, bool]]
+    # The segment's own node in the PARENT AST. Its word spans index the whole
+    # command, not `text` - see validator._match_original_and_reconstructed's
+    # `quote_source`, which is the reason this is handed back at all.
+    node: Any
+
+
 class BashCommandParser:
     """Parse bash commands using bashlex AST analysis.
 
@@ -564,47 +582,16 @@ class BashCommandParser:
 
         return segment
 
-    def extract_command_segments(self, command: str, ast_nodes: list[Any]) -> list[str]:
-        """Extract full command segments from pipelines and command lists.
-
-        SECURITY CRITICAL: Returns the full text of each command segment so
-        each can be validated independently. Prevents bypass via piping/chaining
-        dangerous commands after whitelisted ones.
-
-        Args:
-            command: Original command string
-            ast_nodes: List of bashlex AST nodes from parse()
-
-        Returns:
-            List of command segment strings extracted from the AST
-
-        Example:
-            >>> parser = BashCommandParser()
-            >>> ast = parser.parse("ls | rm -rf / && echo done")
-            >>> parser.extract_command_segments("ls | rm -rf / && echo done", ast)
-            ['ls', 'rm -rf /', 'echo done']
-        """
-        segments = []
+    def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
+        """Collect the AST nodes that each form one independently-validated segment."""
+        nodes: list[Any] = []
 
         def visit(node):  # noqa: PLR0912 - AST traversal requires multiple branches
-            """Recursively visit AST nodes to extract command segments."""
+            """Recursively visit AST nodes to collect command nodes."""
             if hasattr(node, "kind"):
                 # Command nodes contain individual commands
                 if node.kind == "command" and hasattr(node, "pos"):
-                    start, end = node.pos
-                    if start < len(command) and end <= len(command):
-                        segment = command[start:end].strip()
-                        # An escaped trailing blank (`echo hi \ ; ls`) is a
-                        # one-blank argument, and the strip just ate the blank.
-                        # Both callers re-parse the segment, and a dangling
-                        # `echo hi \` parses nowhere: the main loop then loses
-                        # its quote context, the heredoc fallback denies it
-                        # outright. Give the blank back. An even run of
-                        # backslashes is a literal argument and needs nothing.
-                        if (len(segment) - len(segment.rstrip("\\"))) % 2:
-                            segment += " "
-                        if segment:
-                            segments.append(self._close_heredocs(segment, node))
+                    nodes.append(node)
                     return  # Don't recurse into command parts
 
                 # Pipeline nodes - visit each command in the pipeline
@@ -640,7 +627,130 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
 
-        return segments
+        return nodes
+
+    @staticmethod
+    def _rebase(ranges: list[tuple], base: int, end: int) -> list[tuple]:
+        """Move offsets from the whole command onto one segment, dropping any outside it.
+
+        Containment is not a formality, and it does different work per caller.
+
+        For string literals it is a guard: a literal outside the span has no
+        segment-relative expression, and dropping one costs only a false-positive
+        suppression, never a missed match.
+
+        For heredoc ranges it is the LIVE case, and both outcomes are load-bearing.
+        A heredoc nested in a substitution (`diff <(cat <<EOF ... EOF)`) sits INLINE
+        in the slice - _close_heredocs only ever reaches a command's own redirects,
+        so nothing else suppresses it, and `cat` merely emits that text. It is
+        inside the span, so it rebases and keeps suppressing. The segment's OWN
+        body sits PAST the span; _close_heredocs re-appends it at an offset this
+        slice cannot describe, so it is dropped - correct twice over, because the
+        only body it ever appends is a shell's, and a shell's body is code that
+        must stay matchable.
+        """
+        return [(start - base, stop - base, *rest) for start, stop, *rest in ranges if start >= base and stop <= end]
+
+    def _locate_segment(self, command: str, node: Any) -> Optional[tuple[str, int]]:
+        """Return (segment text, its start offset in `command`), or None if unusable.
+
+        The offset is where the STRIPPED text begins, which is what makes
+        segment-relative positions derivable without re-parsing the segment.
+        """
+        start, end = node.pos
+        if start >= len(command) or end > len(command):
+            # Dropping a segment means nothing validates it, which is the
+            # fail-OPEN direction - so it must not happen silently.
+            logger.warning("Segment span (%d, %d) outside command of length %d; segment not validated", start, end, len(command))
+            return None
+        raw = command[start:end]
+        text = raw.strip()
+        # An escaped trailing blank (`echo hi \ ; ls`) is a one-blank argument
+        # and the strip just ate it. Callers re-parse the segment, and a
+        # dangling `echo hi \` parses nowhere: the main loop loses its quote
+        # context, the heredoc fallback denies it outright. Give it back — a
+        # space either way, since `\<tab>` is the same one-blank argument and
+        # the lengths match. An even run of backslashes is a literal argument
+        # and needs nothing.
+        # Done here, the one place the slice is taken, so every caller of
+        # extract_command_segments{,_with_literals} gets it. Sound only because
+        # `node.pos` already spans the blank: that is what keeps `base +
+        # len(text)` on the node end, which extract_command_segments_with_literals
+        # uses to bound its rebased literal ranges. Restoring a character the
+        # span does NOT cover would widen that bound and keep a suppression
+        # range it should have dropped.
+        if (len(text) - len(text.rstrip("\\"))) % 2:
+            text += " "
+        if not text:
+            logger.warning("Segment span (%d, %d) is blank after stripping; segment not validated", start, end)
+            return None
+        return text, start + (len(raw) - len(raw.lstrip()))
+
+    def extract_command_segments(self, command: str, ast_nodes: list[Any]) -> list[str]:
+        """Extract full command segments from pipelines and command lists.
+
+        SECURITY CRITICAL: Returns the full text of each command segment so
+        each can be validated independently. Prevents bypass via piping/chaining
+        dangerous commands after whitelisted ones.
+
+        Args:
+            command: Original command string
+            ast_nodes: List of bashlex AST nodes from parse()
+
+        Returns:
+            List of command segment strings extracted from the AST
+
+        Example:
+            >>> parser = BashCommandParser()
+            >>> ast = parser.parse("ls | rm -rf / && echo done")
+            >>> parser.extract_command_segments("ls | rm -rf / && echo done", ast)
+            ['ls', 'rm -rf /', 'echo done']
+        """
+        return [segment.text for segment in self.extract_command_segments_with_literals(command, ast_nodes)]
+
+    def extract_command_segments_with_literals(self, command: str, ast_nodes: list[Any]) -> list[CommandSegment]:
+        """Segments, their quoted-string ranges, and their own AST node — from ONE parse.
+
+        PERF/SECURITY: the segment loop in `validate_command` used to re-parse
+        every segment — for its string-literal ranges, and since LAB-1732 for the
+        quote-stripped reconstructed pass too. That is N+1 parses per command,
+        which under the native tier (spec §3.2) is N+1 subprocess spawns on a hook
+        that runs before every bash call. A segment is a slice of `command`, so its
+        words already sit in the parent AST: rebase the offsets, and hand the
+        segment's own node back so the reconstructed pass can read that segment's
+        quoting straight out of `command` (see
+        validator._match_original_and_reconstructed). Deriving rather than
+        re-parsing also removes the failure mode the re-parse had to fail closed
+        on — a segment that would not parse standalone no longer exists.
+
+        Args:
+            command: Original command string
+            ast_nodes: List of AST nodes from parse() of the WHOLE command
+
+        Returns:
+            List of CommandSegment - text, its string-literal ranges, its heredoc
+            ranges, and its node - every field relative to `text` except the node.
+            Both range lists go through _rebase, which is where the rule for what
+            a segment may and may not suppress lives. `text` carries its heredoc
+            back (_close_heredocs); that blob is appended AFTER the ranges are
+            rebased, at the end of the text, so it cannot shift them.
+        """
+        results: list[CommandSegment] = []
+        for node in self._segment_nodes(ast_nodes):
+            located = self._locate_segment(command, node)
+            if located is None:
+                continue
+            text, base = located
+            end = base + len(text)
+            results.append(
+                CommandSegment(
+                    text=self._close_heredocs(text, node),
+                    string_literals=self._rebase(self.extract_string_literals(command, [node]), base, end),
+                    heredoc_ranges=self._rebase(self.extract_heredoc_ranges(command, [node]), base, end),
+                    node=node,
+                )
+            )
+        return results
 
     def _collect_words(self, ast_nodes: list[Any]) -> list[tuple[str, Optional[tuple]]]:
         """Collect the word parts that make up the reconstructed command.
