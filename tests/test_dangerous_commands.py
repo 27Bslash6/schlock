@@ -6,7 +6,7 @@ including disk destruction, filesystem manipulation, and permission attacks.
 
 import pytest
 
-from schlock.core.rules import RiskLevel
+from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import validate_command
 from schlock.integrations.shellcheck import is_shellcheck_available
 
@@ -568,6 +568,16 @@ class TestP0FileTruncation:
             "echo -n > file.log",
             "printf '' > data.log",
             "cat input | tee output.log",
+            # Several blanks before the operand are still one operand.
+            "tee   output.log",
+            # A disposable first operand must not hide the real victim behind it.
+            # Quoting the head keeps the raw text from matching; reconstructed, the
+            # operand `' ;'` begins with a blank and a metacharacter (LAB-4360).
+            "\"tee\" ' ;' important.db </dev/null",
+            "\"tee\" ' |' important.db",
+            # An operand may begin with a literal newline; `$` under MULTILINE would
+            # end the line there and call the operand blank.
+            '"tee" "\\n;" important.db </dev/null',
         ],
     )
     def test_file_truncation_blocked(self, safety_rules_path, command):
@@ -585,6 +595,24 @@ class TestP0FileTruncation:
         """Append operations should be allowed."""
         result = validate_command("echo 'data' >> file.log", config_path=safety_rules_path)
         assert result.allowed
+
+    @pytest.mark.parametrize("reconstructed", ["tee  ", ">  ", ": >  ", "true >  ", "echo -n >  ", "printf '' >  "])
+    def test_blank_operand_is_not_a_filename(self, safety_rules_path, reconstructed):
+        r"""No operand in this rule is blank to the end of the text.
+
+        A one-blank argument reconstructs to bare whitespace (`tee \ ` becomes
+        `tee  `), which the rule read as the filename (LAB-4360). The guard is
+        `(?=\s+\S)` in front of the blank run, not a non-blank first-character
+        class: that class also refused an operand such as `' ;'`, and
+        `"tee" ' ;' important.db` then hid an ordinary later victim behind a
+        disposable first operand. It sits before the quantifier so the run is
+        scanned once, and it asks for a non-blank character anywhere after the
+        run - `$` would stop at the newline a quoted operand may begin with.
+        The end-to-end shape is pinned in test_validator.py; this pins the rule.
+        """
+        match = RuleEngine(safety_rules_path).match_command(reconstructed)
+
+        assert match.risk_level == RiskLevel.SAFE, match.message
 
 
 class TestP0NetworkServiceExposure:
