@@ -215,8 +215,9 @@ _STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
 _MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
 
 
-# Wrapper commands that pass through execution to subsequent args. Best-effort, NOT an
-# exhaustive enumeration - an unknown wrapper degrades to the pre-LAB-2754 behaviour.
+# Wrapper commands that pass their argv through VERBATIM to the command they exec: the first
+# non-option word is the program, everything after it is that program's args. Best-effort, NOT
+# an exhaustive enumeration - an unknown wrapper degrades to the pre-LAB-2754 behaviour.
 # SECURITY: 'env exec bash' executes exec despite env being first word
 # Categories for documentation and maintainability:
 # - Privilege: sudo, doas, pkexec (escalate privileges)
@@ -224,7 +225,10 @@ _MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
 # - Execution: env, command, xargs, parallel (modify execution context)
 # - Multicall: busybox, toybox (can invoke any applet)
 # - Namespace: chroot, nsenter, unshare (container/namespace operations)
-WRAPPER_COMMANDS: frozenset[str] = frozenset(
+# This is the set the `exec`/`eval` wrapper-bypass scan in `_detect_dangerous_constructs` keys
+# on: because argv passes through verbatim, a bare `exec`/`eval` word after one of these can only
+# be the shell builtin. Launchers with a grammar of their own live in _LAUNCHER_COMMANDS below.
+_EXEC_PASSTHROUGH_WRAPPERS: frozenset[str] = frozenset(
     {
         # Privilege escalation
         "sudo",  # Run as superuser
@@ -266,6 +270,55 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
         "linux64",  # 64-bit mode
     }
 )
+
+# Launchers that run a caller-supplied command inside an environment, session or sandbox, but
+# through a CLI grammar of their own (subcommands, options) rather than verbatim argv:
+# `uv run bash -c PROG`, `pnpm exec sh -c PROG`, `firejail --net=none bash -c PROG` (LAB-4699).
+# They join WRAPPER_COMMANDS so the shell-delegation re-entry scans their args for a shell - the
+# scan re-enters on EVERY arg position, so the launcher's own subcommand words are skipped for
+# free. They are deliberately NOT in the `exec`/`eval` bypass scan: after one of these `exec` is
+# the TOOL's subcommand (`pnpm exec vitest`, `npm exec -- tsc`, `direnv exec . make`) and `eval`
+# is a screen command (`screen -X eval`), never the shell builtin, so a member here would turn
+# those benign lines into an unappealable BLOCKED (the pre-existing `sudo pnpm exec vitest`
+# over-block is that scan firing on `sudo`, unchanged by this set).
+# Deliberately omitted: `bun`, `uvx`, `pipx` resolve a PACKAGE by name and run its entry point
+# rather than a PATH binary; add them with two-sided pins if a pass-through spelling is shown.
+_LAUNCHER_COMMANDS: frozenset[str] = frozenset(
+    {
+        # Package/environment runners
+        "uv",  # uv run CMD
+        "poetry",  # poetry run CMD
+        "pipenv",  # pipenv run CMD
+        "conda",  # conda run -n ENV CMD
+        "npx",  # npx CMD
+        "npm",  # npm exec -- CMD
+        "pnpm",  # pnpm exec CMD
+        "yarn",  # yarn exec CMD
+        "bunx",  # bunx CMD
+        "direnv",  # direnv exec DIR CMD
+        # Session/terminal multiplexers
+        "screen",  # screen [-dmS NAME] CMD
+        "tmux",  # tmux new-session [-d] CMD
+        # Sandboxes and namespaces
+        "firejail",  # firejail [--opts] CMD
+        "bwrap",  # bubblewrap: bwrap [--binds] CMD
+        "proot",  # proot -r ROOTFS CMD
+        "chpst",  # runit: chpst -u USER CMD
+        # Environment shims and daemonizers
+        "xvfb-run",  # xvfb-run [-a] CMD
+        "faketime",  # faketime TIMESTAMP CMD
+        "caffeinate",  # macOS: caffeinate -i CMD
+        "dbus-run-session",  # dbus-run-session -- CMD
+        "daemonize",  # daemonize /path/to/CMD
+        # File watchers that re-run a command
+        "entr",  # ... | entr [-r] CMD
+        "watchexec",  # watchexec [-e EXT] -- CMD
+    }
+)
+
+# Every base name whose args the shell-delegation re-entry and the here-string sink classifier
+# scan for a shell. Public: validator imports it, and it is the source of truth tests iterate.
+WRAPPER_COMMANDS: frozenset[str] = _EXEC_PASSTHROUGH_WRAPPERS | _LAUNCHER_COMMANDS
 
 
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
@@ -1258,7 +1311,9 @@ class BashCommandParser:
                     # Scan all words looking for exec/eval as a command (not as arg to another tool)
                     # Allow: sudo kubectl exec (kubectl handles exec as subcommand)
                     # Block: sudo exec bash (exec IS the command)
-                    elif cmd_name in WRAPPER_COMMANDS:
+                    # Keyed on the verbatim-argv wrappers only: a launcher's `exec` is its own
+                    # subcommand (`pnpm exec vitest`), see _LAUNCHER_COMMANDS (LAB-4699).
+                    elif cmd_name in _EXEC_PASSTHROUGH_WRAPPERS:
                         words = _get_all_words(node)
                         # Container tools that use "exec" as a subcommand (not shell exec)
                         container_tools = {"kubectl", "docker", "podman", "nerdctl", "crictl", "ctr"}
