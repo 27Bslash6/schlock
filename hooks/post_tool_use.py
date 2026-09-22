@@ -16,9 +16,17 @@ Behavior:
 - Cheap-gated: substring check on the command first (the hook runs on every Bash call;
   latency is load-bearing), then the PreToolUse filter's bashlex-backed recognizer binds
   to real `git … commit` invocations before any subprocess runs.
-- Freshness-gated: the Bash tool "succeeds" even when `git commit` exits non-zero, so
-  only a HEAD committed within FRESHNESS_WINDOW_SECONDS is inspected — a failed re-run
-  must not re-flag a stale commit.
+- Freshness-gated by HEAD identity: the Bash tool "succeeds" even when `git commit`
+  exits non-zero, so only a HEAD this detector has not already seen is inspected — a
+  failed re-run must not re-flag a stale commit. The last-seen HEAD per repository is
+  kept in a small state file (SCHLOCK_POST_COMMIT_STATE, default
+  <user data dir>/post_commit_heads.json). Identity, not wall-clock age: the hook fires
+  after the WHOLE Bash command, so `git commit && <slow test suite>` must still be
+  inspected. Only on first contact with a repo (no recorded HEAD) does a wall-clock
+  window decide, because an unseen stale HEAD after a failed re-run is then
+  indistinguishable from a slow compound command's commit. A HEAD that changed but
+  predates the last look (git pull, a commit from the user's own terminal) is
+  recorded, never flagged — it is not this command's commit to amend.
 - Self-terminating: the amend re-fires this hook; a clean amended message produces no
   output, ending the loop. A pathological re-add of the trailer re-flags — that is the
   correct response, and since the hook only ever informs (never blocks), no state is
@@ -37,11 +45,13 @@ Hook Interface:
 
 import json
 import logging
+import os
 import re
 import shlex
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional
 
@@ -56,13 +66,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 logging.basicConfig(level=logging.INFO, format="[schlock-post-hook] %(levelname)s: %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
-# Only inspect a HEAD committed within this window. Wide enough for compound commands
-# (`git commit -F f && make test`) where the hook fires after the whole command; narrow
-# enough that a later failed/no-op `git commit` doesn't re-flag an old HEAD.
+# Bootstrap-only wall-clock fallback. Freshness is normally decided by HEAD identity
+# ("a commit not yet seen by this detector" — see read_last_seen_head), which a slow
+# compound command (`git commit -F f && make test`) cannot age out of. This window
+# applies only on first contact with a repository, where no recorded HEAD exists and a
+# stale HEAD after a failed/no-op re-run is indistinguishable from a fresh commit.
 FRESHNESS_WINDOW_SECONDS = 30
 
-# Timeout for each git subprocess (seconds). Two run per fresh commit: log + show.
+# Timeout for each git subprocess (seconds). Three run per fresh commit:
+# rev-parse + log + show.
 GIT_TIMEOUT_SECONDS = 5
+
+# Cap on repositories tracked in the last-seen-HEAD state file (insertion-ordered,
+# oldest evicted) so the file cannot grow unboundedly across a machine's lifetime.
+MAX_TRACKED_REPOS = 100
 
 # The file-content extension intentionally recognizes only the canonical phrase —
 # plain ("Generated with Claude Code") or linked-markdown ("Generated with
@@ -140,7 +157,7 @@ def escape_control_chars(text: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
-def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
+def find_file_advertising(cwd: Optional[str]) -> Optional[list[tuple[str, int]]]:
     """Return (path, line_number) locations of the canonical phrase added by HEAD.
 
     `git show HEAD` rather than `git diff HEAD~1 HEAD`: a root commit is still
@@ -153,7 +170,8 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
     `--text` scans paths a .gitattributes `-diff` rule would otherwise hide;
     undecodable bytes in forced-text diffs are replaced, not fatal.
 
-    Fail-open: any git failure returns [] (this is a cosmetic filter).
+    Fail-open: any git failure returns None — distinct from [] (scanned clean) so
+    the caller can leave the HEAD unrecorded and retry the scan next time.
     """
     if is_schlock_checkout(cwd):
         return []
@@ -185,7 +203,8 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
             cwd=cwd or None,
         )
         if result.returncode != 0:
-            return []
+            logger.warning(f"Post-commit file scan failed: git show exited {result.returncode}. Skipping (fail-open).")
+            return None
 
         matches: list[tuple[str, int]] = []
         current_path: Optional[str] = None
@@ -211,23 +230,24 @@ def find_file_advertising(cwd: Optional[str]) -> list[tuple[str, int]]:
                     matches.append((current_path, line_number))
                 line_number += 1
         return matches
-    except (OSError, subprocess.SubprocessError):
-        return []
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning(f"Post-commit file scan failed: {e}. Skipping (fail-open).")
+        return None
 
 
-def read_head_commit(cwd: Optional[str]) -> Optional[tuple[int, str, str]]:
-    """Read HEAD's committer timestamp, short hash, and full message.
+def read_head_commit(cwd: Optional[str]) -> Optional[tuple[int, str, str, str]]:
+    """Read HEAD's committer timestamp, short hash, full hash, and full message.
 
     Returns:
-        (committer_epoch, short_hash, message) or None if cwd is not a git repo,
-        the repo has no commits, or git is unavailable (fail-open).
+        (committer_epoch, short_hash, full_hash, message) or None if cwd is not a
+        git repo, the repo has no commits, or git is unavailable (fail-open).
 
     Reads `git log`, not an attacker-supplied path — none of the TOCTOU/symlink/FIFO
     risks that ruled out reading the `-F` target pre-execution apply here.
     """
     try:
         result = subprocess.run(
-            ["git", "log", "-1", "--format=%ct %h%n%B"],
+            ["git", "log", "-1", "--format=%ct %h %H%n%B"],
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
@@ -237,10 +257,140 @@ def read_head_commit(cwd: Optional[str]) -> Optional[tuple[int, str, str]]:
         if result.returncode != 0:
             return None
         first_line, _, message = result.stdout.partition("\n")
-        epoch_str, _, short_hash = first_line.partition(" ")
-        return int(epoch_str), short_hash, message
+        parts = first_line.split(" ")
+        if len(parts) != 3:
+            return None
+        return int(parts[0]), parts[1], parts[2], message
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
+
+
+def get_repo_key(cwd: Optional[str]) -> Optional[str]:
+    """Stable identity for the last-seen-HEAD state: the absolute git dir.
+
+    Per-worktree (each worktree has its own HEAD) and independent of which
+    subdirectory the command ran from. None on any failure — the caller then
+    falls back to the bootstrap wall-clock window (fail-open).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+            cwd=cwd or None,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def state_file_path() -> Path:
+    """Path of the last-seen-HEAD state file.
+
+    SCHLOCK_POST_COMMIT_STATE overrides (tests, unusual setups); the default sits
+    next to the audit log in the platform user-data dir. platformdirs is imported
+    lazily — this module is imported on every Bash call, but state is only touched
+    after a command has gated in as a real `git commit`.
+    """
+    env_path = os.environ.get("SCHLOCK_POST_COMMIT_STATE")
+    if env_path:
+        return Path(env_path).expanduser()
+    from platformdirs import user_data_dir  # noqa: PLC0415 - lazy, post-gate
+
+    return Path(user_data_dir("schlock", "27b.io")) / "post_commit_heads.json"
+
+
+def read_last_seen(repo_key: Optional[str]) -> Optional[tuple[str, int]]:
+    """(full_hash, seen_at_epoch) last recorded for this repo, or None (unknown/failed)."""
+    if repo_key is None:
+        return None
+    try:
+        state = json.loads(state_file_path().read_text())
+        entry = state.get(repo_key) if isinstance(state, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        full_hash, seen_at = entry.get("hash"), entry.get("seen_at")
+        if isinstance(full_hash, str) and isinstance(seen_at, (int, float)):
+            return full_hash, int(seen_at)
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+def record_seen_head(repo_key: Optional[str], full_hash: str) -> None:
+    """Best-effort atomic record of the HEAD just seen for this repo, with the
+    wall-clock time of the look (seen_at) so a later HEAD that PREDATES it can be
+    recognized as externally created.
+
+    Write failures are swallowed: with no record, the next run degrades to the
+    bootstrap wall-clock window — the pre-identity behavior. No file locking: the
+    read-modify-replace below leaves a microseconds-wide lost-update window
+    between concurrent sessions, whose worst case is one repo dropping back to
+    the bootstrap window for its next commit (a slow compound command's commit
+    there is missed once); the next record self-heals. Locking is not worth that
+    for a detector that informs, never blocks.
+    """
+    if repo_key is None:
+        return
+    tmp = None
+    try:
+        path = state_file_path()
+        try:
+            state = json.loads(path.read_text())
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        # Insertion order is recency order: re-insert, then evict the oldest.
+        # seen_at is floored to whole seconds so a commit landing in the same
+        # second as the look still compares as not-older (git %ct is integral).
+        state.pop(repo_key, None)
+        state[repo_key] = {"hash": full_hash, "seen_at": int(time.time())}
+        if len(state) > MAX_TRACKED_REPOS:
+            for key in list(state)[: len(state) - MAX_TRACKED_REPOS]:
+                del state[key]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # PID-unique temp name so concurrent writers never clobber each other's
+        # in-flight temp file; the atomic replace keeps the state file valid JSON.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(path)
+    except OSError:
+        if tmp is not None:
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
+
+
+def is_uninspected_commit(repo_key: Optional[str], full_hash: str, committed_at: int) -> bool:
+    """True when HEAD is a commit this command may have created and the detector
+    has not yet inspected.
+
+    Records the HEADs it rules out (they are now "seen"); the caller records a HEAD
+    once it is scanned clean or reported, so a transient scan failure on a clean
+    commit is retried rather than permanently suppressed.
+    """
+    last_seen = read_last_seen(repo_key)
+    if last_seen is not None and last_seen[0] == full_hash:
+        return False  # no new commit since the last look — failed/no-op re-run
+    if last_seen is None:
+        if time.time() - committed_at > FRESHNESS_WINDOW_SECONDS:
+            # Bootstrap: with no recorded HEAD for this repo (first contact, or state
+            # unavailable), an old HEAD after a failed re-run is indistinguishable from
+            # a slow compound command's commit — fall back to the wall-clock window
+            # rather than re-flag a stale commit. Record so identity tracking starts.
+            record_seen_head(repo_key, full_hash)
+            return False
+    elif committed_at < last_seen[1]:
+        # HEAD changed but the commit predates our last look, so this command cannot
+        # have created it — it moved externally (git pull, the user's own terminal).
+        # Flagging it would prompt an amend of a commit that is not ours to rewrite.
+        record_seen_head(repo_key, full_hash)
+        return False
+    return True
 
 
 def format_amend_prompt(short_hash: str, patterns_removed: list[dict]) -> str:
@@ -350,20 +500,31 @@ def handle_post_tool_use(input_data: dict) -> Optional[dict]:  # noqa: PLR0911 -
     head = read_head_commit(input_data.get("cwd"))
     if head is None:
         return None
-    committed_at, short_hash, message = head
+    committed_at, short_hash, full_hash, message = head
 
-    # Freshness gate: Bash "succeeds" even when `git commit` was a no-op (nothing staged,
-    # hook failure, --dry-run). Only a just-created HEAD is attributable to this command.
-    if time.time() - committed_at > FRESHNESS_WINDOW_SECONDS:
+    # Freshness gate, by HEAD identity: Bash "succeeds" even when `git commit` was a
+    # no-op (nothing staged, hook failure, --dry-run), so an unchanged HEAD must not be
+    # re-flagged — but wall-clock age cannot decide, because the hook fires after the
+    # WHOLE command and `git commit && <slow suite>` ages HEAD past any window.
+    repo_key = get_repo_key(input_data.get("cwd"))
+    if not is_uninspected_commit(repo_key, full_hash, committed_at):
         return None
 
     try:
         _cleaned, patterns_removed, categories = commit_filter.clean_message(message)
     except Exception as e:
+        # NOT recorded as seen: a transient filter failure must not permanently
+        # suppress this HEAD — the next commit-shaped command retries it.
         logger.warning(f"Post-commit filter failed: {e}. Skipping (fail-open).")
         return None
 
+    # None = scan failed: leave the HEAD unrecorded so the next run retries — unless
+    # message findings report it below (a reported HEAD must not be re-flagged by a
+    # later failed re-run; None is falsy, so the report still fires this run).
     file_matches = find_file_advertising(input_data.get("cwd"))
+    if file_matches is not None or patterns_removed:
+        record_seen_head(repo_key, full_hash)
+
     if not patterns_removed and not file_matches:
         # Clean message — also the amend-loop terminator: a successful amend lands here.
         return None
