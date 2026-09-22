@@ -462,13 +462,25 @@ def _over_size_ceiling(command: str, *, derived: bool) -> Optional[ValidationRes
 
 # Ceiling on distinct (command, tail) suffixes one top-level extraction may visit. Legitimate
 # commands need a few dozen at most. Past it the command is adversarial and extraction fails
-# CLOSED: the extractor raises, validate_command's catch-all returns BLOCKED, the hook denies.
+# CLOSED: the extractor raises, validate_command converts that to an ordinary BLOCKED verdict
+# at the single call site, and the hook denies on it.
 # Needed because the per-call memo bounds ONE wrapper chain, not k independent chains with
 # distinct tails, so total work still grew with command size - and a PreToolUse hook that
 # outlives its timeout fails OPEN. Pinned by test_sibling_chains_past_the_ceiling_fail_closed.
 # ponytail: each suffix costs O(len) for the `args[i+1:]` slice + tuple key, so the worst case
 # under this ceiling is ~0.2 s (measured); index-based re-entry would make it O(1) if needed.
 MAX_DELEGATOR_TOKENS = 256
+
+
+class _DelegatorCeilingError(ValueError):
+    """Raised past MAX_DELEGATOR_TOKENS; converted to a BLOCKED verdict by validate_command.
+
+    An exception rather than a threaded return value because the extractor is recursive and
+    already unwinds. A ValueError SUBCLASS rather than a bare one so the conversion is exact:
+    matching on `str(e)` instead would mislabel any other ValueError out of the extractor as a
+    ceiling hit, which is the failure mode the heredoc handler's string sniffing already has.
+    """
+
 
 # `watch`'s own options. Only these consume a following word; everything after the option run
 # belongs to the command. Getting this wrong over-approximates (an option value is prepended to
@@ -596,7 +608,8 @@ def _shell_delegated_payloads(
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
 
-    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there).
+    Raises _DelegatorCeilingError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed,
+    see there); validate_command turns that into a BLOCKED verdict.
     """
     # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
     # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
@@ -613,7 +626,7 @@ def _shell_delegated_payloads(
             continue
         seen.add(key)
         if len(seen) > MAX_DELEGATOR_TOKENS:
-            raise ValueError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} delegator tokens")
+            raise _DelegatorCeilingError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} delegator tokens")
         base = cmd_name.rsplit("/", 1)[-1]
         found = []
 
@@ -2347,7 +2360,21 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
-        payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
+        try:
+            payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
+        except _DelegatorCeilingError as e:
+            # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH below and _over_size_ceiling
+            # (LAB-4363). Letting this reach the catch-all denied with `error` set, an empty
+            # `alternatives`, a message naming no limit, and `logger.exception(f"... {command!r}")`
+            # writing the whole adversarial command to the log (LAB-4582). `str(e)` so the limit is
+            # stated once, at the raise. The deny itself is unchanged.
+            return ValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=str(e),
+                alternatives=["Run the command directly instead of chaining wrapper commands"],
+                exit_code=1,
+            )
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
