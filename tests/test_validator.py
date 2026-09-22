@@ -2559,3 +2559,17 @@ class TestParseFailureFailsClosed:
         # would be over-reach from "the body is a program" to "the body looks
         # dangerous", which is the LAB-402 failure mode.
         assert validate_command("cat <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is True
+
+
+class TestCshTcshHeredocAgreesWithHereString:
+    """LAB-4442: csh/tcsh were in _SHELL_COMMANDS (the `-c` surface) but neither
+    _HEREDOC_SHELL_COMMANDS nor STDIN_EXEC_INTERPRETERS - the same drift rbash had before it
+    was added to all three. Pins the heredoc-spelling verdict to match `csh <<< ...` and the
+    `bash <<EOF` control above.
+    """
+
+    def test_csh_heredoc_is_blocked(self, safety_rules_path):
+        assert validate_command("csh <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is False
+
+    def test_tcsh_heredoc_is_blocked(self, safety_rules_path):
+        assert validate_command("tcsh <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path).allowed is False
