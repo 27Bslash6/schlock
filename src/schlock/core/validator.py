@@ -2092,7 +2092,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # Validate command/process substitution using AST-based analysis
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
-            sub_results = sub_validator.validate_all_substitutions(ast)
+            sub_results = sub_validator.validate_all_substitutions(ast, command=command)
             for sub_result in sub_results:
                 if not sub_result.allowed:
                     return ValidationResult(
