@@ -17,6 +17,7 @@ import pytest
 from schlock.core import validator
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
+    MAX_DELEGATOR_TOKENS,
     MAX_SHELL_DELEGATION_DEPTH,
     _dash_c_payload,
     _shell_delegated_payloads,
@@ -137,6 +138,97 @@ class TestShellDelegatedPayloadExtraction:
 
     def test_empty_payload_is_ignored(self):
         assert self._p(("bash", ["-c", "   "])) == []
+
+    def test_wrapper_before_runner_keeps_operand_semantics(self):
+        # LAB-3004: a wrapper in front of a dash-c RUNNER re-enters the extractor, so the
+        # runner's leading user/group operand does not end option parsing. Pre-fix the wrapper
+        # branch called `_dash_c_payload` with the default `operand_ends_options=True`, so the
+        # operand stopped the scan and this returned [].
+        assert self._p(("timeout", ["5", "sg", "root", "-c", "mkswap /dev/sda"])) == ["mkswap /dev/sda"]
+        assert self._p(("nice", ["su", "postgres", "-c", "rm -rf /"])) == ["rm -rf /"]
+
+    def test_wrapper_before_watch(self):
+        # LAB-3004: `watch` was absent from the wrapper branch's search set entirely, so a
+        # wrapped `watch` returned []. It now re-enters through the same extractor.
+        assert self._p(("timeout", ["5", "watch", "mkswap /dev/sda"])) == ["mkswap /dev/sda"]
+        assert self._p(("env", ["FOO=1", "watch", "-n", "5", "rm", "-rf", "/"])) == ["rm -rf /"]
+
+    def test_nested_wrappers_thread(self):
+        # A wrapper wrapping a wrapper resolves to the innermost delegator; a suffix re-reached
+        # through a second delegator token is skipped, so exactly one payload, no duplicate.
+        assert self._p(("timeout", ["5", "sudo", "bash", "-c", "rm -rf /"])) == ["rm -rf /"]
+        assert self._p(("sudo", ["timeout", "5", "sg", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
+
+    def test_wrapper_before_bare_shell_has_no_payload(self):
+        # No `-c`, no payload — the recursion must not invent one.
+        assert self._p(("timeout", ["5", "bash", "script.sh"])) == []
+
+    def test_decoy_operand_does_not_end_the_scan(self):
+        # Panel (LAB-3004): a wrapper OPERAND whose basename collides with a delegator name is a
+        # decoy. Scanning only the FIRST match let the decoy end the scan and drop the real
+        # payload behind it. Every delegator position is re-entered, so the decoy over-approximates
+        # (or yields nothing) while the true payload is still found.
+        # `flock ./find sh -c PROG`: lock-file operand basenames to `find`; `find` has no -exec, so
+        # only re-entry on the later `sh` recovers the payload.
+        assert "mkswap /dev/sda" in self._p(("flock", ["find", "sh", "-c", "mkswap /dev/sda"]))
+        assert "mkswap /dev/sda" in self._p(("flock", ["/var/lock/find", "sh", "-c", "mkswap /dev/sda"]))
+        # `flock ./sh sg root -c PROG`: operand basenames to shell `sh`; the true runner `sg`
+        # sits behind it and must still resolve with runner operand semantics.
+        assert "rm -rf /" in self._p(("flock", ["./sh", "sg", "root", "-c", "rm -rf /"]))
+        # `strace -o bash sg root -c PROG`: the `-o FILE` value basenames to `bash`.
+        assert "rm -rf /" in self._p(("strace", ["-o", "bash", "sg", "root", "-c", "rm -rf /"]))
+
+    @pytest.mark.parametrize("wrapper", ["sudo", "su"])
+    def test_repeated_wrappers_extract_each_suffix_once(self, wrapper, monkeypatch):
+        # CodeRabbit on #153 (CWE-400): `sudo sudo ... bash -c PROG` visited every subset of
+        # wrapper positions - pre-fix 2^n extractor calls and 2^(n-1) copies of PROG (n=18:
+        # 131072 payloads, 0.4 s before the first inner validation). Now quadratic calls, one
+        # PROG. `su` is the dual-membership case (owns a -c AND wraps): it still finds PROG once
+        # per `su` node, so it pins the payload dedup that `sudo` alone would let rot. Counted,
+        # not timed: the recursion resolves the module global, so wrapping it observes every
+        # re-entry - the floor proves the wrapper actually saw the recursion.
+        calls = 0
+        real = validator._shell_delegated_payloads
+
+        def counting(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(validator, "_shell_delegated_payloads", counting)
+        n = 12
+        payloads = counting([(wrapper, [wrapper] * (n - 1) + ["bash", "-c", "mkswap /dev/sda"])])
+        assert payloads == ["mkswap /dev/sda"]
+        assert calls >= n, f"{calls} extractor calls: the monkeypatch did not observe the recursion"
+        assert calls <= (n + 1) ** 2, f"{calls} extractor calls for {n} wrappers: not polynomial"
+
+    def test_ceiling_admits_exactly_max_delegator_tokens(self):
+        # CodeRabbit on #153: the sibling test below pins only the reject side, so a `>` -> `>=`
+        # slip would start blocking commands that fit the ceiling exactly. n `nice` tokens ahead of
+        # `bash -c PROG` is n + 1 distinct suffixes: n = MAX - 1 sits on the ceiling, n = MAX is
+        # one past it.
+        def chain(n):
+            return ("nice", ["nice"] * (n - 1) + ["bash", "-c", "echo ok"])
+
+        assert self._p(chain(MAX_DELEGATOR_TOKENS - 1)) == ["echo ok"]
+        with pytest.raises(ValueError, match="delegator tokens"):
+            self._p(chain(MAX_DELEGATOR_TOKENS))
+
+    def test_sibling_chains_past_the_ceiling_fail_closed(self):
+        # Panel on #153: the per-call memo bounds ONE chain, not k independent chains with
+        # distinct tails, so total extraction work still grew with command size - and a
+        # PreToolUse hook that outlives its timeout fails OPEN. Past MAX_DELEGATOR_TOKENS
+        # distinct suffixes the extractor raises; validate_command's catch-all turns that into
+        # BLOCKED with the reason in `error`, which the hook denies on.
+        half = MAX_DELEGATOR_TOKENS // 2 + 1  # two chains of `half` nice tokens + bash > ceiling
+        progs = ("echo a", "echo b")
+        with pytest.raises(ValueError, match="delegator tokens"):
+            self._p(*(("nice", ["nice"] * (half - 1) + ["bash", "-c", prog]) for prog in progs))
+        command = "; ".join(" ".join(["nice"] * half + ["bash", "-c", prog]) for prog in progs)
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert "delegator tokens" in (result.error or "")
 
 
 class TestFindExecPayloadExtraction:
@@ -344,6 +436,135 @@ class TestFindExecDelegation:
         # the second `-exec` is `command not found`, so the payload never runs. schlock leaves it
         # at the pre-existing HIGH (find_exec_dangerous) rather than block a non-executable form.
         assert validate_command('find . -exec echo hi ; -exec sh -c "mkswap /dev/sda" ;').risk_level == RiskLevel.HIGH
+
+
+class TestWrappedRunnerAndWatchDelegation:
+    """LAB-3004: a wrapper in front of a dash-c runner or `watch` gets the bare payload's verdict.
+
+    Pre-fix (`main` @ `a508274`, ShellCheck unavailable) the wrapper branch only searched for a
+    dash-c *program command* and called `_dash_c_payload` with the default
+    `operand_ends_options=True`, so a wrapped runner's operand ended option parsing and `watch`
+    was never looked for at all. Every wrapped form below returned **SAFE / allowed=True** while
+    its bare spelling is BLOCKED.
+    """
+
+    # WRAPPER_COMMANDS is the source of truth; AC-2 asks specifically that "every wrapper entry"
+    # works, so parametrize over a representative spread of them rather than pinning one.
+    _WRAPPERS = ["timeout 5", "sudo", "nice", "nohup", "env FOO=1", "flock /tmp/l", "busybox"]
+
+    @pytest.mark.parametrize("wrapper", _WRAPPERS)
+    def test_wrapped_runner_is_blocked(self, wrapper):
+        # Pre-fix: SAFE / allowed=True.
+        result = validate_command(f'{wrapper} sg root -c "mkswap /dev/sda"')
+        assert result.risk_level == RiskLevel.BLOCKED, f"{wrapper} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("wrapper", _WRAPPERS)
+    def test_wrapped_watch_is_blocked(self, wrapper):
+        # Pre-fix: SAFE / allowed=True.
+        result = validate_command(f'{wrapper} watch "mkswap /dev/sda"')
+        assert result.risk_level == RiskLevel.BLOCKED, f"{wrapper} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_ac1_repro_lines(self):
+        # The two exact repro lines from the ticket. Pre-fix: SAFE / allowed=True.
+        for command in ('timeout 5 sg root -c "mkswap /dev/sda"', 'timeout 5 watch "mkswap /dev/sda"'):
+            result = validate_command(command)
+            assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+            assert result.allowed is False
+
+    def test_dual_membership_forms_still_resolve(self):
+        # su/sg/runuser are both runners and wrappers; both the bare runner and the wrapped
+        # runner must resolve. Pre-fix the wrapped `sudo su -c` was already BLOCKED (su is a
+        # dash-c command found by the old search set) — pinned so the recursion keeps it.
+        for command in (
+            'su -c "mkswap /dev/sda"',
+            'sudo su -c "mkswap /dev/sda"',
+            'sudo bash -c "mkswap /dev/sda"',
+            'busybox sh -c "mkswap /dev/sda"',
+        ):
+            assert validate_command(command).risk_level == RiskLevel.BLOCKED, command
+
+    def test_nested_wrapper_is_blocked(self):
+        # A wrapper wrapping a wrapper threads to the innermost delegator. Pre-fix: SAFE.
+        assert validate_command('timeout 5 sudo watch "mkswap /dev/sda"').risk_level == RiskLevel.BLOCKED
+        assert validate_command('sudo timeout 5 sg root -c "mkswap /dev/sda"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Panel (LAB-3004): a wrapper operand / option value whose basename collides with a
+            # delegator name is a decoy that, under a first-match scan, ended the scan and dropped
+            # the real payload — the exact wrapped-runner/watch bypass this ticket closes, reopened
+            # one layer down. Each of these was SAFE / allowed=True against the first-match cut of
+            # the fix; the bare `sg root -c ...` / `sh -c ...` control is BLOCKED.
+            'flock find sh -c "mkswap /dev/sda"',  # lock-file operand basenames to `find`
+            'flock /tmp/sh sg root -c "mkswap /dev/sda"',  # operand basenames to shell `sh`
+            'flock /tmp/bash watch "mkswap /dev/sda"',  # decoy + wrapped watch
+            'strace -o bash sg root -c "mkswap /dev/sda"',  # `-o FILE` value basenames to `bash`
+            'ltrace -o sh sg root -c "mkswap /dev/sda"',
+            'nsenter --root=/tmp/bash sg root -c "mkswap /dev/sda"',
+            'env A=1 flock /tmp/sh sg root -c "mkswap /dev/sda"',
+        ],
+    )
+    def test_decoy_token_before_delegator_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_wrapped_multiclause_find_all_clauses_scanned(self):
+        # Panel (LAB-3004): with `find` in the scan set, a WRAPPED multi-clause find routes through
+        # the find branch so EVERY -exec clause is inspected, not just the first. Escaped `\;` keeps
+        # both clauses under one find; the dangerous second clause must not slip. Pre-fix: SAFE.
+        assert (
+            validate_command(r'timeout 5 find . -exec sh -c ls \; -exec sh -c "mkswap /dev/sda" \;').risk_level
+            == RiskLevel.BLOCKED
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # AC-2: benign wrapped forms must NOT be over-blocked by the recursion.
+            'timeout 5 sg root -c "ls -la"',
+            "timeout 5 watch date",
+            "nice watch -n 5 date",
+            "timeout 5 bash script.sh",
+        ],
+    )
+    def test_benign_wrapped_forms_stay_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "strace -o bash ls -la",
+            "strace -o sh -f python3 app.py",
+            "ltrace -o watch make",
+            "flock /var/lock/find ls -la",
+            "flock /var/lock/watch git status",
+            "nsenter --root=/tmp/bash ls",
+        ],
+    )
+    def test_benign_delegator_named_operand_is_not_denied(self, command):
+        """The over-approximation has a bound, and this is it.
+
+        The scan re-enters on a wrapper's own operands and option VALUES too, not only on the
+        wrapped command, because telling them apart needs a per-wrapper getopt table whose
+        failure mode is fail-OPEN: one wrong entry skips the real command and drops the payload,
+        which is the decoy bypass this class exists to close. The price is that a benign file
+        named after a delegator gets its tail re-validated - so pin that the price stays below
+        ask/deny. Measured across every `_DELEGATOR_COMMANDS` name x 10 benign tails (1380
+        pairs), one verdict moved at all (`ltrace -o watch make`, SAFE -> LOW, still allowed);
+        the only ask/deny hits were `sudo`/`su`/`doas`/`pkexec` FILENAMES, which the
+        pre-existing `sudo_use` / `privilege_escalation_variants` regex rules block on `main`
+        identically - not this scan. Asserted as "never denied", not "always SAFE", because
+        LOW is the honest current value and pinning SAFE would be pinning a fiction.
+        """
+        result = validate_command(command)
+        assert result.allowed is True, f"{command!r} -> {result.risk_level.name}"
+        assert result.risk_level < RiskLevel.HIGH, f"{command!r} -> {result.risk_level.name}"
 
 
 class TestFindExecUnchanged:
