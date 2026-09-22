@@ -85,8 +85,8 @@ def _get_rule_engine(config_path: Optional[str] = None) -> "RuleEngine":
         return _global_rule_engine
 
 
-def _invalidate_cache_on_ruleset_change(config_path: Optional[str] = None) -> None:
-    """Drop cached verdicts when the requested ruleset is not the one that produced them.
+def _invalidate_on_ruleset_change(config_path: Optional[str] = None) -> None:
+    """Retire every piece of ruleset-derived state when the requested ruleset is not its own.
 
     ValidationCache keys on the command string alone, so without this the first ruleset to
     validate a command owns that command's verdict for the rest of the process: a later call
@@ -98,24 +98,34 @@ def _invalidate_cache_on_ruleset_change(config_path: Optional[str] = None) -> No
     _get_rule_engine() does reload on a path change, but it runs after the lookup has already
     returned the stale hit, so the same compare placed there never fires.
 
-    Production never mixes rulesets (one hook process, one ruleset), so the clear is a
-    test-only event and the hot path keeps both its str key and its hit rate.
+    Clearing the verdict cache alone is NOT enough, and stopping there is the same mistake
+    LAB-2752 recorded - fixing the path the bug report names while a sibling consumer keeps
+    the old ruleset. _global_substitution_validator binds its engine once at construction and
+    ignores config_path forever after, so a cleared cache recomputes the verdict with the
+    PREVIOUS ruleset's engine for anything inside $(...), then stores that answer under the
+    new marker, where no later clear can reach it. `echo "$(cat ~/.kube/config | head)"`
+    validated under a ruleset without 03_credential_theft.yaml and then under the full one
+    returned SAFE, where the full ruleset alone returns BLOCKED. Dropping the singleton here
+    makes the next _get_substitution_validator() rebuild it against the new engine.
     """
-    global _global_cache_path  # noqa: PLW0603
+    global _global_cache_path, _global_substitution_validator  # noqa: PLW0603
 
     # Re-check under the lock: the caller's guard is deliberately unlocked (it runs before
     # every cache hit), so another thread may have switched the ruleset between that compare
     # and this one. Together the two form one double-checked lock.
     #
-    # ponytail: the Step-1 lookup that follows is outside the lock regardless, so two threads
-    # on different rulesets can still interleave and one can read a verdict the other is
-    # clearing. Test-only - production is one hook process holding one ruleset - and the
-    # engine singleton is already racy the same way. Partition the cache per ruleset if that
-    # ever stops being true.
+    # ponytail: the ceiling is write-after-clear, not just a stale read. validate_command's
+    # Step-7 _global_cache.set() is outside this lock and is never re-guarded, so a call
+    # already in flight under the old ruleset can land its verdict AFTER this clear has moved
+    # the marker - and because the marker then matches, no later clear can evict it. Test-only
+    # (production is one hook process holding one ruleset, and no concurrent multi-ruleset
+    # caller exists), and the engine singleton is already racy the same way. To close it,
+    # snapshot the marker before Step 5 and skip the Step-7 set when it moved.
     with _cache_lock:
         if _global_cache_path != config_path:
             _global_cache.clear()
             _global_cache_path = config_path
+            _global_substitution_validator = None
 
 
 def _get_parser() -> "BashCommandParser":
@@ -2149,7 +2159,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # benchmark is at parity with main. It is also the outer half of the helper's
         # double-checked lock - keep it here, and keep it before the lookup.
         if _global_cache_path != config_path:
-            _invalidate_cache_on_ruleset_change(config_path)
+            _invalidate_on_ruleset_change(config_path)
         cached = _global_cache.get(command)
         if cached is not None:
             return cached
