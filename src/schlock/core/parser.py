@@ -428,21 +428,33 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
         # `2>&-` closes an fd - bashlex leaves `output` a bare `-` string.
         return []
 
-    # bashlex reads `$'…'` and `$"…'` as a `$` PARAMETER glued to literal text, so the
-    # word arrives as `$/dev/sda` and matches no path rule - a third way to spell a
-    # hidden target, alongside the `"…"` this ticket fixed. Drop the `$` when the
-    # source says the quote form is dollar-prefixed. This covers the LITERAL spelling
-    # only: `$'\x2f…'` still arrives with its escapes dropped rather than decoded,
-    # which is the repo's documented ANSI-C ceiling (KNOWN_FALLBACK_CEILINGS), not
-    # something this strip pretends to close.
-    target_pos_for_quote = getattr(target, "pos", None)
-    if (
-        word.startswith("$")
-        and target_pos_for_quote
-        and command is not None
-        and command[target_pos_for_quote[0] : target_pos_for_quote[0] + 2] in ("$'", '$"')
-    ):
-        word = word[1:]
+    # bashlex reads the `$` of `$'…'` / `$"…"` as a one-character PARAMETER part glued
+    # to literal text, so the word arrives as `$/dev/sda` and matches no path rule - a
+    # third way to spell a hidden target, alongside the `"…"` this ticket fixed. Drive
+    # the strip off those parts rather than off the first two source characters: a
+    # leading empty fragment (`> ""$"/dev/sda"`) moves the `$` off the start and
+    # defeats a positional test, while the part is still there. A real expansion is
+    # wider than one character (`$HOME` spans five), so it is never stripped.
+    #
+    # Two limits, both deliberate and pinned by tests. `$'\x2f…'` arrives with its
+    # escapes DROPPED rather than decoded - the repo's documented ANSI-C ceiling - and
+    # is caught, if at all, by the encoding rules rather than as a path. And a
+    # single-quoted empty fragment (`> ''$'/dev/sda'`) makes bashlex emit no parameter
+    # part at all and leave a stray quote in the word; that word is already wrong
+    # before this function sees it, and correcting it means re-lexing, not stripping.
+    if command is not None:
+        for part in sorted(getattr(target, "parts", None) or [], key=lambda x: getattr(x, "pos", (0,))[0]):
+            pos = getattr(part, "pos", None)
+            is_dollar_quote = (
+                getattr(part, "kind", None) == "parameter"
+                and pos
+                and pos[1] - pos[0] == 1
+                and command[pos[1] : pos[1] + 1] in ("'", '"')
+            )
+            if is_dollar_quote and word.startswith("$"):
+                word = word[1:]
+            else:
+                break
 
     # Did the SOURCE glue the operator to its target? Read the character before the
     # target rather than computing where the operator ended: bashlex NORMALISES the
@@ -1033,16 +1045,29 @@ class BashCommandParser:
         # gets `heredoc_ranges`, this one never did. Harmless while the whole-command
         # pass only ran as a last resort; once a compound redirect could switch it on,
         # an unrelated `> out.txt` started rescoring inert `cat` input as an executed
-        # command. Suppress the carrying word here, on the same is_shell test the
-        # original pass uses, rather than narrowing the gate - the gate is what makes
-        # compound targets visible at all. Found by adversarial review (Helly R).
-        inert_heredocs = [(s, e) for s, e, is_shell in self.extract_heredoc_ranges(command, ast_nodes) if not is_shell]
+        # command.
+        #
+        # SECURITY: suppress the BODY, never the word that carries it. Containing an
+        # inert heredoc does not make a whole shell word inert - bash concatenates
+        # anything written after the closing paren into the SAME word, so
+        # `$(cat <<EOF … EOF)mk''fs /dev/sda` is one word whose tail is an executed
+        # command name. Suppressing the word swallowed that name and turned a BLOCKED
+        # command SAFE. Found by adversarial review (Helly R), whose first report this
+        # fix caused; the body is located by TEXT SEARCH rather than by offset
+        # arithmetic, because quote-stripping earlier in the word shifts every offset
+        # after it. If the body cannot be located the word is left UNSUPPRESSED: the
+        # cost of that is a false positive, and the cost of the other choice is this
+        # bug again.
+        inert_bodies = [command[s:e] for s, e, is_shell in self.extract_heredoc_ranges(command, ast_nodes) if not is_shell]
         ranges = []
         offset = 0
 
         for word, span in words:
-            carries_inert_heredoc = span is not None and any(span[0] <= s and e <= span[1] for s, e in inert_heredocs)
-            if span is not None and (carries_inert_heredoc or self._quoting_is_load_bearing(command, word, span)):
+            for body in inert_bodies:
+                found = word.find(body) if body else -1
+                if found >= 0:
+                    ranges.append((offset + found, offset + found + len(body)))
+            if span is not None and self._quoting_is_load_bearing(command, word, span):
                 # Absorb the following joining space. In the source that offset
                 # held the closing quote, a character no rule pattern can cross;
                 # reconstruction turns it into whitespace, which patterns ending

@@ -357,3 +357,68 @@ class TestInertHeredocIsNotPromotedByAnUnrelatedRedirect:
     def test_compound_target_still_visible_alongside_a_heredoc(self, safety_rules_path):
         """The gate stays wide: suppressing the body must not re-hide the redirect target."""
         assert _risk('{ cat <<EOF\nhi\nEOF\n} > "/dev/sda"', safety_rules_path) is RiskLevel.BLOCKED
+
+
+class TestHeredocSuppressionCoversTheBodyNotTheWord:
+    """Containing an inert heredoc does not make the whole shell word inert.
+
+    Bash concatenates anything written after the closing paren into the SAME word, so
+    a substitution carrying a heredoc can be glued to an executed command name. An
+    earlier revision of this fix suppressed the entire carrying word and turned a
+    BLOCKED command SAFE — the worst direction for a validator. Found by adversarial
+    review, and these pin the body/word distinction rather than the symptom.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("$(cat <<EOF\n\nEOF\n)mk''fs /dev/sda", "filesystem_format"),
+            ("$(cat <<EOF\n\nEOF\n)wi''pefs /dev/sda", "filesystem_wipe"),
+        ],
+    )
+    def test_command_name_glued_after_a_heredoc_is_still_seen(self, command, rule, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+
+    def test_only_the_body_range_is_suppressed(self):
+        """The suppression range must cover the body, not the word that carries it."""
+        parser = BashCommandParser()
+        command = "$(cat <<EOF\n\nEOF\n)mk''fs /dev/sda"
+        reconstructed, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert "mkfs" in reconstructed
+        # every range is strictly shorter than the word that contains the heredoc
+        assert ranges and all(end - start <= len("\nEOF") for start, end in ranges)
+
+    def test_inert_body_is_still_suppressed(self, safety_rules_path):
+        """The original reason the suppression exists must survive the narrowing."""
+        with_redirect = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
+        assert _verdict(with_redirect, safety_rules_path) == (RiskLevel.MEDIUM, ("chmod_exec",))
+
+
+class TestConcatenatedDollarQuoteForms:
+    """The `$` strip is driven by bashlex's parameter parts, not by source position.
+
+    A leading empty fragment moves the `$` off the start of the target and defeats a
+    positional test while the one-character parameter part is still there.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        ["echo x > $'/dev/sda'", 'echo x > $"/dev/sda"', 'echo x > ""$"/dev/sda"', "echo x > $''$'/dev/sda'"],
+    )
+    def test_concatenated_dollar_quote_is_blocked(self, command, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ("disk_destruction_dd",))
+
+    def test_wide_parameter_is_never_stripped(self, safety_rules_path):
+        """`$HOME` is five characters wide, so it is an expansion, not a quote marker."""
+        assert _risk("echo x > $HOME/out.txt", safety_rules_path) is RiskLevel.SAFE
+
+    def test_single_quoted_empty_fragment_remains_uncovered(self, safety_rules_path):
+        """KNOWN LIMIT, pinned: bashlex mis-lexes this one before we ever see it.
+
+        `> ''$'/dev/sda'` yields the word `'$'/dev/sda` — a stray quote retained, and
+        no parameter part emitted at all. The word is already wrong on arrival, so
+        correcting it means re-lexing the word rather than stripping a marker. SAFE on
+        the pre-change parent and on every revision since; recorded here so the limit
+        is visible rather than mistaken for coverage.
+        """
+        assert _risk("echo x > ''$'/dev/sda'", safety_rules_path) is RiskLevel.SAFE
