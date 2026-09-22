@@ -270,3 +270,90 @@ class TestDataOperandsStayOut:
 
     def test_heredoc_body_stays_inert(self, safety_rules_path):
         assert _risk("cat << EOF\nrm -rf /\nEOF", safety_rules_path) is RiskLevel.SAFE
+
+
+class TestDollarPrefixedQuoteForms:
+    """`$'…'` and `$"…"` are a third way to spell a hidden target.
+
+    bashlex reads the `$` as a PARAMETER glued to literal text, so the word arrives
+    as `$/dev/sda` and matches no path rule. Pre-existing, and it survived the
+    original fix for `"…"` — found by adversarial review.
+
+    The strip covers the LITERAL spelling only. `$'\x2f…'` arrives with its escapes
+    dropped rather than decoded, which is the repo's documented ANSI-C ceiling; the
+    test below pins that as a known gap so it cannot be mistaken for coverage.
+    """
+
+    @pytest.mark.parametrize("command", ["echo x > $'/dev/sda'", 'echo x > $"/dev/sda"'])
+    def test_dollar_quoted_target_is_blocked(self, command, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ("disk_destruction_dd",))
+
+    def test_ordinary_parameter_target_is_not_stripped(self, safety_rules_path):
+        """Only a dollar-QUOTE form loses its `$`; a real expansion keeps it."""
+        assert _risk("echo x > $HOME/out.txt", safety_rules_path) is RiskLevel.SAFE
+
+    def test_ansi_c_escape_spelling_is_caught_by_a_different_rule(self, safety_rules_path):
+        """KNOWN LIMIT, pinned: the strip covers the literal spelling, not decoding.
+
+        bashlex DROPS ANSI-C escapes rather than decoding them, so `$'\\x2f…'` reaches
+        the target as `x2fdevx2fsda` and no path rule sees a device. It is not silent —
+        `hex_octal_encoding` matches the raw text at HIGH — but it is not rated as the
+        disk write it is. Unchanged from the pre-change parent; closing it properly
+        needs real ANSI-C decoding, the repo's documented T3 ceiling.
+        """
+        assert _verdict("echo x > $'\\x2fdev\\x2fsda'", safety_rules_path) == (
+            RiskLevel.HIGH,
+            ("hex_octal_encoding",),
+        )
+
+
+class TestNormalisedDescriptorDoesNotInventAGap:
+    r"""bashlex normalises the descriptor, so source width cannot be re-derived from it.
+
+    Source `02>` arrives as `input=2`; arithmetic on `len(str(fd))` is one short and
+    invents whitespace that is not in the source. That mattered because rule 04's
+    `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before `/dev/`. Glue is now read
+    from the source character before the target instead.
+    """
+
+    @pytest.mark.parametrize("fd", ["2", "02", "002", "0002"])
+    def test_zero_padded_stderr_discard_stays_safe(self, fd, safety_rules_path):
+        assert _verdict(f"shred old.txt {fd}>/dev/null", safety_rules_path) == (RiskLevel.SAFE, ())
+
+    @pytest.mark.parametrize("fd", ["2", "02", "002", "0002"])
+    def test_reconstruction_keeps_the_source_glue(self, fd):
+        """The descriptor normalises to `2`; what must survive is the ABSENCE of a gap."""
+        parser = BashCommandParser()
+        command = f"cmd x {fd}>/dev/null"
+        reconstructed, _ = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert reconstructed == "cmd x 2>/dev/null"
+
+    @pytest.mark.parametrize("fd", ["2", "02", "002"])
+    def test_a_real_gap_is_still_reproduced(self, fd):
+        parser = BashCommandParser()
+        command = f"cmd x {fd}> /dev/null"
+        reconstructed, _ = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert reconstructed == "cmd x 2> /dev/null"
+
+
+class TestInertHeredocIsNotPromotedByAnUnrelatedRedirect:
+    """A process-substitution word carries its heredoc body verbatim into the reconstruction.
+
+    The original-form pass suppresses it via `heredoc_ranges`; the reconstruction never
+    did. Harmless until a compound redirect could switch the whole-command pass on —
+    then an unrelated `> out.txt` rescored text that `cat` merely prints.
+    """
+
+    def test_unrelated_compound_redirect_does_not_promote_heredoc_text(self, safety_rules_path):
+        base = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x"
+        with_redirect = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
+        assert _verdict(base, safety_rules_path) == (RiskLevel.MEDIUM, ("chmod_exec",))
+        assert _verdict(with_redirect, safety_rules_path) == (RiskLevel.MEDIUM, ("chmod_exec",))
+
+    def test_a_shell_heredoc_is_still_executable_text(self, safety_rules_path):
+        """Suppression follows is_shell: `bash <<EOF` runs its body, so it is not inert."""
+        assert _risk("bash <<EOF\nrm -rf /\nEOF", safety_rules_path) is RiskLevel.BLOCKED
+
+    def test_compound_target_still_visible_alongside_a_heredoc(self, safety_rules_path):
+        """The gate stays wide: suppressing the body must not re-hide the redirect target."""
+        assert _risk('{ cat <<EOF\nhi\nEOF\n} > "/dev/sda"', safety_rules_path) is RiskLevel.BLOCKED

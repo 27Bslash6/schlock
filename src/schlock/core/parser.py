@@ -379,7 +379,7 @@ def has_compound_redirects(ast_nodes: list[Any]) -> bool:
     return any(visit(node) for node in ast_nodes or [])
 
 
-def _redirect_words(node: Any) -> list[tuple[str, Optional[tuple]]]:
+def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Optional[tuple]]]:
     r"""One redirection, rendered as reconstruction words: operator, then target.
 
     SECURITY (LAB-2760): a redirect target is never inert the way an argument can
@@ -428,17 +428,34 @@ def _redirect_words(node: Any) -> list[tuple[str, Optional[tuple]]]:
         # `2>&-` closes an fd - bashlex leaves `output` a bare `-` string.
         return []
 
-    # Did the SOURCE glue the operator to its target? Computed from spans alone:
-    # the operator occupies its fd plus its own spelling, starting at the redirect
-    # node. Reconstruction resolves quoting and escapes and must NOT re-space,
-    # because rule 04's `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before
-    # `/dev/` - turning `2>/dev/null` into `2> /dev/null` reclassifies
-    # `shred old.txt 2>/dev/null` from log tampering to filesystem wiping.
-    redirect_pos, target_pos = getattr(node, "pos", None), getattr(target, "pos", None)
+    # bashlex reads `$'…'` and `$"…'` as a `$` PARAMETER glued to literal text, so the
+    # word arrives as `$/dev/sda` and matches no path rule - a third way to spell a
+    # hidden target, alongside the `"…"` this ticket fixed. Drop the `$` when the
+    # source says the quote form is dollar-prefixed. This covers the LITERAL spelling
+    # only: `$'\x2f…'` still arrives with its escapes dropped rather than decoded,
+    # which is the repo's documented ANSI-C ceiling (KNOWN_FALLBACK_CEILINGS), not
+    # something this strip pretends to close.
+    target_pos_for_quote = getattr(target, "pos", None)
+    if (
+        word.startswith("$")
+        and target_pos_for_quote
+        and command is not None
+        and command[target_pos_for_quote[0] : target_pos_for_quote[0] + 2] in ("$'", '$"')
+    ):
+        word = word[1:]
+
+    # Did the SOURCE glue the operator to its target? Read the character before the
+    # target rather than computing where the operator ended: bashlex NORMALISES the
+    # descriptor, so source `02>` arrives as `input=2` and any width arithmetic on
+    # `len(str(fd))` is one short, inventing a gap that is not there. That mattered -
+    # rule 04's `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before `/dev/`, so a
+    # phantom gap reclassified `shred old.txt 02>/dev/null` from log tampering to
+    # filesystem wiping. Reconstruction resolves quoting and escapes; it must never
+    # re-space. Found by adversarial review (Helly R) - the fd matrix that cleared the
+    # arithmetic used 0/1/2/3/10, none of them zero-padded.
+    target_pos = getattr(target, "pos", None)
     glued = bool(
-        redirect_pos
-        and target_pos
-        and target_pos[0] == redirect_pos[0] + (len(str(fd)) if isinstance(fd, int) else 0) + len(operator)
+        target_pos and command is not None and 0 < target_pos[0] <= len(command) and not command[target_pos[0] - 1].isspace()
     )
 
     if operator == ">|" or (operator == ">&" and fd is None):
@@ -874,7 +891,9 @@ class BashCommandParser:
             )
         return results
 
-    def _collect_words(self, ast_nodes: list[Any], include_redirects: bool = True) -> list[tuple[str, Optional[tuple]]]:
+    def _collect_words(
+        self, ast_nodes: list[Any], include_redirects: bool = True, command: Optional[str] = None
+    ) -> list[tuple[str, Optional[tuple]]]:
         r"""Collect the word parts that make up the reconstructed command.
 
         SECURITY (LAB-2760): redirections are collected too, via
@@ -911,7 +930,7 @@ class BashCommandParser:
                         if hasattr(part, "word"):
                             words.append((part.word, getattr(part, "pos", None)))
                         elif include_redirects and getattr(part, "kind", None) == "redirect":
-                            words.extend(_redirect_words(part))
+                            words.extend(_redirect_words(part, command))
                     return  # Don't recurse further into this command
 
                 # Recursively visit child nodes for other structures
@@ -929,7 +948,7 @@ class BashCommandParser:
                 # above cannot reach them. Source order puts them last.
                 if include_redirects:
                     for redirect in getattr(node, "redirects", None) or []:
-                        words.extend(_redirect_words(redirect))
+                        words.extend(_redirect_words(redirect, command))
 
         for node in ast_nodes or []:
             visit(node)
@@ -1007,12 +1026,23 @@ class BashCommandParser:
 
     def _reconstruct(self, command: str, ast_nodes: list[Any], *, include_redirects: bool) -> tuple[str, list[tuple]]:
         """Shared body of the two reconstruction passes."""
-        words = self._collect_words(ast_nodes, include_redirects=include_redirects)
+        words = self._collect_words(ast_nodes, include_redirects=include_redirects, command=command)
+        # A process-substitution word carries its heredoc body VERBATIM (`<(cat <<EOF
+        # … EOF)` is one word spanning the body), so the body reaches the
+        # reconstruction where no heredoc range suppresses it - the original-form pass
+        # gets `heredoc_ranges`, this one never did. Harmless while the whole-command
+        # pass only ran as a last resort; once a compound redirect could switch it on,
+        # an unrelated `> out.txt` started rescoring inert `cat` input as an executed
+        # command. Suppress the carrying word here, on the same is_shell test the
+        # original pass uses, rather than narrowing the gate - the gate is what makes
+        # compound targets visible at all. Found by adversarial review (Helly R).
+        inert_heredocs = [(s, e) for s, e, is_shell in self.extract_heredoc_ranges(command, ast_nodes) if not is_shell]
         ranges = []
         offset = 0
 
         for word, span in words:
-            if span is not None and self._quoting_is_load_bearing(command, word, span):
+            carries_inert_heredoc = span is not None and any(span[0] <= s and e <= span[1] for s, e in inert_heredocs)
+            if span is not None and (carries_inert_heredoc or self._quoting_is_load_bearing(command, word, span)):
                 # Absorb the following joining space. In the source that offset
                 # held the closing quote, a character no rule pattern can cross;
                 # reconstruction turns it into whitespace, which patterns ending
