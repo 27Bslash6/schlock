@@ -1044,16 +1044,11 @@ _OPAQUE_SPANS = {
 # Where `#` opens a comment and `case` is a keyword inside a `$(…)`: the same
 # places a word can start, plus the newline a comment ends on.
 _COMMENT_START_AFTER = _WORD_START_AFTER | frozenset("\n")
-# Where a `((` can be found at command level. The spans are the ones `$(…)`
-# re-lexes (`_COMSUB_STOP_RE`) minus the two it refuses on: a heredoc and a
-# `case` are ordinary shell here, and refusing on either would abandon the walk
-# over text bash reads without trouble. An unbalanced `)` ends nothing at this
-# level, so it is not a stop either.
-_TOP_LEVEL_STOP_RE = re.compile(r"[('\"`\\#]|\$['\"({]")
-# The same walk with every span rule dropped, for text where a quote never
-# closes. Its candidates are a superset of the careful walk's, which is the
-# direction that costs an over-fire rather than a hidden payload.
-_BLIND_STOP_RE = re.compile(r"[(\\]")
+# Where a `((` can start, for the candidate scan. Deliberately NOT a lexer: only
+# a backslash is honoured, so a `((` inside a quote, an expansion or a comment is
+# a candidate too. `_DoubleParen.is_arithmetic` decides each one on bash's real
+# rules, and this scan only chooses who gets asked.
+_OPENER_SCAN_RE = re.compile(r"[(\\]")
 
 # What a `<<` inside an arithmetic command is rewritten to. It MUST NOT contain a
 # `<`: the rewrite recurses through validate_command, and a replacement that
@@ -1093,6 +1088,7 @@ class _DoubleParen:
     def __init__(self, text: str) -> None:
         self.text = text
         self.partners: dict[int, int] = {}
+        self.unclosable: set[int] = set()
 
     def is_arithmetic(self, pos: int) -> bool:
         """True when the `((` at ``pos`` is an arithmetic command, False when it is two subshells.
@@ -1111,63 +1107,75 @@ class _DoubleParen:
                 raise ParseError("Quoting nested too deep inside `((` to follow") from None
         return self.text.startswith(")", close + 1)
 
-    def command_level_openers(self, *, blind: bool = False) -> list[int]:
-        """Offsets of every `((` bash can read as a command, ascending.
+    def command_level_openers(self) -> list[int]:
+        """Offsets of every `((` that could be a command, ascending.
 
-        `is_arithmetic` answers *which reading* a `((` gets; this answers *where
-        a `((` is one at all*. Bash reads `echo '(( 1<<b ))'` as a word, and
-        `is_arithmetic` asked at that offset says arithmetic - it is handed the
-        inside of a quote and reads it as bare parens - so the caller has to
-        know not to ask. Walking the same spans `_skip` already knows keeps that
-        knowledge in one model of bash rather than a second scanner beside it.
+        `is_arithmetic` answers *which reading* a `((` gets; it cannot be asked
+        *where a `((` is one*, because handed the inside of `echo '(( 1<<b ))'`
+        it reads bare parens and says arithmetic. This answers that, and it
+        answers it by OVER-APPROXIMATING on purpose: every `((` in the text is a
+        candidate, wherever it sits.
 
-        No word-start gate on the `((` itself: bash accepts `then((`, `{((` and
-        `!((`, and what a gate would exclude (`x=((`, `echo a((`) is a syntax
-        error it runs nothing of. `$((` is an expansion, and `_skip` steps over
-        the whole of it, so it is never a candidate.
+        Tracking quotes, expansions and comments here was tried and removed. It
+        is the miss direction that fails open - a `((` not offered is a payload
+        left hidden - and three separate shapes reached it, each because bash
+        does not read the text the way a lexical scan does:
 
-        ``blind`` drops every span rule. A quote that never closes - an
-        apostrophe in a heredoc body, which bash does not read as a quote at all
-        - otherwise raises and hides every `((` after it, and a hidden `((`
-        leaves a payload hidden, which is the one direction that fails open. The
-        blind walk's candidates are a superset of this one's, so the caller can
-        simply take them.
+        - a `'` in a heredoc BODY is not a quote to bash, but it pairs with a
+          later one and the span swallows the `((` between them, silently and
+          without raising, so no fallback can notice;
+        - bash does not splice `\\<newline>` inside a `#` comment, so removing
+          splices first buries a real opener inside what a scan then reads as
+          one comment line;
+        - `# ((\n1<<b\n))` - the opener is on the comment line, the `))` is not,
+          and bash runs the arithmetic.
 
-        Raises:
-            ParseError: a span opens and never closes (not raised when ``blind``).
-            RecursionError: the spans nest deeper than the interpreter follows.
-                Left to the caller, which has a non-recursive walk to fall back
-                on; `is_arithmetic` converts its own for the same reason.
+        Over-firing costs nothing measurable in the other direction: across 6307
+        commands the verdicts are identical either way, and across 336 generated
+        quote/comment/heredoc combinations every command this offers extra is
+        one bash runs nothing dangerous in (canary-checked, `rm` shimmed).
+
+        A `$((` is excluded because it is an expansion, not an arithmetic
+        command, and its over-block is tracked separately (27Bslash6/schlock#112).
+        The backslash IS honoured, so `\\((` - an escaped backslash, then a real
+        opener - is still found; a `(?<![$\\])` lookbehind loses that one.
+
+        No word-start gate either: bash accepts `then((`, `{((`, `!((` and
+        `time((`, and what a gate would exclude (`x=((`, `echo a((`) is a syntax
+        error it runs nothing of.
         """
-        stop = _BLIND_STOP_RE if blind else _TOP_LEVEL_STOP_RE
         openers: list[int] = []
         pos = 0
         while True:
-            found = stop.search(self.text, pos)
+            found = _OPENER_SCAN_RE.search(self.text, pos)
             if found is None:
                 return openers
-            hit, pos = found.group(), found.end()
-            if hit == "(":
-                # Walk on into the parens rather than over them: a subshell is
-                # command level too, so `( (( 1<<b )) )` has a real opener in it.
-                if self.text.startswith("(", pos) and (found.start() == 0 or self.text[found.start() - 1] != "$"):
-                    openers.append(found.start())
-            elif hit == "#":
-                if found.start() and self.text[found.start() - 1] not in _COMMENT_START_AFTER:
-                    continue  # mid-word: `echo a#b`
-                newline = self.text.find("\n", pos)
-                if newline < 0:
-                    return openers
-                pos = newline + 1
-            else:
-                pos = self._skip(hit, found.start(), pos)
+            pos = found.end()
+            if found.group() == "\\":
+                pos += 1  # whatever follows is literal, `\\(` included
+            elif self.text.startswith("(", pos) and (found.start() == 0 or self.text[found.start() - 1] != "$"):
+                openers.append(found.start())
 
     def _paren(self, opening: int) -> int:
-        """Offset of the `)` balancing the paren-level `(` at ``opening``, recording every pair passed."""
+        """Offset of the `)` balancing the paren-level `(` at ``opening``, recording every pair passed.
+
+        Records the parens that provably do NOT close as well. Running out of
+        text with a `(` still on the stack is a property of the text after that
+        `(`, not of the scan that happened to reach it, so every offset left on
+        the stack is answered from the memo next time. Without that, text with
+        no closers at all - `((((((…` - re-scans to the end once per opener:
+        8 KB of it cost 7.1 s of CPU, on a hook that runs before every Bash
+        call (0.6 ms with the memo).
+        """
+        if opening in self.unclosable:
+            raise ParseError("`((` never closes; bash reads no command from this text")
         stack = [opening]
         pos = opening + 1
         while stack:
-            found = self._stop(_PAREN_STOP_RE, pos, "`((`")
+            found = _PAREN_STOP_RE.search(self.text, pos)
+            if found is None:
+                self.unclosable.update(stack)
+                raise ParseError("`((` never closes; bash reads no command from this text")
             hit, pos = found.group(), found.end()
             if hit == "(":
                 stack.append(found.start())
@@ -1317,16 +1325,7 @@ def _neuter_arithmetic_shifts(command: str) -> str:
         return command
 
     dparen = _DoubleParen(spliced)
-    try:
-        openers = dparen.command_level_openers()
-    except (ParseError, RecursionError):
-        # Either a span opened and never closed, or they nested deeper than the
-        # interpreter follows - both leave everything past that point
-        # unexamined. Bash does not read a heredoc body as quoted at all, and a
-        # missed `((` is the failure this guard exists for, so re-walk without
-        # the span rules: that walk recurses into nothing and its candidates are
-        # a superset, and `is_arithmetic` still decides each one.
-        openers = dparen.command_level_openers(blind=True)
+    openers = dparen.command_level_openers()
 
     rewritten: Optional[list[str]] = None
     for start, closer in _arithmetic_regions(dparen, openers):
@@ -2190,9 +2189,11 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # Neither is fixed here.
         #
         # Rewriting a shift creates no parens and no new `<<`, so the regions are
-        # the same on a second pass and this recurses exactly once. It also means
-        # a shift somehow missed on one pass is caught on the next, which is why
-        # under-firing here cannot leave a payload hidden.
+        # the same on a second pass and this recurses exactly once. That is the
+        # whole of it: the recursion is gated on the rewrite having CHANGED
+        # something, so a shift missed on the first pass gets no second pass and
+        # stays hidden. Under-firing here is a live bypass, which is why
+        # `command_level_openers` over-approximates rather than lexes.
         neutered = _neuter_arithmetic_shifts(command)
         if neutered != command:
             arithmetic_result = validate_command(neutered, config_path, _depth=_depth)

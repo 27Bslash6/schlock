@@ -1878,16 +1878,26 @@ class TestArithmeticCommandShift:
             ('echo "(( 1<<b ))"', "inside a double-quoted word"),
             ("echo '(( 1<<b ))'", "inside a single-quoted word"),
             ("echo $'(( 1<<b ))'", "inside an ANSI-C string"),
+            ("echo hi # (( 1<<b ))", "inside a comment"),
         ],
     )
-    def test_quoted_arithmetic_is_text_not_an_opener(self, safety_rules_path, command, description):
-        """A `((` bash reads as text is not rewritten here either.
+    def test_quoted_arithmetic_keeps_its_verdict(self, safety_rules_path, command, description):
+        """A `((` bash reads as text is still offered to `is_arithmetic`, and costs nothing.
 
-        A `#` comment is deliberately NOT in this list: bash's `((` matcher does
-        not honour `#`, so neither does the scan. Rewriting a `<<` inside a real
-        comment changes nothing, because bashlex discards comments.
+        The candidate scan does not track quotes or comments on purpose - every
+        shape that made it do so reached the miss direction, which is the one
+        that leaves a payload hidden. So the `<<` in these IS rewritten, and
+        what has to hold is that the verdict does not move: `==` and `<<` are
+        the same width and neither is a rule's business inside a word.
+
+        Byte-identity was asserted here before and is the wrong bar - it made
+        the precision look load-bearing when the only thing it bought was this
+        assertion.
         """
-        assert val_module._neuter_arithmetic_shifts(command) == command, description
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, description
+        assert result.risk_level == RiskLevel.SAFE, description
 
     @pytest.mark.parametrize(
         "command,description",
@@ -1994,6 +2004,59 @@ class TestArithmeticCommandShift:
 
         assert val_module._neuter_arithmetic_shifts(command) != command
 
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # Bash does not splice `\<newline>` inside a `#` comment, so this is
+            # a comment and THEN an arithmetic command. Removing splices first
+            # buried the opener inside one apparent comment line; with the scan
+            # reading comments, the payload stayed hidden and the verdict was
+            # `allowed=True SAFE` while bash ran `rm -rf /` (canary-verified).
+            ("# x\\\n(( 1<<b ))\nrm -rf /\nb", "a line splice ending a comment"),
+            # An apostrophe in a heredoc body is not a quote to bash, but it
+            # pairs with a later one and the span swallowed the `((` between
+            # them - silently, WITHOUT raising, so no fallback could notice.
+            (
+                "cat <<'E'\nit's\nE\n(( 1<<b ))\nrm -rf /\nb\ncat <<'F'\ndon't\nF",
+                "two heredoc-body apostrophes straddling the opener",
+            ),
+        ],
+    )
+    def test_text_bash_lexes_differently_still_finds_the_opener(self, safety_rules_path, command, description):
+        """Both of these ran `rm -rf /` under bash 5.3.9 while schlock said SAFE.
+
+        Each was a live fail-open for as long as the candidate scan tried to be
+        a lexer: one because splices are not removed inside comments, one
+        because a heredoc body is not quoted text. The second is the worse
+        shape - the scan mis-paired and returned normally, so there was no
+        exception for a fallback to catch.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False, description
+        assert "system_destruction" in result.matched_rules, description
+
+    def test_an_opener_bash_comments_out_is_over_blocked_on_purpose(self, safety_rules_path):
+        """The measured cost of not lexing: `# ((` with the `))` on a later line.
+
+        Bash reads the whole `((` away as a comment, opens no arithmetic, and
+        then reads `1<<b` as a real heredoc whose body swallows `rm -rf /` - it
+        runs nothing (canary-verified). `main` allows this and so did a scan
+        that tracked comments; this denies it, on a parse failure rather than a
+        rule.
+
+        It is pinned because it is a deliberate trade, not an accident: the two
+        rows above are canary-proven fail-opens that comment tracking reopens,
+        and this is the shape that pays for closing them. It fails closed, and
+        no realistic command reaches it - across 6307 corpus commands the two
+        readings return identical verdicts.
+        """
+        result = validate_command("# ((\n1<<b\n))\nrm -rf /\nb", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.matched_rules == []
+        assert result.error and "pars" in result.error.lower()
+
     def test_unterminated_arithmetic_is_left_alone(self):
         """Bash runs nothing without the closing `))`, so there is nothing to un-hide."""
         command = "(( 1<<b\nrm -rf /"
@@ -2007,18 +2070,16 @@ class TestArithmeticCommandShift:
         assert once == "(( 1==b ))\nrm -rf /\nb"
         assert val_module._neuter_arithmetic_shifts(once) == once
 
-    def test_disjoint_regions_are_each_collected_once(self):
-        """One region per arithmetic command, not one per opener seen.
+    def test_every_command_level_opener_is_found_and_collected_once(self):
+        """One region per arithmetic command, and none skipped.
 
-        `(( 1<<b ))` repeated has a `((` at the head of every line and nothing
-        nested, so the walk must collect exactly as many regions as there are
-        commands. A count, not a clock: the cost this pins is a complexity
-        class, and a wall-clock ceiling for it is what failed a correct guard on
-        a loaded 3.9 runner (LAB-4337).
+        This does NOT pin the `collected_to` skip - with nothing nested there is
+        nothing for it to skip, and the count is the same with it deleted. What
+        it pins is that the scan offers every opener and the walk vouches for
+        each exactly once, which is the property that breaks if the scan starts
+        suppressing candidates again.
         """
-        commands = 2000
-
-        assert len(_regions("(( 1<<b ))\n" * commands + "ls\nb")) == commands
+        assert len(_regions("(( 1<<b ))\n" * 3 + "ls\nb")) == 3
 
     def test_nested_openers_collapse_to_one_region(self):
         """`((((…` has a `((` at every offset, and every one of them holds every shift.
@@ -2032,27 +2093,62 @@ class TestArithmeticCommandShift:
         """
         assert len(_regions("((" * 2000 + "1<<b " * 2000 + "))" * 2000)) == 1
 
-    def test_whole_pass_stays_inside_a_loose_budget(self):
-        """The counts pin the region loop; this pins everything around it.
+    def test_the_pass_grows_linearly_with_the_command(self):
+        """A ratio, because an absolute ceiling here cannot fail.
 
-        `command_level_openers` could go quadratic without moving a single region count,
-        and no other test bounds this function's cost on a run that reaches CI -
-        `tests/test_performance.py` skips entirely without pytest-benchmark, and
-        the timing suites are `skip_in_ci`. So one deliberately slack ceiling
-        stays. `process_time`, because wall clock bills a shared runner's
-        descheduling to whoever is running, which is what failed a correct guard
-        at 25 ms on 3.9. Shipped costs 13 ms here and 52 ms under `--cov`; two
-        seconds is far enough above that a loaded runner cannot reach it and
-        still close enough that a lost complexity class cannot hide under it.
+        The counts above pin the region walk; this pins everything around it.
+        The obvious form - one input, `assert cpu < 2.0` - was measured against
+        three plausible regressions on its own 44 KB input (a tail-slice
+        quadratic in the scan, `collected_to` deleted, the `partners` memo
+        cleared) and ALL THREE came in under 11 ms. It could not fail, which is
+        the third vacuous timing assertion this guard has carried.
+
+        A ratio across a 4x input can fail, and it is load-immune in the way an
+        absolute ceiling is not: both legs pay the same runner tax, so a busy
+        shared runner moves them together. Linear measures ~4; a lost complexity
+        class measures ~16. `process_time`, so descheduling is not billed here.
         """
-        command = "(( 1<<b ))\n" * 4000 + "ls\nb"
-        cpu = min(
-            timeit.repeat(
-                lambda: val_module._neuter_arithmetic_shifts(command),
-                timer=time.process_time,
-                number=1,
-                repeat=3,
-            )
-        )
+        small = "(( 1<<b ))\n" * 2000 + "ls\nb"
+        large = "(( 1<<b ))\n" * 8000 + "ls\nb"
 
-        assert cpu < 2.0, f"one rewrite pass burned {cpu * 1e3:.0f} ms of CPU against a 2000 ms budget"
+        def cpu(command: str) -> float:
+            return min(
+                timeit.repeat(lambda: val_module._neuter_arithmetic_shifts(command), timer=time.process_time, number=1, repeat=5)
+            )
+
+        ratio = cpu(large) / max(cpu(small), 1e-6)
+
+        assert ratio < 8.0, f"4x the command cost {ratio:.1f}x the CPU; linear is ~4, quadratic is ~16"
+
+    def test_parens_that_never_close_are_not_rescanned_per_opener(self):
+        """`((((((…` with no closer at all: one scan, not one per opener.
+
+        Every opener's `is_arithmetic` runs the paren scan to the end of the
+        text and raises, so without memoising the failure this is quadratic -
+        measured 7.1 s of CPU on an 8 KB command, on a hook that runs before
+        every Bash call. `_DoubleParen` records every paren left on the stack
+        when the text runs out, so the scan happens once.
+
+        Counted rather than timed: the count separates one scan from n scans
+        exactly, on every machine and interpreter.
+        """
+        openers = 2000
+        command = "((" * openers + " 1<<b"
+        searches = 0
+        real = val_module._PAREN_STOP_RE
+
+        class Counting:
+            def search(self, text: str, pos: int):
+                nonlocal searches
+                searches += 1
+                return real.search(text, pos)
+
+        val_module._PAREN_STOP_RE = Counting()
+        try:
+            val_module._neuter_arithmetic_shifts(command)
+        finally:
+            val_module._PAREN_STOP_RE = real
+
+        assert searches < 3 * openers, (
+            f"{searches} paren scans over {openers} openers; one pass is ~{openers}, one scan per opener is ~{openers**2}"
+        )
