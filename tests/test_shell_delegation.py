@@ -799,3 +799,41 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+class TestHereStringGuardSeams:
+    """LAB-4443: mutation-tested seams the parity/extraction tests above don't exercise.
+
+    Each assertion pins one guard proven by mutation (mutation diff, failing test name/output,
+    and revert confirmation are in the PR body) - reading the code is not evidence for these.
+    """
+
+    def test_compound_command_reached_via_recursion_is_blocked(self):
+        # AC-1: extract_stdin_program_redirects's visit() must recurse past the top-level `&&`
+        # list node to reach the `bash <<< ...` command nested inside it - the list node itself
+        # is neither "command" nor "compound", so without recursion nothing is surfaced.
+        result = validate_command('echo hi && bash <<< "rm -rf /"')
+        assert result.risk_level == RiskLevel.BLOCKED, f"-> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_stacked_here_strings_take_the_last_one(self):
+        # AC-2: _stdin_here_string must keep the LAST `<<<` that targeted stdin, not the first -
+        # bash only ever sees the final redirect that touched fd 0.
+        result = validate_command('bash <<< "echo ok" <<< "rm -rf /"')
+        assert result.risk_level == RiskLevel.BLOCKED, f"-> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_leading_assignment_does_not_hide_the_interpreter(self):
+        # AC-3: _command_words must skip the `FOO=1` assignment prefix so the sink classifier
+        # sees `bash` as words[0], not the assignment string.
+        result = validate_command('FOO=1 bash <<< "rm -rf /"')
+        assert result.risk_level == RiskLevel.BLOCKED, f"-> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_assignment_only_command_with_here_string_is_not_a_sink(self):
+        # AC-4: _classify_sink's empty-words guard must return None when a command has no words
+        # at all (`FOO=1 <<< "x"` is an assignment plus a here-string, no interpreter word) - the
+        # false-positive direction, so pin the actual expected level rather than "not BLOCKED".
+        result = validate_command('FOO=1 <<< "x"')
+        assert result.risk_level == RiskLevel.SAFE, f"-> {result.risk_level.name}"
+        assert result.allowed is True
