@@ -1321,6 +1321,12 @@ def _validate_heredoc_command(
         engine = _get_rule_engine(config_path)
         neutered, base_command = _neuter_heredocs(command)
         base_result = _heredoc_base_result(engine, base_command)
+        if base_result.risk_level is RiskLevel.BLOCKED:
+            # Escalation only ever RAISES risk and BLOCKED is the top of the enum, so
+            # the two extra front-door passes provably cannot change this verdict -
+            # they just re-validate a denied command at a cost that grows with its
+            # segment count.
+            return base_result
         return _escalate_past_heredoc(engine, command, neutered, base_result, config_path)
     except ParseError as e:
         # Shell we cannot read is shell we cannot vouch for.
@@ -1341,6 +1347,55 @@ def _validate_heredoc_command(
 def _heredoc_base_result(engine: "RuleEngine", base_command: str) -> ValidationResult:
     """Verdict for the heredoc's own command, ignoring everything around it."""
     first_word = base_command.split()[0]
+
+    # CEILING: a denylist of the ten bare shell spellings in `_SHELL_COMMANDS`, tested
+    # against `openers[0]`'s head as written. It closes the reported shape and NOT its
+    # neighbours, all of which still score LOW here:
+    #   - other interpreters that execute their body - `python3`, `perl`, `node`
+    #     (NOT `awk`: bare `awk <<'X'` is a usage error and `awk '{print}' <<'X'` reads
+    #     the body as data, so it belongs with `cat`);
+    #   - the same shell spelled past the lookup - `/bin/bash`, `env bash`, `'bash'`,
+    #     `timeout 5 bash`, `mksh`;
+    #   - a SECOND heredoc: `_neuter_heredocs` derives `base_command` from the first
+    #     opener only, so `ls <<'X' … X` in front of `bash <<'A;B'` routes around this
+    #     entirely and comes back SAFE.
+    # It also leaves this guard STRICTER than the readable path for three shells:
+    # `csh`/`tcsh`/`rbash` are in `_SHELL_COMMANDS` but not parser's
+    # `_HEREDOC_SHELL_COMMANDS`, so `csh <<'EOF'` / `rm -rf /` is SAFE (its body is
+    # never scanned) while the unreadable `csh <<'A;B'` is denied here.
+    # Upgrade path is one question, not three: ask "will this consumer EXECUTE the body"
+    # rather than "is this word a shell" - which needs the wrapper walk at
+    # `_shell_delegated_payloads`, every opener's head rather than just the first, and
+    # ONE set shared with the parser instead of two that disagree.
+    if first_word in _SHELL_COMMANDS:
+        # A shell's heredoc body IS its program, and `_neuter_heredocs` has already
+        # thrown that body away - so every verdict below this line would be vouching
+        # for code nothing ever read.
+        #
+        # This path is only reached when the body could not be read in the first
+        # place - `_normalise_heredoc_delimiters` hands the command back untouched
+        # for a delimiter it cannot normalise (one that is not a bare word, or a
+        # terminator it cannot match, as CRLF line endings produce), and bashlex then
+        # rejects it. So
+        # `bash <<'A;B'` / `rm -rf /` scored LOW while the identical command with a
+        # bare delimiter is BLOCKED: the normalisation closed the hole it could
+        # reach and left this one open behind it (LAB-3094).
+        #
+        # Ahead of the whitelist check, not after: whitelisting is a statement about
+        # the command, and here the command is not what runs.
+        return ValidationResult(
+            allowed=False,
+            risk_level=RiskLevel.BLOCKED,
+            message=f"BLOCKED: Cannot read the program '{first_word}' would run from this heredoc",
+            # One alternative, deliberately. "Put the script in a file and run it" was
+            # here and is a WORKING BYPASS: `cat <<'A;B' > s.sh` is allowed (inert
+            # consumer, body discarded) and `bash s.sh` is allowed (file never read),
+            # so the denial was handing the reader a two-step route around itself.
+            alternatives=["Use a plain-word heredoc delimiter (<<'EOF'), which is read and validated"],
+            exit_code=1,
+            error=f"Unreadable heredoc delimiter in front of shell interpreter '{first_word}'",
+            matched_rules=[],
+        )
 
     if engine.is_whitelisted(first_word):
         return ValidationResult(

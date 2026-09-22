@@ -1049,6 +1049,49 @@ class TestHeredocSurroundings:
         assert expected_error in (result.error or "")
         assert result.message.startswith("BLOCKED: Cannot determine what this heredoc runs")
 
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ("bash <<'A;B'\nrm -rf /\nA;B", "a delimiter that is not a bare word"),
+            ("sh <<'A;B'\nrm -rf /\nA;B", "the same, in front of another shell"),
+            # `-q` is a legal delimiter, but emitting it bare gives `<<-q` - the
+            # `<<-` operator plus delimiter `q` - so it cannot be normalised either.
+            ("bash <<'-q'\nrm -rf /\n-q", "a delimiter whose bare spelling re-lexes"),
+        ],
+    )
+    def test_a_shell_heredoc_it_cannot_read_fails_closed(self, safety_rules_path, command, description):
+        """A shell's heredoc body is its program, and this path has already discarded it.
+
+        Normalisation hands the command back untouched when the delimiter has no bare
+        spelling, bashlex then rejects it, and `_neuter_heredocs` replaces the body with
+        a placeholder. Allowing on the head alone therefore vouches for code nothing
+        read: each of these scored LOW while the identical command with a bare delimiter
+        is BLOCKED. Terminated on purpose - an unterminated body already denied, which
+        is what hid this one.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.allowed is False, description
+        assert "Unreadable heredoc delimiter" in (result.error or ""), description
+
+    def test_an_unreadable_heredoc_for_an_inert_consumer_still_passes(self, safety_rules_path):
+        """The guard above keys on the CONSUMER, not on the delimiter being unreadable.
+
+        Denying every delimiter without a bare spelling would take this with it, and
+        `cat <<'A;B' > f` is an ordinary file write whose body bash never executes. The
+        body is unread here too - that is simply not a hazard when nothing runs it.
+
+        `cat` only, deliberately. `python3 <<'A;B'` is allowed today as well, and is NOT
+        pinned here: python executes its body, so that verdict is one of the holes the
+        guard does not reach (see its CEILING comment). Asserting it would turn a live
+        under-block into a contract and make the eventual fix look like the regression.
+        """
+        result = validate_command("cat <<'A;B'\nrm -rf /\nA;B", config_path=safety_rules_path)
+
+        assert result.allowed is True
+        assert result.risk_level < RiskLevel.HIGH
+
     def test_invalid_shell_after_a_readable_heredoc_still_denies(self, safety_rules_path):
         """A readable heredoc followed by shell bash itself rejects.
 
