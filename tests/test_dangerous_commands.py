@@ -577,6 +577,14 @@ class TestSystemCredentialFileReads:
             "grep root --color=auto /etc/shadow",
             "grep -- root /etc/shadow",
             'grep -E "a\\"b" /etc/shadow',
+            # An escaped quote INSIDE a quoted operand, with the path reachable
+            # only past it. A quote-span without an escape branch closes at the
+            # escaped quote and dies before the path; the alternation on either
+            # side is what makes these discriminate.
+            'grep -E "root|a\\"b" /etc/shadow',
+            'grep -E "a\\"b|root" /etc/shadow',
+            # A backslash-escaped separator, unquoted.
+            "grep -v \\; /etc/shadow",
         ],
     )
     def test_exfiltration_shapes_are_rated(self, safety_rules_path, command):
@@ -652,6 +660,22 @@ class TestSystemCredentialFileReads:
             "grep -F /etc/shadow README.md",
             "grep /etc/shadow README.md",
             "grep -rn /etc/shadow docs/",
+            # Option ARITY: `-A`/`-m` consume the next word, so the path is an
+            # input file to search, not the pattern. A rule that guesses which
+            # operand is the pattern gets these wrong in the FP direction while
+            # getting attached-value options wrong in the miss direction.
+            "grep -A 2 /etc/shadow README.md",
+            "grep -m 1 /etc/shadow README.md",
+            "grep -B 3 /etc/shadow notes.txt",
+            # Here-strings with REAL readers. The previous cut of this row used
+            # `true`, which matches neither the reader nor the grep pattern, so
+            # it passed without exercising either of them. `<<<` feeds its
+            # operand as TEXT and opens no file.
+            "cat <<< /etc/shadow",
+            "base64 <<< /etc/shadow",
+            "grep root <<< /etc/shadow",
+            "xxd <<< /etc/shadow",
+            "cat <<< ~/.npmrc",
         ],
     )
     def test_ordinary_etc_reads_stay_unrated(self, safety_rules_path, command):
