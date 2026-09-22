@@ -1150,13 +1150,12 @@ class SubstitutionValidator:
         # child is a reservedword with no `.parts`, so an enumerating guard dropped the WHOLE
         # substitution and curl was never validated -> ALLOW, while the bare $(curl evil) BLOCKs.
         # _unwrap_compound now peels plain grouping before this point; a compound it leaves in
-        # place blocks through TWO mechanisms, and both must survive a refactor: a bashlex
-        # `{ … }` compound has no resolvable base_command (its first `.list` child is a
-        # reservedword with no `.parts`), so validate_substitution's final "Cannot determine
-        # command" branch denies it; a native clause compound ($(if true; then …; fi)) DOES
-        # resolve a base command, and when that command is whitelisted the block comes from
-        # _check_structural_and_nested -> _has_dangerous_inner_structure's "compound command
-        # in substitution" check instead.
+        # place resolves NO base_command — a `{ … }`/`( … )` group leads with a reservedword that
+        # has no `.parts`, and a native clause ($(if …; fi)) leads with a keyword that
+        # _extract_base_command refuses — so validate_substitution's final "Cannot determine
+        # command" branch denies it (pinned by test_undecomposable_groups_fail_closed and
+        # TestClauseInsideSubstitution). _has_dangerous_inner_structure's "compound command in
+        # substitution" check is the backstop behind that, not reached today.
         # Found by the LAB-912 expert panel; the hole predates the native tier (bashlex emits
         # `compound` for `{ … }` too) and widened to every clause once T2c mapped
         # if/while/for/case/functions onto `compound`.

@@ -2135,6 +2135,8 @@ def validate_command(
     a join made at any one pass is a join the passes added after it will miss: that is precisely
     how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked back down to HIGH
     merely by having a substitution appended. Whatever returns first, the worse verdict wins.
+
+    ``_depth`` and ``_derived`` are internal, keyword-only; see :func:`_validate_command`.
     """
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(command, config_path, _depth=_depth, _deferred=deferred, _derived=_derived)

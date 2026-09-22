@@ -690,9 +690,9 @@ class TestACredentialNameNeedsAPosition:
             # Inside a double-quoted `$(...)` the substitution validator runs the inner
             # command against the rules before any top-level pattern is consulted
             # (LAB-4182), so the denial is attributed to environment_credential_extraction
-            # matching `printenv <NAME>`, and extended_credential_exposure never gets a
-            # turn. A substitution denial carries no matched_rules, so the pin is the
-            # verdict plus the inner rule's own description in the message.
+            # matching `printenv <NAME>`. A substitution denial carries no matched_rules,
+            # so the pin is the verdict plus the tier prefix and the inner rule's own
+            # description in the message.
             'echo "$(printenv GITHUB_TOKEN)"',
             'printf "%s" "$(printenv AWS_SECRET_ACCESS_KEY)"',
             'echo "Bearer $(printenv GITHUB_TOKEN)"',
@@ -701,7 +701,7 @@ class TestACredentialNameNeedsAPosition:
     def test_substituted(self, command, rules_dir_path):
         result = verdict(command, rules_dir_path)
         assert result.risk_level is RiskLevel.BLOCKED, command
-        assert "Environment variables often contain API keys and tokens" in result.message, command
+        assert "Inner command blocked: Environment variables often contain API keys and tokens" in result.message, command
 
     @pytest.mark.parametrize(
         "command",
