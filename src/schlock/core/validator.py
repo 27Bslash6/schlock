@@ -428,7 +428,7 @@ MAX_SHELL_DELEGATION_DEPTH = 4
 # idempotent, so no admitted input reaches 8x. The bound is not for today's shapes; it is so a
 # future rewrite that DOES compound cannot turn an admitted 64 KiB into an unbounded parse.
 # Judging derived text by MAX_COMMAND_SIZE instead denied a 20 KB command for a 66 KB string
-# the caller never wrote (LAB-4363 panel).
+# the caller never wrote (LAB-4363).
 MAX_DERIVED_COMMAND_SIZE = 8 * MAX_COMMAND_SIZE
 
 
