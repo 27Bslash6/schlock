@@ -21,6 +21,7 @@ because BLOCKED is unrelaxable by every preset and the guard denied `vim ~/.npmr
 are pinned here so the idea cannot come back unmeasured.
 """
 
+import re
 import time
 from unittest.mock import MagicMock, patch
 
@@ -1021,3 +1022,203 @@ class TestDecoyPaddingIsScannedExactly:
         result = verdict(command, rules_dir_path)
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ssh_key_exfiltration" in result.matched_rules
+
+
+# --------------------------------------------------------------------------
+# LAB-4309 -- a LEADING terminating option displaces the subcommand as well
+# --------------------------------------------------------------------------
+
+# git's own usage line is `git [-v | --version] [-h | --help]` -- four tokens,
+# not three.
+TERMINATING = ["--version", "-v", "--help", "-h"]
+
+# Every subcommand the option-run rules rate, across all three verdict bands
+# (HIGH / MEDIUM / LOW). Behind a leading terminating option git dispatches
+# none of them, so every one must fall to SAFE.
+RATED_SUBCOMMANDS = [
+    "push --force",
+    "push -f",
+    "reset --hard",
+    "add -A",
+    "add .",
+    "push",
+    "rebase",
+    "commit -m x",
+]
+
+# Global options that take a SEPARATE value word. Each consumes the token that
+# follows it, so a terminating option in that slot is a VALUE and git runs the
+# subcommand anyway -- 16 of the 72 combinations below were observed dispatching
+# against git 2.43.0, including `--work-tree -v push --force` (remote ref moved)
+# and `--namespace -v reset --hard` (working tree overwritten).
+VALUE_TAKING = ["--work-tree", "--attr-source", "--namespace", "-C", "-c", "--git-dir"]
+
+
+class TestALeadingTerminatingOptionStopsTheRating:
+    """`git -v push --force` prints a version. It does not push.
+
+    Measured against git 2.43.0 across all 4 tokens x 8 subcommands: zero side
+    effects in every cell -- no remote ref moved, no working tree overwritten,
+    nothing staged. Before this change all 32 rated, so schlock asked the user
+    to approve a command that cannot do anything.
+    """
+
+    @pytest.mark.parametrize("token", TERMINATING)
+    @pytest.mark.parametrize("subcommand", RATED_SUBCOMMANDS)
+    def test_the_whole_grid_is_safe(self, token, subcommand, rules_dir_path, clean_worktree):
+        result = verdict(f"git {token} {subcommand}", rules_dir_path)
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.matched_rules == []
+
+    @pytest.mark.parametrize("command", ['git "-v" push --force', "git '-v' push --force"])
+    def test_a_quoted_terminating_option_is_the_same_command(self, command, rules_dir_path):
+        """The AST layer dequotes a whole word, so these reach the rule as `-v`.
+
+        git agrees -- both spellings exit 129 without pushing.
+        """
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("git push --force", "git_force_push"),
+            ("git push -f", "git_force_push"),
+            ("git reset --hard", "git_hard_reset"),
+            ("git add -A", "git_blanket_staging"),
+            ("git add .", "git_blanket_staging"),
+        ],
+    )
+    def test_the_bare_form_still_rates(self, command, rule, rules_dir_path, clean_worktree):
+        """The refusal must cost nothing when no terminating option is present."""
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH
+        assert rule in result.matched_rules
+
+
+class TestTheRefusalIsNotReusableAsAnEvasion:
+    """The reason this guard is pinned to position 1 and nowhere else.
+
+    An earlier cut of this fix refused `-v|-h|--version|--help` wherever it
+    appeared in the option run. It was shipped and reverted, because several git
+    global options take a separate value: git consumes the refused token as that
+    value and runs the subcommand. The refusal then silently unrated a real
+    force push. Position 1 is the only argument that cannot be a flag's value,
+    which is the entire reason the leading form is sound and the general one is
+    not -- so these cases pin the hole shut rather than trusting the reasoning.
+    """
+
+    @pytest.mark.parametrize("option", VALUE_TAKING)
+    @pytest.mark.parametrize("token", TERMINATING)
+    def test_a_terminating_token_in_a_value_slot_still_rates_force_push(self, option, token, rules_dir_path):
+        result = verdict(f"git {option} {token} push --force origin main", rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH
+        assert "git_force_push" in result.matched_rules
+
+    @pytest.mark.parametrize("option", VALUE_TAKING)
+    @pytest.mark.parametrize("token", TERMINATING)
+    def test_a_terminating_token_in_a_value_slot_still_rates_hard_reset(self, option, token, rules_dir_path, clean_worktree):
+        result = verdict(f"git {option} {token} reset --hard HEAD~1", rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH
+        assert "git_hard_reset" in result.matched_rules
+
+    @pytest.mark.parametrize("option", VALUE_TAKING)
+    @pytest.mark.parametrize("token", TERMINATING)
+    def test_a_terminating_token_in_a_value_slot_still_rates_blanket_staging(self, option, token, rules_dir_path):
+        result = verdict(f"git {option} {token} add -A", rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH
+        assert "git_blanket_staging" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A flag's ATTACHED value that merely looks terminating.
+            "git --git-dir=--version push --force",
+            "git -c core.x=--version push --force",
+            # Not the leading position, so not refused -- and git does not run
+            # these either, so a retained rating is an over-rating, not a miss.
+            "git -c x=y -v push --force",
+            # Near-misses on the token itself. git rejects each as an unknown
+            # option and dispatches nothing; rating them is the safe direction.
+            "git -vv push --force",
+            "git -v=x push --force",
+            "git -V push --force",
+            "git --versionx push --force",
+        ],
+    )
+    def test_a_token_that_only_looks_terminating_still_rates(self, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH
+        assert "git_force_push" in result.matched_rules
+
+    def test_a_refused_leading_option_does_not_disarm_a_later_command(self, rules_dir_path):
+        """The patterns are unanchored, so the second `git` is its own match."""
+        result = verdict("git -v push --force && git push --force", rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH
+        assert "git_force_push" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git --work-tree /tmp push --force origin main",
+            "git --namespace ns reset --hard HEAD~1",
+            "git -C /tmp push --force",
+            "git --git-dir /tmp/.git add -A",
+            "git --attr-source HEAD push --force",
+        ],
+    )
+    def test_an_ordinary_value_is_untouched(self, command, rules_dir_path, clean_worktree):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.HIGH
+
+
+class TestTheTerminatingOptionAfterTheSubcommandIsARecordedResidual:
+    """`git push --help` opens a man page and pushes nothing -- and still rates.
+
+    Out of scope for LAB-4309, which fixes the LEADING position only. Pinned at
+    its current verdict so the residual is a recorded fact rather than something
+    rediscovered later, and so a future fix has to move it deliberately.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("git push --help", RiskLevel.MEDIUM),
+            ("git push -h", RiskLevel.MEDIUM),
+            ("git push --force --help", RiskLevel.HIGH),
+            ("git reset --hard --help", RiskLevel.HIGH),
+        ],
+    )
+    def test_the_residual_holds_its_verdict(self, command, expected, rules_dir_path, clean_worktree):
+        assert verdict(command, rules_dir_path).risk_level == expected
+
+
+class TestTheOptionRunFragmentIsIdenticalEverywhere:
+    """Eight copies of one fragment, with nothing but this test keeping them equal.
+
+    The option run is duplicated byte-identically across six rules in
+    10_development_workflows.yaml. Nothing in the loader enforces that, so a
+    partial edit -- fixing force-push and forgetting hard-reset -- would land
+    green and leave half the rules holding the old shape. This fails loudly
+    instead of silently.
+    """
+
+    # From `git` through the first `){0,16}`. Deliberately matches `git(?:` too,
+    # so dropping the refusal from one copy changes the fragment rather than
+    # hiding that copy from the scan.
+    FRAGMENT = re.compile(r"git\(\?.*?\)\{0,16\}")
+    REFUSAL = r"(?!\s+-(?:v|h|-version|-help)(?![^\s;|&]))"
+    EXPECTED_COPIES = 8
+
+    @pytest.fixture
+    def fragments(self, data_dir):
+        raw = (data_dir / "rules" / "10_development_workflows.yaml").read_text(encoding="utf-8")
+        return self.FRAGMENT.findall(raw)
+
+    def test_every_copy_is_present(self, fragments):
+        assert len(fragments) == self.EXPECTED_COPIES
+
+    def test_every_copy_is_byte_identical(self, fragments):
+        assert len(set(fragments)) == 1, f"option run diverged across copies: {sorted(set(fragments))}"
+
+    def test_every_copy_carries_the_leading_refusal(self, fragments):
+        # YAML single-quoted scalars double an embedded quote; the refusal has none.
+        assert all(self.REFUSAL in f for f in fragments)
