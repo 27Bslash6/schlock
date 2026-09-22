@@ -282,15 +282,7 @@ class TestEdgeCasesAndEscapes:
             ('echo "Would delete: rm -rf /"', "Description with pattern", False),
             ('eval "rm -rf /"', "Eval with dangerous string", True),
             # Pipes and chains
-            pytest.param(
-                "ls | rm -rf /",
-                "Pipe to dangerous command",
-                True,
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    reason="LAB-2752: whitelisted prefix short-circuits multi-segment validation",
-                ),
-            ),
+            ("ls | rm -rf /", "Pipe to dangerous command", True),
             ("echo test && rm -rf /", "Chain with dangerous command", True),
             ("echo test || sudo rm file", "OR chain with sudo", True),
             # Obfuscation — ShellCheck escalation is the only guard on these two
