@@ -15,7 +15,7 @@ Usage:
 
     if is_shellcheck_available():
         findings = run_shellcheck("rm -rf $HOME")
-        # Returns list of ShellCheckFinding objects
+        # list of ShellCheckFinding, or None when ShellCheck gave no verdict
 """
 
 import json
@@ -114,8 +114,7 @@ _circuit_breaker_failures: list[float] = []  # Timestamps of recent failures
 _circuit_breaker_open_until: float = 0.0  # When circuit can be retried
 
 # Output size limits (defense against JSON bombs)
-_MAX_OUTPUT_SIZE = 1_000_000  # 1MB max ShellCheck output
-_MAX_FINDINGS_COUNT = 100  # Maximum findings to process
+_MAX_OUTPUT_SIZE = 1_000_000  # 1MB max ShellCheck output; also the only bound on finding count
 _MAX_MESSAGE_LENGTH = 500  # Maximum message field length
 
 # ShellCheck treats a comment whose content begins with the exact token
@@ -262,7 +261,7 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
     shell: str = "bash",
     severity: str = "info",
     timeout: float = 2.0,  # Reduced from 5.0 per security review
-) -> list[ShellCheckFinding]:
+) -> Optional[list[ShellCheckFinding]]:
     """Run shellcheck on a command string.
 
     Args:
@@ -272,7 +271,12 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
         timeout: Maximum time to wait for shellcheck (seconds)
 
     Returns:
-        List of ShellCheckFinding objects, empty if shellcheck unavailable or error.
+        List of ShellCheckFinding objects - empty when ShellCheck ran and found nothing,
+        or is not installed. None when ShellCheck delivered no verdict: circuit open,
+        timeout, oversized output, error exit, unreadable output. None is not "clean";
+        a caller that reads it as [] turns each of those into a bypass (LAB-4586: a
+        slow input switched the control off). Each caller picks fail-open or
+        fail-closed for its own surface.
 
     Note:
         This function never raises - it fails silently to avoid breaking
@@ -282,10 +286,12 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
         - Circuit breaker pattern prevents repeated failures from degrading performance
         - Output size limited to 1MB to prevent JSON bombs
         - Message fields sanitized to prevent log injection
+        - No findings cap: every finding is returned, so none can be pushed off the
+          list by inert padding (LAB-4586); _MAX_OUTPUT_SIZE is the bound
     """
     # Check circuit breaker first
     if _check_circuit_breaker():
-        return []
+        return None
 
     path = get_shellcheck_path()
     if not path:
@@ -314,29 +320,26 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
             timeout=timeout,
         )
 
-        # ShellCheck returns exit code 1 if it finds issues (not an error)
-        # Exit code 2+ indicates actual errors
-        if result.returncode > 1:
+        # Exit 0 or 1 is a verdict (1 = findings). Anything else - exit 2+, or a negative
+        # code for death by signal - is not, and neither is empty stdout: --format=json
+        # prints `[]` for a clean run, so nothing on stdout means ShellCheck died before it
+        # answered. Reading either as clean is the LAB-4586 bypass in another coat.
+        if result.returncode not in (0, 1) or not result.stdout.strip():
+            logger.warning(f"ShellCheck exit {result.returncode} with no verdict: {_sanitize_message(result.stderr)[:200]!r}")
             _record_circuit_breaker_failure()
-            return []
-
-        # Parse JSON output with size limits
-        if not result.stdout.strip():
-            _reset_circuit_breaker()  # Success (no findings)
-            return []
+            return None
 
         # SECURITY: Limit output size to prevent JSON bombs
         if len(result.stdout) > _MAX_OUTPUT_SIZE:
-            logger.warning(f"ShellCheck output exceeds {_MAX_OUTPUT_SIZE} bytes, truncating")
+            logger.warning(f"ShellCheck output exceeds {_MAX_OUTPUT_SIZE} bytes, refusing")
             _record_circuit_breaker_failure()
-            return []
+            return None
 
         findings_json = json.loads(result.stdout)
-
-        # SECURITY: Limit number of findings to process
-        if len(findings_json) > _MAX_FINDINGS_COUNT:
-            logger.warning(f"ShellCheck returned {len(findings_json)} findings, truncating to {_MAX_FINDINGS_COUNT}")
-            findings_json = findings_json[:_MAX_FINDINGS_COUNT]
+        if not isinstance(findings_json, list):
+            logger.warning(f"ShellCheck output is not a JSON array: {type(findings_json).__name__}")
+            _record_circuit_breaker_failure()
+            return None
 
         findings = []
 
@@ -367,18 +370,23 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
                 # Skip malformed findings
                 continue
 
+        # No findings cap here, on purpose. _MAX_OUTPUT_SIZE already bounds this loop
+        # (1MB is at most ~5k findings, ~20ms), and a cap applied before callers filter
+        # to SECURITY_RELEVANT_CODES let 100 inert SC2034s push an SC2114 off the list,
+        # which the caller read as clean (LAB-4586). If one is ever needed it must run
+        # AFTER that filter, never before.
         _reset_circuit_breaker()  # Success
         return findings
 
     except subprocess.TimeoutExpired:
         logger.warning(f"ShellCheck timeout after {timeout}s on command: {command[:50]}...")
         _record_circuit_breaker_failure()
-        return []
+        return None
 
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as e:
-        logger.debug(f"ShellCheck error: {e}")
+        logger.warning(f"ShellCheck error, no verdict: {e}")
         _record_circuit_breaker_failure()
-        return []
+        return None
 
 
 def has_security_relevant_findings(findings: list[ShellCheckFinding]) -> bool:
