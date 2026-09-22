@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from schlock.core.rules import RuleEngine
 from schlock.core.validator import validate_command
 
 
@@ -118,6 +119,28 @@ class TestReDoSProtection:
         elapsed = time.time() - start
 
         assert elapsed < self.MAX_VALIDATION_TIME, f"ReDoS detected: {elapsed:.3f}s for input: {pathological_input[:50]}..."
+
+    @pytest.mark.parametrize("head", ["tee", "> ", "rm"])
+    def test_blank_run_after_a_truncation_head_is_linear(self, safety_rules_path, head):
+        r"""A long blank run after `tee`, `>` or `rm` is scanned once, not once per backtrack.
+
+        The blank-operand guard is `(?=\s+\S)` in FRONT of the quantifier
+        (LAB-4360). Written as `\s+(?!\s*$)` it re-scans the run on every
+        backtracking step: 20,000 blanks cost 500ms at the regex layer against
+        2ms for the base pattern, on a hook that runs before every bash call.
+        Measured at the regex layer because the whole validator already spends
+        over a second on this input in other patterns, which would hide it.
+        """
+        engine = RuleEngine(safety_rules_path)
+        patterns = engine.compiled_patterns["file_truncation"] + engine.compiled_patterns["single_delete"]
+        text = head + " " * 50_000
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.5, f"blank run after {head!r} took {elapsed:.3f}s"
 
 
 class TestBoundedQuantifierEdgeCases:
