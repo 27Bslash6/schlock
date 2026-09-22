@@ -20,6 +20,7 @@ from schlock.core.validator import (
     validate_command,
 )
 from schlock.exceptions import ConfigurationError, ParseError
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 class TestValidator:
@@ -1916,9 +1917,9 @@ class TestHeredocSurroundings:
         seen = []
         real = val_module.validate_command
 
-        def spy(command, config_path=None):
+        def spy(command, config_path=None, **kwargs):
             seen.append(command)
-            return real(command, config_path)
+            return real(command, config_path, **kwargs)
 
         monkeypatch.setattr(val_module, "validate_command", spy)
         val_module._escalate_past_heredoc(
@@ -1931,6 +1932,129 @@ class TestHeredocSurroundings:
 
         assert "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\necho ok" not in seen
         assert seen == ["cat", "echo ok"]
+
+
+class TestInputSizeCeiling:
+    """validate_command refuses oversized input before parsing it (LAB-4363).
+
+    Fail-closed, unlike commit_filter's skip on the same constant; the WHY is at Step 0 in validator.py.
+    """
+
+    OVER_CEILING = [
+        pytest.param(" && ".join(["echo hello"] * 6000), id="and-chained-echo"),
+        pytest.param("".join(f"x{i}=1\n" for i in range(9000)) + "ls", id="newline-assignments"),
+        pytest.param("(( 1<<b ))\n" * 7000 + "ls", id="arithmetic-shift"),
+    ]
+
+    @pytest.mark.parametrize("command", OVER_CEILING)
+    def test_oversized_command_is_denied_naming_size_and_limit(self, command):
+        assert len(command) > MAX_COMMAND_SIZE
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.error is None, "a verdict, not a validation error"
+        assert result.message == f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)"
+
+    def test_ceiling_is_exclusive(self, monkeypatch):
+        """Exactly MAX_COMMAND_SIZE chars still validates; one more is refused (same `>` as commit_filter)."""
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 32)
+        at_limit = "echo " + "a" * 27
+        assert len(at_limit) == 32
+
+        assert validate_command(at_limit).allowed is True
+        over = validate_command(at_limit + "a")
+        assert over.allowed is False
+        assert "33 > 32" in over.message
+
+    def test_oversized_input_is_refused_before_any_parse_and_never_cached(self, monkeypatch):
+        """1 MB must cost O(1): no parser, no rule engine, no special cases, no cache entry.
+
+        Counts work instead of timing it: a raised stub lands in the catch-all and sets `error`,
+        so `error is None` is the proof the guard ran first (wall-clock asserts flake on CI).
+        """
+
+        def unreachable(*_args, **_kwargs):
+            raise AssertionError("oversized input must be refused before this runs")
+
+        for name in ("_get_parser", "_get_rule_engine", "_check_special_cases"):
+            monkeypatch.setattr(val_module, name, unreachable)
+        command = "echo " + "a" * (1024 * 1024)
+
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.error is None, result.error
+        assert val_module._global_cache.get(command) is None
+
+
+class TestDerivedTextCeiling:
+    """The input ceiling judges what the caller submitted, never schlock's rewrite of it (LAB-4363).
+
+    _neuter_heredocs inflates a quoted heredoc ~3.25x, and _escalate_past_heredoc re-validates the
+    result through the front door. Before this, a 20 KB command was denied for a 66 KB string it
+    never wrote. Derived text has its own bound (MAX_DERIVED_COMMAND_SIZE) and its own message.
+    Shapes here are constructed, not sampled: no harvested corpus contains rewrite inflation.
+    """
+
+    HEREDOC_LOW = "Heredoc command 'cat' allowed (content not validated)"
+
+    def test_rewrite_over_input_ceiling_keeps_the_verdict(self, monkeypatch):
+        monkeypatch.setattr(val_module, "MAX_COMMAND_SIZE", 200)
+        command = "cat <<'X'\nX\n" * 10
+        assert len(command) < 200 < len(val_module._neuter_heredocs(command)[0])
+
+        result = validate_command(command)
+
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.LOW
+        assert result.message == self.HEREDOC_LOW
+
+    def test_near_ceiling_heredoc_is_still_allowed(self):
+        """65,513 in, 65,540 after the rewrite: the first counterexample this pins."""
+        command = "cat <<'X'\nX\n#" + "x" * 65500
+        assert len(command) < MAX_COMMAND_SIZE < len(val_module._neuter_heredocs(command)[0])
+
+        result = validate_command(command)
+
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.LOW
+        assert result.message == self.HEREDOC_LOW
+
+    def test_derived_text_has_its_own_bound_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(val_module, "MAX_DERIVED_COMMAND_SIZE", 100)
+        monkeypatch.setattr(val_module, "_escalate_past_heredoc", lambda *a, **k: pytest.fail("rewrite parsed past its bound"))
+        command = "cat <<'X'\nX\n" * 10  # 120 in, 390 derived
+
+        result = validate_command(command)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.error is None
+        assert "Internal expansion" in result.message
+        assert "390" in result.message and "100" in result.message
+        assert "Command exceeds size limit" not in result.message
+
+    def test_input_ceiling_message_reports_the_submitted_size(self):
+        command = "echo hello && " * 6000
+        message = validate_command(command).message
+        assert message == f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars)"
+        assert "Internal expansion" not in message
+
+    def test_oversized_input_is_refused_before_the_cache_is_consulted(self, monkeypatch):
+        """Pins the stronger AC-2 promise: a 1 MB string is never even hashed for lookup."""
+
+        class NoCache:
+            def get(self, _key):
+                pytest.fail("cache consulted for over-ceiling input")
+
+            def set(self, _key, _value):
+                pytest.fail("cache written for over-ceiling input")
+
+        monkeypatch.setattr(val_module, "_global_cache", NoCache())
+        result = validate_command("echo " + "a" * (1024 * 1024))
+        assert result.allowed is False
+        assert result.error is None
 
 
 class TestParseFailureFailsClosed:

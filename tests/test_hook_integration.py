@@ -31,7 +31,7 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
-from schlock.integrations.commit_filter import CommitMessageFilter
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
 
 
 @pytest.fixture(autouse=True)
@@ -185,6 +185,16 @@ class TestHookHandler:
         assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
         # Should have an error reason
         assert "BLOCKED:" in response["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_oversized_command_blocked_as_a_verdict(self):
+        """Over MAX_COMMAND_SIZE is denied through the BLOCKED path, not swallowed as an error (LAB-4363)."""
+        command = " && ".join(["echo hello"] * 6000)
+        assert len(command) > MAX_COMMAND_SIZE
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+
+        output = response["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert output["permissionDecisionReason"].startswith("BLOCKED: Command exceeds size limit")
 
 
 class TestValidatorSingleton:
