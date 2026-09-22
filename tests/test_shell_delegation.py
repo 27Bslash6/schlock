@@ -242,17 +242,20 @@ class TestShellDelegatedPayloadExtraction:
         in something dangerous matches an ordinary rule first and never reaches the ceiling.
         """
         command = " ".join(["timeout", "5"] * 300 + ["ls"])
-        with caplog.at_level(logging.ERROR):
+        # DEBUG, not ERROR: the property is level-independent. Capturing only ERROR would pass
+        # vacuously if a later edit logged the command at WARNING or below.
+        with caplog.at_level(logging.DEBUG):
             result = validate_command(command)
 
         # The fail-closed deny is preserved, not relaxed.
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
 
+        # Also proves the message is not the catch-all's: that handler sets `message` and `error`
+        # in the same return, so error=None rules out "Unexpected validation error: ..." outright.
         assert result.error is None
         assert str(MAX_DELEGATOR_TOKENS) in result.message
         assert "delegator tokens" in result.message
-        assert "Unexpected validation error" not in result.message
         assert result.alternatives  # actionable, not the catch-all's empty list
 
         # Neither the traceback nor the command itself reaches the log.

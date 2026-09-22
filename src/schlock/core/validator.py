@@ -476,9 +476,10 @@ class _DelegatorCeilingError(ValueError):
     """Raised past MAX_DELEGATOR_TOKENS; converted to a BLOCKED verdict by validate_command.
 
     An exception rather than a threaded return value because the extractor is recursive and
-    already unwinds. A ValueError SUBCLASS rather than a bare one so the conversion is exact:
-    matching on `str(e)` instead would mislabel any other ValueError out of the extractor as a
-    ceiling hit, which is the failure mode the heredoc handler's string sniffing already has.
+    already unwinds. A subclass rather than a bare `except ValueError` at the call site: today
+    the extractor raises nothing else, but a bare clause would silently convert a FUTURE
+    unrelated ValueError into this ceiling's verdict - error=None, traceback dropped, a
+    confident wrong message on a deny path. That is LAB-4582's own defect, mirrored.
     """
 
 
@@ -609,7 +610,7 @@ def _shell_delegated_payloads(
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
 
     Raises _DelegatorCeilingError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed,
-    see there); validate_command turns that into a BLOCKED verdict.
+    see there).
     """
     # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
     # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
@@ -2374,6 +2375,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 message=str(e),
                 alternatives=["Run the command directly instead of chaining wrapper commands"],
                 exit_code=1,
+                error=None,
             )
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
