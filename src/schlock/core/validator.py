@@ -841,7 +841,8 @@ def _match_original_and_reconstructed(
     parser: "BashCommandParser",
     command: str,
     ast_nodes: list,
-    string_literals: Optional[list[tuple]] = None,
+    string_literals: list[tuple],
+    quote_source: str,
     heredoc_ranges: Optional[list[tuple]] = None,
 ) -> RuleMatch:
     """Match `command` against the rules as written AND quote/escape-stripped.
@@ -863,10 +864,25 @@ def _match_original_and_reconstructed(
         parser: Parser used to reconstruct the command from its AST
         command: Command (or single segment) to match
         ast_nodes: Parsed AST for `command`
-        string_literals: Pre-computed literal ranges for `command`; derived here
-                         when omitted. Omitting is the safe default - an explicit
-                         `[]` switches suppression off, which is the shape of the
-                         bug this function exists to fix.
+        string_literals: Literal ranges for `command`. Required, not defaulted:
+                         this function cannot derive them once `quote_source` is
+                         in play, because the caller's spans may index a
+                         different string than `command`. An explicit `[]`
+                         switches suppression off, which is the shape of the bug
+                         this function exists to fix - so it has to be a decision
+                         the caller states, never one taken by omission.
+        quote_source: The string `ast_nodes`' word spans index into. Equal to
+                      `command` for a whole command; for a segment validated
+                      under parse-once the node comes from the PARENT parse, so
+                      its spans address the whole command instead.
+                      _quoting_is_load_bearing reads quote characters positionally
+                      out of whatever string it is handed, so the wrong one makes
+                      it report "not quoted" where the source is quoted, and the
+                      reverse - the second of which is an under-block. Required
+                      for that reason: a forgotten argument is a TypeError here,
+                      not a silent wrong answer. Only quote detection uses it; the
+                      ranges returned are offsets into the reconstruction, which
+                      is built from `ast_nodes` alone either way.
         heredoc_ranges: Heredoc ranges for the original-form pass only: heredoc
                         bodies never reach the reconstruction, since
                         _collect_words walks `.word` parts alone.
@@ -874,16 +890,13 @@ def _match_original_and_reconstructed(
     Returns:
         The higher-risk of the two matches.
     """
-    if string_literals is None:
-        string_literals = parser.extract_string_literals(command, ast_nodes)
-
     match = engine.match_command(
         command,
         string_literals=string_literals,
         heredoc_ranges=heredoc_ranges,
     )
 
-    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(command, ast_nodes)
+    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes)
     if reconstructed and reconstructed != command:
         recon_match = engine.match_command(reconstructed, string_literals=suppression_ranges)
         if recon_match.risk_level > match.risk_level:
@@ -2271,7 +2284,9 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # SECURITY CRITICAL: Extract and validate each command segment independently
             # This prevents bypass via piping/chaining dangerous commands after whitelisted ones
             # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
-            segments = parser.extract_command_segments(command, ast)
+            # Literal ranges come from the SAME parse — see the method's docstring
+            # for why the per-segment re-parse had to go (spec §3.2 parse-once).
+            segments = parser.extract_command_segments_with_literals(command, ast)
 
             # Track all matched rules for audit logging (used when multiple segments)
             all_matched_rules = []
@@ -2301,29 +2316,21 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                 highest_match = None
 
                 for segment in segments:
-                    # Re-parse the segment for its own literal ranges and reconstruction.
-                    try:
-                        seg_ast = parser.parse(segment)
-                    except (ParseError, ValueError) as e:
-                        # No AST means no literal suppression and no reconstructed pass -
-                        # the gap that let `"chmod" 777` hide behind a heredoc. Fail
-                        # closed, as the whole-command parse above does once its
-                        # heredoc fallback is exhausted.
-                        return ValidationResult(
-                            allowed=False,
-                            risk_level=RiskLevel.BLOCKED,
-                            message=f"Parse error in segment: {e}",
-                            alternatives=[],
-                            exit_code=1,
-                            error=str(e),
-                        )
-
+                    # Parse-once (spec §3.2): no per-segment re-parse. Every input
+                    # the matcher needs is derived from `ast` - the literal and
+                    # heredoc ranges by _rebase, the reconstruction from the
+                    # segment's own node, whose word spans still index `command`
+                    # and so are read against it via quote_source. There is no
+                    # segment parse left to fail, which is why the fail-closed
+                    # branch that stood in for one is gone rather than dropped.
                     seg_match = _match_original_and_reconstructed(
                         engine,
                         parser,
-                        segment,
-                        seg_ast,
-                        heredoc_ranges=parser.extract_heredoc_ranges(segment, seg_ast),
+                        segment.text,
+                        [segment.node],
+                        string_literals=segment.string_literals,
+                        heredoc_ranges=segment.heredoc_ranges,
+                        quote_source=command,
                     )
 
                     if seg_match.matched and seg_match.rule:
@@ -2356,6 +2363,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                     command,
                     ast,
                     string_literals=string_literals,
+                    quote_source=command,
                     heredoc_ranges=heredoc_ranges,
                 )
         except ConfigurationError as e:
