@@ -26,7 +26,7 @@ from schlock.integrations.shellcheck import (
 from .cache import ValidationCache
 from .parser import WRAPPER_COMMANDS, BashCommandParser
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
-from .substitution import SubstitutionValidator
+from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
 logger = logging.getLogger(__name__)
 
@@ -2140,7 +2140,29 @@ def _escalate_past_heredoc(
     return result
 
 
-def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
+def _substitution_denial(sub_result: SubstitutionValidationResult) -> ValidationResult:
+    """Render a substitution verdict as a ValidationResult.
+
+    The hook maps risk to the action, so only a genuine BLOCKED verdict may claim the word: an
+    amplified-HIGH one is shown as an "ask" prompt, and a prompt whose text reads "BLOCKED" tells
+    the user the opposite of the truth.
+    """
+    denied = sub_result.risk_level == RiskLevel.BLOCKED
+    return ValidationResult(
+        allowed=False,
+        risk_level=sub_result.risk_level,
+        message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
+        alternatives=[
+            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
+            "Run the command directly instead of using substitution",
+            "If this command is safe, request it be added to the whitelist",
+        ],
+        exit_code=1,
+        error=None,
+    )
+
+
+def validate_command(
     command: str,
     config_path: Optional[str] = None,
     *,
@@ -2148,7 +2170,47 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
     _shellcheck: bool = True,
     _derived: bool = False,
 ) -> ValidationResult:
-    """Validate command for safety.
+    """Validate a command for safety — the main validation API.
+
+    Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
+    denial too weak to have short-circuited it. The join lives HERE, outside the passes, because
+    a join made at any one pass is a join the passes added after it will miss: that is precisely
+    how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked back down to HIGH
+    merely by having a substitution appended. Whatever returns first, the worse verdict wins.
+
+    ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
+    :func:`_validate_command`.
+    """
+    deferred: list[SubstitutionValidationResult] = []
+    result = _validate_command(
+        command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
+    )
+    if not deferred:
+        return result
+    sub_denial = deferred[0]
+    # A denial always beats an allow, whatever their levels; between two denials the higher
+    # level wins, and a tie keeps the completed verdict because it carries the matched rules.
+    if result.allowed or sub_denial.risk_level > result.risk_level:
+        return _substitution_denial(sub_denial)
+    return result
+
+
+def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
+    command: str,
+    config_path: Optional[str] = None,
+    *,
+    _depth: int = 0,
+    _deferred: Optional[list[SubstitutionValidationResult]] = None,
+    _shellcheck: bool = True,
+    _derived: bool = False,
+) -> ValidationResult:
+    """Run every validation pass. Call :func:`validate_command` instead.
+
+    ``_deferred`` is an out-parameter: a substitution denial too weak to short-circuit is placed
+    there for the caller to join. It is a list rather than a return value so that every one of
+    this function's returns carries it without having to remember to.
+
+    Validate command for safety.
 
     Main validation API. Orchestrates parsing, rule matching, and caching.
 
@@ -2262,21 +2324,22 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
             sub_results = sub_validator.validate_all_substitutions(ast)
+
+            # Worst verdict wins, and the join is NOT made here. Returning a denial from this
+            # point skips every pass below it — the AST dangerous-flag pass (the only thing that
+            # sees quoted command names) and the multi-segment pass (the only thing that isolates
+            # a blocked segment). A weaker substitution verdict returned here therefore DOWNGRADED
+            # commands those passes deny outright. Consulting match_command() from here does not
+            # fix it: that helper is whitelist-gated, so a whitelisted first word makes it report
+            # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
+            # weaker is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
-                if not sub_result.allowed:
-                    return ValidationResult(
-                        allowed=False,
-                        risk_level=sub_result.risk_level,
-                        message=f"BLOCKED: {sub_result.message}",
-                        alternatives=[
-                            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
-                            "Run the command directly instead of using substitution",
-                            "If this command is safe, request it be added to the whitelist",
-                        ],
-                        exit_code=1,
-                        error=None,
-                    )
-                # Don't cache (substitution content may vary)
+                if sub_result.allowed:
+                    continue  # Don't cache (substitution content may vary)
+                if sub_result.risk_level == RiskLevel.BLOCKED:
+                    return _substitution_denial(sub_result)
+                if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
+                    _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection
             # Uses bashlex AST for BOTH command names AND arguments (no regex shortcuts)
@@ -2343,7 +2406,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         error=None,
                         matched_rules=[],
                     )
-                    if _depth == 0 and _shellcheck:
+                    if _depth == 0 and _shellcheck and not _deferred:
                         _global_cache.set(command, result)
                     return result
 
@@ -2561,7 +2624,9 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # reason: that verdict is weaker than the one a fresh call would produce for the key. The
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
-        if _depth == 0 and _shellcheck:
+        # Nor when a substitution denial is still owed a join: the cached entry would be the
+        # pre-join verdict, and the next identical command would hit it and skip the join.
+        if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)
 
         # Step 8: Return
