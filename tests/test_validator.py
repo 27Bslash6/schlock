@@ -2024,14 +2024,17 @@ class TestParseFailureFailsClosed:
         read a delimiter off the third angle. Either alone restores a base
         command and with it the fail-open.
         """
-        line, openers, _quote = val_module._rewrite_openers('coproc bash <<< "rm -rf /"', "")
+        command = 'coproc bash <<< "rm -rf /"'
+        line, openers = val_module._rewrite_openers(command, val_module._ScanState(), 0, val_module._DoubleParen(command))
 
         assert openers == []
-        assert line == 'coproc bash <<< "rm -rf /"'
+        assert line == command
 
         # Guard 2, independent of the branch above: `<` ends a word, so a
-        # delimiter read off the third angle is empty rather than `"rm`.
-        assert "<" in val_module._WORD_END
+        # delimiter read off the third angle is empty rather than `"rm`. The
+        # set `_read_delimiter` consults is now `_WORD_START_AFTER`; the guard
+        # is the one this always pinned, only its name moved.
+        assert "<" in val_module._WORD_START_AFTER
         with pytest.raises(ParseError, match="empty delimiter"):
             val_module._read_delimiter('<<< "rm -rf /"', 2)
 
