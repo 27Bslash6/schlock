@@ -588,11 +588,15 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
     A `--` between `-c` and the program is skipped, because the shell skips it too
     (`bash -c -- 'echo hi'` prints hi). A `--` *before* any `-c` ends option parsing, so
     there is no inline program at all.
+
+    A `+`-prefixed word is an option (`bash +o pipefail -c PROG`, `sh +e -c PROG` both run
+    PROG - set(1) syntax, verified against bash/dash), so it must not be read as the leading
+    script operand that ends the scan; it never carries `-c` itself.
     """
     for i, word in enumerate(words):
         if word == "--":
             return None  # end of options: a later -c is an argument, not a flag
-        if not word.startswith("-"):
+        if not word.startswith(("-", "+")):
             # For a shell, a leading operand is the script to run, so no -c can follow it. For
             # `su`/`sg`/`runuser` it is a user or group and options continue after it. Once an
             # option has been seen a bare token is that option's value either way - keep

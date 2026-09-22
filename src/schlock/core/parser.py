@@ -215,9 +215,8 @@ _STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
 _MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
 
 
-# Wrapper commands that pass their argv through VERBATIM to the command they exec: the first
-# non-option word is the program, everything after it is that program's args. Best-effort, NOT
-# an exhaustive enumeration - an unknown wrapper degrades to the pre-LAB-2754 behaviour.
+# Wrapper commands that pass through execution to subsequent args. Best-effort, NOT an
+# exhaustive enumeration - an unknown wrapper degrades to the pre-LAB-2754 behaviour.
 # SECURITY: 'env exec bash' executes exec despite env being first word
 # Categories for documentation and maintainability:
 # - Privilege: sudo, doas, pkexec (escalate privileges)
@@ -225,10 +224,11 @@ _MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
 # - Execution: env, command, xargs, parallel (modify execution context)
 # - Multicall: busybox, toybox (can invoke any applet)
 # - Namespace: chroot, nsenter, unshare (container/namespace operations)
-# This is the set the `exec`/`eval` wrapper-bypass scan in `_detect_dangerous_constructs` keys
-# on: because argv passes through verbatim, a bare `exec`/`eval` word after one of these can only
-# be the shell builtin. Launchers with a grammar of their own live in _LAUNCHER_COMMANDS below.
-_EXEC_PASSTHROUGH_WRAPPERS: frozenset[str] = frozenset(
+# Also the set the `exec`/`eval` wrapper-bypass scan in `_detect_dangerous_constructs` keys on,
+# frozen at its pre-LAB-4699 membership: that scan TREATS a bare `exec`/`eval` word after one of
+# these as the shell builtin (an over-approximation - `sudo pnpm exec vitest` blocks), so any name
+# whose own subcommand vocabulary is `exec`/`eval` must go in _LAUNCHER_COMMANDS below instead.
+_EXEC_BYPASS_SCAN_WRAPPERS: frozenset[str] = frozenset(
     {
         # Privilege escalation
         "sudo",  # Run as superuser
@@ -271,31 +271,44 @@ _EXEC_PASSTHROUGH_WRAPPERS: frozenset[str] = frozenset(
     }
 )
 
-# Launchers that run a caller-supplied command inside an environment, session or sandbox, but
-# through a CLI grammar of their own (subcommands, options) rather than verbatim argv:
+# Launchers that run a caller-supplied command inside an environment, session or sandbox:
 # `uv run bash -c PROG`, `pnpm exec sh -c PROG`, `firejail --net=none bash -c PROG` (LAB-4699).
-# They join WRAPPER_COMMANDS so the shell-delegation re-entry scans their args for a shell - the
-# scan re-enters on EVERY arg position, so the launcher's own subcommand words are skipped for
-# free. They are deliberately NOT in the `exec`/`eval` bypass scan: after one of these `exec` is
-# the TOOL's subcommand (`pnpm exec vitest`, `npm exec -- tsc`, `direnv exec . make`) and `eval`
-# is a screen command (`screen -X eval`), never the shell builtin, so a member here would turn
-# those benign lines into an unappealable BLOCKED (the pre-existing `sudo pnpm exec vitest`
-# over-block is that scan firing on `sudo`, unchanged by this set).
-# Deliberately omitted: `bun`, `uvx`, `pipx` resolve a PACKAGE by name and run its entry point
-# rather than a PATH binary; add them with two-sided pins if a pass-through spelling is shown.
+# Same job as the set above for the shell-delegation re-entry and the here-string sink, which
+# scan EVERY arg position for a shell, so a launcher's own subcommand words are skipped for free.
+# Kept apart because they are NOT in the `exec`/`eval` bypass scan: after one of these `exec` is
+# the tool's subcommand (`pnpm exec vitest`, `npm exec -- tsc`, `direnv exec . make`) and `eval`
+# a screen command (`screen -X eval`), so membership in the set above would turn those benign
+# lines into an unappealable BLOCKED. Over-approximation is fail-closed (a benign tail behind a
+# member re-validates to its own verdict), so the bar for a new name is a SAFE-side pin, not
+# proof of pass-through. Covers the shell-on-argv forms only; a launcher's own string-executing
+# grammar (`tmux new -d 'PROG'`, `watchexec 'PROG'`, `npx -c PROG`) is the `watch PROG` shape
+# and tracked separately.
 _LAUNCHER_COMMANDS: frozenset[str] = frozenset(
     {
         # Package/environment runners
         "uv",  # uv run CMD
         "poetry",  # poetry run CMD
         "pipenv",  # pipenv run CMD
+        "pdm",  # pdm run CMD
+        "hatch",  # hatch run CMD
+        "rye",  # rye run CMD
         "conda",  # conda run -n ENV CMD
         "npx",  # npx CMD
         "npm",  # npm exec -- CMD
         "pnpm",  # pnpm exec CMD
         "yarn",  # yarn exec CMD
         "bunx",  # bunx CMD
+        "bundle",  # bundle exec CMD
         "direnv",  # direnv exec DIR CMD
+        "devbox",  # devbox run -- CMD
+        "nix",  # nix develop -c CMD / nix shell ... -c CMD
+        # Version managers
+        "mise",  # mise exec -- CMD
+        "asdf",  # asdf exec CMD
+        "pyenv",  # pyenv exec CMD
+        "rbenv",  # rbenv exec CMD
+        "nvm",  # nvm exec VERSION CMD
+        "volta",  # volta run --node VERSION CMD
         # Session/terminal multiplexers
         "screen",  # screen [-dmS NAME] CMD
         "tmux",  # tmux new-session [-d] CMD
@@ -317,8 +330,8 @@ _LAUNCHER_COMMANDS: frozenset[str] = frozenset(
 )
 
 # Every base name whose args the shell-delegation re-entry and the here-string sink classifier
-# scan for a shell. Public: validator imports it, and it is the source of truth tests iterate.
-WRAPPER_COMMANDS: frozenset[str] = _EXEC_PASSTHROUGH_WRAPPERS | _LAUNCHER_COMMANDS
+# scan for a shell. Public: validator imports it.
+WRAPPER_COMMANDS: frozenset[str] = _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMANDS
 
 
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
@@ -387,6 +400,8 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
     (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
     Explicit stdin paths ('-', '/dev/stdin', ...) -> True. No unambiguous program -> True.
+    A `+`-prefixed word is an option too (`bash +o pipefail`, `sh +e`: set(1) syntax every
+    POSIX shell accepts on its command line), not a script operand.
     """
     inline = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
     saw_option = False
@@ -397,7 +412,7 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
         # Explicit stdin designator -> reads stdin.
         if arg in _STDIN_PATHS:
             return True
-        if not arg.startswith("-"):
+        if not arg.startswith(("-", "+")):
             # A leading positional (before any option) is a script file -> runs it.
             # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
             if not saw_option:
@@ -1311,9 +1326,8 @@ class BashCommandParser:
                     # Scan all words looking for exec/eval as a command (not as arg to another tool)
                     # Allow: sudo kubectl exec (kubectl handles exec as subcommand)
                     # Block: sudo exec bash (exec IS the command)
-                    # Keyed on the verbatim-argv wrappers only: a launcher's `exec` is its own
-                    # subcommand (`pnpm exec vitest`), see _LAUNCHER_COMMANDS (LAB-4699).
-                    elif cmd_name in _EXEC_PASSTHROUGH_WRAPPERS:
+                    # Not the launchers: their `exec` is a subcommand, see _LAUNCHER_COMMANDS.
+                    elif cmd_name in _EXEC_BYPASS_SCAN_WRAPPERS:
                         words = _get_all_words(node)
                         # Container tools that use "exec" as a subcommand (not shell exec)
                         container_tools = {"kubectl", "docker", "podman", "nerdctl", "crictl", "ctr"}

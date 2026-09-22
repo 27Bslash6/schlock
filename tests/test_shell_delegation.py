@@ -15,7 +15,7 @@ with "option requires an argument", so an attached payload is not a thing.
 import pytest
 
 from schlock.core import validator
-from schlock.core.parser import _EXEC_PASSTHROUGH_WRAPPERS, WRAPPER_COMMANDS, BashCommandParser
+from schlock.core.parser import _EXEC_BYPASS_SCAN_WRAPPERS, _LAUNCHER_COMMANDS, WRAPPER_COMMANDS, BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
     MAX_DELEGATOR_TOKENS,
@@ -68,6 +68,13 @@ class TestDashCPayload:
     def test_leading_script_operand_ends_the_scan(self):
         # `bash deploy.sh -c production` passes -c to the SCRIPT, not to bash.
         assert _dash_c_payload(["deploy.sh", "-c", "production"]) is None
+
+    def test_plus_option_is_an_option_not_an_operand(self):
+        # Panel on #204: `bash +o pipefail -c PROG` runs PROG (set(1) syntax, verified against
+        # bash/dash). Pre-fix `+o` was read as the script operand and the scan ended: None.
+        assert _dash_c_payload(["+o", "pipefail", "-c", "rm -rf /"]) == "rm -rf /"
+        assert _dash_c_payload(["+x", "-c", "rm -rf /"]) == "rm -rf /"
+        assert _dash_c_payload(["+x", "script.sh"]) is None
 
     def test_dangling_flag_has_no_payload(self):
         assert _dash_c_payload(["-c"]) is None
@@ -816,24 +823,43 @@ class TestLauncherDelegation:
 
     The fix is membership: the wrapper branch of `_shell_delegated_payloads` re-enters the full
     extractor on every arg position whose basename is a delegator, so `uv run bash -euo pipefail
-    -c PROG` needs only `uv` in the set. The `exec`/`eval` bypass scan in the parser keys on the
-    narrower `_EXEC_PASSTHROUGH_WRAPPERS` instead, so a launcher whose own subcommand is `exec`
-    (`pnpm exec vitest`, `direnv exec . make`, `screen -X eval`) is not read as a shell builtin.
+    -c PROG` needs only `uv` in the set. The `exec`/`eval` bypass scan in the parser keys on
+    `_EXEC_BYPASS_SCAN_WRAPPERS` (main's set, frozen) instead, so a launcher whose own subcommand
+    is `exec` (`pnpm exec vitest`, `direnv exec . make`, `screen -X eval`) is not read as the
+    shell builtin.
+
+    Panel on #204 surfaced a sibling gap in the shared `-c` extractor: a `+`-prefixed option
+    (`bash +o pipefail -c PROG`, set(1) syntax) was read as the leading script operand, so the
+    scan ended and the bare AND every wrapped spelling were SAFE. Fixed in `_dash_c_payload` and
+    `_reads_stdin_as_program`; pinned below.
     """
 
-    # Every launcher AC-1 adds, plus `npm`/`yarn` (`pnpm exec`'s direct siblings). A literal list,
-    # not derived from WRAPPER_COMMANDS: a member dropped from the set must fail here rather than
-    # silently shrink the parametrisation.
+    # Every launcher in `_LAUNCHER_COMMANDS`, as a literal: a member dropped from the set fails
+    # here rather than silently shrinking the parametrisation, and a member ADDED to the set
+    # without a SAFE-side pin below fails `test_set_shapes`.
     _LAUNCHERS = [
         "uv",
         "poetry",
         "pipenv",
+        "pdm",
+        "hatch",
+        "rye",
         "conda",
         "npx",
-        "pnpm",
-        "bunx",
         "npm",
+        "pnpm",
         "yarn",
+        "bunx",
+        "bundle",
+        "direnv",
+        "devbox",
+        "nix",
+        "mise",
+        "asdf",
+        "pyenv",
+        "rbenv",
+        "nvm",
+        "volta",
         "screen",
         "tmux",
         "xvfb-run",
@@ -843,12 +869,23 @@ class TestLauncherDelegation:
         "caffeinate",
         "entr",
         "watchexec",
-        "direnv",
         "dbus-run-session",
         "daemonize",
         "chpst",
         "proot",
     ]
+
+    # `WRAPPER_COMMANDS` on `main` @ `65afe74`, verbatim. The exec/eval bypass scan keys on exactly
+    # this set; a name dropped from it silently turns `doas exec bash` SAFE, a launcher added to
+    # it turns `pnpm exec vitest` BLOCKED.
+    _MAIN_WRAPPERS = frozenset(
+        {
+            "busybox", "chroot", "chrt", "command", "doas", "env", "flock", "ionice", "linux32",
+            "linux64", "ltrace", "nice", "nohup", "nsenter", "parallel", "pkexec", "runuser",
+            "setarch", "setpriv", "setsid", "sg", "stdbuf", "strace", "su", "sudo", "systemd-run",
+            "taskset", "time", "timeout", "toybox", "unbuffer", "unshare", "xargs",
+        }
+    )  # fmt: skip
 
     # One realistic multi-flag spelling per launcher: its real subcommand/option grammar in front
     # of the shell. Pre-fix every one of these was SAFE / allowed=True.
@@ -856,12 +893,25 @@ class TestLauncherDelegation:
         "uv": "uv run bash -euo pipefail -c 'rm -rf /'",
         "poetry": "poetry run bash -euo pipefail -c 'rm -rf /'",
         "pipenv": "pipenv run bash -euo pipefail -c 'rm -rf /'",
+        "pdm": "pdm run bash -euo pipefail -c 'rm -rf /'",
+        "hatch": "hatch run bash -euo pipefail -c 'rm -rf /'",
+        "rye": "rye run bash -euo pipefail -c 'rm -rf /'",
         "conda": "conda run -n env bash -euo pipefail -c 'rm -rf /'",
         "npx": "npx bash --norc -c 'rm -rf /'",
-        "pnpm": "pnpm exec bash -euo pipefail -c 'rm -rf /'",
-        "bunx": "bunx bash --norc -c 'rm -rf /'",
         "npm": "npm exec -- bash -euo pipefail -c 'rm -rf /'",
+        "pnpm": "pnpm exec bash -euo pipefail -c 'rm -rf /'",
         "yarn": "yarn exec bash -euo pipefail -c 'rm -rf /'",
+        "bunx": "bunx bash --norc -c 'rm -rf /'",
+        "bundle": "bundle exec bash -euo pipefail -c 'rm -rf /'",
+        "direnv": "direnv exec . bash -euo pipefail -c 'rm -rf /'",
+        "devbox": "devbox run -- bash -euo pipefail -c 'rm -rf /'",
+        "nix": "nix develop -c bash -euo pipefail -c 'rm -rf /'",
+        "mise": "mise exec -- bash -euo pipefail -c 'rm -rf /'",
+        "asdf": "asdf exec bash -euo pipefail -c 'rm -rf /'",
+        "pyenv": "pyenv exec bash -euo pipefail -c 'rm -rf /'",
+        "rbenv": "rbenv exec bash -euo pipefail -c 'rm -rf /'",
+        "nvm": "nvm exec 20 bash -euo pipefail -c 'rm -rf /'",
+        "volta": "volta run --node 20 bash -euo pipefail -c 'rm -rf /'",
         "screen": "screen -dmS job bash --norc -c 'rm -rf /'",
         "tmux": "tmux new-session -d bash --norc -c 'rm -rf /'",
         "xvfb-run": "xvfb-run -a bash -euo pipefail -c 'rm -rf /'",
@@ -871,27 +921,24 @@ class TestLauncherDelegation:
         "caffeinate": "caffeinate -i bash -euo pipefail -c 'rm -rf /'",
         "entr": "ls *.py | entr -r bash -euo pipefail -c 'rm -rf /'",
         "watchexec": "watchexec -e py -- bash -euo pipefail -c 'rm -rf /'",
-        "direnv": "direnv exec . bash -euo pipefail -c 'rm -rf /'",
         "dbus-run-session": "dbus-run-session -- bash -euo pipefail -c 'rm -rf /'",
         "daemonize": "daemonize /bin/bash -euo pipefail -c 'rm -rf /'",
         "chpst": "chpst -u nobody bash -euo pipefail -c 'rm -rf /'",
         "proot": "proot -r rootfs bash -euo pipefail -c 'rm -rf /'",
     }
 
-    @pytest.mark.parametrize("launcher", _LAUNCHERS)
-    def test_launcher_is_a_wrapper(self, launcher):
-        assert launcher in WRAPPER_COMMANDS
-        assert launcher not in _EXEC_PASSTHROUGH_WRAPPERS, f"{launcher} would trip the exec/eval bypass scan"
-
-    def test_passthrough_wrappers_are_unchanged(self):
-        # The exec/eval scan keeps exactly the set it had; the launchers only widen re-entry.
-        assert _EXEC_PASSTHROUGH_WRAPPERS < WRAPPER_COMMANDS
-        assert {"sudo", "env", "timeout", "xargs", "busybox", "chroot"} <= _EXEC_PASSTHROUGH_WRAPPERS
-        assert _EXEC_PASSTHROUGH_WRAPPERS.isdisjoint(self._LAUNCHERS)
+    def test_set_shapes(self):
+        assert _EXEC_BYPASS_SCAN_WRAPPERS == self._MAIN_WRAPPERS
+        assert set(self._LAUNCHERS) == _LAUNCHER_COMMANDS
+        assert _EXEC_BYPASS_SCAN_WRAPPERS.isdisjoint(_LAUNCHER_COMMANDS)
+        assert WRAPPER_COMMANDS == _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMANDS
+        assert set(self._REALISTIC) == set(self._LAUNCHERS)
 
     @pytest.mark.parametrize("launcher", _LAUNCHERS)
     def test_multiflag_dash_c_is_blocked_by_reentry(self, launcher):
-        # AC-2, the gap form. Pre-fix: SAFE / allowed=True for every launcher.
+        # AC-2, the gap form. Pre-fix: SAFE / allowed=True for every launcher. The rule is asserted
+        # exactly: nothing but re-entry catches this spelling today, and a regex that started to
+        # would be the `-c`-anchored backstop #202 deleted as evadable - worth a failing test.
         command = f"{launcher} bash -euo pipefail -c 'rm -rf /'"
         result = validate_command(command)
         assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
@@ -958,11 +1005,24 @@ class TestLauncherDelegation:
         assert result.allowed is False
         assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
 
-    def test_nested_launcher_inside_payload_is_blocked(self):
-        # A launcher inside the payload re-enters through the same extractor: no depth is special.
-        result = validate_command("""uv run bash -euo pipefail -c "pnpm exec sh -eu -c 'rm -rf /'" """.strip())
-        assert result.risk_level == RiskLevel.BLOCKED
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Panel on #204. Pre-fix (bare AND wrapped, `main` @ `65afe74`): `-c` forms SAFE /
+            # allowed=True, `<<<` forms HIGH / allowed=True. Real bash/sh run every one of these.
+            "bash +o pipefail -c 'rm -rf /'",
+            "sh +e -c 'rm -rf /'",
+            "uv run bash +o pipefail -c 'rm -rf /'",
+            "timeout 5 bash +x -c 'rm -rf /'",
+            "bash +o pipefail <<< 'rm -rf /'",
+            "uv run bash +o pipefail <<< 'rm -rf /'",
+        ],
+    )
+    def test_plus_option_does_not_end_the_scan(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
         assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
 
     @pytest.mark.parametrize(
         "command",
@@ -983,11 +1043,25 @@ class TestLauncherDelegation:
             "direnv exec . make",
             "npm exec -- vitest run",
             "yarn exec vitest",
+            "bundle exec rspec",
+            "mise exec -- node -v",
+            "asdf exec node -v",
+            "pyenv exec python -V",
+            "rbenv exec ruby -v",
+            "nvm exec 20 node -v",
             "screen -X eval 'stuff' 'other'",
             # One benign tail per remaining launcher.
             "pipenv run pytest",
+            "pdm run pytest",
+            "hatch run test",
+            "rye run pytest",
             "npm run build",
             "bunx create-vite",
+            "bundle install",
+            "devbox run build",
+            "nix develop -c make",
+            "nix build .#default",
+            "volta run --node 20 node -v",
             "bwrap --ro-bind / / ls",
             "xvfb-run -a pytest",
             "faketime '2020-01-01 00:00:00' date",
@@ -998,10 +1072,12 @@ class TestLauncherDelegation:
             "daemonize /usr/bin/make",
             "chpst -u nobody make",
             "proot -r rootfs ls",
-            # A launcher's OWN `-c` (tmux start-directory, screen rc file) is not a shell's `-c`,
-            # and a bare shell operand with no `-c` carries no payload.
+            # A launcher's OWN `-c` (tmux start-directory, screen rc file, nix command) is not a
+            # shell's `-c`, and a bare shell operand with no `-c` carries no payload.
             "tmux new-session -d -c /tmp bash",
             "screen -c ~/.screenrc",
+            # `+x` is an option, so the script operand behind it is still a script: no `-c`, no payload.
+            "bash +x script.sh",
         ],
     )
     def test_benign_launcher_tail_stays_safe(self, command):
@@ -1009,10 +1085,3 @@ class TestLauncherDelegation:
         result = validate_command(command)
         assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}: {result.message}"
         assert result.allowed is True
-
-    def test_exec_scan_still_fires_for_passthrough_wrappers(self):
-        # The exec/eval bypass scan is narrowed to `_EXEC_PASSTHROUGH_WRAPPERS`, not removed.
-        for command in ("sudo exec bash", "env exec bash"):
-            result = validate_command(command)
-            assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
-            assert "wrapper command bypass" in result.message
