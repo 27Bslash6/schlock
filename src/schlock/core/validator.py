@@ -2357,9 +2357,13 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # does, but the payload rides a redirect node the extractor above skips. Surface it
             # here; only SHELL here-strings are re-validated as bash (a python/perl here-string is
             # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
-            herestring_payloads = [
-                prog for name, prog in parser.extract_stdin_program_redirects(ast) if name in _SHELL_COMMANDS and prog.strip()
-            ]
+            herestring_payloads = list(
+                dict.fromkeys(
+                    prog
+                    for name, prog in parser.extract_stdin_program_redirects(ast)
+                    if name in _SHELL_COMMANDS and prog.strip()
+                )
+            )
 
         except (ParseError, ValueError) as e:
             # Check if this is a heredoc parse failure (bashlex doesn't support quoted delimiters)
@@ -2521,17 +2525,24 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
         # higher verdict, so no spelling of the wrapper scores below the bare payload.
-        # NOT a general guarantee: this runs after the multi-segment whitelist, so a
-        # whitelisted prefix still short-circuits it (LAB-2759). Deliberately NOT routed through
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a full-span
+        # whitelist match still short-circuits it (#146 closed the prefix case). Deliberately NOT routed through
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
         # `-c`/wrapper/`watch` payloads plus here-string (`<<<`) payloads (LAB-2768); a here-string
         # re-enters validation identically to a `-c` payload, so `bash <<< "$CMD"` matches
-        # `bash -c "$CMD"` rather than fail-closing one spelling of the same delegation.
-        payloads = (
-            _shell_delegated_payloads(commands_with_args) + herestring_payloads if match.risk_level < RiskLevel.BLOCKED else []
-        )
+        # `bash -c "$CMD"` rather than fail-closing one spelling of the same delegation. Every
+        # payload below re-enters validation - and ShellCheck - once, so here-strings share the
+        # extractor's ceiling: without it n distinct `<<<` cost n unbounded re-entries while the
+        # `-c` spelling of the same command stopped at MAX_DELEGATOR_TOKENS, and a hook that
+        # outlives its timeout fails OPEN. Identical payloads collapse first, whichever spelling
+        # surfaced them.
+        payloads: list[str] = []
+        if match.risk_level < RiskLevel.BLOCKED:
+            if len(herestring_payloads) > MAX_DELEGATOR_TOKENS:
+                raise ValueError(f"Here-string re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
+            payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + herestring_payloads))
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:

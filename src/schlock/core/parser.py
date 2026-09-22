@@ -354,21 +354,30 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     return True
 
 
-def _last_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
-    """Content of the last `<<<` here-string in a redirect-bearing list, else None.
+def _stdin_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
+    """Content of the here-string a command's stdin ends up holding, else None.
 
     The here-string content is the redirect's target word (`.output`); a fd-duplication redirect
-    (`>&2`) carries an int there instead, so guard on `.word`. The last `<<<` wins, matching bash's
-    last-stdin-redirect-wins rule.
+    (`>&2`) carries an int there instead, so guard on `.word`. Redirections apply left to right and
+    the last to touch stdin wins: a `<<<` with no fd (or fd 0) sets stdin; `3<<< X` fills fd 3, which
+    a bare interpreter never reads (verified: `bash 3<<< "echo x"` prints nothing) - unless a later
+    `<&3` duplicates it onto stdin (`bash 3<<< "echo x" <&3` prints x), so duplications of a
+    here-string-bearing fd are followed. Taking the last `<<<` regardless of fd let a trailing
+    `3<<< decoy` displace the real payload. A `< file` or heredoc on stdin is deliberately NOT
+    modelled as displacing an earlier here-string: over-surfacing re-validates a payload that may
+    not run (fails closed), under-surfacing misses one that does.
     """
-    here_string = None
+    by_fd: dict[int, str] = {}
     for part in redirect_nodes:
-        if getattr(part, "kind", None) != "redirect" or getattr(part, "type", None) != "<<<":
+        if getattr(part, "kind", None) != "redirect":
             continue
-        target = getattr(part, "output", None)
-        if target is not None and hasattr(target, "word"):
-            here_string = target.word
-    return here_string
+        fd = getattr(part, "input", None) or 0
+        kind, target = getattr(part, "type", None), getattr(part, "output", None)
+        if kind == "<<<" and target is not None and hasattr(target, "word"):
+            by_fd[fd] = target.word
+        elif kind == "<&" and isinstance(target, int) and target in by_fd:
+            by_fd[fd] = by_fd[target]
+    return by_fd.get(0)
 
 
 def _command_words(node: Any) -> "list[str]":
@@ -391,7 +400,10 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
       never execute it - all correctly excluded by `_reads_stdin_as_program`.
     - wrapped: `timeout 5 bash <<< Y`, `env FOO=1 bash <<< Y`. The wrapper execs a shell that
       inherits the wrapper's stdin (verified against timeout/env/stdbuf/nice). Mirrors the wrapper
-      scan in `_shell_delegated_payloads`: find the first interpreter it hands off to.
+      scan in `_shell_delegated_payloads`: EVERY operand position, not the first interpreter name,
+      because a wrapper's own operand can share one - `flock ./bash sh <<< Y` locks a file named
+      bash and runs sh, `strace -o bash sh <<< Y` traces into a file named bash (both run Y in sh,
+      verified). Stopping at the decoy read `sh` as its script operand and surfaced nothing.
 
     `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
     caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
@@ -405,10 +417,10 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
         return (name, here_string)
 
     if name in WRAPPER_COMMANDS:
-        arg_bases = [a.split("/")[-1] for a in args]
-        at = next((i for i, w in enumerate(arg_bases) if w in STDIN_EXEC_INTERPRETERS), None)
-        if at is not None and _reads_stdin_as_program(arg_bases[at], args[at + 1 :]):
-            return (arg_bases[at], here_string)
+        for at, arg in enumerate(args):
+            interpreter = arg.split("/")[-1]
+            if interpreter in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(interpreter, args[at + 1 :]):
+                return (interpreter, here_string)
     return None
 
 
@@ -434,13 +446,13 @@ def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
     """
     kind = getattr(node, "kind", None)
     if kind == "command":
-        here_string = _last_here_string(getattr(node, "parts", []))
+        here_string = _stdin_here_string(getattr(node, "parts", []))
         if here_string is None:
             return None
         return _classify_sink(node, here_string)
 
     if kind == "compound":
-        here_string = _last_here_string(getattr(node, "redirects", []))
+        here_string = _stdin_here_string(getattr(node, "redirects", []))
         if here_string is None:
             return None
         for sink in _command_nodes(node):

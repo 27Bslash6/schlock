@@ -634,7 +634,7 @@ class TestHereStringPayloadExtraction:
 
     def test_compound_here_string_finds_the_first_command_sink(self):
         # A `<<<` on a subshell/brace group feeds the group's stdin; a command inside runs it.
-        # bashlex hangs the redirect on the compound node, not the inner command (panel CRIT).
+        # bashlex hangs the redirect on the compound node, not the inner command.
         assert self._extract('( bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('{ bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
 
@@ -669,6 +669,35 @@ class TestHereStringPayloadExtraction:
         # A plain input redirect (`< file`) is not a here-string; nothing to surface.
         assert self._extract("bash < script.sh") == []
 
+    def test_here_string_on_another_fd_is_not_the_program(self):
+        # bash runs its stdin. `3<<< X` fills fd 3 and nothing reads it (verified: `bash 3<<< "echo
+        # x"` prints nothing; `bash <<< "echo a" 3<<< "echo b"` prints a). Taking the last `<<<`
+        # regardless of fd let a trailing fd-3 decoy displace the stdin payload.
+        assert self._extract('bash <<< "rm -rf /" 3<<< "ls"') == [("bash", "rm -rf /")]
+        assert self._extract('bash 0<<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._extract('bash 3<<< "rm -rf /"') == []
+
+    def test_here_string_duplicated_onto_stdin_is_the_program(self):
+        # `<&3` makes stdin a copy of fd 3, so the fd-3 here-string IS what bash runs (verified:
+        # `bash 3<<< "echo x" <&3` prints x). Followed through a dup chain; a dup of a fd that
+        # holds no here-string changes nothing, so `bash <<< X 3</dev/null <&3` keeps surfacing X
+        # (fails closed - the file, not X, is what bash reads there).
+        assert self._extract('bash 3<<< "rm -rf /" <&3') == [("bash", "rm -rf /")]
+        assert self._extract('bash 3<<< "rm -rf /" 0<&3') == [("bash", "rm -rf /")]
+        assert self._extract('bash 3<<< "rm -rf /" 4<&3 <&4') == [("bash", "rm -rf /")]
+        assert self._extract('bash <<< "rm -rf /" 3</dev/null <&3') == [("bash", "rm -rf /")]
+
+    def test_wrapper_operand_sharing_a_shell_name_does_not_end_the_scan(self):
+        # `flock ./bash sh <<< X` locks a file named bash and runs sh; `strace -o bash sh <<< X`
+        # writes its trace to a file named bash. Both run the here-string in sh (verified against
+        # the real binaries). A first-interpreter-name scan stopped at the decoy, read `sh` as its
+        # script operand, and surfaced nothing - the LAB-3004 decoy shape on the `<<<` surface.
+        assert self._extract('flock ./bash sh <<< "rm -rf /"') == [("sh", "rm -rf /")]
+        assert self._extract('strace -o bash sh <<< "rm -rf /"') == [("sh", "rm -rf /")]
+        # The decoy does not widen the scan past real operand semantics.
+        assert self._extract('timeout 5 bash -c "echo" <<< "rm -rf /"') == []
+        assert self._extract('env FOO=1 bash script.sh <<< "rm -rf /"') == []
+
 
 class TestHereStringDelegationEvasion:
     """AC-1: a here-string payload gets at least the bare payload's verdict.
@@ -694,7 +723,7 @@ class TestHereStringDelegationEvasion:
             'timeout 5 bash <<< "rm -rf /"',
             'env FOO=1 bash <<< "rm -rf /"',
             'nice bash <<< "rm -rf /"',
-            # Compound/group sinks - redirect rides the compound node (panel CRIT; pre-fix HIGH).
+            # Compound/group sinks - redirect rides the compound node (pre-fix HIGH).
             '( bash ) <<< "rm -rf /"',
             '{ bash; } <<< "rm -rf /"',
             '( timeout 5 bash ) <<< "rm -rf /"',
@@ -707,6 +736,12 @@ class TestHereStringDelegationEvasion:
             'if true; then bash; fi <<< "rm -rf /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
+            # Decoys: a trailing here-string on another fd, and a wrapper operand that shares a
+            # shell's basename. bash runs the stdin payload in every case (verified).
+            'bash <<< "rm -rf /" 3<<< "ls"',
+            'bash 3<<< "rm -rf /" <&3',
+            'flock ./bash sh <<< "rm -rf /"',
+            'strace -o bash sh <<< "rm -rf /"',
         ],
     )
     def test_here_string_payload_is_blocked(self, command):
@@ -717,6 +752,20 @@ class TestHereStringDelegationEvasion:
     def test_bare_payload_control_is_blocked(self):
         # The floor each here-string form must reach.
         assert validate_command("rm -rf /").risk_level == RiskLevel.BLOCKED
+
+    def test_here_string_fan_out_past_the_ceiling_fails_closed(self):
+        # Every surfaced here-string re-enters validation - and ShellCheck - once, so n distinct
+        # `<<<` payloads were n unbounded re-entries while the `-c` spelling of the same command
+        # stopped at MAX_DELEGATOR_TOKENS; a PreToolUse hook that outlives its timeout fails
+        # OPEN. Same ceiling, same catch-all denial as the extractor's. Identical payloads
+        # collapse before the count, so repetition alone never trips it.
+        distinct = "; ".join(f'bash <<< "echo {i}"' for i in range(MAX_DELEGATOR_TOKENS + 1))
+        result = validate_command(distinct)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert "distinct payloads" in (result.error or "")
+        repeated = "; ".join('bash <<< "echo hi"' for _ in range(MAX_DELEGATOR_TOKENS + 1))
+        assert validate_command(repeated).allowed is True
 
 
 class TestHereStringBenignUnchanged:
