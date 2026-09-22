@@ -1055,9 +1055,9 @@ class TestHeredocSurroundings:
 
         ShellCheck is a subprocess per call. Re-entering the full pipeline per
         segment spent N+2 of them for a heredoc followed by N commands (LAB-2780).
-        The whitelisted head is pinned to one as well, not zero: there the
-        whole-command pass is short-circuited before its own ShellCheck step,
-        so this one spawn is the only ShellCheck the trailing commands get.
+        The whitelisted head is pinned to one as well, not zero: both passes run
+        with ShellCheck off, so neither can spawn whatever the head is, and the
+        escalation's own spawn is the only ShellCheck the trailing commands get.
         """
         checked: list[str] = []
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
@@ -1118,7 +1118,8 @@ class TestHeredocSurroundings:
         assert result.risk_level == RiskLevel.BLOCKED
 
         # The Step 5 whitelist return has a cache write of its own. Pin it with a
-        # whole-command whitelist entry, which reaches Step 5 by prefix or full-span match.
+        # whole-command whitelist entry, which reaches Step 5 only by full-span match
+        # (is_fully_whitelisted, #146) - a prefix no longer gets there.
         whitelisted = "gh auth token | docker login ghcr.io -u me --password-stdin"
         validate_command(whitelisted, config_path=safety_rules_path, _shellcheck=False)
         assert val_module._global_cache.get(whitelisted) is None
