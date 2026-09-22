@@ -903,7 +903,7 @@ class SubstitutionValidator:
                 # still extract nothing. Adding them here is NOT a one-liner - it makes a
                 # Layer-4 HIGH preempt the rule engine's BLOCKED at validator.py's
                 # first-denial return, which measurably downgrades base64_shell_execution.
-                # Tracked separately; do not "tidy" this by deleting the fall-through.
+                # Tracked as LAB-4579; do not "tidy" this by deleting the fall-through.
                 substitutions.extend(
                     self._substitutions_in_heredoc(getattr(node, "heredoc", None), current_depth, command, budget)
                 )
