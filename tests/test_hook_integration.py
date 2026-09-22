@@ -702,3 +702,16 @@ class TestHookSubprocess:
         proc = self._run("this is not json")
         assert proc.returncode == 2
         assert self._decision(proc)["permissionDecision"] == "deny"
+
+    def test_non_mapping_stdin_denies_and_exits_2(self):
+        """Valid JSON that is not an object must reach main()'s fatal deny — and exit 2.
+
+        handle_pre_tool_use's own except clause also reads input_data as a mapping, so a list
+        raises again inside it and propagates. That is the one route to main()'s generic
+        handler, so this pins its exit code the way the invalid-JSON test pins the other.
+        """
+        proc = self._run("[]")
+        assert proc.returncode == 2
+        output = self._decision(proc)
+        assert output["permissionDecision"] == "deny"
+        assert "Fatal hook error" in output["permissionDecisionReason"]
