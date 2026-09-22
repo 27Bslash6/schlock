@@ -566,6 +566,17 @@ class TestSystemCredentialFileReads:
             "grep -E 'root|daemon' /etc/shadow | base64",
             "grep root /etc/passwd /etc/shadow",
             "grep -f patterns.txt /etc/shadow",
+            # The pattern can arrive CARRIED BY A FLAG instead of as an operand,
+            # in which case there is no non-flag operand before the path and the
+            # "pattern operand present" requirement alone would miss the read.
+            "grep --regexp=root /etc/shadow",
+            "grep --file=patterns.txt /etc/shadow",
+            "grep -eroot /etc/shadow",
+            "grep -fpatterns.txt /etc/shadow",
+            "grep -e root /etc/shadow",
+            "grep root --color=auto /etc/shadow",
+            "grep -- root /etc/shadow",
+            'grep -E "a\\"b" /etc/shadow',
         ],
     )
     def test_exfiltration_shapes_are_rated(self, safety_rules_path, command):

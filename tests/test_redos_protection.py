@@ -115,6 +115,12 @@ class TestReDoSProtection:
             # Shares this class's MAX_VALIDATION_TIME rather than carrying its
             # own constant; the linearity claim is the sibling ratio test's job.
             "cat " + "/etc/" * 1600,
+            # LAB-4466: grep flag storms. `-e`/`-f` must be parseable exactly
+            # one way -- when the flag run could ALSO take them, the two parses
+            # made this quadratic (165ms at n=1600 before the branches were
+            # made disjoint).
+            "grep " + "-eq " * 1600 + "/etc/x",
+            "grep " + "-v " * 1600 + "p /etc/x",
         ],
     )
     def test_all_pathological_inputs_fast(self, pathological_input):
