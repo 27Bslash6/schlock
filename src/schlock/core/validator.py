@@ -2079,12 +2079,7 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
     return "\n".join(rewritten), base_command
 
 
-def _validate_heredoc_command(
-    command: str,
-    config_path: Optional[str] = None,
-    *,
-    _derived: bool = False,
-) -> Optional[ValidationResult]:
+def _validate_heredoc_command(command: str, config_path: Optional[str] = None) -> Optional[ValidationResult]:
     """Validate command containing heredoc that bashlex couldn't parse.
 
     Bashlex doesn't support quoted heredoc delimiters (e.g. << 'EOF'). This
@@ -2529,7 +2524,7 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # e.g., python3 << 'EOF' ... EOF
             if "<<" in command and ("here-document" in str(e) or "heredoc" in str(e).lower()):
                 # Extract command before heredoc and validate that instead
-                heredoc_result = _validate_heredoc_command(command, config_path, _derived=_depth > 0 or _derived)
+                heredoc_result = _validate_heredoc_command(command, config_path)
                 if heredoc_result is not None:
                     return heredoc_result
             # Fall through to block if heredoc handling didn't work
