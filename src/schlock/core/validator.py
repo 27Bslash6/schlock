@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 # Module-level cache (shared across all validation calls)
 _global_cache = ValidationCache(max_size=1000)
+# Which ruleset produced the entries currently in _global_cache. Deliberately NOT
+# _global_rule_engine_path: that one records which engine is loaded, and is advanced by
+# call sites that never touch this cache (LAB-4602).
+_global_cache_path: Optional[str] = None
 
 # Thread lock for RuleEngine and Parser caches
 # SECURITY: Prevents race conditions when multiple threads access shared state
@@ -79,6 +83,39 @@ def _get_rule_engine(config_path: Optional[str] = None) -> "RuleEngine":
         _global_rule_engine = load_rules(config_path)
         _global_rule_engine_path = config_path
         return _global_rule_engine
+
+
+def _invalidate_cache_on_ruleset_change(config_path: Optional[str] = None) -> None:
+    """Drop cached verdicts when the requested ruleset is not the one that produced them.
+
+    ValidationCache keys on the command string alone, so without this the first ruleset to
+    validate a command owns that command's verdict for the rest of the process: a later call
+    naming a different ruleset gets a hit computed under rules it never asked for. Silent, and
+    it inverts mutation testing - revert a pattern, re-run, and the reverted ruleset still
+    appears to deny (LAB-4602).
+
+    Placement is load-bearing: this must run BEFORE validate_command's Step-1 lookup.
+    _get_rule_engine() does reload on a path change, but it runs after the lookup has already
+    returned the stale hit, so the same compare placed there never fires.
+
+    Production never mixes rulesets (one hook process, one ruleset), so the clear is a
+    test-only event and the hot path keeps both its str key and its hit rate.
+    """
+    global _global_cache_path  # noqa: PLW0603
+
+    # Re-check under the lock: the caller's guard is deliberately unlocked (it runs before
+    # every cache hit), so another thread may have switched the ruleset between that compare
+    # and this one. Together the two form one double-checked lock.
+    #
+    # ponytail: the Step-1 lookup that follows is outside the lock regardless, so two threads
+    # on different rulesets can still interleave and one can read a verdict the other is
+    # clearing. Test-only - production is one hook process holding one ruleset - and the
+    # engine singleton is already racy the same way. Partition the cache per ruleset if that
+    # ever stops being true.
+    with _cache_lock:
+        if _global_cache_path != config_path:
+            _global_cache.clear()
+            _global_cache_path = config_path
 
 
 def _get_parser() -> "BashCommandParser":
@@ -2104,7 +2141,15 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         if over is not None:
             return over
 
-        # Step 1: Check cache
+        # Step 1: Check cache, after dropping any verdicts a different ruleset left behind.
+        # Must precede the lookup: _get_rule_engine's own path check (Step 5) is too late to
+        # save a hit that has already returned.
+        # The compare is inline rather than inside the helper because it guards every cached
+        # hit, and the call alone cost ~50ns of a ~410ns cached call; with it inline the
+        # benchmark is at parity with main. It is also the outer half of the helper's
+        # double-checked lock - keep it here, and keep it before the lookup.
+        if _global_cache_path != config_path:
+            _invalidate_cache_on_ruleset_change(config_path)
         cached = _global_cache.get(command)
         if cached is not None:
             return cached
@@ -2463,7 +2508,9 @@ def clear_caches() -> None:
         - Parser cache
     """
     global _global_rule_engine, _global_rule_engine_path, _global_parser, _global_substitution_validator  # noqa: PLW0603
+    global _global_cache_path  # noqa: PLW0603
     _global_cache.clear()
+    _global_cache_path = None
     _global_rule_engine = None
     _global_rule_engine_path = None
     _global_parser = None
