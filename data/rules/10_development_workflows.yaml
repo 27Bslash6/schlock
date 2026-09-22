@@ -7,13 +7,35 @@ rules:
   - name: git_force_push
     description: Force push overwrites remote history
     risk_level: HIGH
-    patterns: ['git\s+push[^;|&]{0,100}--force(?!-with-lease)', 'git\s+push[^;|&]{0,100}\s-f(\s|$)']
+    # Every git global option displaces the subcommand: `git -C <dir> push --force`,
+    # `git -c k=v push --force`, `git --no-pager push --force`. The group below absorbs
+    # them generically rather than enumerating ~10 flags that git keeps adding to.
+    # A flag's value is a shell WORD, so it may mix bare and quoted runs:
+    # `-c user.name='Jane Doe'`. That is written as `B (Q B)*` -- a maximal bare run
+    # that can only be followed by a quote -- so each input has exactly one parse;
+    # two adjacent unanchored bare runs would make the enclosing group exponential.
+    #
+    # The option run is BOUNDED at 16, and that bound is load-bearing. These
+    # patterns are unanchored so `sudo git push --force` still rates, which means
+    # `git` inside an argument (`-C git`, a directory called git) starts another
+    # candidate match. Unbounded, the group greedily consumed the whole remaining
+    # suffix from every one of those starts before failing to find the subcommand:
+    # O(n) starts x O(n) scan, measured at 162 ms on a 13 KB command against a
+    # ~1 ms budget. Per-word parsing being unambiguous says nothing about this --
+    # that property is about one word at one start position.
+    #
+    # Accepted residual: more than 16 global options in one invocation drops the
+    # match. No real git command carries a third of that, and `main` dropped the
+    # match on the FIRST global option, so this is strictly narrower than what it
+    # replaces -- but it is a bound an attacker can pad past, and it is recorded
+    # here rather than discovered later.
+    patterns: ['git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+push[^;|&]{0,100}--force(?!-with-lease)', 'git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+push[^;|&]{0,100}\s-f(\s|$)']
     alternatives: ["Use --force-with-lease"]
 
   - name: git_hard_reset
     description: Hard reset destroys uncommitted work
     risk_level: HIGH
-    patterns: ['git\s+reset\s+--hard']
+    patterns: ['git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+reset\s+--hard']
     alternatives: ["Use git stash first"]
 
   - name: git_blanket_staging
@@ -25,11 +47,11 @@ rules:
       # exempts interactive (-p/-i) and dry-run (-n): patch mode confirms every hunk and can't
       # stage untracked junk; dry runs mutate nothing.
       # 1. '.' is always the whole cwd — blanket wherever it stands as its own argument.
-      - 'git\s+add\b(?![^;|&]{0,100}\s(?:-p|-i|--patch|--interactive|-n|--dry-run)\b)[^;|&]{0,100}\s\.(\s|$)'
+      - 'git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+add\b(?![^;|&]{0,100}\s(?:-p|-i|--patch|--interactive|-n|--dry-run)\b)[^;|&]{0,100}\s\.(\s|$)'
       # 2. --all/-A/-a with NO explicit pathspec: every argument must be a flag (\s+-...), so the
       #    command ends after the flags. A pathspec (git add -A src/foo.py) breaks the flag run
       #    and drops the match. The trailing (?:$|[;|&]) keeps chained sweeps (git add -A && ...).
-      - 'git\s+add\b(?![^;|&]{0,100}\s(?:-p|-i|--patch|--interactive|-n|--dry-run)\b)(?:\s+-[^\s;|&]+)*\s+(?:--all|-A|-a)(?:\s+-[^\s;|&]+)*\s*(?:$|[;|&])'
+      - 'git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+add\b(?![^;|&]{0,100}\s(?:-p|-i|--patch|--interactive|-n|--dry-run)\b)(?:\s+-[^\s;|&]+)*\s+(?:--all|-A|-a)(?:\s+-[^\s;|&]+)*\s*(?:$|[;|&])'
     alternatives:
       - "Stage explicit paths: git add <path> ..."
       - "Review first: git status --short"
@@ -172,7 +194,7 @@ rules:
   - name: git_push
     description: Pushing to remote
     risk_level: MEDIUM
-    patterns: ['^git\s+push\b']
+    patterns: ['^git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+push\b']
     alternatives: ["Review with git log"]
 
   - name: git_merge
@@ -184,7 +206,7 @@ rules:
   - name: git_rebase
     description: Rewrites history
     risk_level: MEDIUM
-    patterns: ['git\s+rebase']
+    patterns: ['git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+rebase']
     alternatives: ["Only rebase local commits"]
 
   - name: chmod_exec
@@ -203,7 +225,7 @@ rules:
   - name: git_commit
     description: Committing changes
     risk_level: LOW
-    patterns: ['^git\s+commit']
+    patterns: ['^git(?:\s+-[^\s;|&]+(?:\s+(?=[^\s;|&-])[^\s;|&''"]*(?:(?:''[^'']*''|"[^"]*")[^\s;|&''"]*)*)?){0,16}\s+commit']
     alternatives: []
 
   - name: npm_install
