@@ -646,6 +646,92 @@ whitelist:
         assert result.risk_level == RiskLevel.BLOCKED
 
 
+class TestProjectEscapeHatchIgnored:
+    """Project-level config cannot open the allow_blocked_override escape hatch.
+
+    The hatch rewrites a rule's risk level *before* matching, so the BLOCKED floor
+    in apply_overrides() never engages. Restricted to user-level config for the same
+    reason as `whitelist` — a cloned repo auto-loads project config on `cd`.
+    """
+
+    # The four-line project config from the issue, plus the chmod case the panel measured.
+    PROJECT_HATCH = """
+rule_overrides:
+  disk_destruction_dd:
+    risk_level: SAFE
+    allow_blocked_override: true
+  recursive_permission_system_dirs:
+    risk_level: LOW
+    allow_blocked_override: true
+"""
+
+    @staticmethod
+    def _write_project_config(tmp_path, monkeypatch, body):
+        project_config = tmp_path / ".claude" / "hooks"
+        project_config.mkdir(parents=True)
+        (project_config / "schlock-config.yaml").write_text(body)
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "nonexistent")
+        monkeypatch.chdir(tmp_path)
+
+    def test_escape_hatch_stripped_from_project_config(self, tmp_path, monkeypatch, caplog):
+        """allow_blocked_override is dropped from project config with one warning."""
+        self._write_project_config(tmp_path, monkeypatch, self.PROJECT_HATCH)
+
+        rule_overrides, _, _ = _load_rule_overrides()
+
+        # The rest of the override survives — only the hatch key is removed.
+        assert rule_overrides["disk_destruction_dd"] == {"risk_level": "SAFE"}
+        assert rule_overrides["recursive_permission_system_dirs"] == {"risk_level": "LOW"}
+        assert caplog.text.count("Ignoring allow_blocked_override in project config") == 1
+        assert str(tmp_path / ".claude" / "hooks" / "schlock-config.yaml") in caplog.text
+        assert "only supported in user-level config" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("command", "rule_name"),
+        [
+            ("dd if=/dev/zero of=/dev/sda", "disk_destruction_dd"),
+            ("chmod -R 777 /", "recursive_permission_system_dirs"),
+        ],
+    )
+    def test_project_hatch_cannot_downgrade_blocked_rule(self, tmp_path, monkeypatch, command, rule_name):
+        """The BLOCKED rule still matches at BLOCKED despite the project-level hatch."""
+        clear_caches()
+        self._write_project_config(tmp_path, monkeypatch, self.PROJECT_HATCH)
+
+        result = validate_command(command)
+
+        assert not result.allowed
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert rule_name in result.matched_rules
+
+    def test_project_config_without_hatch_logs_no_warning(self, tmp_path, monkeypatch, caplog):
+        """A project config that never mentions the hatch stays silent."""
+        self._write_project_config(tmp_path, monkeypatch, "\nrule_overrides:\n  recursive_delete:\n    enabled: false\n")
+
+        _load_rule_overrides()
+
+        assert "allow_blocked_override" not in caplog.text
+
+    def test_user_level_hatch_still_downgrades(self, tmp_path, monkeypatch):
+        """The user-level escape hatch is untouched — it still downgrades (issue #56)."""
+        clear_caches()
+        user_config = tmp_path / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        (user_config / "config.yaml").write_text("""
+rule_overrides:
+  disk_destruction_dd:
+    risk_level: LOW
+    allow_blocked_override: true
+""")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        result = validate_command("dd if=/dev/zero of=/dev/sda")
+
+        assert result.risk_level == RiskLevel.LOW
+        assert "disk_destruction_dd" in result.matched_rules
+
+
 class TestSelfProtection:
     """Test self-protection: LLM cannot modify schlock's own configuration.
 

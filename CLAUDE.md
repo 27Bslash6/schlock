@@ -98,7 +98,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 2. User overrides: `~/.config/schlock/config.yaml`
 3. Project overrides: `.claude/hooks/schlock-config.yaml`
 
-**Rule Overrides**: Per-rule and per-category overrides via `rule_overrides` and `category_overrides` YAML keys. BLOCKED rules cannot be downgraded or disabled (security floor).
+**Rule Overrides**: Per-rule and per-category overrides via `rule_overrides` and `category_overrides` YAML keys. BLOCKED rules cannot be downgraded or disabled (security floor). The floor's one opt-in escape hatch, `allow_blocked_override`, is user-level config only — it is stripped from project-level config with a warning, because it rewrites the risk level *before* matching and would otherwise sidestep the floor rather than be caught by it.
 
 **Command Whitelist**: User-level config (`~/.config/schlock/config.yaml`) supports `whitelist:` — a list of regex patterns that bypass ALL rules including BLOCKED. Project-level config cannot define whitelist patterns (privilege escalation risk). See `docs/CONFIGURATION.md`.
 

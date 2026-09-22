@@ -101,10 +101,28 @@ Overrides are applied in this order (later wins):
 
 #### Security Constraints
 
-- **BLOCKED rules cannot be downgraded or disabled** — this is a non-negotiable security floor
+- **BLOCKED rules cannot be downgraded or disabled** — the only exception is the `allow_blocked_override` escape hatch below
 - **Whitelist patterns are user-level config only** — project-level config cannot define whitelist patterns (see below)
+- **`allow_blocked_override` is user-level config only** — a project-level occurrence is dropped with a warning (see below)
 - Invalid overrides log warnings and are skipped (graceful degradation)
 - Unknown rule or category names log warnings and are skipped
+
+#### Overriding a BLOCKED Rule
+
+The BLOCKED floor has a single, explicit opt-in: `allow_blocked_override: true` alongside the `risk_level` in a **rule-level** override.
+
+```yaml
+# ~/.config/schlock/config.yaml (user-level ONLY)
+rule_overrides:
+  disk_destruction_dd:
+    risk_level: HIGH
+    allow_blocked_override: true   # required, or the downgrade is refused
+```
+
+- It is **user-level only**. In `.claude/hooks/schlock-config.yaml` the key is stripped at load time and logged as a warning, so a repo you clone cannot unlock a BLOCKED rule. The hatch rewrites the risk level *before* matching, so a project-level one would sidestep the BLOCKED floor entirely rather than be caught by it — same threat model as the whitelist restriction below.
+- It is **rule-level only** — `allow_blocked_override` in a `category_overrides` block does nothing.
+- It **never** applies to `self_protection` rules. Those are immutable with or without the hatch.
+- Every use logs a `SECURITY OVERRIDE` warning naming the rule and its new level. Downgrading a rule schlock ships as BLOCKED means you own the consequences.
 
 ### Command Whitelist
 
@@ -162,7 +180,7 @@ Whitelist patterns are **only** loaded from `~/.config/schlock/config.yaml`. Pro
 
 **Why?** Whitelist bypasses ALL rules including BLOCKED. If project-level config could define whitelist patterns, a malicious repository could include a `schlock-config.yaml` that whitelists dangerous commands. Since project config is auto-loaded when you `cd` into a repo, this would be a privilege escalation attack.
 
-Rule and category overrides are safe at the project level because `apply_overrides()` enforces a BLOCKED floor — you can't downgrade BLOCKED rules. Whitelist has no such floor by design (bypassing BLOCKED is its purpose), so it's restricted to user-level config.
+Rule and category overrides are safe at the project level because `apply_overrides()` enforces a BLOCKED floor — you can't downgrade BLOCKED rules from a repo you cloned. Whitelist has no such floor by design (bypassing BLOCKED is its purpose), so it's restricted to user-level config. The floor's one escape hatch, [`allow_blocked_override`](#overriding-a-blocked-rule), is restricted the same way and for the same reason.
 
 #### Available Categories
 

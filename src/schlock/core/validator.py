@@ -223,15 +223,41 @@ def _extract_whitelist_patterns(data: dict, config_path: Path, is_user_level: bo
     return patterns
 
 
+def _strip_project_escape_hatch(file_rule_overrides: dict, config_path: Path, is_user_level: bool) -> None:
+    """Remove ``allow_blocked_override`` from a project config's rule overrides, in place.
+
+    SECURITY: Only user-level config may open the BLOCKED escape hatch (issue #56).
+    The hatch rewrites a rule's risk level *before* matching, so the BLOCKED floor in
+    ``apply_overrides()`` never engages — a cloned repo shipping
+    ``{risk_level: SAFE, allow_blocked_override: true}`` would turn any BLOCKED rule
+    off entirely. Same threat model, and same answer, as the whitelist restriction.
+    """
+    if is_user_level:
+        return
+
+    found = False
+    for props in file_rule_overrides.values():
+        if isinstance(props, dict) and "allow_blocked_override" in props:
+            del props["allow_blocked_override"]
+            found = True
+    if found:
+        logger.warning(
+            f"Ignoring allow_blocked_override in project config {config_path} "
+            "(allow_blocked_override is only supported in user-level config ~/.config/schlock/config.yaml)"
+        )
+
+
 def _load_rule_overrides() -> tuple[dict, dict, list[str]]:
     """Load rule/category overrides and whitelist patterns from config files.
 
     Reads config from both paths in precedence order (user first, project second).
     Project-level overrides win at the property level (not dict-level replace).
 
-    SECURITY: Whitelist patterns are loaded from user-level config ONLY.
-    Project-level config cannot define whitelist patterns because whitelist
-    bypasses ALL rules including BLOCKED — a malicious repo could exploit this.
+    SECURITY: Whitelist patterns and the ``allow_blocked_override`` escape hatch are
+    loaded from user-level config ONLY. Project-level config cannot define whitelist
+    patterns because whitelist bypasses ALL rules including BLOCKED, and cannot open
+    the escape hatch because that downgrades BLOCKED rules before they ever match —
+    a malicious repo could exploit either.
 
     Returns:
         Tuple of (rule_overrides, category_overrides, whitelist_patterns).
@@ -268,6 +294,8 @@ def _load_rule_overrides() -> tuple[dict, dict, list[str]]:
             # Merge rule_overrides (property-level: per-rule keys merge, per-property overwrites)
             file_rule_overrides = data.get("rule_overrides", {})
             if isinstance(file_rule_overrides, dict):
+                # Escape hatch is user-level only (see _strip_project_escape_hatch)
+                _strip_project_escape_hatch(file_rule_overrides, config_path, is_user_level)
                 for rule_name, props in file_rule_overrides.items():
                     if isinstance(props, dict):
                         rule_overrides.setdefault(rule_name, {}).update(props)
