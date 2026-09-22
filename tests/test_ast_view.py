@@ -18,8 +18,10 @@ import json
 import pytest
 
 from schlock.core.ast_view import (
+    _CLAUSE_CHILDREN,
     BASHLEX_KINDS,
     BINARY_OPS,
+    EXPR_OPERANDS,
     MVDAN_NODE_MAP,
     AstView,
     UnmappedNodeError,
@@ -59,6 +61,21 @@ class TestMappingTableIsData:
             produced.add(separator)
         assert produced == BASHLEX_KINDS
         assert len(BASHLEX_KINDS) == 12
+
+    def test_clause_handlers_agree_with_the_node_map(self):
+        # The two tables hold the same contract from opposite ends, and drift
+        # produces a MISLEADING error: a key only in _CLAUSE_CHILDREN raises
+        # "malformed typed-JSON structure: KeyError" and blames the binary for a
+        # table bug. Pin them together (LAB-912 panel finding).
+        for node_type in _CLAUSE_CHILDREN:
+            assert MVDAN_NODE_MAP[node_type] == ("compound", "list"), node_type
+
+    def test_expression_operand_table_has_no_empty_rows(self):
+        # An empty tuple would make _expr_words return [] instead of raising —
+        # the silent-drop the fail-closed contract forbids. `Word` is the leaf and
+        # is handled before the lookup, so it must not appear here.
+        assert "Word" not in EXPR_OPERANDS
+        assert all(EXPR_OPERANDS.values())
 
     def test_pipe_is_not_pipeline(self):
         # `|`/`|&` build a `pipeline` whose separator kind is `pipe`;
@@ -275,6 +292,7 @@ class TestRedirects:
 
     def test_heredoc(self):
         (cmd,) = view("cat <<EOF\nhi\nEOF")
+        assert cmd.pos == (0, 9)  # stops at the delimiter word like bashlex; the body hangs off .heredoc
         redirect = cmd.parts[1]
         assert redirect.type == "<<"
         assert redirect.output.word == "EOF"
@@ -290,7 +308,7 @@ class TestRedirects:
 
 @needs_binary
 class TestPanelFindings:
-    """Regressions from the LAB-911 and LAB-528 expert-panel reviews."""
+    """Regressions from the LAB-911 expert-panel review (all under-block class)."""
 
     def test_command_span_includes_trailing_redirect(self):
         # Panel CRIT: mvdan hangs Redirs off the Stmt, so a command node pos
@@ -377,12 +395,6 @@ class TestPanelFindings:
         }
         with pytest.raises(NativeBridgeError, match="malformed"):
             build_ast_view("a && b", no_op_binary)
-
-    def test_deep_nesting_routes_to_fallback_not_bare_recursion_error(self):
-        # Long timeout so a slow runner cannot pass this via T5's timeout path; both
-        # real overflow sites (json.loads through 3.13, the converter on 3.14+) say "malformed".
-        with pytest.raises(NativeBridgeError, match="malformed"):
-            NativeBridge(timeout=30).parse("$(" * 2000 + "a" + ")" * 2000)
 
     def test_missing_pos_raises_bridge_error(self):
         with pytest.raises(NativeBridgeError):
@@ -478,17 +490,29 @@ class TestUnmappedRaises:
         assert issubclass(UnmappedNodeError, NativeBridgeError)
 
     @needs_binary
-    def test_if_clause_unmapped_for_now(self):
-        # IfClause is outside the 12-kind vocabulary — T2c decides its shape.
-        # Until then it must raise (→ bashlex tier), never silently map.
-        with pytest.raises(UnmappedNodeError, match="IfClause"):
-            view("if true; then a; fi")
+    def test_arithmetic_command_unmapped(self):
+        # `(( … ))` stays unmapped by choice, not by omission: bashlex parses it
+        # but calls the arithmetic body a COMMAND named after the expression, so
+        # a superset-preserving mapping would have to copy that misparse. It is
+        # not one of the 7 bashlex-failing constructs, so the fallback tier costs
+        # nothing here. See _clause_test and tests/test_walker_parity.py.
+        with pytest.raises(UnmappedNodeError, match="ArithmCmd"):
+            view("(( x++ ))")
+
+    @needs_binary
+    def test_coprocess_raises(self):
+        # `coproc` runs the command behind its own pipes — a shape bashlex has no
+        # node for. It arrives as a CoprocClause COMMAND, so the clause table is
+        # what rejects it (`Stmt.Coprocess` is the mksh `|&` spelling, which this
+        # bash-mode CLI never emits).
+        with pytest.raises(UnmappedNodeError, match="CoprocClause"):
+            view("coproc a { sleep 1; }")
 
     @needs_binary
     def test_negated_statement_raises(self):
-        # Dropping `!` would silently invert pipeline semantics; bashlex
-        # handles negation today, so route it to the fallback tier.
-        with pytest.raises(UnmappedNodeError, match="egated"):
+        # Dropping `!` would defeat substitution.py's deliberate fail-closed on a
+        # negated pipeline (`_is_valid_pipeline_topology`). See convert_stmt.
+        with pytest.raises(UnmappedNodeError, match="Negated"):
             view("! a")
 
     @needs_binary
@@ -537,27 +561,20 @@ class TestParserWalkerIntegration:
 
 
 def _nested_cmdsubst(depth: int) -> "tuple[str, dict]":
-    """`$(`×depth + `a` + `)`×depth and its typed-JSON, built iteratively with exact spans."""
+    """`$(`×depth + `a` + `)`×depth as typed-JSON, built iteratively (a recursive builder would
+    overflow first). Spans are uniform: the converter overflows before any consumer reads them."""
     command = "$(" * depth + "a" + ")" * depth
-    n = len(command)
-
-    def span(k):
-        return {"Pos": {"Offset": 2 * k}, "End": {"Offset": n - k}}
-
-    stmt = None
-    for k in range(depth, -1, -1):
-        if stmt is None:
-            part = {"Type": "Lit", "Pos": {"Offset": 2 * k}, "End": {"Offset": 2 * k + 1}, "Value": "a"}
-        else:
-            part = {"Type": "CmdSubst", **span(k), "Stmts": [stmt]}
-        word = {**span(k), "Parts": [part]}
-        stmt = {**span(k), "Cmd": {"Type": "CallExpr", **span(k), "Args": [word]}}
-    return command, {"Type": "File", **span(0), "Stmts": [stmt]}
+    span = {"Pos": {"Offset": 0}, "End": {"Offset": len(command)}}
+    part: dict = {"Type": "Lit", **span, "Value": "a"}
+    for _ in range(depth):
+        stmt = {**span, "Cmd": {"Type": "CallExpr", **span, "Args": [{**span, "Parts": [part]}]}}
+        part = {"Type": "CmdSubst", **span, "Stmts": [stmt]}
+    stmt = {**span, "Cmd": {"Type": "CallExpr", **span, "Args": [{**span, "Parts": [part]}]}}
+    return command, {"Type": "File", **span, "Stmts": [stmt]}
 
 
 class TestRecursionRouting:
-    """Both RecursionError sites in build_ast_view re-raise as NativeBridgeError (see the
-    json.loads clause for why the site is interpreter-dependent). Neither test needs the binary."""
+    """Both RecursionError sites re-raise as NativeBridgeError; neither test needs the binary."""
 
     def test_json_scanner_overflow_routes_to_fallback(self, monkeypatch):
         # The overflow depth depends on interpreter and stack size, so the trigger is faked.
@@ -565,7 +582,7 @@ class TestRecursionRouting:
             raise RecursionError("maximum recursion depth exceeded")
 
         monkeypatch.setattr(json, "loads", overflow)
-        with pytest.raises(NativeBridgeError, match="malformed"):
+        with pytest.raises(NativeBridgeError, match="too deeply nested"):
             build_ast_view("echo hi", "{}")
 
     def test_converter_overflow_routes_to_fallback(self):

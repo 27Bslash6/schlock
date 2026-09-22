@@ -127,18 +127,11 @@ def _sub_denied(parser: BashCommandParser, nodes: "list") -> bool:
 
 
 def _covered(needle: str, haystack: "list[str]") -> bool:
-    """A bashlex segment is covered when native reproduces it — exactly, or as a
-    heredoc-extended prefix.
-
-    Containment is allowed ONLY for a heredoc-introducing segment (`<<` present):
-    native's segment carries the body, bashlex's stops at `cat << EOF`, and both
-    slice the SAME source from the SAME start, so native's is bashlex's plus the
-    body — a `startswith`, not an arbitrary substring (LAB-1584 oracle-input
-    note). A blanket `needle in h` would let a bashlex segment be "covered" by a
-    coincidental substring of an UNRELATED native segment, masking a dropped
-    segment — the exact under-block this oracle exists to catch (craftsman finding).
-    """
-    return any(needle == h or ("<<" in needle and h.startswith(needle)) for h in haystack)
+    """A bashlex segment is covered only when native reproduces it EXACTLY. Both tiers slice
+    the same span and re-attach heredocs the same way, so heredoc segments match verbatim;
+    a substring or prefix relaxation would let an UNRELATED native segment mask a dropped
+    one — the under-block this oracle exists to catch (craftsman finding)."""
+    return needle in haystack
 
 
 @needs_binary

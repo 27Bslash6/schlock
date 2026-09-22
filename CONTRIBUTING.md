@@ -121,7 +121,7 @@ uv run ruff format .
 ```python
 # Unit tests: tests/test_<module>.py
 # Integration tests: tests/test_hook_integration.py
-# Benchmarks: tests/test_benchmarks.py
+# Benchmarks: tests/test_performance.py
 ```
 
 ### Running Tests
@@ -138,7 +138,7 @@ uv run pytest --cov=src/schlock --cov-report=html
 open htmlcov/index.html
 
 # Benchmarks
-uv run pytest tests/test_benchmarks.py -v -s
+uv run pytest tests/test_performance.py -v -s
 ```
 
 ## Adding Security Rules
@@ -211,14 +211,7 @@ hooks/ → integrations/ → core/ → external (bashlex, pyyaml)
 
 ## Performance Guidelines
 
-**Targets** (enforced via benchmarks):
-- Cache hits: < 0.1ms
-- Simple command parsing: < 1ms
-- Complex command parsing: < 5ms
-- Rule matching (40 rules): < 2ms
-- Full validation (cold): < 15ms
-- Cached validation: < 0.5ms
-- Bulk throughput: ~100 validations/sec
+**Targets** are the budgets asserted in `tests/test_performance.py` (pytest-benchmark medians, enforced in CI).
 
 **Cache design**:
 - Thread-safe LRU with OrderedDict
