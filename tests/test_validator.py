@@ -21,7 +21,7 @@ from schlock.core.validator import (
 )
 from schlock.exceptions import ConfigurationError, ParseError
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
-from schlock.integrations.shellcheck import ShellCheckFinding, ShellCheckSeverity
+from schlock.integrations.shellcheck import ShellCheckFinding, ShellCheckSeverity, is_shellcheck_available
 
 
 class TestValidator:
@@ -1059,6 +1059,10 @@ class TestHeredocSurroundings:
         The whitelisted head is pinned to one as well, not zero: both passes run
         with ShellCheck off, so neither can spawn whatever the head is, and the
         escalation's own spawn is the only ShellCheck the trailing commands get.
+
+        Pins the count and that the spawn saw the tail, not the exact rewrite:
+        what the spawn returns, and what the caller does with it, is pinned by
+        the tests below (LAB-4586), and an exact-text pin here cannot see either.
         """
         checked: list[str] = []
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
@@ -1067,7 +1071,8 @@ class TestHeredocSurroundings:
 
         validate_command(f"{head} <<'EOF'\nx\nEOF\n{tail}", config_path=safety_rules_path)
 
-        assert checked == [f"{head} <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n{tail}"]
+        assert len(checked) == 1
+        assert checked[0].endswith(tail)
 
     @pytest.mark.parametrize("head", ["cat", "ls"])
     def test_shellcheck_still_reaches_the_shell_around_a_heredoc(self, safety_rules_path, monkeypatch, head):
@@ -1085,6 +1090,46 @@ class TestHeredocSurroundings:
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.message == "Alongside heredoc: ShellCheck: deletes a system directory"
         assert result.matched_rules[-1] == "shellcheck:SC2114"
+
+    @pytest.mark.parametrize("head", ["cat", "ls"])
+    def test_a_shellcheck_run_with_no_verdict_fails_closed_behind_a_heredoc(self, safety_rules_path, monkeypatch, head):
+        """A spawn that returns no verdict is refused, not read as clean.
+
+        run_shellcheck returns None on timeout, oversized output or an open
+        circuit. This spawn is the only ShellCheck the trailing commands get, so
+        None here means they are unchecked; reading it as [] made a slow input a
+        switch for the control (LAB-4586). The rule name is asserted, not just the
+        verdict, so an accidental deny cannot stand in for this one.
+        """
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: None)
+
+        result = validate_command(f"{head} <<'EOF'\nx\nEOF\necho done", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules[-1] == "shellcheck:incomplete"
+        assert "ShellCheck did not complete" in result.message
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize("padding", [0, 95, 100, 110])
+    def test_inert_padding_does_not_push_sc2114_past_the_finding_cap(self, safety_rules_path, monkeypatch, padding):
+        """Real ShellCheck: 110 unused-variable findings must not hide `rm -r$''f /usr`.
+
+        run_shellcheck capped findings at 100 before filtering to security codes,
+        so padding the command with inert `aN=1` assignments pushed SC2114 off the
+        list and the single heredoc spawn read the empty result as clean: 95
+        findings BLOCKED, 100 allowed (LAB-4586). Asserts the rule, not the verdict.
+        """
+        # The class fixture pins ShellCheck off; this test is about the real binary.
+        monkeypatch.setattr(val_module, "is_shellcheck_available", is_shellcheck_available)
+        pad = "".join(f"a{i}=1;" for i in range(padding))
+
+        result = validate_command(f"ls <<'ZZ'\nbody\nZZ\n{pad}rm -r$''f /usr", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "shellcheck:SC2114" in result.matched_rules
 
     def test_a_delegated_payload_keeps_its_own_shellcheck(self, safety_rules_path, monkeypatch):
         """Skipping ShellCheck for a segment must not skip it for the payload the segment runs.

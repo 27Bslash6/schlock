@@ -57,6 +57,7 @@ class TestShellCheckExecution:
         """Test that shellcheck finds issues in problematic commands."""
         # SC2086: Double quote to prevent globbing
         findings = run_shellcheck("echo $HOME")
+        assert findings is not None
         assert len(findings) > 0
         assert any(f.code == 2086 for f in findings)
 
@@ -65,6 +66,7 @@ class TestShellCheckExecution:
         """Test that shellcheck passes clean commands."""
         # Well-quoted command should have fewer/no issues
         findings = run_shellcheck('echo "hello world"')
+        assert findings is not None
         # May still have some style issues but not security
         security = get_security_findings(findings)
         assert len(security) == 0
@@ -73,6 +75,7 @@ class TestShellCheckExecution:
     def test_run_shellcheck_eval_warning(self):
         """Test that eval with variables is flagged."""
         findings = run_shellcheck('eval "$user_input"')
+        assert findings is not None
         # Should flag SC2154 (referenced but not assigned)
         assert len(findings) > 0
 
@@ -265,7 +268,7 @@ class TestCircuitBreaker:
         sc._circuit_breaker_open_until = 0.0
 
     def test_circuit_breaker_skips_when_open(self):
-        """Test shellcheck is skipped when circuit is open."""
+        """An open circuit yields no verdict (None), not a clean result (LAB-4586)."""
         import time  # noqa: PLC0415
 
         import schlock.integrations.shellcheck as sc  # noqa: PLC0415
@@ -274,7 +277,7 @@ class TestCircuitBreaker:
         sc._circuit_breaker_open_until = time.monotonic() + 60.0
 
         result = sc.run_shellcheck("echo test")
-        assert result == []
+        assert result is None
 
         # Cleanup
         sc._circuit_breaker_open_until = 0.0
@@ -314,7 +317,7 @@ class TestShellCheckErrorHandling:
             patch("subprocess.run", return_value=mock_result),
         ):
             findings = sc.run_shellcheck("echo test")
-            assert findings == []
+            assert findings is None
 
         # Cleanup
         sc._circuit_breaker_failures.clear()
@@ -355,34 +358,41 @@ class TestShellCheckErrorHandling:
             patch("subprocess.run", return_value=mock_result),
         ):
             findings = sc.run_shellcheck("echo test")
-            assert findings == []
+            assert findings is None
 
         # Cleanup
         sc._circuit_breaker_failures.clear()
 
-    def test_findings_count_limit(self):
-        """Test truncation of excessive findings."""
+    def test_findings_count_limit_spares_security_findings(self):
+        """The cap bounds inert findings only; a security finding past position 100 survives.
+
+        Capping the raw list first let 100 inert SC2034s push the SC2114 at the end off
+        the list, and the caller read the empty security filter as clean (LAB-4586).
+        """
         import json  # noqa: PLC0415
         from unittest.mock import MagicMock, patch  # noqa: PLC0415
 
         import schlock.integrations.shellcheck as sc  # noqa: PLC0415
 
-        # Create more findings than the limit
-        many_findings = [
-            {"code": 2086, "level": "info", "message": f"Issue {i}", "line": 1, "column": 1, "endLine": 1, "endColumn": 1}
+        inert = [
+            {"code": 2034, "level": "warning", "message": f"a{i} unused", "line": 1, "column": 1, "endLine": 1, "endColumn": 1}
             for i in range(sc._MAX_FINDINGS_COUNT + 10)
         ]
+        payload = {"code": 2114, "level": "warning", "message": "deletes", "line": 1, "column": 1, "endLine": 1, "endColumn": 1}
 
         mock_result = MagicMock()
         mock_result.returncode = 1
-        mock_result.stdout = json.dumps(many_findings)
+        mock_result.stdout = json.dumps([*inert, payload])  # the one that matters is last
 
         with (
             patch.object(sc, "get_shellcheck_path", return_value="/usr/bin/shellcheck"),
             patch("subprocess.run", return_value=mock_result),
         ):
             findings = sc.run_shellcheck("echo test")
-            assert len(findings) <= sc._MAX_FINDINGS_COUNT
+
+        assert findings is not None
+        assert [f.code for f in sc.get_security_findings(findings)] == [2114]
+        assert len(findings) == sc._MAX_FINDINGS_COUNT + 1
 
     def test_invalid_code_skipped(self):
         """Test findings with invalid codes are skipped."""
@@ -408,6 +418,7 @@ class TestShellCheckErrorHandling:
             patch("subprocess.run", return_value=mock_result),
         ):
             findings = sc.run_shellcheck("echo test")
+            assert findings is not None
             assert len(findings) == 1  # Only the valid one
             assert findings[0].code == 2086
 
@@ -433,6 +444,7 @@ class TestShellCheckErrorHandling:
             patch("subprocess.run", return_value=mock_result),
         ):
             findings = sc.run_shellcheck("echo test")
+            assert findings is not None
             # Only the valid finding should be returned
             assert len(findings) == 1
             assert findings[0].code == 2086
@@ -453,7 +465,7 @@ class TestShellCheckErrorHandling:
             patch("subprocess.run", side_effect=subprocess.TimeoutExpired("shellcheck", 2.0)),
         ):
             findings = sc.run_shellcheck("echo test")
-            assert findings == []
+            assert findings is None
 
         # Cleanup
         sc._circuit_breaker_failures.clear()
@@ -477,7 +489,7 @@ class TestShellCheckErrorHandling:
             patch("subprocess.run", return_value=mock_result),
         ):
             findings = sc.run_shellcheck("echo test")
-            assert findings == []
+            assert findings is None
 
         # Cleanup
         sc._circuit_breaker_failures.clear()

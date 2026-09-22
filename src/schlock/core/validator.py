@@ -2016,6 +2016,8 @@ def _escalate_past_heredoc(
     (`kubectl delete`). A payload a segment delegates to a shell (`bash -c …`)
     is re-entered with ShellCheck on by Step 5c, deliberately: ShellCheck never
     reads inside a `-c` string, so that re-entry is the payload's only check.
+    Being the only check, the spawn fails closed: a run with no verdict is
+    BLOCKED, not read as clean (LAB-4586).
 
     Escalation only ever raises risk. That is what keeps a legitimate heredoc's
     existing verdict intact, and it bounds a misread body *end* to a false
@@ -2054,7 +2056,22 @@ def _escalate_past_heredoc(
             result = replace(candidate_result, message=f"Alongside heredoc: {candidate_result.message}")
 
     if result.risk_level < RiskLevel.BLOCKED and is_shellcheck_available():
-        findings = get_security_findings(run_shellcheck(neutered))
+        findings = run_shellcheck(neutered)
+        if findings is None:
+            # This spawn is the only ShellCheck the commands around the heredoc get, so a
+            # run with no verdict (timeout, oversized output, open circuit) is refused,
+            # not skipped: read as clean, a slow input was a switch for the control
+            # (LAB-4586). Named in matched_rules so the audit log can tell this deny apart.
+            return replace(
+                result,
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="Alongside heredoc: ShellCheck did not complete, so the shell around the heredoc is unchecked",
+                alternatives=["Run the commands after the heredoc as a separate, shorter Bash call"],
+                exit_code=1,
+                matched_rules=[*result.matched_rules, "shellcheck:incomplete"],
+            )
+        findings = get_security_findings(findings)
         if findings:
             result = replace(
                 result,
@@ -2413,7 +2430,10 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         shellcheck_elevated = False
         security_findings: list = []  # Initialize for type checker
         if _shellcheck and is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
-            findings = run_shellcheck(command)
+            # A run with no verdict (None) is read as clean HERE, for now: whether this
+            # top-level pass should fail closed like the heredoc pass does is an open
+            # policy question (LAB-4362), not decided by the change that made None visible.
+            findings = run_shellcheck(command) or []
             security_findings = get_security_findings(findings)
             if security_findings:
                 # Elevate to BLOCKED if ShellCheck found security issues
