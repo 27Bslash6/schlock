@@ -2156,8 +2156,10 @@ class TestSiblingSubstitutionsRateTheWorst:
         "command",
         [
             'echo "$(x=1) $(echo b)"',
-            # Multi-segment with a whitelisted prefix: the held denial must beat the
-            # full-command whitelist short-circuit, not be replaced by SAFE.
+            # Multi-segment. NOTE: since LAB-2752 made the full-command whitelist
+            # check span-anchored, this row no longer reaches that short-circuit -
+            # it now pins the Step 7 release instead. The short-circuit's own guard
+            # is pinned by test_full_span_whitelist_does_not_clear_a_held_denial.
             "ls $(x=1); echo hi",
         ],
     )
@@ -2166,6 +2168,30 @@ class TestSiblingSubstitutionsRateTheWorst:
 
         assert result.risk_level == RiskLevel.HIGH
         assert result.allowed is False
+
+    def test_full_span_whitelist_does_not_clear_a_held_denial(self, tmp_path, monkeypatch):
+        """A whitelist entry spanning the WHOLE chain must not turn a held denial SAFE.
+
+        The multi-segment `is_fully_whitelisted` short-circuit returns SAFE and
+        caches it. LAB-4149 guards it with an early return of the held denial.
+        Reaching that guard needs all three at once - several segments, a denial
+        held below BLOCKED, and a whitelist pattern that spans start to end - and
+        only a "$"-anchored entry can supply the third. Before LAB-2752 the
+        built-in prefix match supplied it for free, so `ls $(x=1); echo hi` above
+        used to land here; it no longer does, which left the guard unpinned. Drop
+        the guard and this test returns SAFE / allowed=True.
+        """
+        user_config = tmp_path / ".config" / "schlock"
+        user_config.mkdir(parents=True)
+        (user_config / "config.yaml").write_text("whitelist:\n  - '^ls .*; echo hi$'\n")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        clear_caches()
+
+        result = validate_command("ls $(x=1); echo hi")
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.HIGH
+        assert "x=1" in result.message
 
     def test_whitelisted_siblings_stay_safe(self, safety_rules_path):
         result = validate_command('echo "$(echo a) $(echo b)"', config_path=safety_rules_path)
