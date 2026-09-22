@@ -1510,20 +1510,22 @@ class TestHeredocSurroundings:
         with pytest.raises(ParseError, match=f"unclosed {re.escape(opener)}"):
             val_module._neuter_heredocs(f"cat <<'A'\nz\nA\n{tail}\nrm -rf /")
 
-    def test_a_heredoc_only_bashlex_sees_fails_closed(self, safety_rules_path):
-        """bashlex has this lexer's old bug, and it gets the last word on the re-parse.
+    def test_a_heredoc_only_bashlex_sees_denies_on_the_payload_rule(self, safety_rules_path):
+        """bashlex has this lexer's old bug, and it used to get the last word on the re-parse.
 
         Bash reads `(( 1<<b ))` as a left shift and so does `_rewrite_openers` -
-        the payload is still in the rewrite. bashlex reads `<<b` as a
-        redirection, so `rm -rf /` becomes its body and is dropped before any
-        rule runs, leaving the verdict at the whitelisted head's floor.
+        the payload is still in the rewrite. bashlex read `<<b` as a
+        redirection, so `rm -rf /` became its body and was dropped before any
+        rule ran, leaving the verdict at the whitelisted head's floor. The deny
+        that remained came from a *parse error*, which is a deny nobody chose:
+        it evaporates the moment bashlex parses the text some other way, and it
+        says nothing about the payload.
 
-        This was fail-closed by accident until `_close_heredocs` landed on main:
-        the segment used to re-enter this fallback, find no terminator and
-        raise. Re-attaching the body is correct for a real heredoc, and it
-        removed the accident - so the disagreement is detected now rather than
-        survived. Asserted on the rewrite and the reason, not on `BLOCKED`
-        alone, which this returned before the guard as well.
+        The Step 3b guard rewrites the shift before bashlex sees the command
+        (LAB-4317), so bashlex no longer gets the last word and the verdict now
+        comes from the rule the payload matches. Both halves are asserted: the
+        fallback lexer still keeps the payload in its rewrite, and the end-to-end
+        verdict names `system_destruction` rather than a parse failure.
         """
         command = "ls <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb"
         neutered, _ = val_module._neuter_heredocs(command)
@@ -1531,8 +1533,10 @@ class TestHeredocSurroundings:
 
         result = validate_command(command, config_path=safety_rules_path)
 
+        assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
-        assert "does not open" in (result.error or "")
+        assert "system_destruction" in result.matched_rules
+        assert result.error is None, "a parse failure would deny too, and would mask a regression"
 
     def test_a_substitution_inside_a_compound_assignment_still_refuses_case(self):
         """`x=( $(case …) )`: the carve-out for `x=( … )` does not reach the `$(…)` in it.
