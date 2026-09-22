@@ -768,7 +768,14 @@ class TestUnanchoredSearchStaysLinear:
         command = self.ADVERSARY.replace(" status", " " + operation)
         start = time.perf_counter()
         verdict(command, rules_dir_path)
-        assert time.perf_counter() - start < 1.0
+        # The regression this guards is O(starts) x O(scan) over a 14 KB adversary:
+        # seconds to minutes, not a tight constant. The old 1.0s was calibrated on a
+        # dev box (0.23s there) and left no slack for the slowest supported runtime --
+        # Python 3.9 on a shared runner measured 1.0013s for the *linear* implementation
+        # and turned main red. The exponent is pinned machine-independently by
+        # test_cost_grows_linearly_not_quadratically below; this case only has to
+        # separate linear from quadratic, so give it room to mean that on any runner.
+        assert time.perf_counter() - start < 5.0
 
     def test_cost_grows_linearly_not_quadratically(self, rules_dir_path):
         """A quadratic scan quadruples per doubling; a linear one doubles.

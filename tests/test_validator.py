@@ -4,6 +4,7 @@ Also includes FIX 5: matched_rules field population test.
 """
 
 import re
+import sys
 import time
 
 import pytest
@@ -1977,43 +1978,58 @@ class TestParseFailureFailsClosed:
         val_module._global_cache.clear()
 
     @pytest.mark.parametrize(
-        "command,description",
+        "command,expected_reason,description",
         [
             # AC-1: the reported command, and the second spelling the ticket
             # names. Both were `allowed=True LOW "Heredoc command 'coproc'
             # allowed (content not validated)"` at a508274.
-            ('coproc bash <<< "rm -rf /"', "the reported command"),
-            ('coproc sh <<< "rm -rf /"', "a second shell, named in AC-1"),
-            ('coproc bash <<<"rm -rf /"', "no space after the here-string operator"),
-            ("coproc bash <<< 'a << b'", "a literal `<<` inside the here-string payload"),
+            ('coproc bash <<< "rm -rf /"', "No heredoc opener found", "the reported command"),
+            ('coproc sh <<< "rm -rf /"', "No heredoc opener found", "a second shell, named in AC-1"),
+            ('coproc bash <<<"rm -rf /"', "No heredoc opener found", "no space after the here-string operator"),
+            ("coproc bash <<< 'a << b'", "No heredoc opener found", "a literal `<<` inside the here-string payload"),
             # Also fail-open at a508274, and the worst verdict of the set: the
             # whitelisted head vouched for the coproc after the terminator.
-            ("ls <<'EOF'\nx\nEOF\ncoproc bash <<< 'rm -rf /'", "whitelisted head, coproc after the terminator"),
+            (
+                "ls <<'EOF'\nx\nEOF\ncoproc bash <<< 'rm -rf /'",
+                "Cannot determine what this heredoc runs: Unexpected parsing error",
+                "whitelisted head, coproc after the terminator",
+            ),
             # An unparseable construct owning a *real* heredoc. The fallback
             # rewrites the body away and re-validates; the rewrite is no more
             # parseable than the original, so it denies.
-            ("coproc bash <<'EOF'\nrm -rf /\nEOF", "unparseable head owning a quoted-delimiter heredoc"),
-            # Reaches the fallback like the cases above, but was already denied
-            # at a508274 - by the *other* exit, `Parse error`. So the routing
-            # for this spelling moved between a508274 and #148 while the verdict
-            # did not, which is why it is not counted among the regressions.
-            ('coproc bash <<< "$(rm -rf /)"', "substitution payload, denied at both heads"),
+            (
+                "coproc bash <<'EOF'\nrm -rf /\nEOF",
+                "Cannot determine what this heredoc runs: Unexpected parsing error",
+                "unparseable head owning a quoted-delimiter heredoc",
+            ),
+            # Denied at a508274 too, but by a different exit (`Parse error`), so
+            # the routing for this spelling moved between a508274 and #148 while
+            # the verdict did not -- which is why it is not counted among the
+            # regressions. The reason pinned here is where it lands *now*.
+            ('coproc bash <<< "$(rm -rf /)"', "No heredoc opener found", "substitution payload, denied at both heads"),
             # Controls. These never reach the fallback at all - bashlex blames
             # them on something whose text lacks "heredoc", so the trigger's
             # second half is false and the handler denies directly. All three
             # were already BLOCKED at a508274; the report compared against `case`.
-            ('case x in y) bash;; esac <<< "rm -rf /"', "case: denied before the fallback"),
-            ('select x in a; do bash; done <<< "rm -rf /"', "select: denied before the fallback"),
-            ('coproc CO { bash; } <<< "rm -rf /"', "named coprocess: denied before the fallback"),
+            ('case x in y) bash;; esac <<< "rm -rf /"', "Parse error:", "case: denied before the fallback"),
+            ('select x in a; do bash; done <<< "rm -rf /"', "Parse error:", "select: denied before the fallback"),
+            ('coproc CO { bash; } <<< "rm -rf /"', "Parse error:", "named coprocess: denied before the fallback"),
         ],
     )
-    def test_unparseable_command_is_never_allowed(self, safety_rules_path, command, description):
-        """schlock is fail-closed by contract; an unreadable command is not vouched for."""
+    def test_unparseable_command_is_never_allowed(self, safety_rules_path, command, expected_reason, description):
+        """schlock is fail-closed by contract; an unreadable command is not vouched for.
+
+        The verdict alone does not pin the finding: these ten reach BLOCKED by three
+        different exits, and a routing change that moved a case between them would
+        leave every verdict assertion green. `expected_reason` names the exit, and
+        the three strings are mutually exclusive, so a case cannot drift silently.
+        """
         result = validate_command(command, config_path=safety_rules_path)
 
         assert result.allowed is False, f"{description}: {result.message}"
         assert result.risk_level == RiskLevel.BLOCKED, description
         assert result.exit_code == 1, description
+        assert expected_reason in result.message, f"{description}: {result.message}"
 
     def test_here_string_is_not_an_opener_at_either_guard(self):
         """The two guards that close AC-1, each pinned where it lives.
@@ -2073,13 +2089,24 @@ class TestParseFailureFailsClosed:
 
         The body is `echo hi`, not `rm -rf /`, so a rule match cannot supply the
         denial the parse failure is supposed to.
+
+        The nesting is taken from the host's own limit rather than a fixed 300, so
+        the stack is exhausted on any interpreter instead of only on one whose limit
+        happens to sit above it. Lowering the limit instead would be the shorter
+        route, but `sys.setrecursionlimit` raises when the caller's stack is already
+        deeper than the new value, and under pytest that depth is not ours to know.
         """
-        deep = "$(" * 300 + "echo hi" + ")" * 300
+        nesting = sys.getrecursionlimit()
+        deep = "$(" * nesting + "echo hi" + ")" * nesting
 
         result = validate_command(deep, config_path=safety_rules_path)
 
         assert result.allowed is False
         assert result.message.startswith("Parse error:")
+        # Without this the assertion above also passes for an ordinary ParseError,
+        # and the RecursionError-to-ParseError conversion the docstring is about
+        # could be dropped with the test still green.
+        assert "maximum recursion depth" in result.message
 
     # --- documented residual (NOT a fix; pins current behaviour so a change is
     # --- visible). LAB-3094, untouched by this ticket.
