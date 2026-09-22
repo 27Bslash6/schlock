@@ -101,7 +101,7 @@ Overrides are applied in this order (later wins):
 
 #### Security Constraints
 
-- **BLOCKED rules cannot be downgraded or disabled** — this is a non-negotiable security floor
+- **BLOCKED rules cannot be downgraded or disabled** — a non-negotiable security floor; the hook pins `risk_tolerance.levels.BLOCKED` to `deny` regardless of what any config file says
 - **Whitelist patterns are user-level config only** — project-level config cannot define whitelist patterns (see below)
 - Invalid overrides log warnings and are skipped (graceful degradation)
 - Unknown rule or category names log warnings and are skipped
