@@ -45,6 +45,10 @@ class TestBlockedPatternCoverage:
             "rm -rf $HOME",
             "rm -rf ~",
             "rm -fr $HOME",
+            "rm -R /",  # BSD spelling
+            "rm --recursive $HOME",
+            "rm -Rf ~",
+            "rm -r ~",  # -f only silences prompts
         ]
         for cmd in dangerous:
             result = validate_command(cmd, config_path=safety_rules_path)
@@ -55,6 +59,7 @@ class TestBlockedPatternCoverage:
         safe = [
             "rm -rf /tmp/test",  # Specific path
             "rm -rf ./node_modules",  # Relative path
+            "rm -rf ~/.cache",  # Under home, not home
             "rm file.txt",  # Single file
         ]
         for cmd in safe:
@@ -233,6 +238,9 @@ class TestHighPatternCoverage:
         dangerous = [
             "rm -r directory",
             "rm -rf test",
+            "rm -R directory",  # BSD spelling
+            "rm -fr test",  # recursion behind another flag
+            "rm --recursive test",
             "find . -name '*.tmp' -delete",
             "find /tmp -delete",
         ]

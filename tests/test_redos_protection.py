@@ -190,3 +190,51 @@ class TestBoundedQuantifierEdgeCases:
             else:
                 # HIGH is allowed but should have high risk level
                 assert result.risk_level.value >= 3, f"Should be HIGH risk: {cmd}"
+
+
+class TestRecursiveFlagPatternsAreLinear:
+    r"""The rm rules that read the recursive flag stay linear on the shapes that hurt them.
+
+    Regex layer, one rule at a time: the whole validator spends longer than these
+    budgets on other patterns for the same inputs. The `rm heads` row is the shape
+    that made the flag-run form `(?:-\S*\s+)*` quadratic (4.3 s at 8,000 heads):
+    `\brm` anchors inside every `x.rm`, and an unbounded run lets each head rescan
+    the tail; the bounded lazy span costs each head at most 100 steps. The blank
+    run is the shape a `\s+` head pays for: every blank it gives back re-runs the
+    span, 100 steps per blank on a bounded span and the whole tail on an unbounded
+    one; a single `\s` lets the span absorb the blanks in one pass. 500,000 blanks
+    so that the `\s+` form of a bounded-span rule (about 750 ms) fails this budget
+    while the `\s` form stays near 10 ms. hidden_glob_destruction keeps its
+    unbounded spans and is not on the heads row: it was quadratic there before this
+    change and still is.
+    """
+
+    SHAPES = [
+        ("flag run", "rm " + "-f " * 10_000 + "x"),
+        ("blank run", "rm" + " " * 500_000),
+        ("unlink blanks", "unlink" + " " * 500_000),
+    ]
+
+    @pytest.mark.parametrize("rule", ["recursive_delete", "system_destruction", "hidden_glob_destruction", "unlink_delete"])
+    @pytest.mark.parametrize(("label", "text"), SHAPES, ids=[s[0] for s in SHAPES])
+    def test_flag_and_blank_runs_are_fast(self, safety_rules_path, rule, label, text):
+        engine = RuleEngine(safety_rules_path)
+
+        start = time.perf_counter()
+        for pattern in engine.compiled_patterns[rule]:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.25, f"{rule} on {label} took {elapsed:.3f}s"
+
+    @pytest.mark.parametrize("rule", ["recursive_delete", "system_destruction"])
+    def test_rm_heads_are_linear(self, safety_rules_path, rule):
+        engine = RuleEngine(safety_rules_path)
+        text = "rm -f " + "x.rm " * 8_000
+
+        start = time.perf_counter()
+        for pattern in engine.compiled_patterns[rule]:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.25, f"{rule} on 8,000 rm heads took {elapsed:.3f}s"

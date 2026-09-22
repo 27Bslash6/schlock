@@ -1,5 +1,5 @@
 # Category: File Destruction
-# Risk Levels: BLOCKED, HIGH
+# Risk Levels: BLOCKED, HIGH, MEDIUM
 # Description: Commands that can destroy files and directory trees
 
 rules:
@@ -10,21 +10,48 @@ rules:
     patterns: [':\(\)\{.{0,200}:\|:&\};:', ':\(\)\s*\{.{0,200}:\s*\|\s*:\s*&\s*\}\s*;?\s*:']
     alternatives: ["NEVER run fork bombs"]
 
+  # The recursive flag, in every spelling GNU and BSD rm accept:
+  #   -(?<=\s-)(?:[a-zA-Z]*[rR]|-r)
+  # A short bundle is one `-` then letters, with `r` or `R` anywhere in it (`-rf`,
+  # `-fr`, `-vRf`); the long form is `--recursive`, and getopt_long takes any
+  # unambiguous prefix, so `--r` covers it (no other rm long option starts with r).
+  # The lookbehind pins the token to a blank: without it `--force` matches at its
+  # second dash and `my-r-file` at its hyphen. It sits after the literal `-` rather
+  # than before it (`(?<!\S)-` reads the same) because the literal fails first on
+  # four positions in five, before the assertion runs: half the cost on a long
+  # operand list. No `-f` is required: `rm -r ~` deletes every writable file in the
+  # tree, `-f` only silences the prompts.
+  # recursive_delete and hidden_glob_destruction below reuse this fragment verbatim.
+  # Linear: the token starts on a literal `-` and `[a-zA-Z]*` cannot cross a blank,
+  # so a failed attempt backtracks inside one token only, and the spans in front of
+  # it are bounded. The head is one `\s`, not `\s+`: the span absorbs further blanks,
+  # and a `\s+` head gave every blank back one at a time, re-running the span each
+  # time (40 ms on `rm` + 40,000 blanks at the regex layer; 1 ms with `\s`).
   - name: system_destruction
     description: Complete filesystem destruction
     risk_level: BLOCKED
-    patterns: ['\brm\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]{0,100}\s+(\/|\/\*|\$HOME|~)(\s|$)', '\brm\s+(\/|\/\*)\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)']
+    # Targets: `/`, `/*`, and `$HOME` or `~` bare, with a trailing `/`, or with `/*`.
+    # `rm -rf ~/` and `rm -rf ~/*` empty the home directory exactly as `rm -rf ~` does.
+    patterns:
+      - '\brm\s[^;|&]{0,100}-(?<=\s-)(?:[a-zA-Z]*[rR]|-r)[^;|&]{0,100}\s+(?:\/\*?|(?:\$HOME|~)(?:\/\*?)?)(?:\s|$)'
+      - '\brm\s+(?:\/\*?|(?:\$HOME|~)(?:\/\*?)?)\s[^;|&]{0,100}-(?<=\s-)(?:[a-zA-Z]*[rR]|-r)'
     alternatives: ["Specify exact files instead"]
 
   - name: hidden_glob_destruction
     description: rm -rf .* can delete parent directory via .. glob expansion
     risk_level: BLOCKED
     patterns:
-      # rm with recursive flags and .* glob
-      - '\brm\s+[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]*\s+\.\*(\s|$)'
-      - '\brm\s+\.\*[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)'
-      # Direct .* at end of rm command
-      - '\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?\.\*\s*$'
+      # rm with a recursive flag (the system_destruction fragment) and a .* glob.
+      # The unbounded spans, not the flag token, are the cost here: with N flag
+      # tokens on one line every recursive hit rescans the tail for `.*`, so these
+      # two patterns are quadratic in N, as they were with the literal `-rf` group.
+      # The first head is one `\s` for the reason given on system_destruction: with
+      # `\s+` in front of an unbounded span, `rm` + 50,000 blanks cost 7 s.
+      - '\brm\s[^;|&]*-(?<=\s-)(?:[a-zA-Z]*[rR]|-r)[^;|&]*\s+\.\*(\s|$)'
+      - '\brm\s+\.\*[^;|&]*-(?<=\s-)(?:[a-zA-Z]*[rR]|-r)'
+      # Bare `rm .*` at the end of the command. `.` and `..` are refused, the dotfiles
+      # go. With a recursive flag in front the first pattern above already matches.
+      - '\brm\s+\.\*\s*$'
     alternatives:
       - "On many shells, .* expands to include . and .."
       - "Use 'rm -rf .[^.]*' to exclude . and .."
@@ -34,7 +61,14 @@ rules:
   - name: recursive_delete
     description: Recursive delete can destroy directory trees
     risk_level: HIGH
-    patterns: ['\brm\s+-r', '\bfind.{0,200}-delete']
+    # The recursive flag (system_destruction fragment) anywhere in the first 100
+    # chars after `rm`: GNU rm permutes arguments, so `rm dir -r` recurses too. The
+    # span is lazy and bounded, so a head that never finds the flag costs at most
+    # 100 steps, and `\brm` heads add up linearly (8,000 `x.rm` operands on one line:
+    # 15 ms). The unbounded flag-run alternative `(?:-\S*\s+)*` was measured
+    # quadratic on that shape (4.3 s), because every head rescans the whole run.
+    # It stops at a newline like `;`: a bare newline ends the command.
+    patterns: ['\brm\s[^;|&\n]{0,100}?-(?<=\s-)(?:[a-zA-Z]*[rR]|-r)', '\bfind.{0,200}-delete']
     alternatives: ["Use rm -ri for interactive"]
 
   - name: find_exec_rm
@@ -70,3 +104,16 @@ rules:
     risk_level: MEDIUM
     patterns: ['\btar\s+.{0,100}(-x|--extract).{0,100}/', '\bunzip\s+.{0,100}-o', '\bgunzip\s+.{0,100}-f', '\b7z\s+x\s+.{0,100}-y', '\brar\s+x\s+.{0,100}-o\+']
     alternatives: ["Extract to safe directory", "Review archive contents first", "Use sandboxed extraction"]
+
+  - name: unlink_delete
+    description: unlink deletes a file without backup
+    risk_level: MEDIUM
+    # The rm sibling is single_delete (10_development_workflows). `\b`, not `^`:
+    # unlink takes exactly one operand, so `/usr/bin/unlink x` and `env unlink x`
+    # are the same delete. One blank run then one non-blank; nothing to backtrack
+    # into. Over-reaches onto `npm unlink <pkg>` (drops a symlink) and `unlink
+    # --help`; MEDIUM is allow under `balanced`, so the cost there is an audit line.
+    # 14_self_protection keeps its own BLOCKED `unlink` on schlock's config paths;
+    # match_command returns the highest rule, so that verdict is unchanged.
+    patterns: ['\bunlink\s+\S']
+    alternatives: ["Backup first"]
