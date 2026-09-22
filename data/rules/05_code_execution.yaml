@@ -182,7 +182,16 @@ rules:
     patterns:
       # base64 -d piped to shell
       - 'base64\s+(-d|--decode)[^;|&]*\|\s*(bash|sh|zsh|eval)'
-      - '(bash|sh|zsh).*<<<.*\$\(base64\s+(-d|--decode)'
+      # base64 decoded straight onto a shell's stdin. Both runs are BOUNDED.
+      # Written `.*` this was cubic in the density of shell names and `<<<`
+      # tokens, so a command near the size limit took minutes to scan, on a
+      # matcher that runs before every bash call; `.{0,200}` matches the same
+      # strings in milliseconds. Do not widen them back to `.*`. Do not narrow
+      # them to a separator class either - everything after `<<<` is here-string
+      # CONTENT, where `;` and `&&` are payload text rather than structure, and
+      # a separator class there stops reading half way through the payload.
+      # A bounded quantifier is not a boundary; this is depth, not a gate.
+      - '(bash|sh|zsh).{0,200}<<<.{0,200}\$\(base64\s+(-d|--decode)'
       # An `echo <base64> | base64 -d | sh` form was listed here too. It was
       # strictly subsumed by the first pattern above (which needs no echo prefix
       # and also covers zsh/eval), and its unanchored `{20,}` run followed by
