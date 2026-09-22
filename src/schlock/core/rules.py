@@ -18,6 +18,31 @@ from schlock.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
+# A whitelist entry vouches for the command it DESCRIBES; the match is a prefix
+# by design (issue #66, so "^ls\b" keeps covering "ls -la"), which means whatever
+# the entry's tail never described rides along on its authority. Two constructs
+# turn that from a convenience into a hole, and neither is visible to a pattern
+# that only describes the head of the command:
+#
+#   ".."  walks out of the directory the entry names. "chmod -R 777 /tmp/../.."
+#         is not LIKE "chmod -R 777 /", it IS it.
+#   "<>"  redirects. "ls -la > ~/.ssh/authorized_keys" is a whitelisted reader
+#         being used as an arbitrary-file writer; "ls <(curl ...|sh)" runs a
+#         second command the entry never mentioned.
+#
+# Refusing the whitelist is NOT refusing the command. The whitelist is an
+# override that short-circuits to SAFE; declining it only sends the command to
+# the ordinary rules to be judged on its merits, so this guard can over-fire
+# (a filename containing ">", a harmless "ls ../src") without blocking anything
+# that was not already blocked. That asymmetry is what makes one coarse
+# string-level test the right size here: is_whitelisted() takes a bare str with
+# no AST, and a guard whose worst case is "evaluate normally" does not need one.
+#
+# Deliberately in the engine rather than in each YAML entry: the per-entry
+# version is this rule written once per pattern and re-written on every pattern
+# added, which is the failure this file has already had three tickets for.
+_WHITELIST_DISQUALIFIER = re.compile(r"\.\.|[<>]")
+
 
 class RiskLevel(Enum):
     """Risk levels for command validation.
@@ -633,8 +658,11 @@ class RuleEngine:
             command: Command string to check
 
         Returns:
-            True if command matches any whitelist pattern
+            True if command matches any whitelist pattern, and carries neither
+            ".." nor a redirection (see _WHITELIST_DISQUALIFIER)
         """
+        if _WHITELIST_DISQUALIFIER.search(command):
+            return False
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
     def is_fully_whitelisted(self, command: str) -> bool:
@@ -654,6 +682,12 @@ class RuleEngine:
             True if a whitelist pattern matches from the start of the command
             through to its end
         """
+        # Same disqualifiers as the prefix check. Today no shipped entry can span a
+        # command carrying one, so this guard is unreachable through the current
+        # data - which is exactly why it is here: the invariant belongs to the
+        # whitelist mechanism, not to the entries that happen to be in the YAML.
+        if _WHITELIST_DISQUALIFIER.search(command):
+            return False
         # >= not ==: a pattern ending in \s* consumes trailing whitespace that rstrip()
         # already discounted, so a legitimate span can overshoot.
         end = len(command.rstrip())

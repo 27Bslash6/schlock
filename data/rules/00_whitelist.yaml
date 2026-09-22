@@ -31,9 +31,22 @@ whitelist:
   # needed here, so anything below these three drops to the recursive-delete tier (HIGH).
   - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)$
 
-  # Safe /tmp operations (testing/temporary files)
-  - ^chmod\s+[0-7]{3}\s+/tmp/
-  - ^chmod\s+-R\s+[0-7]{3}\s+/tmp/
+  # Safe /tmp operations (testing/temporary files).
+  # "$"-anchored: without it this was a bare prefix, so every operand after the
+  # /tmp path rode along on the entry's authority -- "chmod 755 /tmp/x /etc/shadow"
+  # and "chmod -R 777 /tmp/a /" both matched, and the second is "chmod -R 777 /".
+  # Path segments use the same shape as the artifact-dir entry above: optional
+  # leading dot, then a non-dot character. That admits ".pytest_cache" and
+  # excludes "." and ".." in every position, which is what stops "/tmp/../.." --
+  # literally "/", no symlink required -- from being spelled as a /tmp path.
+  # Depth is NOT capped, unlike the rm entry: chmod(2) follows a symlink named on
+  # the command line, so "chmod -R 777 /tmp/link" is already the symlink residual
+  # this file documents above and a cap would buy nothing against it. Resolving
+  # symlinks is out of scope here -- the whitelist matches a raw string before the
+  # shell touches the filesystem. Globs are likewise not admitted: "chmod 755
+  # /tmp/*.sh" simply drops to the ordinary rules, which rate it SAFE anyway.
+  - '^chmod\s+[0-7]{3}\s+/tmp(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*)+$'
+  - '^chmod\s+-R\s+[0-7]{3}\s+/tmp(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*)+$'
 
   # Safe container registry authentication via gh CLI
   # Token is piped directly to docker's credential store, never exposed to stdout/logs.
