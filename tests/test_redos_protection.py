@@ -142,6 +142,27 @@ class TestReDoSProtection:
 
         assert elapsed < 0.5, f"blank run after {head!r} took {elapsed:.3f}s"
 
+    @pytest.mark.parametrize(("head", "lines"), [("rm -f", 200), ("rm -rf", 50)])
+    def test_multiline_rm_is_linear_in_line_count(self, safety_rules_path, head, lines):
+        r"""The `rm` operand spans stop at a newline, so N lines cost N line scans, not N tails.
+
+        At the regex layer 200 `rm -f` lines cost 2s on the two
+        vcs_directory_deletion twins and 50 `rm -rf` lines cost 2s on
+        hidden_glob_destruction, about 8x per doubling; with `[^;|&\n]*` both are
+        under 10ms. Regex layer because the whole validator spends ~0.4s on this
+        input in per-segment passes, which would hide the twins.
+        """
+        engine = RuleEngine(safety_rules_path)
+        patterns = engine.compiled_patterns["vcs_directory_deletion"] + engine.compiled_patterns["hidden_glob_destruction"]
+        text = (head + " " * 200 + "\n") * lines
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.5, f"{lines} lines of {head!r} took {elapsed:.3f}s"
+
 
 class TestBoundedQuantifierEdgeCases:
     """Test edge cases around the boundaries of quantifiers."""
