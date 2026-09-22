@@ -2601,7 +2601,6 @@ class TestMultilineSubstitution:
             ('echo "$(echo a\nrm -rf /\n)"', "closing paren on its own line"),
             ('x="$(\n  echo a\n  rm -rf /\n)"', "indented block layout"),
             ('echo "$(git status\nrm -rf /)"', "whitelisted first line does not vouch for the second"),
-            ('echo "$(cat <<EOF\nbody\nEOF\nrm -rf /)"', "heredoc body before the payload"),
             ('echo "$(echo a\nrm -rf /\necho c)"', "payload on a middle line"),
             ('echo "$(echo a;\nrm -rf /)"', "`;` then newline"),
             ('echo "$(echo a &&\n  echo b\nrm -rf /)"', "continued AND-list then a new line"),
@@ -2627,12 +2626,17 @@ class TestMultilineSubstitution:
             ('echo "$(echo a\necho b)"', RiskLevel.SAFE, "two whitelisted lines"),
             ('echo "`echo a\necho b`"', RiskLevel.SAFE, "two whitelisted lines in backticks"),
             ('echo "$(echo a\n)"', RiskLevel.SAFE, "trailing newline before the paren"),
+            ('echo "$(echo a\n# done\n)"', RiskLevel.SAFE, "trailing comment line before the paren"),
+            ('echo "`echo a\n\n`"', RiskLevel.SAFE, "backtick body, blank line before EOF"),
             ("echo `echo a\n`", RiskLevel.SAFE, "backtick body, trailing newline: the unit loop ends on EOF, not `)`"),
             ('x="$(\n  git rev-parse HEAD\n)"', RiskLevel.SAFE, "indented block layout, whitelisted body"),
             ('echo "$( (echo a\necho b) )"', RiskLevel.SAFE, "subshell body, already a list in stock bashlex"),
             # Each of these pins one seam of the unit loop: the `;` must not be doubled with a
-            # newline operator, a unit that is itself a list must be flattened, and the resume
-            # point must be the tokenizer's index (past a heredoc body), not the newline's.
+            # newline operator, and a unit that is itself a list must be flattened. The heredoc row
+            # pins that a body's data never becomes a command; the resume point itself (the
+            # tokenizer's index past the body, not the newline's end) is pinned by the whitelisted-
+            # and dangerous-tail rows of TestHeredocTailInSubstitution, where a wrong resume
+            # would drop or misread the line after the terminator.
             ('echo "$(echo a;\necho b)"', RiskLevel.SAFE, "`;` then newline, both lines benign"),
             ('echo "$(echo a; echo b\necho c)"', RiskLevel.SAFE, "a list unit followed by a plain unit"),
             ('echo "$(cat <<EOF\nrm -rf /\nEOF\n)"', RiskLevel.SAFE, "payload is heredoc data, never a command"),
@@ -2709,7 +2713,6 @@ class TestHeredocTailInSubstitution:
         "command,description",
         [
             ('x="$(cat <<IN\nhello\nIN\n)"', "the benign idiom: nothing between the terminator and the closer"),
-            ('echo "$(cat <<IN\nhello\nIN\n)"', "same, argument position"),
             ('echo "$(cat <<IN\nhello\nIN\n  \n)"', "whitespace-only tail"),
             ('echo "$(cat <<-IN\n\thello\n\tIN\n)"', "<<- with an empty tail"),
             ('echo "$(cat <<IN\nhello\nIN\ndate)"', "whitelisted tail"),

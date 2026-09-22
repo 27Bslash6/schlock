@@ -196,7 +196,9 @@ def _parse_all_substitution_units(
 
         terminator: Any = unit.tok._current_token
         if body_ended(terminator):
-            break  # the unit ended at its ``)``; EOF never lands here (yacc reads it as $end), only at the peek below
+            # The unit ended at its ``)``. EOF never lands here: the tokenizer appends a trailing
+            # newline, so a unit ends on NEWLINE or the closer, and EOF is only seen at the peek below.
+            break
         if terminator.ttype is not newline_type:
             # Only a newline, ``)`` or EOF can end an ``inputunit``. Anything else means the grammar
             # moved under us; handing back the prefix would silently drop the rest of the body.
@@ -228,8 +230,10 @@ def _parse_all_substitution_units(
 # ``_parsedolparen`` (``$( )``, ``<( )``) and the backtick branch of ``_expandwordinternal`` both
 # reach ``_recursiveparse`` by module-global lookup, so one rebind covers all three spellings.
 # Assigning to a name bashlex no longer reads would install nothing and leave the truncating
-# parse live, so a bashlex that renamed it must fail this import - the hook then denies every
-# command, loudly - rather than run.
+# parse live, so a bashlex that renamed it must fail this import rather than run. Note what
+# that buys: the hook imports this module at top level, so the failure is a traceback and exit 1
+# before any decision is written, and Claude Code treats a non-2 exit as a non-blocking error
+# and runs the command. Loud, not fail-closed - the hook's import-time posture is its own fix.
 if not hasattr(bashlex.subst, "_recursiveparse"):
     raise ImportError("bashlex.subst._recursiveparse is missing; the multi-line substitution correction cannot install")
 bashlex.subst._recursiveparse = _parse_all_substitution_units
