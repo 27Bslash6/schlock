@@ -1587,7 +1587,8 @@ class SubstitutionValidator:
     def _check_structural_and_nested(self, sub_node: SubstitutionNode, depth: int) -> SubstitutionValidationResult | None:
         """Check structural safety and nested substitutions.
 
-        Shared logic between Layer 1 (whitelist) and Layer 1b (contextual whitelist).
+        The structural half of :meth:`_check_vetted`. A result below BLOCKED must be joined
+        with :meth:`_check_inner_rules`, never returned as it is.
 
         Returns:
             BLOCKED for dangerous or suspicious structure, else the worst nested denial at its
@@ -1773,16 +1774,18 @@ class SubstitutionValidator:
                 max_risk = result.risk_level
             all_whitelisted = all_whitelisted and result.whitelisted
 
-        if worst_denial is not None:
+        # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
+        # It runs even when a segment was denied: a HIGH segment must not hide a pattern that
+        # only the whole matches, `tar czf - ~/.ssh | cat` being one (LAB-4149). A tie keeps
+        # the segment's verdict.
+        blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
+        if worst_denial is not None and (blocked is None or worst_denial.risk_level >= blocked.risk_level):
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=worst_denial.risk_level,
                 message=worst_denial.message,
                 inner_results=inner_results,
             )
-
-        # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
-        blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
         if blocked:
             return blocked
 
@@ -1852,7 +1855,8 @@ class SubstitutionValidator:
 
         # Layer 1b: Contextual whitelist — commands with subcommand-dependent safety.
         # Adds subcommand structural analysis on top of the rules every tier runs.
-        # e.g., kubectl: "get pods" is safe, but "get secrets -o json" is caught by YAML rules.
+        # e.g., kubectl: "get pods" is safe, "get secrets" fails the structural check, and
+        # "describe pod x ~/.ssh/id_rsa" passes it but not the YAML rules.
         if sub_node.base_command in CONTEXTUAL_SUBSTITUTION_COMMANDS:
             blocked = self._check_vetted(sub_node, depth)
             if blocked:
@@ -1928,9 +1932,9 @@ class SubstitutionValidator:
                         inner_results=inner_results,
                     )
 
-        # Unknown command - default deny in substitution context. Ordered BEFORE the held
-        # nested denial: this is a fail-closed BLOCKED and a held denial is at most HIGH,
-        # so returning the denial first would downgrade it (LAB-4149).
+        # No determinable base command: fail-closed BLOCKED. Ordered BEFORE the held nested
+        # denial, which is at most HIGH, so returning the denial first would downgrade it
+        # (LAB-4149).
         if not sub_node.base_command:
             return SubstitutionValidationResult(
                 allowed=False,
