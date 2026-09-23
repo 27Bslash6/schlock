@@ -344,6 +344,17 @@ class TestDollarPrefixedQuoteForms:
         parser = BashCommandParser()
         assert parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))[0] == "echo a > /dev/sda"
 
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            # A backslash (possible ANSI-C escape) or a multi-word span skips the rebuild.
+            ("echo a > $'/etc/passwd\\x00'", "protect_system_files"),
+            ("echo a > $'/dev/sda'$(echo a b)", "disk_destruction_dd"),
+        ],
+    )
+    def test_unrebuilt_target_still_loses_its_leading_marker(self, command, rule, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+
     def test_ordinary_parameter_target_is_not_stripped(self, safety_rules_path):
         """Only a dollar-QUOTE form loses its `$`; a real expansion keeps it."""
         assert _risk("echo x > $HOME/out.txt", safety_rules_path) is RiskLevel.SAFE

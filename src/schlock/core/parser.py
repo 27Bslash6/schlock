@@ -166,9 +166,10 @@ _DATA_REDIRECT_OPERATORS = frozenset({"<<", "<<-", "<<<"})
 # reads `>& word` as `&> word` when no fd is given.
 _OPERATOR_ALIASES = {">|": ">", ">&": "&>"}
 
-# The `$` that opens `$'…'` / `$"…"` outside any quotes (group 1). Escapes and quoted
-# runs are matched first so a `$` inside them is consumed, not taken as a marker.
-_DOLLAR_QUOTE_MARKER = re.compile(r"""\\.|'[^']*'|"(?:[^"\\]|\\.)*"|(\$)(?=['"])""", re.DOTALL)
+# The `$` that opens `$'…'` / `$"…"` outside any quotes (group 1), in a span with no
+# backslash. Quoted runs are matched first so a `$` inside them is consumed, not taken
+# as a marker.
+_DOLLAR_QUOTE_MARKER = re.compile(r"""'[^']*'|"[^"]*"|(\$)(?=['"])""")
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -478,15 +479,22 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     # after one (`'/'$'dev/sda'`) it emits no part for the marker at all, so neither
     # the word nor its parts can be trusted. Rebuild the word from the SOURCE span:
     # drop every marker, then let shlex do POSIX quote removal. A real expansion
-    # (`$HOME`) is not followed by a quote, so it is kept. A span shlex cannot read as
-    # one word (whitespace inside `$(…)`, an ANSI-C `\'`) keeps bashlex's word.
+    # (`$HOME`) is not followed by a quote, so it is kept.
+    #
+    # With no backslash in the span that IS bash's reading. A backslash may be an
+    # ANSI-C escape (`$'\x2fdev'`) that needs decoding shlex does not do, so such a
+    # span, like one shlex cannot read as a single word (whitespace inside `$(…)`),
+    # keeps bashlex's word, less a leading marker.
     target_pos = getattr(target, "pos", None)
-    if command is not None and target_pos:
-        span = _DOLLAR_QUOTE_MARKER.sub(lambda m: "" if m.group(1) else m.group(0), command[target_pos[0] : target_pos[1]])
+    span = command[target_pos[0] : target_pos[1]] if command is not None and target_pos else ""
+    rebuilt: list[str] = []
+    if span and "\\" not in span:
         with contextlib.suppress(ValueError):
-            unquoted = shlex.split(span)
-            if len(unquoted) == 1:
-                word = unquoted[0]
+            rebuilt = shlex.split(_DOLLAR_QUOTE_MARKER.sub(lambda m: "" if m.group(1) else m.group(0), span))
+    if len(rebuilt) == 1:
+        word = rebuilt[0]
+    elif span.startswith(("$'", '$"')) and word.startswith("$"):
+        word = word[1:]
 
     # Did the SOURCE glue the operator to its target? Read the character before the
     # target rather than computing where the operator ended: bashlex NORMALISES the
