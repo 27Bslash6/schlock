@@ -1854,8 +1854,11 @@ class SubstitutionValidator:
         is. The whole rendered text is that re-check against the YAML rules, catching patterns
         no single segment holds.
 
-        Fail-closed: a segment we cannot turn into a substitution node (e.g. a compound
-        ``{ … }``/``( … )``/``if`` segment) blocks the whole substitution.
+        Fail-closed: a segment that yields no substitution node blocks the whole substitution (a
+        backstop — ``_create_substitution_node`` keeps any segment that has a command node). A
+        clause segment (``if``/``for``/``while``/``case``) is NOT caught there: it becomes a node
+        with no base command, its own ``validate_substitution`` call denies it BLOCKED ("Cannot
+        determine command"), and the worst-segment aggregation below carries that up.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 

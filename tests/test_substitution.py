@@ -1934,6 +1934,11 @@ class TestGroupedAndRedirectedSubstitutions:
             # Control flow: branches this module cannot decompose, so no base command is claimed.
             'echo "$( if true; then rm -rf /; fi )"',
             'echo "$( for i in 1; do rm -rf /; done )"',
+            # The same clause as one segment of a list or pipeline: the segment is validated as its own
+            # substitution and hits the same no-base-command block — not the unknown-command HIGH of `x=1`.
+            'echo "$(x=1; if true; then rm -rf /; fi)"',
+            'echo "$(date && for f in x; do rm -rf /; done)"',
+            'echo "$(ls | while read f; do rm -rf /; done)"',
             # A grouping that carries its own redirection is a real write, not inert grouping.
             'echo "$( (ls) > /tmp/x )"',
         ],
@@ -1949,6 +1954,18 @@ class TestGroupedAndRedirectedSubstitutions:
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
         assert "cannot determine command" in result.message.lower()
+
+    @pytest.mark.parametrize(
+        ("command", "risk", "allowed"),
+        [
+            ('echo "$(cd foo; make)"', RiskLevel.HIGH, False),  # unknown segment stays ask, not deny
+            ('echo "$(echo a; echo b)"', RiskLevel.SAFE, True),
+        ],
+    )
+    def test_plain_lists_keep_their_rating(self, command, risk, allowed):
+        """The clause block must not bleed onto ordinary lists."""
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (risk, allowed)
 
     def test_substitution_denial_does_not_downgrade_a_stronger_rule(self):
         """Worst verdict wins, not the first one found.
