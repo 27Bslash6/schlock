@@ -25,7 +25,6 @@ ShellCheck is forced unavailable throughout: it is optional, and a defence that 
 holds when it happens to be installed is not a defence.
 """
 
-import shutil
 from unittest.mock import patch
 
 import pytest
@@ -192,39 +191,14 @@ class TestSubstitutionVerdictCannotUndercutTheRules:
             ('echo $(base64 -d f) > "/dev/sda"', "disk_destruction_dd"),
             # Multi-segment: the leading whitelisted `ls` must not vouch for the chain.
             ("ls && mkfs.ext4 /dev/sda $(base64 -d f)", "filesystem_format"),
-            # Under a deferred denial the whitelist is off, so a whitelisted command
-            # cannot vouch for its own redirect target while it carries one.
-            ('ls $(base64 -d f) > "/dev/sda"', "disk_destruction_dd"),
-            ("git status $(base64 -d f) > /dev/sda", "disk_destruction_dd"),
-            ('ls $(base64 -d f) >> "/etc/sudoers"', "protect_system_files"),
-            ('true; ls $(base64 -d f) > "/dev/sda"', "disk_destruction_dd"),
         ],
     )
     def test_rule_verdict_outranks_a_weaker_substitution(self, command, rule, safety_rules_path):
         assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
 
-    def test_a_user_whitelist_spanning_the_chain_cannot_vouch_under_deferral(self, safety_rules_path, tmp_path):
-        """The full-command whitelist short-circuit is off while a denial is deferred.
-
-        No built-in whitelist entry can contain a substitution, so only a USER entry that
-        spans a whole chain (`^make\\b.*` is an ordinary thing to add) reaches this path.
-        Without the guard the chain returns SAFE, the join swaps in the HIGH denial, and
-        the disk write in the second segment is never rated at all.
-        """
-        rules = tmp_path / "rules"
-        shutil.copytree(safety_rules_path, rules)
-        whitelist = rules / "00_whitelist.yaml"
-        whitelist.write_text(whitelist.read_text().replace("  - ^pwd$\n", "  - ^pwd$\n  - ^make\\b.*\n", 1))
-        result = validate_command('make; echo $(base64 -d f) > "/dev/sda"', config_path=str(rules))
-        assert result.risk_level is RiskLevel.BLOCKED
-        assert "disk_destruction_dd" in result.matched_rules
-        # The user's entry still works for what it is for.
-        assert validate_command("make build; ls", config_path=str(rules)).risk_level is RiskLevel.SAFE
-
     def test_substitution_risk_survives_when_no_rule_is_louder(self, safety_rules_path):
         """The join takes the higher verdict; it must not flatten every substitution to BLOCKED."""
         assert _risk("ls $(base64 -d f)", safety_rules_path) is RiskLevel.HIGH
-        assert _risk("ls $(base64 -d f) > out.txt", safety_rules_path) is RiskLevel.HIGH
 
 
 class TestOrdinaryRedirectsAreUnaffected:

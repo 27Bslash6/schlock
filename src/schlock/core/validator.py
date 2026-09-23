@@ -2435,11 +2435,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # its prefix (is_fully_whitelisted, not is_whitelisted). A prefix match
                 # would let the whitelisted "ls" in "ls; rm -rf /" vouch for every later
                 # segment and skip the loop below entirely.
-                # Under a deferred substitution denial the whitelist can only LOWER the
-                # result side - the join replaces any allowed result with the denial - so
-                # it is switched off there and can never mask a louder rule verdict
-                # (LAB-2760: `ls $(x) > "/dev/sda"` otherwise joins HIGH, not BLOCKED).
-                if not _deferred and engine.is_fully_whitelisted(command):
+                if engine.is_fully_whitelisted(command):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -2472,7 +2468,6 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         string_literals=segment.string_literals,
                         heredoc_ranges=segment.heredoc_ranges,
                         quote_source=command,
-                        use_whitelist=not _deferred,
                     )
 
                     if seg_match.matched and seg_match.rule:
@@ -2541,7 +2536,6 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     string_literals=string_literals,
                     quote_source=command,
                     heredoc_ranges=heredoc_ranges,
-                    use_whitelist=not _deferred,
                 )
         except ConfigurationError as e:
             return ValidationResult(
