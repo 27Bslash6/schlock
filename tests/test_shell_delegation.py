@@ -851,6 +851,29 @@ class TestBase64DecodeAtCommandPosition:
             "$(base64 --dec x)",
             "$(/usr/bin/base64 -d x)",
             "$(env base64 -d x)",
+            # A non-literal flag is read as a decode, and a glob that bash expands to a decoder.
+            "$(base64 $F x)",
+            '$(base64 "$F" x)',
+            "$(/usr/bin/bas?64 -d x)",
+            "$(/usr/bin/base6[4] -d x)",
+            # The other coreutils base-N decoders.
+            "$(base32 -d x)",
+            "$(basenc --base64 -d x)",
+            # Expert panel: the decode moves off the first word and bash still runs it. An empty
+            # bare expansion is dropped, and a wrapper executes its operand.
+            "$(true) $(base64 -d x)",
+            "$EMPTY $(base64 -d x)",
+            "${EMPTY} $(base64 -d x)",
+            "command $(base64 -d x)",
+            "builtin $(base64 -d x)",
+            "env $(base64 -d x)",
+            "env -i FOO=1 $(base64 -d x)",
+            "nohup $(base64 -d x)",
+            "timeout 5 $(base64 -d x)",
+            "nice -n 10 nohup $(base64 -d x)",
+            "xargs $(base64 -d x)",
+            "bash -c '\nenv $(base64 -d x)'",
+            'bash <<< "\nnohup $(base64 -d x)"',
         ],
     )
     def test_decode_run_as_a_command_is_blocked(self, command):
@@ -873,6 +896,12 @@ class TestBase64DecodeAtCommandPosition:
             'TOKEN=$(echo "$S" | base64 -d)',
             # Encoding at command position is not the decode-and-execute shape.
             "$(base64 x)",
+            # A wrapper assigns a decode, or passes it as data to a literal command it runs.
+            'env TOKEN=$(echo "$S" | base64 -d) ./run',
+            'timeout 30 curl -H "Authorization: Basic $(echo "$T" | base64 -d)" https://x',
+            'nohup ./server --key "$(base64 -d k)"',
+            # A quoted empty word is not dropped, so the decode stays an argument.
+            '"" $(base64 -d x)',
         ],
     )
     def test_decode_as_data_is_not_escalated(self, command):
