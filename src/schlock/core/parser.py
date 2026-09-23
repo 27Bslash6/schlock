@@ -299,6 +299,10 @@ def _command_nodes(node: Any) -> "list[Any]":
     Returns ALL commands in a group so a stdin consumer that is not the first command
     (`{ true; bash; }`, a while/for/if body) is still seen. Stops at each command without
     descending into its own parts (word-level substitutions are not group stdin consumers).
+
+    The ONE walk skeleton for both stdin-sink surfaces - `_here_string_program` and the pipe-to-shell
+    `check_pipeline` - so a future bashlex child-attr change cannot leave one silently under-scanning
+    (LAB-2768, LAB-3006).
     """
     found: list[Any] = []
 
@@ -1340,8 +1344,8 @@ class BashCommandParser:
 
         The AST-based detection looks at the actual command structure:
         1. Find pipeline nodes
-        2. Extract first command name (download tool?)
-        3. Extract subsequent command names (shell interpreter?)
+        2. Collect every command of each stage (a group/loop stage shares the pipe)
+        3. Download tool upstream -> shell downstream, or any downstream stdin-exec interpreter
 
         Args:
             ast_nodes: List of bashlex AST nodes from parse()
@@ -1403,16 +1407,16 @@ class BashCommandParser:
             if not hasattr(node, "parts"):
                 return
 
-            # Per stage, the (command name, args) of every command that can read the pipe, in order.
+            # Per stage, the (command name, args) of every command in it, in order.
             stages = []
             for part in node.parts:
-                kind = getattr(part, "kind", None)
                 # A subshell/group/loop stage shares the pipe with EVERY inner command: one that does
                 # not read stdin leaves it for the next, so `{ true; bash; }` and the body of
                 # `while :; do bash; done` run the piped data (#97, LAB-3006; verified in real bash).
                 # Over-approximating to every command is the fail-closed direction, as for `<<<`
-                # (`_here_string_program`). Inner pipelines are also caught by the recursive walk.
-                commands = [part] if kind == "command" else (_command_nodes(part) if kind == "compound" else [])
+                # (`_here_string_program`). An inner pipeline's sink is also caught by the recursive
+                # walk; the duplicate message is collapsed at return.
+                commands = _command_nodes(part)
                 # Resolve multicall wrappers (busybox/toybox) to their applet so the stage is
                 # classified by what actually runs (`busybox sh` -> `sh`).
                 resolved = [
@@ -1424,7 +1428,10 @@ class BashCommandParser:
             if len(stages) < 2:
                 return
 
-            # The download->shell rule keys on each stage's FIRST command, as before.
+            # Rule (1) deliberately stays on each stage's FIRST command. It matches names only - no
+            # stdin check - so widening it to every command would spread its existing over-block
+            # (`git ls-files | python3 check.py`) into every `git ls-files | while read f; do
+            # python3 check.py "$f"; done` loop. Rule (2) is the precise check and reads them all.
             names = [stage[0][0] for stage in stages]
 
             # (1) Existing remote-code-execution pattern: download tool -> shell interpreter.
@@ -1461,4 +1468,4 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
 
-        return dangers
+        return list(dict.fromkeys(dangers))

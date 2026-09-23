@@ -868,6 +868,9 @@ class TestPipedCompoundLaterSink:
             "echo x | if true; then cat; fi",
             # A shell in the PRODUCER group reads the caller's stdin, not the pipe.
             "{ curl x; bash; } | cat",
+            # The name-only download->shell rule stays on each stage's first command, so a script
+            # run per line of a git listing is not read as download-and-run.
+            'git ls-files | while read f; do python3 tools/check.py "$f"; done',
         ],
     )
     def test_non_executing_body_stays_safe(self, command):
