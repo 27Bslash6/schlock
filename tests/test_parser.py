@@ -1,6 +1,8 @@
 """Tests for BashCommandParser."""
 
 import logging
+import shutil
+import subprocess
 
 import bashlex
 import pytest
@@ -643,3 +645,155 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [(seg.text, seg.string_literals) for seg in pairs] == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
     text, literals = pairs[0].text, pairs[0].string_literals
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
+
+
+# ANSI-C `$'...'` word decoding (LAB-3005). bashlex tokenizes `$'...'` boundaries correctly but
+# dequotes it wrongly (`$'rm\t-rf\t/'` -> `$rmt-rft/`), so every check keyed on word text - the
+# `-c` / `watch` / `<<<` payloads, a pipe-to-shell interpreter name - judged a string bash never
+# runs. Each expected value below is what bash 5.3 produced (`printf '%s' WORD | od -c`); the
+# oracle test re-asks the real binary wherever one is installed.
+_ANSI_C_DECODES = [
+    (r"$'rm\t-rf\t/'", "rm\t-rf\t/"),
+    (r"$'\x2drf'", "-rf"),
+    (r"$'\x2g'", "\x02g"),  # \x takes one OR two hex digits
+    (r"$'\xg'", "\\xg"),  # ...and none leaves the escape literal
+    (r"$'\x414'", "A4"),  # never three
+    (r"$'\1011'", "A1"),  # octal: one to three digits
+    (r"$'\z\q'", "\\z\\q"),  # an unknown escape keeps its backslash
+    (r"$'it\'s'", "it's"),
+    (r"""$'a"b'""", 'a"b'),
+    (r"""$'\?\"'""", '?"'),
+    (r"$'\E\e\a\b\f\v\r'", "\x1b\x1b\a\b\f\v\r"),
+    (r"$'ab\0cd'ef", "abef"),  # NUL ends the quoted part; the word carries on after it
+    (r"$'ab\x00cd'", "ab"),
+    (r"$'ba''sh'", "bash"),
+    (r"""x"y"$'z'""", "xyz"),
+    (r"""a\q$'z'""", "aqz"),
+    (r"""\$'z'""", "$z"),  # an escaped `$` opens no ANSI-C quote
+    (r"""'$'$'z'""", "$z"),
+    (r"""\\$'z'""", "\\z"),
+    (r'''a$'b'"$'c'"''', "ab$'c'"),  # inside double quotes `$'` is literal
+    (r"""$'z'"a\qb\$c\"d\\e\`f" """.strip(), 'za\\qb$c"d\\e`f'),
+    (r"$'a\\'", "a\\"),
+    ("$'a\\\nb'", "a\\\nb"),  # backslash-newline is literal inside $'...'
+    ("$\\\n'\\x41'", "A"),  # ...but a line continuation before the quote is removed first
+    ("x\\\n$'y'", "xy"),
+    (r"$'\u72m'", "rm"),  # \u reads up to four hex digits, \U up to eight
+    (r"$'\u00411'", "A1"),
+    (r"$'\U000000411'", "A1"),
+    (r"$'a\u0gb'", "a"),  # a NUL by code point truncates too
+    (r"$'\ug\Ug'", "\\ug\\Ug"),
+]
+
+
+def _echo_arg(command: str) -> str:
+    [(_, args), *_] = parser_mod.BashCommandParser().extract_commands_with_args(parser_mod.BashCommandParser().parse(command))
+    return args[0]
+
+
+class TestAnsiCWordDecoding:
+    @pytest.mark.parametrize(("word", "expected"), _ANSI_C_DECODES)
+    def test_word_text_is_what_bash_runs(self, word, expected):
+        assert _echo_arg(f"echo {word}") == expected
+
+    @pytest.mark.parametrize(("word", "expected"), _ANSI_C_DECODES)
+    def test_expected_values_match_real_bash(self, word, expected):
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("no bash to ask")
+        ran = subprocess.run([bash, "-c", f"printf %s {word}"], capture_output=True, check=True)  # noqa: S603
+        assert ran.stdout == expected.encode()
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            # Expansions are copied through raw, exactly as bashlex spells them without `$'`.
+            ("""echo "$x"$'\\t'""", "$x\t"),
+            ("""echo ${x}$'\\t'""", "${x}\t"),
+            ("""echo "$(ls)"$'\\t'""", "$(ls)\t"),
+            ("""echo $'\\t'"`ls`" """, "\t`ls`"),
+        ],
+    )
+    def test_expansions_beside_an_ansi_c_quote_stay_raw(self, command, expected):
+        assert _echo_arg(command) == expected
+
+    def test_every_word_position_is_decoded(self):
+        p = parser_mod.BashCommandParser()
+        nodes = p.parse("""X=$'\\x61' $'\\x62ash' -c $'\\x63' <<< $'\\x64' | echo "$(printf $'\\x65')" """)
+        words = []
+
+        class Collect(bashlex.ast.nodevisitor):
+            def visitword(self, n, word):
+                words.append(word)
+
+            def visitassignment(self, n, word):
+                words.append(word)
+
+        for node in nodes:
+            Collect().visit(node)
+        assert {"X=a", "bash", "c", "d", "e"} <= set(words)
+
+    @pytest.mark.parametrize(
+        ("word", "expected"),
+        [
+            # Non-ASCII decodes are left to the locale by bash, so not asked of the oracle. Each
+            # stays a word character (see `_ansi_c_escape`); the byte values match bash's own.
+            (r"$'\xff'", "\xff"),
+            (r"$'\777'", "\xff"),  # octal wraps to a byte, as bash's does
+            (r"$'\U2713 ok'", "\N{CHECK MARK} ok"),
+        ],
+    )
+    def test_non_ascii_escapes_decode_to_word_characters(self, word, expected):
+        assert _echo_arg(f"echo {word}") == expected
+
+    @pytest.mark.parametrize(
+        "word",
+        [
+            r"$'\cA'",  # control-character edge cases nothing benign needs
+            r"$'\c'",
+            r"$'\U110000'",  # past Unicode: bash emits invalid UTF-8
+            r"$'\UD800'",  # a surrogate: likewise
+        ],
+    )
+    def test_unmodelled_escapes_fail_closed(self, word):
+        with pytest.raises(ParseError, match="ANSI-C"):
+            parser_mod.BashCommandParser().parse(f"bash -c {word} x")
+
+    @pytest.mark.parametrize(
+        "span",
+        [
+            "$'a\\'",  # the backslash escapes the closing quote, so it never closes
+            "$'a' \"b",  # likewise an open double quote
+            "$'a'\\",  # a bare trailing backslash
+            "$'a' b",  # an unquoted blank: bash would split this word
+            "$'a'`b`",  # an expansion bashlex did not model as a child node
+            "$'a'$b",
+            "$'a'\"$(b)\"",
+        ],
+    )
+    def test_dequote_fails_closed_on_what_it_cannot_account_for(self, span):
+        # bashlex's tokenizer honours `$'...'` boundaries, so none of these reach `_dequote`
+        # through `parse` today. They are the backstop if its word spans ever drift: kept and
+        # pinned directly, because an unreachable guard nobody can test is the one that rots.
+        with pytest.raises(ParseError, match="ANSI-C"):
+            parser_mod._dequote(span, 0, len(span), {})
+
+    @pytest.mark.parametrize(
+        ("word", "expected"),
+        [
+            ('$"bash"', "bash"),  # locale translation without a catalog is a plain "..."
+            ('$"ba"sh', "bash"),
+            ('$"a\\$b\\q"', "a$b\\q"),
+            ('$"x $HOME"', "x $HOME"),
+        ],
+    )
+    def test_locale_quotes_read_as_double_quotes(self, word, expected):
+        assert _echo_arg(f"echo {word}") == expected
+
+    def test_commands_without_ansi_c_quotes_are_untouched(self):
+        # The gate is the literal `$'`: bashlex's own dequoting stands everywhere else, quirks
+        # included (bash prints `a\\qb` here; changing that is not this decoder's business).
+        command = """echo "a\\qb" 'c' d\\e"""
+        [raw] = bashlex.parse(command)
+        assert parser_mod.BashCommandParser().extract_commands_with_args([raw]) == [("echo", ["aqb", "c", "de"])]
+        assert _echo_arg(command) == "aqb"
