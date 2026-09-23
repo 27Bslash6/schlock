@@ -1931,21 +1931,21 @@ class TestGroupedAndRedirectedSubstitutions:
     @pytest.mark.parametrize(
         "command",
         [
-            # Control flow: branches this module cannot decompose, so no base command is claimed.
+            # Control flow: branches this module cannot decompose.
             'echo "$( if true; then rm -rf /; fi )"',
             'echo "$( for i in 1; do rm -rf /; done )"',
-            # The same clause as one segment of a list or pipeline: the segment is validated as its own
-            # substitution and hits the same no-base-command block — not the unknown-command HIGH of `x=1`.
+            'echo "$(while true; do rm -rf /; done)"',
+            'echo "$(until false; do rm -rf /; done)"',
+            # The same clause as one segment of a list or pipeline blocks the whole substitution,
+            # not the unknown-command HIGH of `x=1`.
             'echo "$(x=1; if true; then rm -rf /; fi)"',
             'echo "$(date && for f in x; do rm -rf /; done)"',
             'echo "$(ls | while read f; do rm -rf /; done)"',
-            'echo "$(while true; do rm -rf /; done)"',
-            'echo "$(until false; do rm -rf /; done)"',
             # A function definition shadows the command it names, so its body runs when the name is
-            # called. bashlex emits kind "function", whose name used to resolve as the base command:
-            # a whitelisted name (`date`) read SAFE, any other name or the `function` keyword HIGH.
+            # called. bashlex emits kind "function" and its name still resolves as the base command:
+            # before the guard, a whitelisted name (`date`) read SAFE, any other name or the
+            # `function` keyword HIGH.
             'echo "$(date() { rm -rf /; }; date)"',
-            'echo "$(date() { cat ~/.ssh/id_rsa; }; date)"',
             'echo "$(date() { rm -rf /; })"',
             'echo "$(date && date() { rm -rf /; })"',
             'echo "$(ls | date() { rm -rf /; })"',
@@ -1959,14 +1959,13 @@ class TestGroupedAndRedirectedSubstitutions:
     def test_undecomposable_groups_fail_closed(self, command):
         """What cannot be unwrapped must block outright, not degrade to an unknown command.
 
-        A ReservedwordNode's ``.word`` is "if"/"for" — a keyword, not a command. Letting it stand
-        in as the base command rated a whole uninspectable branch as merely unknown (HIGH, which
-        the permissive preset allows).
+        Rating an uninspectable branch as merely unknown (HIGH) lets the permissive preset run it.
+        The message pins the non-simple-command guard, not whichever fallback also happens to deny.
         """
         result = validate_command(command)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
-        assert "cannot determine command" in result.message.lower()
+        assert "non-simple command in substitution" in result.message.lower()
 
     @pytest.mark.parametrize(
         ("command", "risk", "allowed"),

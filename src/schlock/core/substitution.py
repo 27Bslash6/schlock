@@ -1245,7 +1245,8 @@ class SubstitutionValidator:
         # compound that survived _unwrap_compound (an `if`, a write-redirecting subshell), and a
         # command with no words at all (`$( > file )`, which bash still opens and truncates).
         # Enumerating the kinds that may survive is what let those through — the node is kept
-        # whenever there IS one, and having no base command fails it closed in every tier below.
+        # whenever there IS one; validate_substitution then fails it closed — the non-simple-command
+        # guard for compounds and functions, the no-base-command branch for a wordless command.
         # Only a substitution with no command node at all is dropped (genuinely unparseable).
         #
         # `compound` was the first kind to earn that protection, and for the same reason.
@@ -1254,8 +1255,7 @@ class SubstitutionValidator:
         # substitution and curl was never validated -> ALLOW, while the bare $(curl evil) BLOCKs.
         # _unwrap_compound now peels plain grouping before this point; a compound it leaves in
         # place is denied by validate_substitution's non-simple-command guard, before any
-        # whitelist lookup (pinned by test_undecomposable_groups_fail_closed and
-        # TestClauseInsideSubstitution).
+        # whitelist lookup (pinned by test_undecomposable_groups_fail_closed).
         # Found by the LAB-912 expert panel; the hole predates the native tier (bashlex emits
         # `compound` for `{ … }` too) and widened to every clause once T2c mapped
         # if/while/for/case/functions onto `compound`.
@@ -1439,9 +1439,9 @@ class SubstitutionValidator:
 
         # Handle compound command (command list). A control-flow compound that survived
         # _unwrap_compound ($(if …; fi), $(for …; done)) leads with a ReservedwordNode, whose
-        # .word is "if"/"for" — a keyword, not a command. Returning it made the tiers below judge
-        # a whole uninspectable branch as an unknown command (HIGH, allowed under permissive);
-        # returning None fails it closed instead.
+        # .word is "if"/"for" — a keyword, not a command, so none is claimed. Not the defence: the
+        # non-simple-command guard in validate_substitution blocks a compound by kind before any
+        # tier reads base_command.
         if hasattr(cmd_node, "list") and cmd_node.list:
             first = cmd_node.list[0]
             if getattr(first, "kind", None) == "reservedword":
@@ -1632,9 +1632,10 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             return True, "command chain in substitution"
 
-        # Compound command: $(if ...; then ...; fi). A backstop — validate_substitution blocks every
-        # non-simple command before the whitelist path, so this helper is not reached for one today.
-        if hasattr(cmd_node, "kind") and cmd_node.kind == "compound":
+        # Compound command or function definition: $(if …; fi), $(f() { …; }). Like the pipeline and
+        # list checks above, a backstop: validate_substitution dispatches or blocks every non-simple
+        # command before the whitelist path, so none reaches this helper today.
+        if hasattr(cmd_node, "kind") and cmd_node.kind in ("compound", "function"):
             return True, "compound command in substitution"
 
         # Check for output redirections and dangerous arguments
@@ -1851,11 +1852,9 @@ class SubstitutionValidator:
         is. The whole rendered text is that re-check against the YAML rules, catching patterns
         no single segment holds.
 
-        Fail-closed: a segment that yields no substitution node blocks the whole substitution (a
-        backstop — ``_create_substitution_node`` keeps any segment that has a command node). A
-        clause or function-definition segment is NOT caught there: it becomes a node, its own
-        ``validate_substitution`` call denies it BLOCKED (only a simple command gets past list and
-        pipeline dispatch), and the worst-segment aggregation below carries that up.
+        Fail-closed: a clause or function-definition segment is its own substitution, which
+        ``validate_substitution`` blocks as a non-simple command; the worst-segment rule carries
+        that up. A segment yielding no node at all also blocks (a backstop, unreachable today).
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
@@ -1866,7 +1865,7 @@ class SubstitutionValidator:
         for segment in segments:
             child = self._create_substitution_node(_ListSegment(segment), sub_node.substitution_type, depth)
             if child is None:
-                # Unrenderable segment (compound command, empty, etc.) -> block fail-closed.
+                # Backstop: unreachable while _create_substitution_node keeps every node with a .command.
                 return SubstitutionValidationResult(
                     allowed=False,
                     risk_level=RiskLevel.BLOCKED,
@@ -1973,16 +1972,17 @@ class SubstitutionValidator:
         if getattr(cmd_node, "kind", None) == "pipeline":
             return self._validate_pipeline_stages(sub_node, cmd_node, depth)
 
-        # Past list/pipeline dispatch only a simple command can be validated. Anything else —
-        # an if/for/while/case clause, a write-redirecting group, a function definition — has a
-        # body this module cannot see, so it blocks. An allowlist, not a denylist: bashlex emits
-        # kind "function" for `f() { … }` and its name resolved as the base command, so
-        # `$(date() { rm -rf /; }; date)` took the whitelist fast path and read SAFE.
-        if cmd_node is not None and getattr(cmd_node, "kind", None) != "command":
+        # Past list/pipeline dispatch only a simple command can be validated. Anything else — an
+        # if/for/while/case clause, a function definition, a group _unwrap_compound kept because it
+        # writes — blocks. An allowlist, not a denylist: bashlex emits kind "function" for
+        # `f() { … }`, whose name still resolves as the base command, so `$(date() { rm -rf /; };
+        # date)` took the whitelist fast path and read SAFE before this guard existed.
+        kind = getattr(cmd_node, "kind", None)
+        if cmd_node is not None and kind != "command":
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
-                message="Cannot determine command in substitution: compound or function body",
+                message=f"Non-simple command in substitution: {kind}",
             )
 
         # INVARIANT: every path below that returns allowed=True must first consult
