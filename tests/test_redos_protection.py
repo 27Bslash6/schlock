@@ -144,7 +144,7 @@ class TestReDoSProtection:
 
     @pytest.mark.parametrize("text", ["IFS=" + " " * 50_000 + "read", "IFS=" + "x" * 50_000])
     def test_ifs_override_pattern_is_linear(self, safety_rules_path, text):
-        """The empty-IFS exemption (LAB-4916) is a fixed-width lookahead, checked once per `IFS=`."""
+        """The empty-IFS exemption is a fixed-width lookahead, checked once per `IFS=`."""
         engine = RuleEngine(safety_rules_path)
 
         start = time.perf_counter()
