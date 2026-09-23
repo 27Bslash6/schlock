@@ -31,7 +31,12 @@ import pytest
 
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
-from schlock.core.validator import clear_caches, validate_command
+from schlock.core.validator import (
+    _get_rule_engine,
+    _match_original_and_reconstructed,
+    clear_caches,
+    validate_command,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -199,6 +204,31 @@ class TestSubstitutionVerdictCannotUndercutTheRules:
     def test_substitution_risk_survives_when_no_rule_is_louder(self, safety_rules_path):
         """The join takes the higher verdict; it must not flatten every substitution to BLOCKED."""
         assert _risk("ls $(base64 -d f)", safety_rules_path) is RiskLevel.HIGH
+
+
+class TestUseWhitelistGovernsEveryForm:
+    """`use_whitelist=False` must reach the original-form pass, not only the reconstructions.
+
+    A command can reconstruct to exactly its own text, in which case the reconstructed
+    pass is skipped as a duplicate and the original form is the only one that runs. If
+    that pass ignored the flag, a caller asking for no whitelist would silently get one.
+    """
+
+    def test_original_form_honours_use_whitelist_false(self):
+        parser = BashCommandParser()
+        command = "ls > /dev/sda"
+        ast = parser.parse(command)
+        assert parser.reconstruct_command_with_suppression_ranges(command, ast)[0] == command
+        match = _match_original_and_reconstructed(
+            _get_rule_engine(None),
+            parser,
+            command,
+            ast,
+            string_literals=parser.extract_string_literals(command, ast),
+            quote_source=command,
+            use_whitelist=False,
+        )
+        assert (match.risk_level, match.rule.name) == (RiskLevel.BLOCKED, "disk_destruction_dd")
 
 
 class TestOrdinaryRedirectsAreUnaffected:
