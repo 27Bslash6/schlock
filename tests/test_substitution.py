@@ -1863,6 +1863,57 @@ class TestWorstVerdictWins:
         assert result.risk_level != RiskLevel.BLOCKED
 
 
+@pytest.mark.usefixtures("no_shellcheck")
+class TestSubstitutionDenialNamesItsRule:
+    """A substitution denial names the YAML rule behind it in ``matched_rules`` (LAB-4649).
+
+    The audit log attributes a verdict by rule name, and a test pinned on a rule description
+    breaks on a copy edit. Each path that denies on a rule match carries the name to the top.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "risk", "rule"),
+        [
+            # _check_inner_rules, on a vetted reader: amplified HIGH, amplified BLOCKED.
+            ('echo "$(git push)"', RiskLevel.HIGH, "git_push"),
+            ('echo "$(printenv GITHUB_TOKEN)"', RiskLevel.BLOCKED, "environment_credential_extraction"),
+            # Layer 4, on an unrecognised command: BLOCKED, and amplified HIGH reported BLOCKED.
+            ('echo "$(chmod 777 /etc/shadow)"', RiskLevel.BLOCKED, "chmod_777"),
+            ('echo "$(chmod +x script.sh)"', RiskLevel.BLOCKED, "chmod_exec"),
+            # Nested, through the vetted tier and through Layer 3.
+            ('echo "$(echo $(x=1) $(printenv GITHUB_TOKEN))"', RiskLevel.BLOCKED, "environment_credential_extraction"),
+            ('echo "$(foo $(git push))"', RiskLevel.HIGH, "git_push"),
+            # A list segment and a pipeline stage, each behind a harmless first one.
+            ('echo "$(ls; printenv GITHUB_TOKEN)"', RiskLevel.BLOCKED, "environment_credential_extraction"),
+            ('echo "$(cat f | git push)"', RiskLevel.HIGH, "git_push"),
+        ],
+    )
+    def test_denial_carries_the_rule_name(self, command, risk, rule):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed, result.matched_rules) == (risk, False, [rule])
+
+    @pytest.mark.parametrize(
+        ("command", "rules"),
+        [
+            ("rm -r mydir $(base64 -d f)", ["recursive_delete"]),
+            ("rm -r mydir $(git push)", ["recursive_delete", "git_push"]),
+        ],
+    )
+    def test_a_tie_keeps_the_command_rule_and_stays_denied(self, command, rules):
+        """`rm -r mydir` alone is HIGH with allowed=True; the substitution beside it is a HIGH denial.
+
+        The tie went to the substitution result and dropped `recursive_delete`. Keeping the
+        completed result instead must not keep its allowed=True: the substitution was refused.
+        """
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed, result.exit_code, result.matched_rules) == (
+            RiskLevel.HIGH,
+            False,
+            1,
+            rules,
+        )
+
+
 class TestSubstitutionWriteAndWordlessShapes:
     """Shapes that write, or that have no command word at all, must not read SAFE."""
 
@@ -2400,6 +2451,7 @@ class TestListSegmentBranchCoverage:
 
         class _Match:
             matched = True
+            rule = None
             risk_level = RiskLevel.HIGH
             message = "mock cross-segment rule"
 

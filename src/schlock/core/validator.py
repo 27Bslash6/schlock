@@ -2162,6 +2162,7 @@ def _substitution_denial(sub_result: SubstitutionValidationResult) -> Validation
         ],
         exit_code=1,
         error=None,
+        matched_rules=list(sub_result.matched_rules),
     )
 
 
@@ -2191,11 +2192,18 @@ def validate_command(
     if not deferred:
         return result
     sub_denial = deferred[0]
-    # A denial always beats an allow, whatever their levels; between two denials the higher
-    # level wins, and a tie keeps the completed verdict because it carries the matched rules.
-    if result.allowed or sub_denial.risk_level > result.risk_level:
+    # The higher level wins. A tie keeps the completed verdict, which names the command's own
+    # rule, but always denied: a HIGH rule match arrives with allowed=True, and the substitution
+    # beside it was still refused. Deciding on `allowed` instead sent every HIGH tie to the
+    # substitution branch, so `rm -r d $(base64 -d f)` lost `recursive_delete` from the audit log.
+    if sub_denial.risk_level > result.risk_level:
         return _substitution_denial(sub_denial)
-    return result
+    return replace(
+        result,
+        allowed=False,
+        exit_code=1,
+        matched_rules=list(dict.fromkeys([*result.matched_rules, *sub_denial.matched_rules])),
+    )
 
 
 def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow

@@ -974,6 +974,7 @@ class SubstitutionValidationResult:
     whitelisted: bool = False  # True if matched whitelist (fast path)
     depth_exceeded: bool = False  # True if hit MAX_SUBSTITUTION_DEPTH
     inner_results: list[SubstitutionValidationResult] = field(default_factory=list)
+    matched_rules: list[str] = field(default_factory=list)  # YAML rule(s) behind a denial, for the audit log
 
 
 class SubstitutionValidator:
@@ -1625,6 +1626,7 @@ class SubstitutionValidator:
                 risk_level=worst.risk_level,
                 message=f"Nested substitution blocked: {worst.message}",
                 inner_results=[worst],
+                matched_rules=worst.matched_rules,
             )
 
         return None
@@ -1785,6 +1787,7 @@ class SubstitutionValidator:
                 risk_level=worst_denial.risk_level,
                 message=worst_denial.message,
                 inner_results=inner_results,
+                matched_rules=worst_denial.matched_rules,
             )
         if blocked:
             return blocked
@@ -1900,6 +1903,7 @@ class SubstitutionValidator:
                 risk_level=worst.risk_level,
                 message=f"Nested substitution blocked: {worst.message}",
                 inner_results=inner_results,
+                matched_rules=worst.matched_rules,
             )
             if worst.risk_level == RiskLevel.BLOCKED:
                 return nested_denial
@@ -1913,6 +1917,7 @@ class SubstitutionValidator:
         if sub_node.inner_command:
             rule_match = self.rule_engine.match_command(sub_node.inner_command)
             if rule_match and rule_match.matched:
+                matched_rules = [rule_match.rule.name] if rule_match.rule else []
                 # Amplify risk by +1 level for substitution context
                 amplified_risk = self._amplify_risk(rule_match.risk_level)
                 if amplified_risk == RiskLevel.BLOCKED:
@@ -1921,6 +1926,7 @@ class SubstitutionValidator:
                         risk_level=RiskLevel.BLOCKED,
                         message=f"Inner command blocked: {rule_match.message}",
                         inner_results=inner_results,
+                        matched_rules=matched_rules,
                     )
                 if amplified_risk == RiskLevel.HIGH:
                     # HIGH in substitution context - treat as blocked for safety
@@ -1930,6 +1936,7 @@ class SubstitutionValidator:
                         risk_level=RiskLevel.BLOCKED,
                         message=f"High-risk command in substitution context: {rule_match.message}",
                         inner_results=inner_results,
+                        matched_rules=matched_rules,
                     )
 
         # No determinable base command: fail-closed BLOCKED. Ordered BEFORE the held nested
@@ -2001,6 +2008,7 @@ class SubstitutionValidator:
             if amplified_risk == RiskLevel.BLOCKED
             else f"Risky command in substitution: {rule_match.message}",
             inner_results=inner_results or [],
+            matched_rules=[rule_match.rule.name] if rule_match.rule else [],
         )
 
     def _amplify_risk(self, risk_level: RiskLevel) -> RiskLevel:
