@@ -803,13 +803,14 @@ class TestHereStringDelegationEvasion:
         # Every surfaced here-string re-enters validation - and ShellCheck - once, so n distinct
         # `<<<` payloads were n unbounded re-entries while the `-c` spelling of the same command
         # stopped at MAX_DELEGATOR_TOKENS; a PreToolUse hook that outlives its timeout fails
-        # OPEN. Same ceiling, same catch-all denial as the extractor's. Identical payloads
-        # collapse before the count, so repetition alone never trips it.
+        # OPEN. Same ceiling as the extractor's. Identical payloads collapse before the count, so
+        # repetition alone never trips it.
         distinct = "; ".join(f'bash <<< "echo {i}"' for i in range(MAX_DELEGATOR_TOKENS + 1))
         result = validate_command(distinct)
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.allowed is False
-        assert "distinct payloads" in (result.error or "")
+        assert result.error is None
+        assert "distinct payloads" in result.message
         repeated = "; ".join('bash <<< "echo hi"' for _ in range(MAX_DELEGATOR_TOKENS + 1))
         assert validate_command(repeated).allowed is True
 

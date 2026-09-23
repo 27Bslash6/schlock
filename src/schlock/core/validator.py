@@ -2554,9 +2554,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # surfaced them.
         payloads: list[str] = []
         if match.risk_level < RiskLevel.BLOCKED:
-            if len(herestring_payloads) > MAX_DELEGATOR_TOKENS:
-                raise ValueError(f"Here-string re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
             try:
+                if len(herestring_payloads) > MAX_DELEGATOR_TOKENS:
+                    raise _DelegatorCeilingError(f"Here-string re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
                 payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + herestring_payloads))
             except _DelegatorCeilingError as e:
                 # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH below and _over_size_ceiling
@@ -2568,7 +2568,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     allowed=False,
                     risk_level=RiskLevel.BLOCKED,
                     message=str(e),
-                    alternatives=["Run the command directly instead of chaining wrapper commands"],
+                    alternatives=["Run the command directly instead of delegating it through wrappers or here-strings"],
                     exit_code=1,
                     error=None,
                 )
