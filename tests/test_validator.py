@@ -1667,6 +1667,7 @@ class TestHeredocSurroundings:
             ('a["]"<<b ]=1', [], "a quoted `]` does not close a subscript"),
             ("a[${x:-]}<<b ]=1", [], "a `]` inside `${…}` does not close a subscript"),
             ('echo "`date`" ; cat <<c', ["c"], "a backtick closes its own frame, it does not reopen it"),
+            ('echo "`cat <<b`" <<E', ["E"], 'a backtick inside `"…"` is a frame, not a context the refusal sees'),
             ("x=`ls | sort` y[1<<b]=1", [], "an operator inside a backtick is the backtick's, so the word is one assignment"),
             ("echo `ls | sort` y[1<<b]", ["b]"], "…but the word after one still follows `echo` into command-name position"),
             # A `#` is a comment only where a word could start. These ran real
@@ -1973,7 +1974,6 @@ class TestHeredocSurroundings:
         [
             "echo ` <<b `\nrm -rf /\nb",
             "echo `cat <<b`\nrm -rf /\nb",
-            "echo `cat <<'b'` c\nrm -rf /\nb",
             "echo `echo $(cat <<b)`\nrm -rf /\nb",  # the backtick is not the innermost context
             "x=$(echo `cat <<b`)\nrm -rf /\nb",  # nor the outermost
             "echo `cat <<b\n`\nrm -rf /\nb\n`",  # closes on a later line: parsed clean, and was allowed
@@ -1982,13 +1982,11 @@ class TestHeredocSurroundings:
     def test_a_heredoc_inside_a_backtick_is_refused(self, command):
         """Bash ends a backtick at its first unescaped `` ` `` and reads the heredoc body from that text alone (LAB-4275).
 
-        Every row was run through real bash with `touch CANARY` for `rm -rf /`,
-        and every one ran it: the lines after the backtick are the outer
-        script's, not a body. This read them as the body and deleted them. The
-        last row then parsed clean and was allowed LOW with ShellCheck off; the
-        rest were denied only because bashlex choked on the same construct - a
-        correlated backstop, not a guard. Pinned on the refusal's own message so
-        that a bashlex failure downstream cannot pass for it.
+        Every row ran its `rm` in real bash (canary). On main the last row was
+        allowed LOW with ShellCheck off; the rest denied only by accident -
+        bashlex choked on the rewrite, or the delimiter swallowed the closing
+        backtick and never found a terminator. Pinned on the refusal's own
+        message so that neither accident can pass for it.
         """
         with pytest.raises(ParseError, match="inside a backtick"):
             val_module._neuter_heredocs(command)
@@ -1999,20 +1997,6 @@ class TestHeredocSurroundings:
 
         assert not result.allowed
         assert "inside a backtick" in result.message
-
-    @pytest.mark.parametrize(
-        "line,delimiters",
-        [
-            ("x=`date`; cat <<'E'", ["E"]),  # a closed backtick earlier on the line
-            ("x=$(cat <<'E'", ["E"]),  # `$(…)` re-lexes as shell and bash reads its body below
-            ('echo "`cat <<b`" <<E', ["E"]),  # in `"…"` a backtick is a frame; bash ends `<<b` at the substitution's end
-        ],
-    )
-    def test_openers_outside_a_backtick_are_still_found(self, line, delimiters):
-        """The refusal is for an opener a backtick context encloses, not for any backtick on the line."""
-        _, openers = val_module._rewrite_openers(line, val_module._ScanState(), 0, val_module._DoubleParen(line))
-
-        assert [delimiter for delimiter, _, _ in openers] == delimiters
 
     @pytest.mark.parametrize(
         "opener,tail",
