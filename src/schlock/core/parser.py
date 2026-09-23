@@ -126,8 +126,8 @@ _apply_andor_substitution_correction()
 # and wrapper-command checks.
 # A heredoc body is inert text to `cat` and source code to `bash`, which decides
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
-# segment has to carry it (extract_command_segments). One set, so the two answers
-# cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
+# segment has to carry it (extract_command_segments), and whether the validator
+# re-validates a here-string as bash. One set, so the answers cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
 #
 # `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
 # bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
@@ -141,8 +141,8 @@ _apply_andor_substitution_correction()
 # the rbash drift with a different interpreter.
 #
 # `source`/`.` are here because `source /dev/stdin <<EOF` runs the body as bash in the
-# current shell (LAB-3522). Public because the validator re-validates a here-string only
-# for these same interpreters: a here-string is stdin exactly as a heredoc is.
+# current shell (LAB-3522). Public for that validator filter: a here-string is stdin exactly
+# as a heredoc is.
 HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh", "source", "."})
 
 STDIN_EXEC_INTERPRETERS = frozenset(
@@ -223,13 +223,22 @@ _INLINE_CODE_FLAGS = {
 }
 
 
-def has_expansion(word: str) -> bool:
-    """True if `word` still holds a `$` or backtick expansion bashlex left unexpanded.
+# First characters that let an operand expand to no word at all or to an option (LAB-3522):
+# `"$@"` is empty in a Claude Code Bash call, `X=-s; bash $X` splits into `-s`, `{-s,}` brace-
+# expands to `-s`, a glob can match nothing (nullglob) or a file named `-s`, and `<(cat)` reads
+# the same pipe the shell was meant to run.
+_UNFIXED_OPERAND_STARTS = frozenset("$`{*?[<")
 
-    Such a word is not an unambiguous operand: `"$@"` expands to nothing in a Claude Code Bash
-    call, and an unquoted `$X` can word-split into options (LAB-3522).
+
+def may_expand(word: str) -> bool:
+    """True if operand `word` might not reach the command as the single literal word it reads as.
+
+    Only the first character matters: once a word starts with a literal, its first field starts
+    with that literal too, so `./run-$ENV.sh` stays one script however `$ENV` splits. Textual
+    and quote-stripped (bashlex already removed the quotes), so `"$HOME/x.py"` and a literal
+    `'$x'` count as well - over-inclusive on purpose, the fail-closed direction.
     """
-    return "$" in word or "`" in word
+    return word[:1] in _UNFIXED_OPERAND_STARTS
 
 
 # Tokens that explicitly designate STDIN as the program source.
@@ -238,7 +247,9 @@ _STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
 # Multicall binaries dispatch to an applet named by their first positional arg
 # (`busybox sh`, `toybox cat`). Classify the pipeline stage by the resolved applet, not the
 # wrapper, so `cat x | busybox sh` is seen as a shell sink while bare `busybox` (no applet) is not.
-_MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
+# `builtin` is not a binary but dispatches the same way (`builtin source /dev/stdin`), and it
+# reaches both stdin surfaces through this resolver (LAB-3522).
+_MULTICALL_BINARIES = frozenset({"busybox", "toybox", "builtin"})
 
 
 # Wrapper commands that pass through execution to subsequent args. Best-effort, NOT an
@@ -355,8 +366,8 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     Fail-CLOSED model (a security check must not guess flag arity): the interpreter is exempt
     (returns False) only when a program source is UNAMBIGUOUS —
       - an inline-code flag valid for this interpreter (-c / -e / -m / ...), separate or attached; or
-      - a positional (non-dash) script token appearing BEFORE any option flag, and holding no
-        unexpanded `$`/backtick: `bash "$@"` is a bare bash when `$@` is empty (LAB-3522).
+      - a positional (non-dash) script token appearing BEFORE any option flag, and not one that
+        `may_expand`: `bash "$@"` is a bare bash when `$@` is empty (LAB-3522).
     Once an option flag is seen, a following non-dash token is treated as that flag's VALUE
     (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
     (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
@@ -373,10 +384,11 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
             return True
         if not arg.startswith("-"):
             # A leading literal positional (before any option) is a script file -> runs it.
-            # A leading expansion may be nothing or options, so it is no program source at all.
+            # A leading expansion is unknown - nothing, options, a script - so assume stdin and
+            # stop: scanning on would let `X=-s; bash $X script.sh` exempt on `script.sh`.
             # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
             if not saw_option:
-                return has_expansion(arg)
+                return may_expand(arg)
             continue
         saw_option = True
     return True

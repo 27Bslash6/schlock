@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import HEREDOC_SHELL_COMMANDS, WRAPPER_COMMANDS, BashCommandParser, has_expansion
+from .parser import HEREDOC_SHELL_COMMANDS, WRAPPER_COMMANDS, BashCommandParser, may_expand
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -458,7 +458,11 @@ def _check_dangerous_command_flags(
 #
 # Shells: `-c PROG` runs PROG, and a LEADING operand is the script to run, which ends option
 # parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
-_SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "rbash"})
+#
+# Derived from the parser's set so the shell list lives once (its drift gave rbash and csh/tcsh
+# bugs). `source`/`.` stay out: they take no `-c`, and `.` is an everyday path operand that would
+# register as a delegator behind every wrapper (LAB-3522).
+_SHELL_COMMANDS: frozenset[str] = HEREDOC_SHELL_COMMANDS - {"source", "."}
 
 # Not shells, but their `-c` argument is a command string they hand to one. Their leading
 # operand is a user/group/file rather than a script, so it must NOT end option parsing
@@ -596,9 +600,10 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
             # For a shell, a leading operand is the script to run, so no -c can follow it. For
             # `su`/`sg`/`runuser` it is a user or group and options continue after it. Once an
             # option has been seen a bare token is that option's value either way - keep
-            # scanning. A leading expansion is no script (`bash "$@" -c PROG` runs PROG), so it
-            # ends nothing. Same reading as parser._reads_stdin_as_program.
-            if i == 0 and operand_ends_options and not has_expansion(word):
+            # scanning. A leading operand that `may_expand` is no script (`bash "$@" -c PROG`
+            # runs PROG), so scanning goes on to find the -c; parser._reads_stdin_as_program
+            # stops there instead, because it has no later token to find (LAB-3522).
+            if i == 0 and operand_ends_options and not may_expand(word):
                 return None
             continue
         if word.startswith("--") or "c" not in word[1:]:
