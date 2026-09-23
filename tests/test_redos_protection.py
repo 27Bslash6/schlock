@@ -142,9 +142,9 @@ class TestReDoSProtection:
 
         assert elapsed < 0.5, f"blank run after {head!r} took {elapsed:.3f}s"
 
-    @pytest.mark.parametrize("text", ["IFS=" + " " * 50_000 + "read", "IFS=" + "x" * 50_000])
+    @pytest.mark.parametrize("text", ["IFS=" + " " * 50_000 + "read", "IFS=" + "x" * 50_000, "I" + "\\\n" * 25_000])
     def test_ifs_override_pattern_is_linear(self, safety_rules_path, text):
-        """The empty-IFS exemption is a fixed-width lookahead, checked once per `IFS=`."""
+        """The IFS-override pattern scans a blank run or a `\\<newline>` run once, not once per backtrack."""
         engine = RuleEngine(safety_rules_path)
 
         start = time.perf_counter()

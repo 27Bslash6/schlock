@@ -1165,6 +1165,10 @@ class TestObfuscationDetection:
             # A leading quoted blank is caught on the raw pass only: reconstruction drops the quotes.
             "IFS=' ,' read -r a b",
             "IFS=$' \\t' read a",
+            # Reconstruction drops quotes and joins lines: these read as IFS='' / IFS= there.
+            "IFS\\\n=\\'\\'; x=a\\'b; $x",
+            "IFS\\\n=' ,'; x=a,b; $x",
+            "I\\\nFS=\\ ,; x=a,b; $x",
         ]
         for cmd in dangerous:
             result = validate_command(cmd, config_path=safety_rules_path)
@@ -1177,9 +1181,6 @@ class TestObfuscationDetection:
         [
             "IFS= read -r line",
             'cat f | while IFS= read -r line; do echo "$line"; done',
-            "IFS='' read -r line",
-            'IFS="" read -r line',
-            'IFS=""; echo done',
             # The heredoc re-validation path ("Alongside heredoc:") the report hit.
             "python3 - <<'PY'\nprint(1)\nPY\ncat f | while IFS= read -r line; do echo \"$line\"; done",
         ],
