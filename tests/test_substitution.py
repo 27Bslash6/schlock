@@ -8,9 +8,10 @@ import time
 import pytest
 
 from schlock.core import validator as validator_module
-from schlock.core.parser import BashCommandParser
+from schlock.core.parser import WRAPPER_COMMANDS, BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
+    _VETTED_LAUNCHERS,
     DANGEROUS_SUBSTITUTION_COMMANDS,
     MAX_SUBSTITUTION_DEPTH,
     SAFE_SUBSTITUTION_COMMANDS,
@@ -57,6 +58,11 @@ class TestSubstitutionConstants:
         """No command should be in both lists."""
         overlap = SAFE_SUBSTITUTION_COMMANDS & DANGEROUS_SUBSTITUTION_COMMANDS
         assert len(overlap) == 0, f"Commands in both lists: {overlap}"
+
+    def test_vetted_commands_that_run_others_are_launchers(self):
+        """The glued-git-option guard exempts vetted readers, so a vetted wrapper must be a launcher."""
+        wrappers = SAFE_SUBSTITUTION_COMMANDS & (WRAPPER_COMMANDS | validator_module._DELEGATOR_COMMANDS)
+        assert wrappers <= _VETTED_LAUNCHERS, wrappers - _VETTED_LAUNCHERS
 
 
 class TestSubstitutionDataClasses:
@@ -1721,6 +1727,10 @@ class TestWhitelistedSubstitutionYamlRules:
             # through the pipeline and list renderers
             "echo \"$(git log | git difftool -x'rm -rf /')\"",
             "echo \"$(cd x && git difftool -x'rm -rf /')\"",
+            # a vetted launcher runs git, and the reader exemption keys on the command word
+            "echo \"$(op run -- git difftool -x'rm -rf /')\"",
+            "echo \"$(awk 'BEGIN{c=ARGV[1] FS ARGV[2] FS ARGV[3]; print 1 | c}' git difftool '-xrm -rf /')\"",
+            "echo \"$(git difftool -x'rm -rf /' HEAD cat)\"",
             # Accepted over-block: whether -S's value is data is git's option table to know.
             # The message names the fix, `-S 'foo bar'`.
             "echo \"$(git log -S'foo bar')\"",
@@ -1746,6 +1756,8 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(sed -e's/ /_/g' f)\"",
             # git as data before the glued word: git parses nothing that precedes it
             "echo \"$(grep -rn -e'-o json' vendor/git)\"",
+            # git as a reader's argument is data: printf is the command, not git
+            "echo \"$(printf '%s' git '-xhello world')\"",
             # the two spellings the denial message points at
             "echo \"$(git log -S 'foo bar')\"",
             "echo \"$(git log --format='%h %s')\"",

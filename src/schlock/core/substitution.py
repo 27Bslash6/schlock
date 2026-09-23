@@ -764,17 +764,27 @@ _STRUCTURED_WORD = re.compile(r"^\S*=")
 # A second word is required: `-d' '` glues on a lone separator, not a payload.
 _GLUED_MULTIWORD_OPTION = re.compile(r"^-[^-\s]\S*\s+\S")
 
+# Vetted commands that can hand git an argv the caller wrote: git itself, `op run -- git …`,
+# `find -exec`, awk's `system()` and `print |`, sed's `e`. Their own structural checks deny the
+# exec modes too; listing them here keeps this guard from leaning on those checks.
+# `sort --compress-program` and `sdiff --diff-program` run a program with arguments of their own.
+_VETTED_LAUNCHERS: frozenset[str] = frozenset({"git", "op", "find", "awk", "sed"})
+
 
 def _hides_a_glued_git_payload(words: list[str]) -> bool:
     """Could git be running a command glued onto one of its short options, unreadably?
 
     Scoped to git: it is the one vetted command that executes a glued short-option value
     (`difftool -x`, `rebase -x`, `clone -u`), and on a reader the same shape is data —
-    `date -d'1 day ago'` must stay SAFE. Only the words after git are scanned: git parses
+    `date -d'1 day ago'` must stay SAFE. A vetted reader never hands git our arguments, so
+    `printf '%s' git '-xa b'` is data; a command we have not vetted may be a wrapper
+    (`timeout 5 git …`) and is scanned. Only the words after git are scanned: git parses
     nothing before itself, and `grep -e'-o json' vendor/git` is a reader. `--` does not end
     the scan, because a value-taking option swallows it: `git --namespace -- difftool -x'…'`
     still runs the payload.
     """
+    if words and words[0] in SAFE_SUBSTITUTION_COMMANDS and words[0] not in _VETTED_LAUNCHERS:
+        return False
     start = next((index for index, word in enumerate(words) if word.rsplit("/", 1)[-1] == "git"), None)
     if start is None:
         return False
