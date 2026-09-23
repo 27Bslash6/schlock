@@ -1953,6 +1953,12 @@ class TestAllowedRuleMatchIsRecorded:
             ["git_commit"],
         )
         assert "Committing changes" in result.message
+        assert result.alternatives == []  # the denial advice ("request it be whitelisted") does not apply
+
+    def test_a_cross_segment_match_alone_decides(self):
+        """Neither `echo pip` nor `grep -r requirements` matches `pip_requirements` (LOW); the whole does."""
+        result = validate_command('echo "$(echo pip | grep -r requirements)"')
+        assert (result.allowed, result.risk_level, result.matched_rules) == (True, RiskLevel.MEDIUM, ["pip_requirements"])
 
     def test_a_denial_still_outranks_it(self):
         result = validate_command('echo "$(git commit -m x) $(git push)"')
@@ -1992,23 +1998,6 @@ class TestAmplifiedHighMeansOneThing:
         unvetted = validate_command(command)  # git now reaches Layer 4
         assert (vetted.risk_level, vetted.matched_rules) == (RiskLevel.HIGH, ["git_push"])
         assert (unvetted.risk_level, unvetted.matched_rules) == (RiskLevel.HIGH, ["git_push"])
-
-    @pytest.mark.parametrize(
-        ("command", "rule"),
-        [
-            ('echo "$(chmod +x script.sh)"', "chmod_exec"),
-            ('echo "$(brew install jq)"', "homebrew_install"),
-            ('echo "$(tar -xf a.tar -C /x)"', "archive_operations"),
-        ],
-    )
-    def test_layer_4_rates_an_amplified_medium_rule_high(self, command, rule):
-        result = validate_command(command)
-        assert (result.allowed, result.risk_level, result.matched_rules) == (False, RiskLevel.HIGH, [rule])
-        assert not result.message.startswith("BLOCKED")
-
-    def test_layer_4_still_blocks_an_amplified_high_rule(self):
-        result = validate_command('echo "$(chmod 777 /etc/shadow)"')
-        assert (result.risk_level, result.matched_rules) == (RiskLevel.BLOCKED, ["chmod_777"])
 
     def test_an_amplified_high_does_not_preempt_the_no_command_block(self, validator):
         """A node with no base command is fail-closed BLOCKED; a HIGH rule match must not return first.

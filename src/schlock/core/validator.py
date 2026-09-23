@@ -2156,7 +2156,9 @@ def _substitution_verdict(sub_result: SubstitutionValidationResult) -> Validatio
         allowed=sub_result.allowed,
         risk_level=sub_result.risk_level,
         message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
-        alternatives=[
+        alternatives=[]
+        if sub_result.allowed
+        else [
             "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
             "Run the command directly instead of using substitution",
             "If this command is safe, request it be added to the whitelist",
@@ -2226,7 +2228,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution denial too weak to short-circuit is placed
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE and below BLOCKED is placed
     there for the caller to join. It is a list rather than a return value so that every one of
     this function's returns carries it without having to remember to.
 
@@ -2670,7 +2672,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # reason: that verdict is weaker than the one a fresh call would produce for the key. The
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
-        # Nor when a substitution denial is still owed a join: the cached entry would be the
+        # Nor when a substitution verdict is still owed a join: the cached entry would be the
         # pre-join verdict, and the next identical command would hit it and skip the join.
         if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)

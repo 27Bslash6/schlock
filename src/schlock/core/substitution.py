@@ -974,7 +974,7 @@ class SubstitutionValidationResult:
     whitelisted: bool = False  # True if matched whitelist (fast path)
     depth_exceeded: bool = False  # True if hit MAX_SUBSTITUTION_DEPTH
     inner_results: list[SubstitutionValidationResult] = field(default_factory=list)
-    matched_rules: list[str] = field(default_factory=list)  # YAML rule(s) behind a denial, for the audit log
+    matched_rules: list[str] = field(default_factory=list)  # YAML rule(s) that decided the level, for the audit log
 
 
 class SubstitutionValidator:
@@ -1634,10 +1634,11 @@ class SubstitutionValidator:
     def _check_vetted(self, sub_node: SubstitutionNode, depth: int) -> SubstitutionValidationResult | None:
         """Structural, nested and YAML-rule checks for a vetted command, joined at the worst.
 
-        A BLOCKED structural or nested verdict ends it. A lesser nested denial is held, not
-        returned, so the rules can still rate the command itself higher - appending `$(x=1)`
-        must not decide the verdict of the command it is appended to (LAB-4149). A tie goes
-        to the rule verdict, which names the command's own risk.
+        A BLOCKED structural or nested verdict ends it. A lesser nested verdict (a denial, or an
+        allowed rule match) is held, not returned, so the rules can still rate the command
+        itself higher - appending `$(x=1)` must not decide the verdict of the command it is
+        appended to (LAB-4149). A tie goes to the rule verdict, which names the command's own
+        risk.
 
         Returns:
             The worst denial, else the worst allowed rule match, or None if every check passes.
@@ -1647,7 +1648,7 @@ class SubstitutionValidator:
         held = self._check_structural_and_nested(sub_node, depth)
         if held and held.risk_level == RiskLevel.BLOCKED:
             return held
-        ruled = self._check_inner_rules(sub_node)
+        ruled = self._check_inner_rules(sub_node, vetted=True)
         if held and (ruled is None or held.risk_level > ruled.risk_level):
             return held
         return ruled
@@ -1738,15 +1739,14 @@ class SubstitutionValidator:
         Each segment is wrapped as its own substitution and run through the full
         ``validate_substitution`` pipeline at the SAME depth (decomposition, not nesting). The
         whole is allowed only if every segment is allowed; the combined risk is the max over
-        segments and it is whitelisted only if every segment is. The whole rendered text is then
-        re-checked against the YAML rules to catch cross-segment patterns.
+        segments and the cross-segment rule match, and it is whitelisted only if every segment
+        is. The whole rendered text is that re-check against the YAML rules, catching patterns
+        no single segment holds.
 
         Fail-closed: a segment we cannot turn into a substitution node (e.g. a compound
         ``{ … }``/``( … )``/``if`` segment) blocks the whole substitution.
         """
         from .rules import RiskLevel  # noqa: PLC0415
-
-        risk_order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
 
         inner_results: list[SubstitutionValidationResult] = []
         all_whitelisted = True
@@ -1768,7 +1768,7 @@ class SubstitutionValidator:
                 # Worst segment wins, not the first denied one. The level decides the action
                 # (HIGH -> ask, BLOCKED -> deny), so returning here reported `$( (a && rm -rf /) )`
                 # at the unknown-command level of `a` and never looked at the blacklisted `rm`.
-                if worst_denial is None or risk_order.index(result.risk_level) > risk_order.index(worst_denial.risk_level):
+                if worst_denial is None or result.risk_level > worst_denial.risk_level:
                     worst_denial = result
                 continue
             all_whitelisted = all_whitelisted and result.whitelisted
@@ -1777,8 +1777,8 @@ class SubstitutionValidator:
         # It runs even when a segment was denied: a HIGH segment must not hide a pattern that
         # only the whole matches, `tar czf - ~/.ssh | cat` being one (LAB-4149). A tie keeps
         # the segment's verdict.
-        blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
-        if worst_denial is not None and (blocked is None or worst_denial.risk_level >= blocked.risk_level):
+        ruled = self._check_inner_rules(sub_node, inner_results=inner_results, vetted=True)
+        if worst_denial is not None and (ruled is None or worst_denial.risk_level >= ruled.risk_level):
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=worst_denial.risk_level,
@@ -1786,11 +1786,11 @@ class SubstitutionValidator:
                 inner_results=inner_results,
                 matched_rules=worst_denial.matched_rules,
             )
-        if blocked and not blocked.allowed:
-            return blocked
+        if ruled and not ruled.allowed:
+            return ruled
 
         # Allowed: rated at the worst segment or cross-segment rule match, which names its rule.
-        flagged = [r for r in (*inner_results, blocked) if r and r.risk_level > RiskLevel.SAFE]
+        flagged = [r for r in (*inner_results, ruled) if r and r.risk_level > RiskLevel.SAFE]
         worst = max(flagged, key=lambda r: r.risk_level, default=None)
         if worst is not None:
             return SubstitutionValidationResult(
@@ -1848,9 +1848,9 @@ class SubstitutionValidator:
         if getattr(cmd_node, "kind", None) == "pipeline":
             return self._validate_pipeline_stages(sub_node, cmd_node, depth)
 
-        # INVARIANT: every path below that returns allowed=True must first pass
-        # _check_inner_rules(). Skipping it is what made a whitelisted command get a
-        # weaker check than an unrecognised one (LAB-4182).
+        # INVARIANT: every path below that returns allowed=True must first consult
+        # _check_inner_rules() and return its verdict if it has one. Skipping it is what made a
+        # whitelisted command get a weaker check than an unrecognised one (LAB-4182).
         #
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):
@@ -1959,11 +1959,12 @@ class SubstitutionValidator:
         sub_node: SubstitutionNode,
         inner_results: list[SubstitutionValidationResult] | None = None,
         *,
-        vetted: bool = True,
+        vetted: bool,
     ) -> SubstitutionValidationResult | None:
         """Run the YAML rule engine over a substitution's inner command.
 
-        Defense in depth for every tier that would otherwise return allowed=True. Being on a
+        Every tier runs it: defense in depth for the vetted tiers that would otherwise return
+        allowed=True, and the rule check of Layer 4 (``vetted=False``). Being on a
         whitelist means the base command is safe to *name* in a substitution, not that every
         invocation of it is: a whitelist is a base-command judgement, and base commands like
         ``git`` and ``kubectl`` carry their real risk in the subcommand. Without this, a
