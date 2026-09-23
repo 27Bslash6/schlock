@@ -1702,6 +1702,46 @@ class TestWhitelistedSubstitutionYamlRules:
     @pytest.mark.parametrize(
         "command",
         [
+            # Dequoted, the payload's first word fuses with the flag (`-xrm`), so no `\brm` rule
+            # can see it; the first two were also suppressed as opaque data (LAB-4265).
+            "echo \"$(git difftool -x'rm -rf /')\"",
+            "echo \"$(git difftool -x'/bin/rm -rf /')\"",
+            "echo \"$(git submodule foreach -q'rm -rf /')\"",
+            # a cluster hides the split point, and a backslash leaves no quote to split at
+            "echo \"$(git difftool -yx'rm -rf /')\"",
+            'echo "$(git difftool -xrm\\ -rf\\ /)"',
+            # through the pipeline and list renderers
+            "echo \"$(git log | git difftool -x'rm -rf /')\"",
+            "echo \"$(cd x && git difftool -x'rm -rf /')\"",
+        ],
+    )
+    def test_multi_word_value_glued_to_a_short_option_is_denied(self, command):
+        """A glued multi-word value is unreadable, so it is denied rather than guessed at."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(git log -n5)"',
+            "echo \"$(grep -rn'pattern' src/)\"",
+            'echo "$(sort -k2 f)"',
+            'echo "$(head -n20 f)"',
+            # a separator glued on is one word of whitespace, not a payload
+            "echo \"$(cut -d' ' -f1 f)\"",
+            "echo \"$(sort -t' ' -k2 f)\"",
+            # after `--` a dash-leading word is a positional
+            "echo \"$(grep -- '-a b' f)\"",
+        ],
+    )
+    def test_ordinary_glued_short_options_stay_safe(self, command):
+        """Only a value with a second word is unreadable; a glued datum or separator is not."""
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "echo \"$(ssh host 'rm -rf /')\"",
             "echo \"$(someunknownbin 'mkfs.ext4 /dev/sda')\"",
         ],

@@ -757,6 +757,13 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
 # and reads the right-hand side, and only that side was ever quoted. See _is_opaque_argument.
 _STRUCTURED_WORD = re.compile(r"^\S*=")
 
+# A short option with a multi-word value glued on, e.g. `-x'rm -rf /'`. Dequoted it renders as
+# `-xrm -rf /`: the value's first word fuses with the flag, so no `\b`-anchored rule can see it,
+# and where the value starts inside a cluster (`-yx…`) is unknowable without per-command option
+# tables. Unreadable, so denied (LAB-4265). A second word is required: `cut -d' '` glues on a
+# lone separator, not a payload.
+_GLUED_MULTIWORD_OPTION = re.compile(r"^-[^-\s]\S*\s+\S")
+
 
 def _is_opaque_argument(part: Any) -> bool:
     """Is this word ONE argument the command receives whole, with nothing to interpret inside?
@@ -1540,6 +1547,9 @@ class SubstitutionValidator:
                 # Collect arguments for dangerous pattern checks
                 if hasattr(part, "word"):
                     args.append(part.word)
+
+            if any(_GLUED_MULTIWORD_OPTION.match(arg) for arg in _options_before_double_dash(args[1:])):
+                return True, "multi-word value glued to a short option is unreadable; put a space after the option"
 
             if base_command == "git" and args:
                 git_reason = dangerous_git_config(args)
