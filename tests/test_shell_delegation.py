@@ -859,7 +859,7 @@ class TestBase64DecodeAtCommandPosition:
             # The other coreutils base-N decoders.
             "$(base32 -d x)",
             "$(basenc --base64 -d x)",
-            # Expert panel: the decode moves off the first word and bash still runs it. An empty
+            # The decode moves off the first word and bash still runs it. An empty
             # bare expansion is dropped, and a wrapper executes its operand.
             "$(true) $(base64 -d x)",
             "$EMPTY $(base64 -d x)",
