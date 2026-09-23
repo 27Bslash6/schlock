@@ -1,10 +1,13 @@
 """Top-level under-block fixes: pipe-to-shell + git -c exec (security)."""
 
+import time
+
 import pytest
 
+from schlock.core import validator as validator_module
 from schlock.core.parser import _reads_stdin_as_program
 from schlock.core.rules import RiskLevel
-from schlock.core.substitution import dangerous_find, dangerous_git_config, dangerous_kubectl
+from schlock.core.substitution import awk_command_pipe, dangerous_find, dangerous_git_config, dangerous_kubectl
 from schlock.core.validator import validate_command
 
 
@@ -84,6 +87,65 @@ class TestTopLevelGitC:
 
     def test_fsmonitor_boolean_not_blocked_top_level(self):
         assert validate_command("git -c core.fsmonitor=true status").risk_level != RiskLevel.BLOCKED
+
+
+class TestTopLevelAwkCommandPipe:
+    """LAB-4832: awk `print | c` / `c | getline` runs a command; at top level that is BLOCKED."""
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk 'BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; c | getline l; print l}' 'id'",
+            'awk \'BEGIN{print "rm -rf /" | "sh"}\'',  # literal target: no backstop either
+            "awk '{printf \"%s\\n\", $0 | cmd}' f",
+            "awk '{print $0 |& c}' f",  # gawk coprocess
+            "gawk 'BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /'",
+            "/usr/bin/awk '{print | c}' f",
+            'awk \'/"/ {print 1 | c; x = "a"}\' f',  # quote in a regex must not pair with a later one
+            "awk '{print ($1+$2)/2 | c}' f",  # division, not a regex literal hiding the pipe
+        ],
+    )
+    def test_command_pipe_blocks(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk -F'|' '{print $1}' f",
+            "awk '$1 || $2 {print}' f",
+            "awk '/error|warn/ {print}' f",
+            "awk '{if ($1 ~ /foo|bar/) print $2}' f",
+            "awk '{print $1 \"|\" $2}' f",
+            "awk '{print}' f | sort",
+            "awk '{print > \"out.txt\"}' f",  # file write: not an exec, out of scope at top level
+            "awk -f prog.awk f",
+            "awk '{while ((getline l < \"f\") > 0) print l}' f",  # getline from a file
+        ],
+    )
+    def test_non_exec_awk_not_blocked(self, command):
+        assert validate_command(command).risk_level != RiskLevel.BLOCKED
+
+    def test_system_stays_high(self):
+        """The command-pipe check must not change the existing system() rating (HIGH, ask)."""
+        assert validate_command("awk 'BEGIN{system(\"id\")}'").risk_level == RiskLevel.HIGH
+
+    def test_helper(self):
+        assert awk_command_pipe(["awk", "{print | c}"]) is not None
+        assert awk_command_pipe(["awk", "$1 || $2 {print}"]) is None
+
+    @pytest.mark.parametrize("program", ['"' + '\\"' * 40000, "(/" + "\\/" * 40000])
+    def test_literal_scan_is_linear(self, program):
+        """An unclosed literal must not rescan from every quote: the quadratic form took ~11s."""
+        start = time.perf_counter()
+        awk_command_pipe(["awk", program])
+        assert time.perf_counter() - start < 0.5
 
 
 class TestReadsStdinAsProgram:

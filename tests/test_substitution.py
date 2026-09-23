@@ -2570,6 +2570,9 @@ class TestDangerousAwkHelper:
             ["awk", "NR>1 {print $2}"],  # numeric comparison, not a redirect
             ["awk", "-v", "n=3", "{print $n}"],
             ["awk", "-F|", "{print $1}"],  # pipe as field separator, not pipe-to-command
+            ["awk", "$1 || $2 {print}"],  # logical OR, not a pipe (LAB-4832)
+            ["awk", "/error|warn/ {print}"],  # regex alternation, not a pipe
+            ["awk", '{print $1 "|" $2}'],  # a pipe character inside a string literal
         ],
     )
     def test_safe_awk(self, args):
@@ -2592,10 +2595,26 @@ class TestDangerousAwkHelper:
             ["awk", "-i", "inplace", "{print}"],
             ["awk", "-l", "ext", "{}"],
             ["awk", "-E", "prog.awk"],
+            # LAB-4832: the pipe target is a variable, so no string literal sits beside the `|`
+            ["awk", "BEGIN{c=ARGV[1]; print 1 | c}"],
+            ["awk", "{print | cmd}"],
+            ["awk", "BEGIN{c=ARGV[1]; c | getline l}"],
         ],
     )
     def test_dangerous_awk(self, args):
         assert dangerous_awk(args) is not None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /')\"",
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; c | getline l; print l}' 'id')\"",
+        ],
+    )
+    def test_variable_pipe_target_blocked_in_substitution(self, command, monkeypatch):
+        """LAB-4832: the payload sits in a quoted argument, so no YAML rule backstops the scan."""
+        monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+        assert validate_command(command).allowed is False
 
 
 class TestDangerousSedHelper:

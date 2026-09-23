@@ -510,14 +510,12 @@ def dangerous_find(args: list[str]) -> str | None:
 # awk constructs that execute commands or write files from inside the program text. Blunt regex
 # scan over ALL args (program text, -v values, separators alike): over-blocking a rare string
 # comparison like `$1 > "m"` inside a substitution is acceptable; missing system()/pipe-to-command/
-# file writes is not. Known ceiling: a pipe/redirect target held in a VARIABLE (`print | c`) evades
-# this text scan — the parser's pipe-to-shell layer and YAML rules remain as backstops. See #104.
+# file writes is not. Pipes to a command — literal, VARIABLE (`print | c`) or gawk `|&` — are
+# caught by awk_command_pipe below, not here. Known ceiling: a redirect target held in a variable
+# (`print > f`) still evades this scan — a file write, not an exec. See #104.
 _AWK_DANGEROUS_TEXT = re.compile(
     r"system\s*\("  # system("cmd") — arbitrary exec
     r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
-    r'|\|\s*"'  # print | "cmd" — pipe to a command
-    r'|"\s*\|'  # "cmd" | … — command string on the left of a pipe
-    r"|\|&"  # gawk |& coprocess
     r'|>\s*"'  # print > "file" / >> "file" — file write from inside awk
     r"|@load|@include"  # gawk: load extension / include external source
 )
@@ -525,6 +523,34 @@ _AWK_DANGEROUS_TEXT = re.compile(
 # awk flags that load external program code (contents unknown -> fail closed) or enable writes.
 # Prefix match covers attached forms (-fprog.awk). Case-sensitive: -F (field separator) is safe.
 _AWK_DANGEROUS_FLAG_PREFIXES = ("-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec")
+
+
+# One leftmost-match pass over awk's two literal forms, so a quote inside a regex literal (`/"/`)
+# cannot pair with a later quote and swallow real code. A `/` opens a regex only where awk expects
+# an operand (after these chars or at the start); after an identifier, number, `)` or `]` it is
+# division and stays code. Mis-reading a regex as code only over-blocks. Both literals are line-
+# bounded and may run unclosed to the newline (a syntax error to awk, so nothing runs): that keeps
+# the scan linear — a closing delimiter that never comes cannot trigger a rescan from every quote.
+_AWK_LITERAL = re.compile(r'"(?:[^"\\\n]|\\.)*"?|(?:^|(?<=[(,~!{};&|?:=}\n]))\s*/(?:[^/\\\n]|\\.)*/?')
+# awk has no bitwise OR: outside literals a lone `|` is always a command pipe (`print | cmd`,
+# `cmd | getline`, gawk `|&`), whatever expression names the command.
+_AWK_LONE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
+# Every awk pipe needs one of these, so an arg without them is not program text (`-F|`, `OFS=|`).
+_AWK_PIPE_KEYWORD = re.compile(r"\b(?:printf?|getline)\b")
+
+
+def awk_command_pipe(args: list[str]) -> str | None:
+    """Return a reason if an awk program pipes output to, or reads from, a command, else None.
+
+    Target-agnostic, so `print | c` with `c` from ARGV is caught where the literal-anchored
+    _AWK_DANGEROUS_TEXT misses it. Used by dangerous_awk (substitution) and by the top-level
+    validator (BLOCKED), where the payload sits in a quoted arg no YAML rule can see. LAB-4832.
+    """
+    for arg in args:
+        code = _AWK_LITERAL.sub('""', arg)
+        if _AWK_PIPE_KEYWORD.search(code) and _AWK_LONE_PIPE.search(code):
+            return "awk program pipes to or from a command (print | cmd, cmd | getline)"
+    return None
 
 
 def dangerous_awk(args: list[str]) -> str | None:
@@ -537,7 +563,7 @@ def dangerous_awk(args: list[str]) -> str | None:
             return f"awk {arg} loads external program code or enables writes"
         if _AWK_DANGEROUS_TEXT.search(arg):
             return "awk program executes commands or writes files (system/getline/pipe/redirect)"
-    return None
+    return awk_command_pipe(args)
 
 
 # sed is allowed inside substitution only in a conservative read-only form: clusterable boolean
@@ -1560,8 +1586,8 @@ class SubstitutionValidator:
                     return True, kubectl_reason
 
             # awk/sed are whitelisted as read-only pipeline stages but carry exec/write escape
-            # hatches (awk system()/getline/pipes, sed -i/-f/e/w commands) — same contextual
-            # pattern as find above. See #104.
+            # hatches (awk system()/getline/pipes to a literal or variable command, sed -i/-f/e/w
+            # commands) — same contextual pattern as find above. See #104, LAB-4832.
             if base_command == "awk" and args:
                 awk_reason = dangerous_awk(args)
                 if awk_reason:
