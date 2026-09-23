@@ -693,15 +693,12 @@ def _echo_arg(command: str) -> str:
 
 @pytest.fixture(scope="module")
 def real_bash() -> str:
-    """The installed bash, skipped when it predates `\\u` / `\\U` (bash 4.2): macOS's /bin/bash 3.2 reads them literally."""
+    """The installed bash, skipped when it reads `\\u` / `\\U` literally (bash < 4.2, e.g. macOS's /bin/bash 3.2)."""
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("no bash to ask")
-    version = subprocess.run(  # noqa: S603
-        [bash, "-c", 'printf "%s %s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}"'], capture_output=True, text=True, check=True
-    ).stdout.split()
-    if tuple(int(part) for part in version) < (4, 2):
-        pytest.skip("bash < 4.2 has no \\u / \\U escapes")
+    if subprocess.run([bash, "-c", r"printf %s $'\u41'"], capture_output=True, check=True).stdout != b"A":  # noqa: S603
+        pytest.skip("this bash has no \\u / \\U escapes")
     return bash
 
 
