@@ -59,7 +59,7 @@ class TestSelfProtectDecide:
     @pytest.mark.parametrize(
         "tool_name,tool_input",
         [
-            # A swapped parser binary is a global under-block (LAB-531): every rule reads its AST.
+            # A swapped parser binary is a global under-block: every rule reads its AST.
             ("Write", {"file_path": ".claude-plugin/bin/linux-amd64/schlock-parse", "content": "x"}),
             ("Write", {"file_path": "/p/schlock/0.9.3/.claude-plugin/bin/darwin-arm64/schlock-parse", "content": "x"}),
             ("Edit", {"file_path": "/p/.claude-plugin/bin/MANIFEST.json", "new_string": "x", "old_string": "y"}),

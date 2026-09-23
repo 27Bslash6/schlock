@@ -7,7 +7,7 @@ under a hard output bound and a hard deadline. Turning that JSON into an
 machine that decides what happens when this bridge raises is
 `parser.TieredParser` (spec §6).
 
-Two invariants carry the security weight here:
+Three invariants carry the security weight here:
 
 1. **Bounded read, not `capture_output`.** `subprocess.run(capture_output=True)`
    buffers stdout without limit. This bridge runs behind a PreToolUse hook on
@@ -18,9 +18,28 @@ Two invariants carry the security weight here:
    command. Returning the bytes we did read would hand the walkers a prefix AST
    with a trailing `; rm -rf /` silently dropped, so every non-zero exit raises
    and the accumulated output is discarded (spec §3.1, §11 finding 10).
+3. **Never exec an unverified binary.** A swapped `schlock-parse` that emits a
+   benign AST defeats every rule at once, so the resolved binary's SHA-256 must
+   equal the digest `MANIFEST.json` records for this platform before the first
+   spawn; a mismatch, or no digest at all, raises → bashlex with a warning
+   (spec §6 row 2, §7).
+
+What the hash check does NOT catch, and what does (spec §7):
+- A malicious commit that updates the binary AND its MANIFEST entry together —
+  the hash then matches. The CI job that rebuilds from pinned source and asserts
+  byte-equality with the committed binary (spec §9 T9) covers that.
+- A write that lands both files in the installed plugin. The MANIFEST sits in the
+  same `.claude-plugin/bin/` the self-protection layers block writes to
+  (validator SELF_PROTECTION_PATHS, hooks/self_protect.py, the
+  schlock_plugin_binary_write rule); the hash check is the backstop for a swap
+  that got past them, not a replacement for them.
+- A swap racing the gap between hashing and spawning. The check is on the file at
+  rest; a concurrent writer is already running code outside schlock.
 """
 
 import contextlib
+import hashlib
+import json
 import os
 import platform
 import signal
@@ -32,6 +51,7 @@ from typing import Optional
 from schlock.exceptions import ParseError
 
 BINARY_NAME = "schlock-parse"
+MANIFEST_NAME = "MANIFEST.json"
 
 # Vendored binaries live beside the plugin manifest (spec §7); same root walk as
 # validator.py's project_root.
@@ -96,21 +116,51 @@ def platform_dir() -> str:
 
 
 def resolve_binary(bin_root: Optional[Path] = None) -> Path:
-    """Locate the vendored `schlock-parse` for this platform.
+    """Locate the vendored `schlock-parse` for this platform and verify it against MANIFEST.json.
 
     Raises:
-        NativeBridgeError: platform unsupported, binary absent, or not executable.
-            Never returns None — a missing parser must surface as a failure the
-            fallback chain can see, not as a silent allow.
+        NativeBridgeError: platform unsupported, binary absent, not executable, or not
+            the binary MANIFEST.json records. Never returns None — a missing or swapped
+            parser must surface as a failure the fallback chain can see, not as a silent
+            allow.
     """
     root = DEFAULT_BIN_ROOT if bin_root is None else bin_root
     suffix = ".exe" if platform.system().lower() == "windows" else ""
-    path = root / platform_dir() / f"{BINARY_NAME}{suffix}"
+    key = f"{platform_dir()}/{BINARY_NAME}{suffix}"
+    path = root / key
     if not path.is_file():
         raise NativeBridgeError(f"native parser binary not found: {path}")
     if not os.access(path, os.X_OK):
         raise NativeBridgeError(f"native parser binary not executable: {path}")
+    _verify_digest(path, root / MANIFEST_NAME, key)
     return path
+
+
+def _verify_digest(path: Path, manifest: Path, key: str) -> None:
+    """Raise unless `path`'s SHA-256 is the digest `manifest` records under `key` (spec §7).
+
+    Fails closed: an absent or unreadable MANIFEST, or one without this platform's entry, is
+    an integrity failure, never "nothing to check".
+    """
+    try:
+        expected = json.loads(manifest.read_text(encoding="utf-8"))["binaries"][key]
+    except (OSError, ValueError, LookupError, TypeError) as exc:
+        raise NativeBridgeError(f"no MANIFEST SHA-256 for {key} in {manifest}: {exc!r}; refusing to execute {path}")
+    digest = hashlib.sha256()
+    try:
+        # Chunked, not read_bytes(): copying 2.4 MB into a fresh hook process's heap cost
+        # ~1 ms of the ~2.6 ms check (measured cold, median).
+        with path.open("rb") as binary:
+            for chunk in iter(lambda: binary.read(_READ_CHUNK_SIZE), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise NativeBridgeError(f"cannot hash native parser binary {path}: {exc}")
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise NativeBridgeError(
+            f"native parser binary failed its integrity check (possible tampering): SHA-256 of {path} is "
+            f"{actual}, MANIFEST records {expected!r}; refusing to execute it"
+        )
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -132,8 +182,9 @@ class NativeBridge:
     """Runs `schlock-parse` and returns its raw typed-JSON AST.
 
     Args:
-        binary_path: explicit binary, bypassing platform resolution (tests, and
-            T5's forced-tier switch).
+        binary_path: explicit binary, bypassing platform resolution AND the MANIFEST
+            check — the caller vouches for it. Tests only; production (`TieredParser`)
+            always resolves.
         max_ast_json_size: output bound in bytes; overflow kills the child.
         timeout: seconds the exchange may take before the child is killed (spec §6).
     """
@@ -149,11 +200,13 @@ class NativeBridge:
         self._timeout = timeout
 
     def _binary(self) -> Path:
-        # Resolved lazily and cached on success only, so a machine without a
-        # vendored binary keeps raising (→ fallback) instead of caching a lie.
-        # T6 (binary integrity) inserts the MANIFEST SHA-256 check here, before the
-        # path is cached: a mismatch raises NativeBridgeError → bashlex with a
-        # warning (spec §6 row 2). The tier machine already routes and logs it.
+        # Resolved — and SHA-256-verified against MANIFEST.json — lazily at the first exec,
+        # and cached on success only, so a missing or tampered binary keeps raising
+        # (→ bashlex with a warning, spec §6 row 2) instead of caching a lie.
+        # ponytail: verified once per bridge, i.e. once per hook process (T8 holds one), not
+        # once per spawn. The check costs ~1.7 ms cold against a ~2-3 ms spawn; a swap
+        # between two spawns inside one short-lived hook needs a concurrent writer, which
+        # already runs code outside schlock. Re-verify per spawn if the bridge goes long-lived.
         if self._binary_path is None:
             self._binary_path = resolve_binary()
         return self._binary_path

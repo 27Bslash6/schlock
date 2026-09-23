@@ -5,16 +5,22 @@ and the exit-code contract of tools/schlock-parse. Nothing here asserts on the
 shape of the typed-JSON beyond "it decodes" — mapping it to an AstView is T2b.
 """
 
+import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
+from schlock.core import native_bridge
 from schlock.core.native_bridge import (
+    BINARY_NAME,
+    DEFAULT_BIN_ROOT,
     MAX_AST_JSON_SIZE,
     MAX_COMMAND_SIZE,
     NATIVE_TIMEOUT,
@@ -86,6 +92,117 @@ class TestBinaryResolution:
         bridge = NativeBridge(binary_path=tmp_path / "absent")
         with pytest.raises(NativeBridgeError):
             bridge.parse_json("echo hi")
+
+
+def _vendor(root: Path, content: bytes, digest: Optional[str] = None) -> Path:
+    """Lay out `root` like .claude-plugin/bin/: this platform's binary plus a MANIFEST for it."""
+    path = root / platform_dir() / BINARY_NAME
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    path.chmod(0o755)
+    entry = hashlib.sha256(content).hexdigest() if digest is None else digest
+    manifest = {"schema": 1, "binaries": {f"{platform_dir()}/{BINARY_NAME}": entry}}
+    (root / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return path
+
+
+class TestBinaryIntegrity:
+    """Spec §7: never exec a binary whose SHA-256 is not the one MANIFEST.json records."""
+
+    STAND_IN = b"#!/bin/sh\necho '{}'\n"
+
+    def test_matching_digest_resolves(self, tmp_path):
+        path = _vendor(tmp_path, self.STAND_IN)
+        assert resolve_binary(bin_root=tmp_path) == path
+
+    def test_bit_flipped_binary_raises(self, tmp_path):
+        path = _vendor(tmp_path, self.STAND_IN)
+        tampered = bytearray(path.read_bytes())
+        tampered[len(tampered) // 2] ^= 0x01
+        path.write_bytes(bytes(tampered))
+        with pytest.raises(NativeBridgeError, match="SHA-256"):
+            resolve_binary(bin_root=tmp_path)
+
+    @needs_binary
+    def test_bit_flipped_vendored_binary_raises(self, tmp_path):
+        # The acceptance case on the real artefact: a copy of the shipped binary, one bit flipped.
+        real = resolve_binary()
+        path = tmp_path / platform_dir() / real.name
+        path.parent.mkdir()
+        tampered = bytearray(real.read_bytes())
+        tampered[len(tampered) // 2] ^= 0x01
+        path.write_bytes(bytes(tampered))
+        path.chmod(0o755)
+        shutil.copy(DEFAULT_BIN_ROOT / "MANIFEST.json", tmp_path / "MANIFEST.json")
+        with pytest.raises(NativeBridgeError, match="SHA-256"):
+            resolve_binary(bin_root=tmp_path)
+
+    def test_missing_manifest_raises(self, tmp_path):
+        _vendor(tmp_path, self.STAND_IN)
+        (tmp_path / "MANIFEST.json").unlink()
+        with pytest.raises(NativeBridgeError, match="MANIFEST"):
+            resolve_binary(bin_root=tmp_path)
+
+    @pytest.mark.parametrize(
+        "manifest",
+        [
+            '{"schema": 1, "binaries": {"plan9-386/schlock-parse": "00"}}',  # no entry for this platform
+            '{"schema": 1, "binaries": {}}',
+            '{"schema": 1}',
+            '{"schema": 1, "binaries": ["schlock-parse"]}',
+            "[]",
+            "not json",
+            "",
+        ],
+    )
+    def test_manifest_without_this_platforms_digest_raises(self, tmp_path, manifest):
+        # Fail closed: no recorded digest is an integrity failure, never "nothing to check".
+        _vendor(tmp_path, self.STAND_IN)
+        (tmp_path / "MANIFEST.json").write_text(manifest, encoding="utf-8")
+        with pytest.raises(NativeBridgeError, match="MANIFEST"):
+            resolve_binary(bin_root=tmp_path)
+
+    def test_non_string_digest_raises(self, tmp_path):
+        _vendor(tmp_path, self.STAND_IN)
+        (tmp_path / "MANIFEST.json").write_text(
+            json.dumps({"binaries": {f"{platform_dir()}/{BINARY_NAME}": None}}), encoding="utf-8"
+        )
+        with pytest.raises(NativeBridgeError, match="SHA-256"):
+            resolve_binary(bin_root=tmp_path)
+
+    def test_tampered_binary_is_never_executed(self, tmp_path, monkeypatch, spawned):
+        _vendor(tmp_path, self.STAND_IN, digest="0" * 64)
+        monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
+        with pytest.raises(NativeBridgeError, match="SHA-256"):
+            NativeBridge().parse_json("echo hi")
+        assert spawned == []
+
+    def test_check_runs_at_first_exec_not_construction(self, tmp_path, monkeypatch, spawned):
+        # The check sits in the exec path: a swap after the bridge is built is still caught.
+        path = _vendor(tmp_path, self.STAND_IN)
+        monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
+        bridge = NativeBridge()
+        path.write_bytes(b"#!/bin/sh\necho swapped\n")
+        with pytest.raises(NativeBridgeError, match="SHA-256"):
+            bridge.parse_json("echo hi")
+        assert spawned == []
+
+    def test_verified_binary_is_executed(self, tmp_path, monkeypatch, spawned):
+        _vendor(tmp_path, self.STAND_IN)
+        monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
+        assert NativeBridge().parse_json("echo hi").strip() == "{}"
+        assert len(spawned) == 1
+
+    def test_vendored_binary_matches_its_manifest(self):
+        # needs_binary skips when resolve_binary raises, so a stale MANIFEST would silently skip
+        # the whole native suite. Fail loudly instead whenever a binary is vendored here.
+        try:
+            relative = f"{platform_dir()}/{BINARY_NAME}{'.exe' if platform.system().lower() == 'windows' else ''}"
+        except NativeBridgeError:
+            pytest.skip("no native tier for this platform")
+        if not (DEFAULT_BIN_ROOT / relative).is_file():
+            pytest.skip("no vendored schlock-parse binary for this platform")
+        assert resolve_binary() == DEFAULT_BIN_ROOT / relative
 
 
 @needs_binary

@@ -120,16 +120,19 @@ class TestFailureTableLandsOnBashlex:
         payload["Stmts"][0]["Cmd"]["Type"] = "FrobExpr"
         assert _is_bashlex(_auto(fake_binary(_emit(payload))).parse("echo hi"))
 
-    def test_integrity_failure_at_the_binary_site_falls_back_and_warns(self, monkeypatch, caplog):
-        # Spec §6 row 2. T6 raises at NativeBridge._binary() (MANIFEST SHA-256 mismatch); the
-        # router needs no new code for it — this pins that the site is already routed and logged.
-        def tampered(self):
-            raise NativeBridgeError("MANIFEST SHA-256 mismatch for schlock-parse")
-
-        monkeypatch.setattr(NativeBridge, "_binary", tampered)
+    def test_tampered_binary_falls_back_and_warns_without_executing(self, tmp_path, monkeypatch, caplog, spawned):
+        # Spec §6 row 2: a vendored binary whose SHA-256 is not MANIFEST's is never spawned.
+        binary = tmp_path / native_bridge.platform_dir() / native_bridge.BINARY_NAME
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\necho '{}'\n", encoding="utf-8")
+        binary.chmod(0o755)
+        manifest = {"binaries": {f"{native_bridge.platform_dir()}/{native_bridge.BINARY_NAME}": "0" * 64}}
+        (tmp_path / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+        monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
         with caplog.at_level(logging.WARNING, logger=LOGGER):
             assert _is_bashlex(TieredParser(tier="auto").parse("echo hi"))
-        assert any("mismatch" in r.getMessage() for r in caplog.records)
+        assert spawned == []
+        assert any("integrity check" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
 
     def test_bashlex_also_failing_raises_parse_error(self, fake_binary):
         # Terminal row: no tier left, so ParseError → validator.py → BLOCKED. The message is

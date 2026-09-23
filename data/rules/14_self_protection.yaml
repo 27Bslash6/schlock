@@ -66,7 +66,7 @@ rules:
 
   # Block writes into the plugin's native parser binaries + MANIFEST (bin/) and its vendored
   # Python deps (vendor/). Every rule reads the AST they produce, so a swapped parser is a
-  # global under-block (LAB-531). The native bridge also hashes the binary against MANIFEST
+  # global under-block. The native bridge also hashes the binary against MANIFEST
   # before each exec; this rule stops the swap, the hash check catches one that got through.
   - name: schlock_plugin_binary_write
     description: "Self-protection: Write to schlock's vendored parser binaries or dependencies"

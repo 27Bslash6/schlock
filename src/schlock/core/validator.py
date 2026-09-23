@@ -734,7 +734,7 @@ def _check_contextual_high_risk(
 
 # SELF-PROTECTION: Paths that identify schlock configuration files, and the plugin directories
 # holding the native parser binaries + MANIFEST (bin/) and the vendored Python deps (vendor/) —
-# a swap of either is a global under-block, since every rule reads what they parse (LAB-531).
+# a swap of either is a global under-block, since every rule reads what they parse (spec §7).
 # A directory entry covers everything beneath it. Any command containing these paths is subject
 # to allowlist enforcement. hooks/self_protect.py keeps a copy (test_self_protect.py syncs them).
 SELF_PROTECTION_PATHS = (
