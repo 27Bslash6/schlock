@@ -241,8 +241,10 @@ def may_expand(word: str) -> bool:
     return word[:1] in _UNFIXED_OPERAND_STARTS
 
 
-# Tokens that explicitly designate STDIN as the program source.
-_STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+# Tokens that explicitly designate STDIN as the program source. `/proc/thread-self/fd/0` is the
+# per-thread alias of `/proc/self/fd/0`; both resolve to fd 0, so leaving it out let it read as a
+# literal script and exempt on every interpreter (LAB-3522).
+_STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "/proc/thread-self/fd/0"})
 
 # Multicall binaries dispatch to an applet named by their first positional arg
 # (`busybox sh`, `toybox cat`). Classify the pipeline stage by the resolved applet, not the

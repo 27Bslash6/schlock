@@ -909,6 +909,12 @@ class TestSourceReadsStdinAsProgram:
             'builtin source /dev/stdin <<< "rm -rf /"',
             'echo "rm -rf /" | builtin . /dev/stdin',
             'command . /dev/stdin <<< "rm -rf /"',
+            # LAB-3522: /proc/thread-self/fd/0 is the Linux thread alias of /proc/self/fd/0 and
+            # names the same stdin - it must classify identically on every interpreter.
+            'source /proc/thread-self/fd/0 <<< "rm -rf /"',
+            '. /proc/thread-self/fd/0 <<< "rm -rf /"',
+            'bash /proc/thread-self/fd/0 <<< "rm -rf /"',
+            'echo "rm -rf /" | source /proc/thread-self/fd/0',
         ],
     )
     def test_denied(self, command):
