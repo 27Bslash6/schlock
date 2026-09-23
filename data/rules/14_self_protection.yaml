@@ -63,3 +63,21 @@ rules:
     alternatives:
       - "Edit schlock configuration manually outside of Claude Code"
       - "Use /schlock:setup to configure schlock interactively"
+
+  # Block writes into the plugin's native parser binaries + MANIFEST (bin/) and its vendored
+  # Python deps (vendor/). Every rule reads the AST they produce, so a swapped parser is a
+  # global under-block (LAB-531). The native bridge also hashes the binary against MANIFEST
+  # before each exec; this rule stops the swap, the hash check catches one that got through.
+  - name: schlock_plugin_binary_write
+    description: "Self-protection: Write to schlock's vendored parser binaries or dependencies"
+    risk_level: BLOCKED
+    patterns:
+      # Output redirect (> or >>)
+      - '>>?\s*\S*\.claude-plugin/(bin|vendor)\b'
+      # Copy/move/link, delete, permissions, raw write, archive extraction, download
+      - '\b(tee|cp|mv|install|ln|rsync|dd|rm|unlink|truncate|shred|chmod|chown|chattr|tar|unzip|curl|wget)\b.*\.claude-plugin/(bin|vendor)\b'
+      # In-place edit (short and GNU long-form flags)
+      - '\b(sed|perl)\b[^|]*(-i|--in-?place|-pi).*\.claude-plugin/(bin|vendor)\b'
+    alternatives:
+      - "Rebuild the parser binaries with tools/schlock-parse/build.sh outside Claude Code"
+      - "Reinstall the plugin: /plugin install schlock@schlock"

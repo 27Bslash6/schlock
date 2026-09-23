@@ -27,20 +27,26 @@ import sys
 from typing import Optional
 
 # Keep in sync with schlock.core.validator.SELF_PROTECTION_PATHS (enforced by test_self_protect.py).
-SELF_PROTECTION_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
+# The two .claude-plugin entries are directories: the parser binaries + MANIFEST, and vendored deps.
+SELF_PROTECTION_PATHS = (
+    "schlock-config.yaml",
+    ".config/schlock/config.yaml",
+    ".claude-plugin/bin",
+    ".claude-plugin/vendor",
+)
 
 # File-mutating tools whose target path is checked against the protected config files.
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 
 _DENY_REASON = (
-    "BLOCKED: Modification of schlock safety configuration is not allowed.\n"
+    "BLOCKED: Modification of schlock safety configuration or its vendored parser files is not allowed.\n"
     "Edit configuration manually outside of Claude Code, "
     "or use /schlock:setup to configure interactively."
 )
 
 
 def _targets_protected(path: str) -> bool:
-    """True if a file path resolves to a protected schlock config file.
+    """True if a file path resolves to a protected schlock config file or plugin directory.
 
     Normalizes BOTH sides with normcase(normpath(...)) so the suffix check is correct on
     every platform: normpath collapses '..' and '//' and (on Windows) rewrites '/' to the
@@ -49,18 +55,16 @@ def _targets_protected(path: str) -> bool:
     '.../schlock/../schlock/config.yaml' OR a Windows-style backslash/drive-letter path
     can't slip past — the latter previously did, because a hard-coded '/' suffix never
     matches normpath's backslash output on Windows. normpath/normcase are pure string
-    manipulation — no filesystem access, so no TOCTOU. Suffix match (not substring) so
-    'not-schlock-config.yaml-backup' does NOT match, while both the bare filename and an
-    absolute '.../.config/schlock/config.yaml' do.
+    manipulation — no filesystem access, so no TOCTOU. Whole-component match (not substring)
+    so 'not-schlock-config.yaml-backup' and '.claude-plugin/binary.md' do NOT match, while the
+    bare filename, an absolute '.../.config/schlock/config.yaml' and anything beneath
+    '.claude-plugin/bin/' do: the protected components must appear as one contiguous run.
     """
     if not path:
         return False
-    norm = os.path.normcase(os.path.normpath(path))
-    for protected in SELF_PROTECTION_PATHS:
-        protected_norm = os.path.normcase(os.path.normpath(protected))
-        if norm == protected_norm or norm.endswith(os.path.sep + protected_norm):
-            return True
-    return False
+    sep = os.path.sep
+    norm = sep + os.path.normcase(os.path.normpath(path)) + sep
+    return any(sep + os.path.normcase(os.path.normpath(p)) + sep in norm for p in SELF_PROTECTION_PATHS)
 
 
 def decide(input_data: dict) -> Optional[dict]:

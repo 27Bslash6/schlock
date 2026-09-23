@@ -732,10 +732,17 @@ def _check_contextual_high_risk(
     return None
 
 
-# SELF-PROTECTION: Paths that identify schlock configuration files.
-# Any command containing these paths is subject to allowlist enforcement.
-# Also imported by hooks/pre_tool_use.py for hook-level self-protection.
-SELF_PROTECTION_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
+# SELF-PROTECTION: Paths that identify schlock configuration files, and the plugin directories
+# holding the native parser binaries + MANIFEST (bin/) and the vendored Python deps (vendor/) —
+# a swap of either is a global under-block, since every rule reads what they parse (LAB-531).
+# A directory entry covers everything beneath it. Any command containing these paths is subject
+# to allowlist enforcement. hooks/self_protect.py keeps a copy (test_self_protect.py syncs them).
+SELF_PROTECTION_PATHS = (
+    "schlock-config.yaml",
+    ".config/schlock/config.yaml",
+    ".claude-plugin/bin",
+    ".claude-plugin/vendor",
+)
 
 
 def _matches_protected_path(text: str) -> bool:
@@ -754,9 +761,10 @@ def _matches_protected_path(text: str) -> bool:
                 break
             # Character before must be path separator, whitespace, quote, or start
             before_ok = idx == 0 or text[idx - 1] in " \t\n\"'(,;|&>=/"
-            # Character after must be whitespace, quote, punctuation, or end
+            # Character after must be whitespace, quote, punctuation, a path separator
+            # (a directory entry's contents), or end
             end = idx + len(path)
-            after_ok = end >= len(text) or text[end] in " \t\n\"'(),;|&>"
+            after_ok = end >= len(text) or text[end] in " \t\n\"'(),;|&>/"
             if before_ok and after_ok:
                 return True
             idx += 1
@@ -887,7 +895,7 @@ def _make_self_protection_result(command: str) -> ValidationResult:
     return ValidationResult(
         allowed=False,
         risk_level=RiskLevel.BLOCKED,
-        message="BLOCKED: Modification of schlock safety configuration is not allowed",
+        message="BLOCKED: Modification of schlock safety configuration or its vendored parser files is not allowed",
         alternatives=[
             "Edit schlock configuration manually outside of Claude Code",
             "Use /schlock:setup to configure schlock interactively",

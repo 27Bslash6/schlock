@@ -56,6 +56,38 @@ class TestSelfProtectDecide:
     def test_allows_non_config_writes(self, tool_name, tool_input):
         assert decide({"tool_name": tool_name, "tool_input": tool_input}) is None
 
+    @pytest.mark.parametrize(
+        "tool_name,tool_input",
+        [
+            # A swapped parser binary is a global under-block (LAB-531): every rule reads its AST.
+            ("Write", {"file_path": ".claude-plugin/bin/linux-amd64/schlock-parse", "content": "x"}),
+            ("Write", {"file_path": "/p/schlock/0.9.3/.claude-plugin/bin/darwin-arm64/schlock-parse", "content": "x"}),
+            ("Edit", {"file_path": "/p/.claude-plugin/bin/MANIFEST.json", "new_string": "x", "old_string": "y"}),
+            ("Write", {"file_path": "/p/.claude-plugin/bin", "content": "x"}),  # the directory itself
+            ("Write", {"file_path": "/p/.claude-plugin/bin/../bin/linux-amd64/schlock-parse", "content": "x"}),
+            # Vendored Python (bashlex, yaml) runs inside the hook: same stakes.
+            ("MultiEdit", {"file_path": "/p/.claude-plugin/vendor/bashlex/parser.py", "edits": []}),
+            ("NotebookEdit", {"notebook_path": "/p/.claude-plugin/vendor/x.ipynb", "new_source": "x"}),
+        ],
+    )
+    def test_blocks_write_to_vendored_binaries(self, tool_name, tool_input):
+        result = decide({"tool_name": tool_name, "tool_input": tool_input})
+        assert result is not None
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            ".claude-plugin/plugin.json",
+            ".claude-plugin/binary-notes.md",  # component prefix, not the bin/ directory
+            ".claude-plugin/vendored.txt",
+            "/usr/local/bin/tool",  # a bin/ that is not the plugin's
+            "tools/schlock-parse/main.go",
+        ],
+    )
+    def test_allows_writes_beside_vendored_binaries(self, file_path):
+        assert decide({"tool_name": "Write", "tool_input": {"file_path": file_path, "content": "x"}}) is None
+
     @pytest.mark.parametrize("tool_name", ["Bash", "Read", "Grep", "Glob", "WebFetch", "file_write", ""])
     def test_allows_non_write_tools(self, tool_name):
         # Even pointing at a config path, a non-write tool is not this hook's concern.
@@ -143,6 +175,8 @@ class TestSelfProtectWindowsPaths:
             r"project\.claude\hooks\schlock-config.yaml",  # project config, backslash
             ".config/schlock\\config.yaml",  # mixed forward/back separators
             r".CONFIG\SCHLOCK\CONFIG.YAML",  # case-insensitive on Windows (normcase folds)
+            r"C:\Users\u\.claude\plugins\schlock\.claude-plugin\bin\windows-amd64\schlock-parse.exe",
+            r"C:\p\.CLAUDE-PLUGIN\Vendor\yaml\__init__.py",
         ],
     )
     def test_windows_paths_blocked(self, monkeypatch, file_path):

