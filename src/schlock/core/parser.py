@@ -326,8 +326,8 @@ def _nodes_of_kind(node: Any, kind: str) -> "list[Any]":
 def _command_nodes(node: Any) -> "list[Any]":
     """Every command in a group, so a stdin consumer that is not the first (`{ true; bash; }`, a
     while/for/if body) is still seen. A nested function definition's body is counted too: bash can
-    call it without naming it (`trap g EXIT`, `command_not_found_handle`, a computed command word),
-    which `_function_sinks` cannot resolve by name, so over-counting is the fail-closed reading."""
+    call it without naming it (`trap g EXIT`, `command_not_found_handle`, a computed command word), so
+    counting it wherever it is defined is the fail-closed reading."""
     return _nodes_of_kind(node, "command")
 
 
