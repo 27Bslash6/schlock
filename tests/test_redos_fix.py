@@ -12,7 +12,6 @@ import time
 
 import pytest
 
-from schlock.core import validator
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import validate_command
 
@@ -58,6 +57,7 @@ class TestReDoSFix:
         # This is acceptable tradeoff - DoS protection > catching every variant
         # The important thing is that it completes quickly
 
+    @pytest.mark.usefixtures("no_shellcheck")
     @pytest.mark.parametrize(
         "command",
         [
@@ -65,7 +65,7 @@ class TestReDoSFix:
             pytest.param("rm " + "-rf\\; " * 5000 + "x", id="separator-flags"),
         ],
     )
-    def test_redos_rm_pathological(self, safety_rules_path, monkeypatch, command):
+    def test_redos_rm_pathological(self, safety_rules_path, command):
         """rm with 5000 flags: schlock's parse and rule pass must stay linear.
 
         ShellCheck is forced off and the rules load before the clock starts, so the 0.7s
@@ -77,14 +77,11 @@ class TestReDoSFix:
         a target those rules accept. A span widened to ``.*`` therefore backtracks across
         every later token and goes quadratic.
         """
-        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
         validate_command("true", config_path=safety_rules_path)  # load the rules untimed
 
         start = time.time()
         validate_command(command, config_path=safety_rules_path)  # Result unused - testing timing
         elapsed = time.time() - start
-        # Verdicts computed with ShellCheck off must not leak into later tests.
-        validator._global_cache.clear()
 
         assert elapsed < 0.7, f"validating took {elapsed:.3f}s (budget 0.7s)"
 
