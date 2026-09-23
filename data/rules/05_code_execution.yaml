@@ -167,8 +167,13 @@ rules:
       # ${IFS} usage (bypasses space detection)
       - '\$\{IFS\}'
       - '\$IFS'
-      # IFS override (changing field separator)
-      - '\bIFS\s*=\s*[^;\s]+'
+      # IFS override (changing field separator). An EMPTY value (IFS=, IFS='',
+      # IFS="") is exempt: it disables word splitting, so it cannot split an
+      # expansion into hidden words - and `while IFS= read -r line` is the
+      # standard line-reading idiom. No blank after `=`, or `IFS= read` would
+      # match with `read` as the value. A prefix to `read` with a NON-empty
+      # value stays matched: a shell function named `read` inherits it.
+      - '\bIFS\s*=(?!(?:''''|"")(?![^;\s]))[^;\s]+'
       # IFS parameter expansion variants
       - '\$\{IFS[^}]*\}'
     alternatives:
