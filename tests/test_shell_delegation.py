@@ -838,9 +838,6 @@ class TestUnexpandedOperandIsNotAScript:
     - `-c`, and `find -exec` / wrappers that re-enter it: `_dash_c_payload` scans on for the `-c`.
     - heredocs: already covered - a shell's heredoc body is scanned whatever its operands.
 
-    Wrapped pipe sinks (`echo X | timeout 5 bash "$@"`) and wrapped heredocs stay open with every
-    other operand; they are their own gap, not this decision's.
-
     Cost, accepted: `cat data | python3 "$HOME/p.py"` now blocks as pipe-to-interpreter (bashlex
     strips the quotes that would prove it one word). Same friction the value-flag rule already
     accepts for `cat data | python3 -u app.py`. A here-string or `-c` payload is only
