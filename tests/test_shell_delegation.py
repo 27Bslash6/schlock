@@ -967,14 +967,23 @@ class TestShellFunctionStdinSink:
         assert self._here('f() { bash; }; f <<< "rm -rf /"; f() { :; }') == [("bash", "rm -rf /")]
         assert self._pipe('f() { bash; }; echo "rm -rf /" | f; f() { :; }') == ["data piped into shell interpreter: bash"]
 
-    def test_a_definition_runs_nothing_until_called(self):
-        # A nested definition's body runs when IT is called, not when the enclosing function is.
-        assert self._here('f() { g() { bash; }; }; f <<< "rm -rf /"') == []
-        assert self._pipe('f() { g() { bash; }; }; echo "rm -rf /" | f') == []
-        assert self._here('f() { g() { bash; }; g; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
-        assert self._pipe('f() { g() { bash; }; g; }; echo "rm -rf /" | f') == ["data piped into shell interpreter: bash"]
+    def test_nested_definition_counts_toward_the_enclosing_body(self):
+        # DECISION: a nested definition's body is folded into the enclosing function or group. Calling
+        # `f` below only defines `g`, so real bash runs nothing - but bash can also call `g` without
+        # naming it, which the table cannot resolve, so over-counting is the fail-closed reading.
+        assert self._here('f() { g() { bash; }; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._pipe('f() { g() { bash; }; }; echo "rm -rf /" | f') == ["data piped into shell interpreter: bash"]
+        # Each of these runs the payload in real bash through a call that never names `g`.
+        assert self._pipe('echo "rm -rf /" | { g() { bash; }; trap g EXIT; }') == ["data piped into shell interpreter: bash"]
+        assert self._here('{ command_not_found_handle() { bash; }; zzz; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
         # A redirect on the definition itself applies at every call (`f` below runs the payload).
         assert self._here('f() { bash; } <<< "rm -rf /"; f') == [("bash", "rm -rf /")]
+
+    def test_call_by_a_name_the_stage_classifier_cannot_read(self):
+        # bash resolves `f/` to the function; the stage's own name lookup returns nothing for a word
+        # ending in `/`, and dropping that stage skipped rule (2) altogether.
+        assert self._pipe('f/() { bash; }; echo "rm -rf /" | f/') == ["data piped into shell interpreter: bash"]
+        assert self._pipe('f/() { bash; }; echo "rm -rf /" | { f/; }') == ["data piped into shell interpreter: bash"]
 
     @pytest.mark.skipif(not hasattr(signal, "SIGALRM"), reason="needs SIGALRM")
     def test_recursion_reaching_a_shell_terminates(self):

@@ -294,10 +294,9 @@ def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     return cmd_name, args
 
 
-def _nodes_of_kind(node: Any, kind: str, stop: "tuple[str, ...]" = ("command",)) -> "list[Any]":
-    """Every `kind` node reachable from `node`, in source order, never entering a `stop` node - by
-    default a command's own parts (word-level substitutions are validated separately and are not group
-    stdin consumers).
+def _nodes_of_kind(node: Any, kind: str) -> "list[Any]":
+    """Every `kind` node reachable from `node`, in source order, never entering a command's own parts
+    (word-level substitutions are validated separately and are not group stdin consumers).
 
     The ONE walk skeleton behind both stdin-sink surfaces - `_here_string_programs` and the pipe-to-shell
     `check_pipeline` - and the function table that feeds them (`_function_sinks`), so a future bashlex
@@ -310,7 +309,7 @@ def _nodes_of_kind(node: Any, kind: str, stop: "tuple[str, ...]" = ("command",))
             return
         if n.kind == kind:
             found.append(n)
-        if n.kind in stop:
+        if n.kind == "command":
             return
         for attr in ("list", "parts", "command"):
             child = getattr(n, attr, None)
@@ -325,10 +324,11 @@ def _nodes_of_kind(node: Any, kind: str, stop: "tuple[str, ...]" = ("command",))
 
 
 def _command_nodes(node: Any) -> "list[Any]":
-    """Every command a group runs, so a stdin consumer that is not the first (`{ true; bash; }`, a
-    while/for/if body) is still seen. A nested function definition runs nothing - its body runs at a
-    call, which `_function_sinks` resolves - so its commands are not the group's."""
-    return _nodes_of_kind(node, "command", stop=("command", "function"))
+    """Every command in a group, so a stdin consumer that is not the first (`{ true; bash; }`, a
+    while/for/if body) is still seen. A nested function definition's body is counted too: bash can
+    call it without naming it (`trap g EXIT`, `command_not_found_handle`, a computed command word),
+    which `_function_sinks` cannot resolve by name, so over-counting is the fail-closed reading."""
+    return _nodes_of_kind(node, "command")
 
 
 def _function_sinks(ast_nodes: "list[Any]", classify: "Callable[[Any], list[str]]") -> "dict[str, list[str]]":
@@ -1490,7 +1490,9 @@ class BashCommandParser:
                 resolved = [
                     _resolve_multicall(cmd_name, _stage_args(c)) for c in commands if (cmd_name := self._get_command_name(c))
                 ]
-                if resolved:
+                # A function call counts even when `_get_command_name` cannot name it (`f/`, which bash
+                # still resolves to the function) - dropping the stage would skip rule (2) entirely.
+                if resolved or any(_call_name(c) in functions for c in commands):
                     stages.append((resolved, commands))
 
             if len(stages) < 2:
@@ -1500,7 +1502,7 @@ class BashCommandParser:
             # stdin check - so widening it to every command would spread its existing over-block
             # (`git ls-files | python3 check.py`) into every `git ls-files | while read f; do
             # python3 check.py "$f"; done` loop. Rule (2) is the precise check and reads them all.
-            names = [resolved[0][0] for resolved, _ in stages]
+            names = [resolved[0][0] if resolved else "" for resolved, _ in stages]
 
             # (1) Existing remote-code-execution pattern: download tool -> shell interpreter.
             first_cmd = names[0]
