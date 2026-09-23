@@ -2191,18 +2191,23 @@ def validate_command(
     )
     if not deferred:
         return result
-    sub_denial = deferred[0]
-    # The higher level wins. A tie keeps the completed verdict, which names the command's own
-    # rule, but always denied: a HIGH rule match arrives with allowed=True, and the substitution
-    # beside it was still refused. Deciding on `allowed` instead sent every HIGH tie to the
-    # substitution branch, so `rm -r d $(base64 -d f)` lost `recursive_delete` from the audit log.
-    if sub_denial.risk_level > result.risk_level:
-        return _substitution_denial(sub_denial)
+    denial = _substitution_denial(deferred[0])
+    # The higher level wins, on level alone: a HIGH rule match arrives with allowed=True, so
+    # deciding on `allowed` sent every HIGH tie to the substitution and `rm -r d $(base64 -d f)`
+    # lost `recursive_delete`. A tie is denied and reports both halves, so a cheap HIGH rule
+    # up front cannot hide the refused substitution from the prompt. Only `deferred[0]`, the
+    # first worst substitution, is named.
+    if denial.risk_level > result.risk_level:
+        return denial
+    if denial.risk_level < result.risk_level:
+        return result
     return replace(
         result,
         allowed=False,
         exit_code=1,
-        matched_rules=list(dict.fromkeys([*result.matched_rules, *sub_denial.matched_rules])),
+        message=f"{result.message}; {denial.message}",
+        alternatives=[*result.alternatives, *denial.alternatives],
+        matched_rules=[*result.matched_rules, *denial.matched_rules],
     )
 
 

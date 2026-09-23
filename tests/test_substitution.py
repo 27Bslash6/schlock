@@ -1903,7 +1903,8 @@ class TestSubstitutionDenialNamesItsRule:
         """`rm -r mydir` alone is HIGH with allowed=True; the substitution beside it is a HIGH denial.
 
         The tie went to the substitution result and dropped `recursive_delete`. Keeping the
-        completed result instead must not keep its allowed=True: the substitution was refused.
+        completed result instead must not keep its allowed=True, and must not drop the
+        substitution from the prompt: a cheap HIGH rule up front would then hide it.
         """
         result = validate_command(command)
         assert (result.risk_level, result.allowed, result.exit_code, result.matched_rules) == (
@@ -1912,6 +1913,17 @@ class TestSubstitutionDenialNamesItsRule:
             1,
             rules,
         )
+        assert result.message.startswith("Recursive delete")
+        assert "in substitution" in result.message
+
+    def test_a_worse_command_verdict_does_not_take_the_substitution_rule(self):
+        """`$(git push)` is deferred at HIGH; the blacklisted `$(rm -r d)` beside it decides BLOCKED.
+
+        The substitution's rule did not decide the verdict, so it must not be the one named.
+        """
+        result = validate_command("ls $(git push) $(rm -r d)")
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "git_push" not in result.matched_rules
 
 
 class TestSubstitutionWriteAndWordlessShapes:
