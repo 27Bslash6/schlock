@@ -658,6 +658,10 @@ class TestHereStringPayloadExtraction:
             ("bash", "rm -rf /"),
         ]
 
+    def test_wrapper_non_shell_operand_does_not_shadow_the_shell(self):
+        # `env -u python3` unsets a variable named python3; bash runs the here-string (verified).
+        assert ("bash", "rm -rf /") in self._extract('env -u python3 -i bash <<< "rm -rf /"')
+
     def test_compound_without_an_interpreter_surfaces_nothing(self):
         # Only a stdin-executing interpreter is a sink; `cat`/`read` consume stdin but never run it.
         assert self._extract('{ true; cat; } <<< "some text"') == []
@@ -761,6 +765,11 @@ class TestHereStringDelegationEvasion:
             'while :; do python3 --version; bash; done <<< "chmod -R 777 /"',
             'if true; then python3 -V; bash; fi <<< "chmod -R 777 /"',
             '{ node -v; sh; } <<< "rm -rf /"',
+            # Same shadowing inside a wrapper: a non-shell basename in an option-value slot must not
+            # win the operand scan over the shell the wrapper runs (LAB-3006 panel MAJ; pre-fix HIGH).
+            'env -u python3 -i bash <<< "chmod -R 777 /"',
+            'strace -o python3 -f bash <<< "chmod -R 777 /"',
+            '{ strace -o python3 -f bash; } <<< "chmod -R 777 /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
             # LAB-4442: same drift as rbash, for csh/tcsh.
@@ -810,6 +819,7 @@ class TestHereStringBenignUnchanged:
             # Compound surfacing re-validates the payload, so a benign one still passes.
             '{ true; bash; } <<< "echo hi"',
             '{ true; cat; } <<< "some text"',
+            'env -u python3 -i bash <<< "ls"',
         ],
     )
     def test_benign_here_string_stays_safe(self, command):

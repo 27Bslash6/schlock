@@ -392,8 +392,8 @@ def _command_words(node: Any) -> "list[str]":
     return words
 
 
-def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
-    """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
+def _classify_sink(sink: Any) -> "list[str]":
+    """Every interpreter command node `sink` could run its stdin through as a program.
 
     Two shapes, mirroring the `-c` path:
     - direct: the sink is a stdin-executing interpreter reading stdin as a program. `bash -c X <<< Y`
@@ -405,24 +405,28 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
       because a wrapper's own operand can share one - `flock ./bash sh <<< Y` locks a file named
       bash and runs sh, `strace -o bash sh <<< Y` traces into a file named bash (both run Y in sh,
       verified). Stopping at the decoy read `sh` as its script operand and surfaced nothing.
+      EVERY match is returned, not the first: a non-shell basename in an option-value slot
+      (`env -u python3 -i bash <<< Y`, `strace -o python3 -f bash <<< Y`) otherwise wins, the caller
+      drops it as non-shell, and the shell that runs Y is never re-validated (LAB-3006).
 
-    `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
-    caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
+    Callers keep only `_SHELL_COMMANDS` names for bash re-validation (validator Step 5c).
     """
     words = _command_words(sink)
     if not words:
-        return None
+        return []
 
     name, args = _resolve_multicall(words[0].split("/")[-1], words[1:])
     if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args):
-        return (name, here_string)
+        return [name]
 
-    if name in WRAPPER_COMMANDS:
-        for at, arg in enumerate(args):
-            interpreter = arg.split("/")[-1]
-            if interpreter in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(interpreter, args[at + 1 :]):
-                return (interpreter, here_string)
-    return None
+    if name not in WRAPPER_COMMANDS:
+        return []
+    return [
+        interpreter
+        for at, arg in enumerate(args)
+        if (interpreter := arg.split("/")[-1]) in STDIN_EXEC_INTERPRETERS
+        and _reads_stdin_as_program(interpreter, args[at + 1 :])
+    ]
 
 
 def _here_string_programs(node: Any) -> "list[tuple[str, str]]":
@@ -444,23 +448,19 @@ def _here_string_programs(node: Any) -> "list[tuple[str, str]]":
       Every sink is returned, not the first: `python3 --version` fails closed as a stdin reader, so a
       first-match return let it shadow the later `bash` that runs X (`{ python3 --version; bash; }
       <<< X`), and the caller drops non-shell payloads (LAB-3006).
-
-    `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
-    caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
     """
     kind = getattr(node, "kind", None)
     if kind == "command":
         here_string = _stdin_here_string(getattr(node, "parts", []))
         if here_string is None:
             return []
-        found = _classify_sink(node, here_string)
-        return [found] if found is not None else []
+        return [(name, here_string) for name in _classify_sink(node)]
 
     if kind == "compound":
         here_string = _stdin_here_string(getattr(node, "redirects", []))
         if here_string is None:
             return []
-        return [found for sink in _command_nodes(node) if (found := _classify_sink(sink, here_string)) is not None]
+        return [(name, here_string) for sink in _command_nodes(node) for name in _classify_sink(sink)]
     return []
 
 
@@ -1413,7 +1413,7 @@ class BashCommandParser:
                 # not read stdin leaves it for the next, so `{ true; bash; }` and the body of
                 # `while :; do bash; done` run the piped data (#97, LAB-3006; verified in real bash).
                 # Over-approximating to every command is the fail-closed direction, as for `<<<`
-                # (`_here_string_program`). An inner pipeline's sink is also caught by the recursive
+                # (`_here_string_programs`). An inner pipeline's sink is also caught by the recursive
                 # walk; the duplicate message is collapsed at return.
                 commands = _command_nodes(part)
                 # Resolve multicall wrappers (busybox/toybox) to their applet so the stage is
