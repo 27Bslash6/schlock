@@ -873,22 +873,45 @@ class TestSelfProtection:
     @pytest.mark.parametrize(
         "command",
         [
+            # An allowlisted name only means "reader" if nothing in the same command redefines it.
+            "LD_AUDIT=/tmp/e.so cat .claude-plugin/bin/MANIFEST.json",
+            "PATH=/tmp/x:$PATH cat .claude-plugin/bin/MANIFEST.json",
+            "./evil/cat .claude-plugin/bin/MANIFEST.json",
+            "export PATH=/tmp/x:$PATH; cat .claude-plugin/bin/MANIFEST.json",
+            'cat() { cp /tmp/evil "$1"; }; cat .claude-plugin/bin/MANIFEST.json',
+            "hash -p /tmp/x cat; cat ~/.config/schlock/config.yaml",
+            # Newlines keep the regex split to one `ls ...` segment; the parsed segments catch it.
+            "ls\nexport PATH=/tmp/x\ncat .claude-plugin/bin/MANIFEST.json",
+        ],
+    )
+    def test_blocks_readers_redefined_in_the_same_command(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "ls -la .claude-plugin/bin/",
             "sha256sum .claude-plugin/bin/linux-amd64/schlock-parse",
             "cat .claude-plugin/bin/MANIFEST.json",
             "file .claude-plugin/bin/linux-amd64/schlock-parse",
             "grep -rn def .claude-plugin/vendor/bashlex",
             "cat .claude-plugin/bin/MANIFEST.json > .claude-plugin/binary-notes.md",
+            "ls .claude-plugin/bin && cat .claude-plugin/bin/MANIFEST.json | head -3",
         ],
     )
     def test_allows_plugin_binary_reads(self, command):
         result = validate_command(command)
         assert result.allowed, f"Should allow: {command}"
 
-    def test_read_chained_after_an_unrelated_write_is_not_self_protection(self):
-        # The un-overridable rule must not reach across `&&` to pair `rm` with a later read.
-        result = validate_command("rm -rf build && cat .claude-plugin/bin/MANIFEST.json")
-        assert not {"self_protection:config_write", "schlock_plugin_binary_write"} & set(result.matched_rules)
+    def test_yaml_rule_does_not_pair_a_write_with_a_later_read(self):
+        # Layer 1 alone: its verb patterns stop at a separator, so `rm` is not read as writing the
+        # path a later `cat` names. (Layer 2 still blocks this command: a preceding step can
+        # plant a shadowing `cat` on PATH, so it admits nothing but plain reads.)
+        engine = RuleEngine.from_directory(Path(__file__).parent.parent / "data" / "rules")
+        match = engine.match_command("rm -rf build && cat .claude-plugin/bin/MANIFEST.json")
+        assert match.rule is None or match.rule.name != "schlock_plugin_binary_write"
 
     @pytest.mark.parametrize(
         "text,expected",

@@ -191,7 +191,7 @@ Categories are derived from rule file names (strip numeric prefix and extension)
 The `self_protection` category contains BLOCKED rules that prevent LLM agents from modifying schlock's own configuration files and its vendored parser files (`.claude-plugin/bin/`, `.claude-plugin/vendor/`). These rules are enforced at three layers:
 
 1. **YAML rules** (BLOCKED) — standard rule matching, cannot be overridden
-2. **Hardcoded allowlist check** — when a protected path is detected in a command, only known read-only commands (cat, grep, ls, head, tail, stat, diff, jq, etc.) are permitted; all other commands are blocked, including readers that can run another program (rg, bat, less, view)
+2. **Hardcoded allowlist check** — when a protected path is detected in a command, only known read-only commands (cat, grep, ls, head, tail, stat, diff, jq, etc.) are permitted; all other commands are blocked, including readers that can run another program (e.g. rg, bat, less, view) and any command that also carries a `VAR=` prefix or another non-read step
 3. **Dedicated PreToolUse hook** (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting protected paths
 
 The allowlist approach (layer 2) is secure by default: new or unknown commands are blocked without needing to enumerate every possible write tool. This prevents bypass via obscure commands like `ln`, `dd`, `rsync`, or scripting languages.

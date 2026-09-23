@@ -774,9 +774,9 @@ def _matches_protected_path(text: str) -> bool:
 # SELF-PROTECTION: Read-only commands allowed to reference protected paths.
 # Allowlist approach: any command NOT in this set is BLOCKED when it references a protected path.
 # Only inherently read-only commands are included (cannot modify files by design). "Reads" is
-# not enough: a command that can run another program is out, because that program gets the
-# protected path — rg (--pre, its config file), ag/ack (--pager), the pagers less and more
-# (LESSOPEN; macOS more is less), bat (--pager, its config file), and view (vim; `-c 'w!'`).
+# not enough: a command that can be told to run another program of the caller's choosing is
+# out — rg, ag, ack, less, more (less on macOS), bat and view (vim). See
+# test_blocks_read_commands_that_can_run_a_program.
 _SELF_PROTECTION_READ_ALLOWLIST = frozenset(
     {
         "cat",
@@ -820,18 +820,32 @@ _PATH_RESPELLING_RE = re.compile(r"/(?:\.?/)+")
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
 
 
-def _check_self_protection(command: str) -> Optional[ValidationResult]:
+def _is_plain_read(segment: str) -> bool:
+    """True if `segment` is a bare allowlisted reader and nothing else.
+
+    Bare means the first word IS an allowlist name: no `VAR=` prefix (a loader variable or
+    PATH decides what that name runs), no path (`/tmp/x/cat` is not cat), and no process
+    substitution, which can hide any command inside an allowed one.
+    """
+    words = segment.split()
+    return bool(words) and words[0] in _SELF_PROTECTION_READ_ALLOWLIST and not re.search(r"[<>]\s*\(", segment)
+
+
+def _check_self_protection(command: str, parsed_segments: Optional[list[str]] = None) -> Optional[ValidationResult]:
     """Allowlist-based check preventing modification of schlock's protected paths.
 
     SECURITY CRITICAL: Uses an allowlist approach — when a protected path (config file or
-    vendored parser/deps directory) is detected in a command, only known read-only commands
-    are permitted. All other commands are blocked. This prevents bypass via obscure write
-    commands (ln, dd, rsync, etc.) that a denylist would miss.
+    vendored parser/deps directory) appears anywhere in a command, EVERY segment of that
+    command must be a plain read (`_is_plain_read`); anything else blocks. This prevents
+    bypass via obscure write commands (ln, dd, rsync, etc.) that a denylist would miss, and
+    via any segment that changes what a later reader's name runs (`export`, a function
+    definition, `hash -p`) — which is why segments that never name the path count too.
 
     Defense-in-depth: This is layer 2 of 3. Even if YAML rules (layer 1) are corrupted
     or the hook file_path check (layer 3) is bypassed, this hardcoded check blocks
-    tampering. validate_command runs it on the whole command and again on every parsed
-    segment, since the regex split below does not separate `&` or newline-chained commands.
+    tampering. Step 3 of validate_command runs it on the raw string; once the command has
+    parsed, validate_command runs it again with the parsed segments, because the regex split
+    below keeps `ls & cp ...` and newline-chained commands in one segment.
 
     Known limitation: Variable indirection (e.g., f=config.yaml; rm "$f") can bypass
     this check because the expanded path doesn't appear in the command string. Mitigated
@@ -839,11 +853,12 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
 
     Args:
         command: Command string to check
+        parsed_segments: The command's segments from the AST, when it has parsed
 
     Returns:
-        ValidationResult blocking the command if it targets schlock config, None otherwise
+        ValidationResult blocking the command if it touches a protected path, None otherwise
     """
-    # Detection-only copy, case-folded (APFS and NTFS are case-insensitive by default) with
+    # Detection-only copies, case-folded (APFS and NTFS are case-insensitive by default) with
     # `//` and `/./` collapsed, so a respelling of a protected path still matches.
     probe = _PATH_RESPELLING_RE.sub("/", command.lower())
 
@@ -851,63 +866,35 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
     if not _matches_protected_path(probe):
         return None
 
-    # Check 1: Block any redirect operators (> or >>) targeting config files
+    # Check 1: Block any redirect operators (> or >>) targeting a protected path
     for pattern in _SELF_PROTECTION_REDIRECT_PATTERNS:
         if pattern.search(probe):
             return _make_self_protection_result(command)
 
-    # Check 2: Allowlist — verify all commands touching config paths are read-only
-    # NOTE: Uses regex splitting rather than bashlex AST parsing. This is intentional:
-    # - Self-protection runs pre-parse on the hot path; AST adds ~5ms latency
-    # - AST parsing can itself fail, requiring fallback logic
-    # - The allowlist approach already handles known bypass constructs:
-    #   * Subshells: $(cmd) → first word is "$(cmd", not in allowlist → BLOCKED
-    #   * eval: eval "rm ..." → "eval" not in allowlist → BLOCKED
-    #   * Quoting: config path must appear as literal string for fast-path trigger
-    # - Only variable indirection (f=config; rm "$f") bypasses this check,
-    #   which AST parsing also can't solve (bashlex doesn't resolve variables).
-    #   Mitigated by YAML rules (layer 1) and hook file_path checks (layer 3).
-    segments = _SEGMENT_SPLIT_RE.split(probe)
-    for raw_segment in segments:
-        segment = raw_segment.strip()
-        if not segment:
-            continue
-        # Strip leading environment variable assignments (e.g., "DUMMY=1 FOO=bar rm ...")
-        # These prefix a command but don't change what it does — the command after them
-        # is what matters. If ONLY assignments remain, it's a pure assignment (skip).
-        stripped = re.sub(r'^([A-Za-z_]\w*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+)+', "", segment)
-        if not stripped:
-            continue
-        # Only check segments that reference a config path
-        if not _matches_protected_path(segment):
-            continue
-        # Extract command name (first word, strip path prefix)
-        words = stripped.split()
-        if not words:
-            continue
-        cmd = words[0].rsplit("/", 1)[-1]
-        if cmd not in _SELF_PROTECTION_READ_ALLOWLIST:
-            return _make_self_protection_result(command)
-        # Even if cmd is allowlisted, block if segment contains process substitution
-        # >(cmd) or <(cmd) — these can hide arbitrary commands inside an allowed outer command
-        if re.search(r"[<>]\s*\(", segment):
-            return _make_self_protection_result(command)
+    # Check 2: Allowlist — every segment is a plain read. The raw string is split by regex
+    # (this runs pre-parse, and parsing can fail); subshells `$(cmd`, `eval` and quoted names
+    # are not allowlist words, so they block here.
+    # ponytail: a pipeline counts as segments too, so `cat <protected> | sort` blocks. Allow
+    # downstream pipe stages if that over-block bites; they cannot redefine the reader.
+    segments = _SEGMENT_SPLIT_RE.split(probe) + [_PATH_RESPELLING_RE.sub("/", s.lower()) for s in parsed_segments or []]
+    if not all(_is_plain_read(segment) for segment in segments if segment.strip()):
+        return _make_self_protection_result(command)
 
     return None
 
 
 def _make_self_protection_result(command: str) -> ValidationResult:
     """Create a BLOCKED ValidationResult for self-protection violations."""
-    logger.warning(f"Self-protection: blocked protected-path modification attempt: {command[:100]}")
+    logger.warning(f"Self-protection: blocked a command referencing a protected path: {command[:100]}")
     return ValidationResult(
         allowed=False,
         risk_level=RiskLevel.BLOCKED,
-        message="BLOCKED: Modification of schlock safety configuration or its vendored parser files is not allowed",
+        message="BLOCKED: Only plain read commands may reference schlock's configuration or vendored parser files",
         alternatives=[
             "Edit schlock configuration manually outside of Claude Code",
             "Use /schlock:setup to configure schlock interactively",
             "Restore vendored parser files by reinstalling: /plugin install schlock@schlock",
-            "To read these files, use cat, grep, head, tail or ls",
+            "To read these files, run cat, grep, head, tail or ls on its own: no VAR= prefix, no other commands",
         ],
         exit_code=1,
         error=None,
@@ -2417,13 +2404,12 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 
             # If we have multiple segments, validate each one
             if len(segments) > 1:
-                # Self-protection again, per parsed segment and ahead of the whitelist (Step 3's
-                # guarantee): its regex split keeps `ls & cp x .claude-plugin/bin/...` and
-                # newline-chained commands as one read-only-looking segment; the AST does not.
-                for segment in segments:
-                    protected = _check_self_protection(segment.text)
-                    if protected is not None:
-                        return protected
+                # Self-protection again with the parsed segments, ahead of the whitelist (Step
+                # 3's guarantee): its regex split keeps `ls & cp ...` and newline-chained
+                # commands in one read-only-looking segment; the AST does not.
+                protected = _check_self_protection(command, [segment.text for segment in segments])
+                if protected is not None:
+                    return protected
 
                 # Full-command whitelist check before segment validation.
                 # Per-segment validation cannot detect safe multi-command patterns
