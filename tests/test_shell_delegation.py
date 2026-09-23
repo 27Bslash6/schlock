@@ -854,6 +854,7 @@ class TestBase64DecodeAtCommandPosition:
             # A non-literal flag is read as a decode, and a glob that bash expands to a decoder.
             "$(base64 $F x)",
             '$(base64 "$F" x)',
+            "$(base64 ${D%/} x)",
             "$(/usr/bin/bas?64 -d x)",
             "$(/usr/bin/base6[4] -d x)",
             # The other coreutils base-N decoders.
@@ -896,6 +897,7 @@ class TestBase64DecodeAtCommandPosition:
             'TOKEN=$(echo "$S" | base64 -d)',
             # Encoding at command position is not the decode-and-execute shape.
             "$(base64 x)",
+            "$(base64 /tmp/-d)",
             # A wrapper assigns a decode, or passes it as data to a literal command it runs.
             'env TOKEN=$(echo "$S" | base64 -d) ./run',
             'timeout 30 curl -H "Authorization: Basic $(echo "$T" | base64 -d)" https://x',

@@ -436,9 +436,10 @@ def _runs_decode(node: Any) -> bool:
     (`env base64 -d`, `busybox base64 -d`) is not a way around it.
     """
     if getattr(node, "kind", None) == "command":
-        names = [w.split("/")[-1] for w in _command_words(node)]
-        at = next((i for i, name in enumerate(names) if _is_decoder(name)), None)
-        if at is not None and any(_is_decode_flag(w) for w in names[at + 1 :]):
+        # Basename only the name: an argument keeps its `$` (`${D%/}`) and its path (`/tmp/-d`).
+        words = _command_words(node)
+        at = next((i for i, w in enumerate(words) if _is_decoder(w.split("/")[-1])), None)
+        if at is not None and any(_is_decode_flag(w) for w in words[at + 1 :]):
             return True
     for attr in ("parts", "command", "list", "pipe", "compound"):
         child = getattr(node, attr, None)
