@@ -687,9 +687,12 @@ class TestACredentialNameNeedsAPosition:
     @pytest.mark.parametrize(
         "command",
         [
-            # The substitution validator does not recurse into a DOUBLE-QUOTED
-            # `$(...)`, so this rule is the only thing covering these. The
-            # unquoted twin is caught by environment_credential_extraction.
+            # Inside a double-quoted `$(...)` the substitution validator runs the inner
+            # command against the rules before any top-level pattern is consulted
+            # (LAB-4182), so the denial is attributed to environment_credential_extraction
+            # matching `printenv <NAME>`. A substitution denial carries no matched_rules,
+            # so the pin is the verdict plus the tier prefix and the inner rule's own
+            # description in the message.
             'echo "$(printenv GITHUB_TOKEN)"',
             'printf "%s" "$(printenv AWS_SECRET_ACCESS_KEY)"',
             'echo "Bearer $(printenv GITHUB_TOKEN)"',
@@ -697,7 +700,8 @@ class TestACredentialNameNeedsAPosition:
     )
     def test_substituted(self, command, rules_dir_path):
         result = verdict(command, rules_dir_path)
-        assert "extended_credential_exposure" in result.matched_rules, command
+        assert result.risk_level is RiskLevel.BLOCKED, command
+        assert "Inner command blocked: Environment variables often contain API keys and tokens" in result.message, command
 
     @pytest.mark.parametrize(
         "command",
@@ -757,7 +761,18 @@ class TestUnanchoredSearchStaysLinear:
     failed search gives up after a fixed number of options.
     """
 
-    ADVERSARY = "git" + " -c user.name=x' y' -C git" * 512 + " status"
+    # n is load-bearing, not arbitrary. The regression is quadratic and the fix is
+    # linear, so the gap between them GROWS with n -- and it has to outgrow the
+    # spread between the fastest and slowest machine that runs this, or no budget
+    # can tell a slow runner from a restored O(n^2). Measured on 3.9, bounded vs
+    # the same rules with the {0,16} option bound removed:
+    #     n= 512   0.44s vs  1.22s   2.8x   <- smaller than the ~3x runner spread
+    #     n=1024   0.80s vs  3.80s   4.8x
+    #     n=2048   1.36s vs 13.61s  10.0x
+    # 512 is why the old 1.0s budget could both false-fail a correct run (CI
+    # measured 1.0013s) and let the unbounded mutant through. 2048 buys the
+    # separation a constant needs.
+    ADVERSARY = "git" + " -c user.name=x' y' -C git" * 2048 + " status"
 
     @pytest.mark.parametrize(
         "operation",
@@ -768,7 +783,18 @@ class TestUnanchoredSearchStaysLinear:
         command = self.ADVERSARY.replace(" status", " " + operation)
         start = time.perf_counter()
         verdict(command, rules_dir_path)
-        assert time.perf_counter() - start < 1.0
+        # Balanced on the machine that gates merges, not on whichever box ran it
+        # last. Scaling the 1.0013s CI measured at n=512 gives ~4.0s there for the
+        # linear implementation, against ~30s for the quadratic one: 2.5x of room
+        # below this budget, 3x of margin above it. A faster box only makes the
+        # check more lenient, and locally this class is `slow` and outside the
+        # default gate anyway. Costs the 3.9 leg ~24s.
+        #
+        # Verified by mutation rather than by argument: drop the {0,16} option
+        # bound from data/rules/10_development_workflows.yaml and all six cases
+        # must go red. Measured 11.25-14.08s mutant vs 1.45-1.60s bounded, under
+        # `pytest --cov` on 3.9. At the old n=512 the mutant passed.
+        assert time.perf_counter() - start < 10.0
 
     def test_cost_grows_linearly_not_quadratically(self, rules_dir_path):
         """A quadratic scan quadruples per doubling; a linear one doubles.

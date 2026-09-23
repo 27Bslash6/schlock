@@ -26,13 +26,17 @@ from schlock.integrations.shellcheck import (
 from .cache import ValidationCache
 from .parser import WRAPPER_COMMANDS, BashCommandParser
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
-from .substitution import SubstitutionValidator
+from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
 logger = logging.getLogger(__name__)
 
 
 # Module-level cache (shared across all validation calls)
 _global_cache = ValidationCache(max_size=1000)
+# Which ruleset produced the entries currently in _global_cache. Deliberately not
+# _global_rule_engine_path: that records which engine is LOADED, and call sites that never
+# touch this cache advance it (LAB-4602).
+_global_cache_path: Optional[str] = None
 
 # Thread lock for RuleEngine and Parser caches
 # SECURITY: Prevents race conditions when multiple threads access shared state
@@ -81,6 +85,43 @@ def _get_rule_engine(config_path: Optional[str] = None) -> "RuleEngine":
         return _global_rule_engine
 
 
+def _invalidate_on_ruleset_change(config_path: Optional[str] = None) -> None:
+    """Retire every piece of ruleset-derived state when the requested ruleset is not its own.
+
+    ValidationCache keys on the command string alone, so without this the first ruleset to
+    validate a command owns that command's verdict for the rest of the process: a later call
+    naming a different ruleset gets a hit computed under rules it never asked for. Silent, and
+    it inverts mutation testing - revert a pattern, re-run, and the reverted ruleset still
+    appears to deny (LAB-4602).
+
+    Placement is load-bearing: this must run BEFORE validate_command's Step-1 lookup.
+    _get_rule_engine() does reload on a path change, but it runs after the lookup has already
+    returned the stale hit, so the same compare placed there never fires.
+
+    Clearing the verdict cache alone is not enough on its own: the substitution layer holds
+    its own ruleset-derived state. That is fixed where it lives, in _get_substitution_validator
+    - see its docstring - rather than by reaching across from here, so it also holds for
+    callers that never come through validate_command.
+    """
+    global _global_cache_path  # noqa: PLW0603
+
+    # Re-check under the lock: the caller's guard is deliberately unlocked (it runs before
+    # every cache hit), so another thread may have switched the ruleset between that compare
+    # and this one. Together the two form one double-checked lock.
+    #
+    # ponytail: the ceiling is write-after-clear, not just a stale read. validate_command's
+    # Step-7 _global_cache.set() is outside this lock and is never re-guarded, so a call
+    # already in flight under the old ruleset can land its verdict AFTER this clear has moved
+    # the marker - and because the marker then matches, no later clear can evict it. Test-only
+    # (production is one hook process holding one ruleset, and no concurrent multi-ruleset
+    # caller exists), and the engine singleton is already racy the same way. To close it,
+    # snapshot the marker before Step 5 and skip the Step-7 set when it moved.
+    with _cache_lock:
+        if _global_cache_path != config_path:
+            _global_cache.clear()
+            _global_cache_path = config_path
+
+
 def _get_parser() -> "BashCommandParser":
     """Get cached BashCommandParser.
 
@@ -96,18 +137,28 @@ def _get_parser() -> "BashCommandParser":
 
 
 def _get_substitution_validator(config_path: Optional[str] = None) -> "SubstitutionValidator":
-    """Get cached SubstitutionValidator.
+    """Get a SubstitutionValidator bound to the CURRENT rule engine.
 
     PERF: SubstitutionValidator caches whitelist lookups.
     Thread-safe: Uses _cache_lock to prevent race conditions.
+
+    Rebuilds whenever the engine changes, not only on first use. This used to cache on
+    `is None` alone and ignore config_path forever after, so once the ruleset changed it
+    kept vouching with the PREVIOUS ruleset's engine - and this layer is whitelist-first
+    default-deny, so a stale whitelist admits commands the named ruleset denies
+    (`echo "$(cat ~/.kube/config | head)"` came back SAFE under a ruleset that blocks it).
+
+    Keyed on the engine OBJECT, not on a second config_path global: _get_rule_engine already
+    owns that decision, and an identity check cannot drift out of sync with it. It also
+    covers callers that reach this function directly rather than through validate_command -
+    tests/test_walker_parity.py does exactly that (LAB-4602).
     """
     global _global_substitution_validator  # noqa: PLW0603
 
     with _cache_lock:
-        if _global_substitution_validator is None:
-            parser = _get_parser()
-            engine = _get_rule_engine(config_path)
-            _global_substitution_validator = SubstitutionValidator(parser, engine)
+        engine = _get_rule_engine(config_path)
+        if _global_substitution_validator is None or _global_substitution_validator.rule_engine is not engine:
+            _global_substitution_validator = SubstitutionValidator(_get_parser(), engine)
         return _global_substitution_validator
 
 
@@ -600,10 +651,13 @@ def _shell_delegated_payloads(
     `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
     <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
 
+    Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
+    are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
+    Step 5c re-entry as these payloads (LAB-2768).
+
     Deliberately NOT covered, each tracked separately: remote delegation (`ssh host "..."`,
-    a different trust domain); non-shell interpreters (`python3 -c`, `perl -e`) whose payload
-    is not bash and would be nonsense to re-validate as bash; and here-strings
-    (`bash <<< "..."`), which the AST hides on a redirect node. WRAPPER_COMMANDS is
+    a different trust domain) and non-shell interpreters (`python3 -c`, `perl -e`) whose
+    payload is not bash and would be nonsense to re-validate as bash. WRAPPER_COMMANDS is
     best-effort, not an exhaustive enumeration of every exec-passthrough binary.
 
     A first word that is neither a delegator nor a wrapper is never scanned, so
@@ -1885,7 +1939,7 @@ def _validate_heredoc_command(
         if over is not None:
             return over
         base_result = _heredoc_base_result(engine, base_command)
-        return _escalate_past_heredoc(engine, command, neutered, base_result, config_path)
+        return _escalate_past_heredoc(command, neutered, base_result, config_path)
     except ParseError as e:
         # Shell we cannot read is shell we cannot vouch for.
         logger.debug(f"Heredoc unreadable, failing closed: {e}")
@@ -1991,7 +2045,6 @@ def _refuse_a_heredoc_the_rewrite_did_not_write(nodes: list[Any]) -> None:
 
 
 def _escalate_past_heredoc(
-    engine: "RuleEngine",
     command: str,
     neutered: str,
     result: ValidationResult,
@@ -2006,22 +2059,33 @@ def _escalate_past_heredoc(
     The rewritten command is validated through the front door, so it gets the
     whole pipeline - segments, substitutions, dangerous flags, rules - rather
     than a second hand-rolled approximation of it. Its segments are then
-    validated individually as well, because a whitelisted prefix short-circuits
-    the whole-command pass before the per-segment loop it relies on (LAB-2752).
+    validated individually as well, because a full-span whitelist entry
+    short-circuits the whole-command pass before the per-segment loop it relies
+    on. A whitelisted *prefix* used to do the same; #146 (LAB-2752) narrowed
+    that gate to `is_fully_whitelisted`, so the prefix case no longer reaches
+    it, but an end-anchored entry still does.
     Neither pass subsumes the other: the whole-command pass is the only one that
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
     whitelist cannot silence.
 
-    The extra passes cost real time, and the reason they are worth it is that
-    this is the exceptional path - only a quoted heredoc delimiter arrives here.
-    Measured: `cat <<'EOF' > s.sh … EOF` plus two commands is 21ms against 7ms
-    for the same work without a heredoc (ShellCheck installed, one subprocess
-    per pass); a pathological 2000-command chain is 538ms against 409ms for that
-    chain with no heredoc in front of it. Gating the per-segment pass on
-    "was the whole-command pass whitelisted" would recover most of that, and is
-    deliberately not done: it would make this control's correctness depend on a
-    predicate about another function's short-circuit, which is a fail-open
-    coupling traded for milliseconds on a path that is already the slow one.
+    Both passes run with ShellCheck off, and ShellCheck runs once here, on the
+    whole rewrite. It is a subprocess per call, so leaving it on in every pass
+    cost N+2 spawns for a heredoc followed by N commands (LAB-2780). It cannot
+    simply stay on in the whole-command pass alone: a full-span whitelist entry
+    short-circuits that pass before its ShellCheck step, and the per-segment
+    pass is then the only place the trailing commands are ShellChecked at all -
+    `"rm" -rf /` and `rm -$''rf /` are caught by nothing else. Running it here
+    sees every segment in one spawn and depends on no predicate about the other
+    function's short-circuit; gating on "was the whole-command pass
+    whitelisted" would, and was rejected as a fail-open coupling. Rule matching
+    alone in place of the per-segment re-entry was rejected for the same kind of
+    loss: the re-entry is what gives a segment behind a whitelisted head its
+    quote-stripped match (`r\\m -rf /`) and its contextual checks
+    (`kubectl delete`). A payload a segment delegates to a shell (`bash -c …`)
+    is re-entered with ShellCheck on by Step 5c, deliberately: ShellCheck never
+    reads inside a `-c` string, so that re-entry is the payload's only check.
+    Each of those spawns is the only ShellCheck its text gets, so each fails
+    closed: a run with no verdict is BLOCKED, not read as clean (LAB-4586).
 
     Escalation only ever raises risk. That is what keeps a legitimate heredoc's
     existing verdict intact, and it bounds a misread body *end* to a false
@@ -2055,21 +2119,115 @@ def _escalate_past_heredoc(
     for candidate in candidates:
         if not candidate.strip():
             continue
-        candidate_result = validate_command(candidate, config_path, _derived=True)
+        candidate_result = validate_command(candidate, config_path, _shellcheck=False, _derived=True)
         if candidate_result.risk_level.value > result.risk_level.value:
             result = replace(candidate_result, message=f"Alongside heredoc: {candidate_result.message}")
+
+    if result.risk_level < RiskLevel.BLOCKED and is_shellcheck_available():
+        findings = run_shellcheck(neutered)
+        if findings is None:
+            # This spawn is the only ShellCheck the commands around the heredoc get, so a
+            # run with no verdict (timeout, oversized output, open circuit) is refused,
+            # not skipped: read as clean, a slow input was a switch for the control
+            # (LAB-4586). Named in matched_rules so the audit log can tell this deny apart.
+            return replace(
+                result,
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="Alongside heredoc: ShellCheck did not complete, so the shell around the heredoc is unchecked",
+                alternatives=[
+                    "Run the commands after the heredoc as a separate, shorter Bash call",
+                    "If every heredoc is refused, ShellCheck itself is failing: fix or uninstall it",
+                ],
+                exit_code=1,
+                matched_rules=[*result.matched_rules, "shellcheck:incomplete"],
+            )
+        findings = get_security_findings(findings)
+        if findings:
+            result = replace(
+                result,
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"Alongside heredoc: ShellCheck: {findings[0].message}",
+                alternatives=[f"See {findings[0].wiki_url}"],
+                exit_code=1,
+                matched_rules=[*result.matched_rules, f"shellcheck:{findings[0].sc_code}"],
+            )
 
     return result
 
 
-def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
+def _substitution_denial(sub_result: SubstitutionValidationResult) -> ValidationResult:
+    """Render a substitution verdict as a ValidationResult.
+
+    The hook maps risk to the action, so only a genuine BLOCKED verdict may claim the word: an
+    amplified-HIGH one is shown as an "ask" prompt, and a prompt whose text reads "BLOCKED" tells
+    the user the opposite of the truth.
+    """
+    denied = sub_result.risk_level == RiskLevel.BLOCKED
+    return ValidationResult(
+        allowed=False,
+        risk_level=sub_result.risk_level,
+        message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
+        alternatives=[
+            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
+            "Run the command directly instead of using substitution",
+            "If this command is safe, request it be added to the whitelist",
+        ],
+        exit_code=1,
+        error=None,
+    )
+
+
+def validate_command(
     command: str,
     config_path: Optional[str] = None,
     *,
     _depth: int = 0,
+    _shellcheck: bool = True,
     _derived: bool = False,
 ) -> ValidationResult:
-    """Validate command for safety.
+    """Validate a command for safety — the main validation API.
+
+    Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
+    denial too weak to have short-circuited it. The join lives HERE, outside the passes, because
+    a join made at any one pass is a join the passes added after it will miss: that is precisely
+    how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked back down to HIGH
+    merely by having a substitution appended. Whatever returns first, the worse verdict wins.
+
+    ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
+    :func:`_validate_command`.
+    """
+    deferred: list[SubstitutionValidationResult] = []
+    result = _validate_command(
+        command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
+    )
+    if not deferred:
+        return result
+    sub_denial = deferred[0]
+    # A denial always beats an allow, whatever their levels; between two denials the higher
+    # level wins, and a tie keeps the completed verdict because it carries the matched rules.
+    if result.allowed or sub_denial.risk_level > result.risk_level:
+        return _substitution_denial(sub_denial)
+    return result
+
+
+def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
+    command: str,
+    config_path: Optional[str] = None,
+    *,
+    _depth: int = 0,
+    _deferred: Optional[list[SubstitutionValidationResult]] = None,
+    _shellcheck: bool = True,
+    _derived: bool = False,
+) -> ValidationResult:
+    """Run every validation pass. Call :func:`validate_command` instead.
+
+    ``_deferred`` is an out-parameter: a substitution denial too weak to short-circuit is placed
+    there for the caller to join. It is a list rather than a return value so that every one of
+    this function's returns carries it without having to remember to.
+
+    Validate command for safety.
 
     Main validation API. Orchestrates parsing, rule matching, and caching.
 
@@ -2092,6 +2250,11 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         command: Bash command string to validate
         config_path: Optional path to rules file (for testing)
         _depth: Internal, keyword-only. Shell-delegation recursion depth; callers leave it at 0.
+        _shellcheck: Internal, keyword-only. False skips the ShellCheck subprocess and leaves the
+            verdict out of the cache; for a fragment of a command that is ShellChecked whole
+            elsewhere. Applies to this call only: a shell-delegated payload (Step 5c) is re-entered
+            with ShellCheck on, deliberately - ShellCheck never reads inside a `-c` string, so that
+            re-entry is the payload's only check.
         _derived: Internal, keyword-only. True when ``command`` is text schlock produced from an
             admitted command (a heredoc rewrite or one of its segments), so the derived-text
             ceiling applies, not the caller's. Callers leave it False.
@@ -2118,7 +2281,13 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         if over is not None:
             return over
 
-        # Step 1: Check cache
+        # Step 1: Check cache, after dropping any verdicts a different ruleset left behind.
+        # Inline rather than a plain call: this guards every cached hit and the call alone
+        # cost ~50ns of a ~410ns cached call, which is the whole margin against main. It is
+        # the outer half of the helper's double-checked lock, so it must stay before the
+        # lookup and must never be NARROWER than the helper's own compare.
+        if _global_cache_path != config_path:
+            _invalidate_on_ruleset_change(config_path)
         cached = _global_cache.get(command)
         if cached is not None:
             return cached
@@ -2172,21 +2341,22 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
             sub_results = sub_validator.validate_all_substitutions(ast)
+
+            # Worst verdict wins, and the join is NOT made here. Returning a denial from this
+            # point skips every pass below it — the AST dangerous-flag pass (the only thing that
+            # sees quoted command names) and the multi-segment pass (the only thing that isolates
+            # a blocked segment). A weaker substitution verdict returned here therefore DOWNGRADED
+            # commands those passes deny outright. Consulting match_command() from here does not
+            # fix it: that helper is whitelist-gated, so a whitelisted first word makes it report
+            # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
+            # weaker is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
-                if not sub_result.allowed:
-                    return ValidationResult(
-                        allowed=False,
-                        risk_level=sub_result.risk_level,
-                        message=f"BLOCKED: {sub_result.message}",
-                        alternatives=[
-                            "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
-                            "Run the command directly instead of using substitution",
-                            "If this command is safe, request it be added to the whitelist",
-                        ],
-                        exit_code=1,
-                        error=None,
-                    )
-                # Don't cache (substitution content may vary)
+                if sub_result.allowed:
+                    continue  # Don't cache (substitution content may vary)
+                if sub_result.risk_level == RiskLevel.BLOCKED:
+                    return _substitution_denial(sub_result)
+                if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
+                    _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection
             # Uses bashlex AST for BOTH command names AND arguments (no regex shortcuts)
@@ -2196,6 +2366,18 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
             dangerous_check = _check_dangerous_command_flags(commands_with_args)
             if dangerous_check is not None:
                 return dangerous_check
+
+            # LAB-2768: here-strings (`bash <<< PROG`) execute PROG the same way `bash -c PROG`
+            # does, but the payload rides a redirect node the extractor above skips. Surface it
+            # here; only SHELL here-strings are re-validated as bash (a python/perl here-string is
+            # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
+            herestring_payloads = list(
+                dict.fromkeys(
+                    prog
+                    for name, prog in parser.extract_stdin_program_redirects(ast)
+                    if name in _SHELL_COMMANDS and prog.strip()
+                )
+            )
 
         except (ParseError, ValueError) as e:
             # Check if this is a heredoc parse failure (bashlex doesn't support quoted delimiters)
@@ -2253,7 +2435,8 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
                         error=None,
                         matched_rules=[],
                     )
-                    _global_cache.set(command, result)
+                    if _depth == 0 and _shellcheck and not _deferred:
+                        _global_cache.set(command, result)
                     return result
 
                 highest_risk = RiskLevel.SAFE
@@ -2356,27 +2539,39 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
         # higher verdict, so no spelling of the wrapper scores below the bare payload.
-        # NOT a general guarantee: this runs after the multi-segment whitelist, so a
-        # whitelisted prefix still short-circuits it (LAB-2759). Deliberately NOT routed through
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a full-span
+        # whitelist match still short-circuits it (#146 closed the prefix case). Deliberately NOT routed through
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
-        try:
-            payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
-        except _DelegatorCeilingError as e:
-            # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH below and _over_size_ceiling
-            # (LAB-4363). Letting this reach the catch-all denied with `error` set, an empty
-            # `alternatives`, a message naming no limit, and `logger.exception(f"... {command!r}")`
-            # writing the whole adversarial command to the log (LAB-4582). `str(e)` so the limit is
-            # stated once, at the raise. The deny itself is unchanged.
-            return ValidationResult(
-                allowed=False,
-                risk_level=RiskLevel.BLOCKED,
-                message=str(e),
-                alternatives=["Run the command directly instead of chaining wrapper commands"],
-                exit_code=1,
-                error=None,
-            )
+        # `-c`/wrapper/`watch` payloads plus here-string (`<<<`) payloads (LAB-2768); a here-string
+        # re-enters validation identically to a `-c` payload, so `bash <<< "$CMD"` matches
+        # `bash -c "$CMD"` rather than fail-closing one spelling of the same delegation. Every
+        # payload below re-enters validation - and ShellCheck - once, so here-strings share the
+        # extractor's ceiling: without it n distinct `<<<` cost n unbounded re-entries while the
+        # `-c` spelling of the same command stopped at MAX_DELEGATOR_TOKENS, and a hook that
+        # outlives its timeout fails OPEN. Identical payloads collapse first, whichever spelling
+        # surfaced them.
+        payloads: list[str] = []
+        if match.risk_level < RiskLevel.BLOCKED:
+            if len(herestring_payloads) > MAX_DELEGATOR_TOKENS:
+                raise ValueError(f"Here-string re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
+            try:
+                payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + herestring_payloads))
+            except _DelegatorCeilingError as e:
+                # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH below and _over_size_ceiling
+                # (LAB-4363). Letting this reach the catch-all denied with `error` set, an empty
+                # `alternatives`, a message naming no limit, and `logger.exception(f"... {command!r}")`
+                # writing the whole adversarial command to the log (LAB-4582). `str(e)` so the limit is
+                # stated once, at the raise. The deny itself is unchanged.
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=str(e),
+                    alternatives=["Run the command directly instead of chaining wrapper commands"],
+                    exit_code=1,
+                    error=None,
+                )
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
@@ -2413,9 +2608,30 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # SC2114: "Warning: deletes a system directory" catches rm -r$''f /
         shellcheck_elevated = False
         security_findings: list = []  # Initialize for type checker
-        if is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
+        if _shellcheck and is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
             findings = run_shellcheck(command)
-            security_findings = get_security_findings(findings)
+            if findings is None and _depth > 0:
+                # A payload re-entered from Step 5c (`bash -c "…"`) gets its only ShellCheck
+                # here - no outer spawn reads inside a `-c` string - so a run with no verdict
+                # is refused, as the heredoc spawn refuses it (LAB-4586). At depth 0 the same
+                # None is still read as clean: whether the top-level pass should fail closed
+                # is LAB-4362's open question, not decided here.
+                shellcheck_elevated = True
+                alternatives = ["Shorten the delegated payload or run it as its own Bash call"]
+                match = RuleMatch(
+                    matched=True,
+                    rule=SecurityRule(
+                        name="shellcheck:incomplete",
+                        description="ShellCheck gave no verdict on a shell-delegated payload",
+                        risk_level=RiskLevel.BLOCKED,
+                        patterns=[],
+                        alternatives=alternatives,
+                    ),
+                    risk_level=RiskLevel.BLOCKED,
+                    message="ShellCheck did not complete, so the payload is unchecked",
+                    alternatives=alternatives,
+                )
+            security_findings = get_security_findings(findings or [])
             if security_findings:
                 # Elevate to BLOCKED if ShellCheck found security issues
                 shellcheck_elevated = True
@@ -2460,8 +2676,13 @@ def validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation fl
         # Never at depth > 0: the shell-delegation depth cap makes a verdict depend on nesting
         # level, and the cache is keyed on the command string alone. Caching a capped inner
         # verdict flipped `watch watch watch watch ls` from SAFE to BLOCKED for the rest of the
-        # process once a deeper chain had been seen.
-        if _depth == 0:
+        # process once a deeper chain had been seen. Never with ShellCheck skipped, for the same
+        # reason: that verdict is weaker than the one a fresh call would produce for the key. The
+        # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
+        # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
+        # Nor when a substitution denial is still owed a join: the cached entry would be the
+        # pre-join verdict, and the next identical command would hit it and skip the join.
+        if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)
 
         # Step 8: Return
@@ -2492,7 +2713,9 @@ def clear_caches() -> None:
         - Parser cache
     """
     global _global_rule_engine, _global_rule_engine_path, _global_parser, _global_substitution_validator  # noqa: PLW0603
+    global _global_cache_path  # noqa: PLW0603
     _global_cache.clear()
+    _global_cache_path = None
     _global_rule_engine = None
     _global_rule_engine_path = None
     _global_parser = None
