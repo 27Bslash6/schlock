@@ -1587,10 +1587,12 @@ class SubstitutionValidator:
     def _check_structural_and_nested(self, sub_node: SubstitutionNode, depth: int) -> SubstitutionValidationResult | None:
         """Check structural safety and nested substitutions.
 
-        Shared logic between Layer 1 (whitelist) and Layer 1b (contextual whitelist).
+        The structural half of :meth:`_check_vetted`. A result below BLOCKED must be joined
+        with :meth:`_check_inner_rules`, never returned as it is.
 
         Returns:
-            A BLOCKED result if checks fail, or None if everything passes.
+            BLOCKED for dangerous or suspicious structure, else the worst nested denial at its
+            own level (an unknown `$(x=1)` is HIGH), or None if everything passes.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
@@ -1612,17 +1614,41 @@ class SubstitutionValidator:
                 message=f"Suspicious pattern in substitution: {reason}",
             )
 
-        for nested in sub_node.nested_substitutions:
-            nested_result = self.validate_substitution(nested, depth + 1)
-            if not nested_result.allowed:
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=nested_result.risk_level,
-                    message=f"Nested substitution blocked: {nested_result.message}",
-                    inner_results=[nested_result],
-                )
+        # Rate at the WORST denied child, not the first (LAB-4149): an unknown `$(x=1)`
+        # ahead of `$(rm -rf /)` must not downgrade BLOCKED to HIGH.
+        nested_results = [self.validate_substitution(nested, depth + 1) for nested in sub_node.nested_substitutions]
+        denied = [r for r in nested_results if not r.allowed]
+        if denied:
+            worst = max(denied, key=lambda r: r.risk_level)
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=worst.risk_level,
+                message=f"Nested substitution blocked: {worst.message}",
+                inner_results=[worst],
+            )
 
         return None
+
+    def _check_vetted(self, sub_node: SubstitutionNode, depth: int) -> SubstitutionValidationResult | None:
+        """Structural, nested and YAML-rule checks for a vetted command, joined at the worst.
+
+        A BLOCKED structural or nested verdict ends it. A lesser nested denial is held, not
+        returned, so the rules can still rate the command itself higher - appending `$(x=1)`
+        must not decide the verdict of the command it is appended to (LAB-4149). A tie goes
+        to the rule verdict, which names the command's own risk.
+
+        Returns:
+            The worst denial, or None if every check passes.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        held = self._check_structural_and_nested(sub_node, depth)
+        if held and held.risk_level == RiskLevel.BLOCKED:
+            return held
+        ruled = self._check_inner_rules(sub_node)
+        if held and (ruled is None or held.risk_level > ruled.risk_level):
+            return held
+        return ruled
 
     def _is_valid_list_topology(self, parts: list[Any]) -> bool:
         """True if ``parts`` is a well-formed bashlex command list: strictly alternating
@@ -1748,16 +1774,18 @@ class SubstitutionValidator:
                 max_risk = result.risk_level
             all_whitelisted = all_whitelisted and result.whitelisted
 
-        if worst_denial is not None:
+        # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
+        # It runs even when a segment was denied: a HIGH segment must not hide a pattern that
+        # only the whole matches, `tar czf - ~/.ssh | cat` being one (LAB-4149). A tie keeps
+        # the segment's verdict.
+        blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
+        if worst_denial is not None and (blocked is None or worst_denial.risk_level >= blocked.risk_level):
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=worst_denial.risk_level,
                 message=worst_denial.message,
                 inner_results=inner_results,
             )
-
-        # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
-        blocked = self._check_inner_rules(sub_node, inner_results=inner_results)
         if blocked:
             return blocked
 
@@ -1815,10 +1843,7 @@ class SubstitutionValidator:
         #
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):
-            blocked = self._check_structural_and_nested(sub_node, depth)
-            if blocked:
-                return blocked
-            blocked = self._check_inner_rules(sub_node)
+            blocked = self._check_vetted(sub_node, depth)
             if blocked:
                 return blocked
             return SubstitutionValidationResult(
@@ -1830,13 +1855,10 @@ class SubstitutionValidator:
 
         # Layer 1b: Contextual whitelist — commands with subcommand-dependent safety.
         # Adds subcommand structural analysis on top of the rules every tier runs.
-        # e.g., kubectl: "get pods" is safe, but "get secrets -o json" is caught by YAML rules.
+        # e.g., kubectl: "get pods" is safe, "get secrets" fails the structural check, and
+        # "describe pod x ~/.ssh/id_rsa" passes it but not the YAML rules.
         if sub_node.base_command in CONTEXTUAL_SUBSTITUTION_COMMANDS:
-            blocked = self._check_structural_and_nested(sub_node, depth)
-            if blocked:
-                return blocked
-
-            blocked = self._check_inner_rules(sub_node)
+            blocked = self._check_vetted(sub_node, depth)
             if blocked:
                 return blocked
 
@@ -1864,18 +1886,23 @@ class SubstitutionValidator:
                 message=f"Suspicious pattern in substitution: {reason}",
             )
 
-        # Layer 3: Recursive validation of nested substitutions
-        inner_results: list[SubstitutionValidationResult] = []
-        for nested in sub_node.nested_substitutions:
-            nested_result = self.validate_substitution(nested, depth + 1)
-            inner_results.append(nested_result)
-            if not nested_result.allowed:
-                return SubstitutionValidationResult(
-                    allowed=False,
-                    risk_level=nested_result.risk_level,
-                    message=f"Nested substitution blocked: {nested_result.message}",
-                    inner_results=inner_results,
-                )
+        # Layer 3: Recursive validation of nested substitutions, rated at the worst denied
+        # child rather than the first (LAB-4149). A BLOCKED child ends it here; a lesser
+        # denial is held so Layer 4 can still rate the command itself BLOCKED - otherwise
+        # `$(chmod 777 /etc/shadow $(x=1))` would read as HIGH, which permissive allows.
+        inner_results = [self.validate_substitution(nested, depth + 1) for nested in sub_node.nested_substitutions]
+        denied = [r for r in inner_results if not r.allowed]
+        nested_denial = None
+        if denied:
+            worst = max(denied, key=lambda r: r.risk_level)
+            nested_denial = SubstitutionValidationResult(
+                allowed=False,
+                risk_level=worst.risk_level,
+                message=f"Nested substitution blocked: {worst.message}",
+                inner_results=inner_results,
+            )
+            if worst.risk_level == RiskLevel.BLOCKED:
+                return nested_denial
 
         # Layer 4: Validate inner command against YAML rules
         # NO literal_ranges here, deliberately: this tier judges commands the whitelist does not
@@ -1905,13 +1932,18 @@ class SubstitutionValidator:
                         inner_results=inner_results,
                     )
 
-        # Unknown command - default deny in substitution context
+        # No determinable base command: fail-closed BLOCKED. Ordered BEFORE the held nested
+        # denial, which is at most HIGH, so returning the denial first would downgrade it
+        # (LAB-4149).
         if not sub_node.base_command:
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
                 message="Cannot determine command in substitution",
             )
+
+        if nested_denial is not None:
+            return nested_denial
 
         # Command not in whitelist and not explicitly dangerous
         # This is the "gray area" - we block by default for security
