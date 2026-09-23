@@ -915,10 +915,28 @@ class TestSourceReadsStdinAsProgram:
             '. /proc/thread-self/fd/0 <<< "rm -rf /"',
             'bash /proc/thread-self/fd/0 <<< "rm -rf /"',
             'echo "rm -rf /" | source /proc/thread-self/fd/0',
+            # Lexical spellings of the same path; each ran its stdin in real bash.
+            'source //dev/stdin <<< "rm -rf /"',
+            'source /dev/./stdin <<< "rm -rf /"',
+            'source /dev/../dev/stdin <<< "rm -rf /"',
+            'source /proc/$$/fd/0 <<< "rm -rf /"',
+            'cd /dev && source ./stdin <<< "rm -rf /"',
+            'echo "rm -rf /" | bash //dev/stdin',
         ],
     )
     def test_denied(self, command):
         assert validate_command(command).allowed is False, command
+
+    @pytest.mark.parametrize(
+        "operand",
+        ["-", "/dev/stdin", "/dev//stdin", "/dev/fd/0", "/proc/self/fd/../fd/0", "/proc/12/task/12/fd/0", "stdin"],
+    )
+    def test_every_stdin_spelling_reads_stdin(self, operand):
+        assert _reads_stdin_as_program("source", [operand]) is True
+
+    @pytest.mark.parametrize("operand", ["file.sh", "/dev/stdin.sh", "/proc/self/fd/01", "fd/0x"])
+    def test_lookalike_script_still_exempts(self, operand):
+        assert _reads_stdin_as_program("source", [operand]) is False
 
 
 class TestStdinProgramBenignUnchanged:

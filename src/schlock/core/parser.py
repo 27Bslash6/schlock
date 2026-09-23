@@ -9,6 +9,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import bisect
 import logging
+import posixpath
 from typing import Any, NamedTuple, Optional
 
 import bashlex
@@ -241,10 +242,22 @@ def may_expand(word: str) -> bool:
     return word[:1] in _UNFIXED_OPERAND_STARTS
 
 
-# Tokens that explicitly designate STDIN as the program source. `/proc/thread-self/fd/0` is the
-# per-thread alias of `/proc/self/fd/0`; both resolve to fd 0, so leaving it out let it read as a
-# literal script and exempt on every interpreter (LAB-3522).
-_STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "/proc/thread-self/fd/0"})
+def _names_stdin(arg: str) -> bool:
+    """True if operand `arg` designates STDIN as the program source.
+
+    A suffix test on the lexically normalised path, not a list of spellings: every one of
+    `//dev/stdin`, `/dev/./stdin`, `/dev/../dev/stdin`, `/proc/thread-self/fd/0`,
+    `/proc/$$/fd/0` and `./stdin` (cwd `/dev`) ran its stdin in real bash, and an exact-match
+    set missed each in turn (LAB-3522). Over-inclusive on purpose: a real script named `stdin`
+    only loses its exemption, the fail-closed direction.
+    """
+    if arg == "-":
+        return True
+    path = posixpath.normpath(arg)
+    # ponytail: lexical only - a user symlink to /dev/stdin, or `cd /proc/self/fd && source 0`,
+    # names stdin through filesystem/cwd state no parser sees.
+    return path in ("stdin", "fd/0") or path.endswith(("/stdin", "/fd/0"))
+
 
 # Multicall binaries dispatch to an applet named by their first positional arg
 # (`busybox sh`, `toybox cat`). Classify the pipeline stage by the resolved applet, not the
@@ -373,7 +386,7 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     Once an option flag is seen, a following non-dash token is treated as that flag's VALUE
     (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
     (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
-    Explicit stdin paths ('-', '/dev/stdin', ...) -> True. No unambiguous program -> True.
+    Explicit stdin paths ('-', '/dev/stdin', ... - see `_names_stdin`) -> True. No unambiguous program -> True.
     """
     inline = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
     saw_option = False
@@ -382,7 +395,7 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
         if arg in inline or (len(arg) > 2 and arg[0] == "-" and f"-{arg[1]}" in inline):
             return False
         # Explicit stdin designator -> reads stdin.
-        if arg in _STDIN_PATHS:
+        if _names_stdin(arg):
             return True
         if not arg.startswith("-"):
             # A leading literal positional (before any option) is a script file -> runs it.
