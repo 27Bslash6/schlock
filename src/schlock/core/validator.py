@@ -771,28 +771,24 @@ def _matches_protected_path(text: str) -> bool:
     return False
 
 
-# SELF-PROTECTION: Read-only commands allowed to reference config files.
-# Allowlist approach: any command NOT in this set is BLOCKED when it references config paths.
-# Only inherently read-only commands are included (cannot modify files by design).
+# SELF-PROTECTION: Read-only commands allowed to reference protected paths.
+# Allowlist approach: any command NOT in this set is BLOCKED when it references a protected path.
+# Only inherently read-only commands are included (cannot modify files by design). "Reads" is
+# not enough: a command that can run another program is out, because that program gets the
+# protected path — rg (--pre, its config file), ag/ack (--pager), the pagers less and more
+# (LESSOPEN; macOS more is less), bat (--pager, its config file), and view (vim; `-c 'w!'`).
 _SELF_PROTECTION_READ_ALLOWLIST = frozenset(
     {
         "cat",
         "grep",
         "egrep",
-        "fgrep",
-        "rg",
-        "ag",
-        "ack",  # Content viewing/searching
+        "fgrep",  # Content viewing/searching
         "ls",
         "dir",
         "stat",
         "file",  # File info
         "head",
         "tail",
-        "less",
-        "more",
-        "bat",
-        "view",  # Pagers/viewers
         "wc",
         "md5sum",
         "sha256sum",
@@ -911,6 +907,7 @@ def _make_self_protection_result(command: str) -> ValidationResult:
             "Edit schlock configuration manually outside of Claude Code",
             "Use /schlock:setup to configure schlock interactively",
             "Restore vendored parser files by reinstalling: /plugin install schlock@schlock",
+            "To read these files, use cat, grep, head, tail or ls",
         ],
         exit_code=1,
         error=None,

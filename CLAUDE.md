@@ -102,10 +102,10 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 
 **Command Whitelist**: User-level config (`~/.config/schlock/config.yaml`) supports `whitelist:` — a list of regex patterns that bypass ALL rules including BLOCKED. Project-level config cannot define whitelist patterns (privilege escalation risk). See `docs/CONFIGURATION.md`.
 
-**Self-Protection**: Three-layer defense prevents LLM agents from modifying schlock config:
+**Self-Protection**: Three-layer defense prevents LLM agents from modifying schlock config and its vendored parser files (`.claude-plugin/bin/`, `.claude-plugin/vendor/`):
 1. YAML rules (`14_self_protection.yaml`, BLOCKED) — can't be overridden
-2. Hardcoded validator check (`_check_self_protection`) — independent of YAML rules
-3. Dedicated PreToolUse hook (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting config files
+2. Hardcoded validator check (`_check_self_protection`) — independent of YAML rules; its read allowlist excludes any reader that can run another program (rg, bat, less, view)
+3. Dedicated PreToolUse hook (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting protected paths
 
 ## Installation
 

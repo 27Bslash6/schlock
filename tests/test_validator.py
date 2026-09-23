@@ -852,6 +852,27 @@ class TestSelfProtection:
     @pytest.mark.parametrize(
         "command",
         [
+            # Each of these reads, but can also run a program the agent chose, with the protected
+            # path as its argument (rg --pre, the pagers' preprocessors) or write directly (view).
+            "rg --pre /tmp/rewriter needle .claude-plugin/vendor/bashlex/parser.py",
+            "rg --pre=/tmp/rewriter needle .claude/hooks/schlock-config.yaml",
+            "RIPGREP_CONFIG_PATH=/tmp/rc rg needle .claude-plugin/bin/MANIFEST.json",
+            "view -c 'w! .claude-plugin/bin/MANIFEST.json' -c 'q!' /tmp/evil",
+            'LESSOPEN="/tmp/rewriter %s" less .claude-plugin/bin/MANIFEST.json',
+            'LESSOPEN="/tmp/rewriter %s" more ~/.config/schlock/config.yaml',  # macOS more is less
+            "bat --paging=always --pager /tmp/rewriter .claude-plugin/bin/MANIFEST.json",
+            "ag --pager /tmp/rewriter needle .claude-plugin/vendor/bashlex/parser.py",
+            "ack --pager=/tmp/rewriter needle .claude-plugin/vendor/bashlex/parser.py",
+        ],
+    )
+    def test_blocks_read_commands_that_can_run_a_program(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert "self_protection" in str(result.matched_rules)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "ls -la .claude-plugin/bin/",
             "sha256sum .claude-plugin/bin/linux-amd64/schlock-parse",
             "cat .claude-plugin/bin/MANIFEST.json",
