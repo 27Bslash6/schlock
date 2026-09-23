@@ -123,10 +123,11 @@ class TestTopLevelAwkCommandPipe:
             "awk '/error|warn/ {print}' f",
             "awk '{if ($1 ~ /foo|bar/) print $2}' f",
             "awk '{print $1 \"|\" $2}' f",
-            "awk '{print}' f | sort",
             "awk '{print > \"out.txt\"}' f",  # file write: not an exec, out of scope at top level
             "awk -f prog.awk f",
             "awk '{while ((getline l < \"f\") > 0) print l}' f",  # getline from a file
+            "awk '{print $1} # x|y' f",  # a pipe inside a comment, not code (panel FP)
+            "awk '{print $1 \"|\" $2}' f",  # a pipe inside a string literal
         ],
     )
     def test_non_exec_awk_not_blocked(self, command):
@@ -136,9 +137,11 @@ class TestTopLevelAwkCommandPipe:
         """The command-pipe check must not change the existing system() rating (HIGH, ask)."""
         assert validate_command("awk 'BEGIN{system(\"id\")}'").risk_level == RiskLevel.HIGH
 
-    def test_helper(self):
-        assert awk_command_pipe(["awk", "{print | c}"]) is not None
-        assert awk_command_pipe(["awk", "$1 || $2 {print}"]) is None
+    def test_scanner_folds_line_continuation(self):
+        # awk joins `\<newline>`; the scanner must too, or a continued division/string hides |.
+        # The `\\\n` here is a literal backslash then a newline, matching the shell payload.
+        assert awk_command_pipe(["awk", "BEGIN{x = 4 \\\n/ 2; print 1 | c}"]) is not None
+        assert awk_command_pipe(["awk", 'BEGIN{x = "a\\\nb"; print 1 | c}']) is not None
 
     @pytest.mark.parametrize("program", ['"' + '\\"' * 40000, "(/" + "\\/" * 40000])
     def test_literal_scan_is_linear(self, program):
