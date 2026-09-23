@@ -1641,6 +1641,47 @@ class TestWhitelistedSubstitutionYamlRules:
         assert result.risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
+        "command",
+        [
+            # the parser resolves an unambiguous prefix, so these ARE the listed options
+            "echo \"$(git fetch --upload 'rm -rf /' .)\"",
+            "echo \"$(git rebase --exe 'rm -rf /' main)\"",
+            "echo \"$(git ls-remote --upload 'rm -rf /' .)\"",
+            "echo \"$(git push --receive 'rm -rf /' origin)\"",
+            "echo \"$(git send-email --sendmail 'rm -rf /' HEAD~1)\"",
+            "echo \"$(sort --compress 'rm -rf /' f)\"",
+            "echo \"$(sdiff --diff 'rm -rf /' a b)\"",
+            # documented short form, and an alias spelling Getopt::Long also accepts
+            "echo \"$(git clone -u 'rm -rf /' https://x/y)\"",
+            "echo \"$(git send-email --tocmd 'rm -rf /' HEAD~1)\"",
+            # the subcommand sits behind git's own value-taking options
+            "echo \"$(git -C /repo --git-dir /repo/.git fetch --upload 'rm -rf /' .)\"",
+            "echo \"$(git -c color.ui=never clone -u 'rm -rf /' https://x/y)\"",
+        ],
+    )
+    def test_abbreviated_and_short_exec_options_suppress_nothing(self, command):
+        """An abbreviation or short form must reach the verdict its canonical spelling does (LAB-4268)."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # `--author` prefixes `--authors-prog` — an option of `git svn`, not of `git log`.
+            # This is the shape that reverted the first, flat prefix match.
+            "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
+            # a complete option is not an abbreviation of the longer one it prefixes
+            "echo \"$(git send-email --to 'Ray Walker' --cc 'a b' --subject 'rm -rf / fix' p)\"",
+            # `-u` is `--upload-pack` on clone only; on fetch it is --update-head-ok
+            "echo \"$(git fetch -u origin --negotiation-tip 'rm -rf /')\"",
+        ],
+    )
+    def test_exec_options_resolve_only_within_their_own_command(self, command):
+        """Prefix resolution is safe only inside the namespace the parser actually searches."""
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
         ("command", "expected_ranges"),
         [
             # The command name is never data, however it is quoted — it IS the command.

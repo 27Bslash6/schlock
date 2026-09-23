@@ -807,16 +807,85 @@ _ARGUMENT_EXECUTING_FLAGS = frozenset(
         "--authors-prog", "--compress-program", "--diff-program", "--pager",
     }
 )  # fmt: skip
-# `-x` is paired with its subcommand rather than listed flat. It runs a command for `git rebase`
-# and `git difftool`, but `grep -x` matches whole lines, `diff -x` excludes a pattern and `ls -x`
-# sorts across — a flat entry is matched against every command and over-blocks all three.
+# getopt_long, git's parse-options and Perl's Getopt::Long all accept an unambiguous prefix, so
+# `git fetch --upload` IS `--upload-pack` and walks straight past the exact set above. Resolving
+# a prefix is only safe inside the namespace the parser actually searches, hence the key: per
+# command, and for git per SUBCOMMAND. A flat prefix match was tried and reverted because
+# `git log --author` resolved to `--authors-prog`, which only `git svn` has (LAB-4268).
+# Short forms are keyed for the same reason: `-u` is `--upload-pack` on clone but
+# `--update-head-ok` on fetch, and `-x` runs a command on rebase and difftool while `grep -x`,
+# `diff -x` and `git clean -x` mean something ordinary.
+_ARGUMENT_EXECUTING_OPTIONS = {
+    "sort": frozenset({"--compress-program"}),
+    "sdiff": frozenset({"--diff-program"}),
+    "git clone": frozenset({"-u", "--upload-pack"}),
+    "git fetch": frozenset({"--upload-pack"}),
+    "git pull": frozenset({"--upload-pack"}),
+    "git ls-remote": frozenset({"--upload-pack", "--exec"}),
+    "git push": frozenset({"--receive-pack", "--exec"}),
+    "git send-pack": frozenset({"--receive-pack", "--exec"}),
+    "git archive": frozenset({"--exec"}),
+    "git rebase": frozenset({"-x", "--exec"}),
+    "git difftool": frozenset({"-x", "--extcmd"}),
+    "git send-email": frozenset(
+        {"--to-cmd", "--tocmd", "--cc-cmd", "--cccmd", "--header-cmd", "--headercmd", "--sendmail-cmd", "--sendmailcmd"}
+    ),
+    "git svn": frozenset({"--authors-prog"}),
+}
+# A complete option beats the longer one it happens to prefix: send-email's `--to` names a
+# recipient, it does not abbreviate `--to-cmd`.
+_COMPLETE_OPTIONS = {"git send-email": frozenset({"--to", "--cc"})}
+# git's own options that take their value as the NEXT word. git matches these exactly.
+_GIT_OPTIONS_WITH_VALUE = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"}
+)
+# Sub-subcommands and a script, so positional words rather than options.
 _ARGUMENT_EXECUTING_GIT = (
     ("submodule", "foreach"),
     ("bisect", "run"),
     ("filter-branch",),
-    ("rebase", "-x"),
-    ("difftool", "-x"),
 )
+
+
+def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
+    """Split the words after ``git`` into the subcommand and the subcommand's own arguments."""
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        index += 2 if args[index] in _GIT_OPTIONS_WITH_VALUE else 1
+    if index >= len(args):
+        return "", []
+    return args[index], args[index + 1 :]
+
+
+def _names_option(word: str, options: frozenset[str], complete: frozenset[str]) -> bool:
+    """Does ``word`` spell one of ``options`` as a prefix-resolving option parser reads it?"""
+    name = word.partition("=")[0]
+    if name in options:
+        return True
+    if not name.startswith("--") or len(name) <= 2 or name in complete:
+        return False
+    return any(option.startswith(name) for option in options)
+
+
+def _runs_an_exec_option(words: list[str]) -> bool:
+    """Does any command in ``words`` receive one of its exec options, however it is spelled?
+
+    Every word is tried as the command, so a wrapper (``sudo``, ``env``, ``xargs``) or a path
+    (``/usr/bin/sort``) still reaches the table. Coarse in the same fail-closed direction as
+    :func:`_executes_an_argument`.
+    """
+    for index, word in enumerate(words):
+        command, args = word.rsplit("/", 1)[-1], words[index + 1 :]
+        if command == "git":
+            subcommand, args = _git_subcommand(args)
+            command = f"git {subcommand}"
+        options = _ARGUMENT_EXECUTING_OPTIONS.get(command)
+        if options is None:
+            continue
+        complete = _COMPLETE_OPTIONS.get(command, frozenset())
+        if any(_names_option(arg, options, complete) for arg in args):
+            return True
+    return False
 
 
 def _executes_an_argument(words: list[str]) -> bool:
@@ -831,7 +900,7 @@ def _executes_an_argument(words: list[str]) -> bool:
     Deliberately coarse: a match disables suppression for the whole rendered command, which
     only ever costs a false positive on an exotic spelling, never a missed denial.
     """
-    if any(word in _ARGUMENT_EXECUTING_FLAGS for word in words):
+    if any(word in _ARGUMENT_EXECUTING_FLAGS for word in words) or _runs_an_exec_option(words):
         return True
     return "git" in words and any(all(part in words for part in shape) for shape in _ARGUMENT_EXECUTING_GIT)
 
