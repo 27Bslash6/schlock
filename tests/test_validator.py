@@ -1190,14 +1190,17 @@ class TestHeredocSurroundings:
     def test_shellcheck_still_reaches_the_shell_around_a_heredoc(self, safety_rules_path, monkeypatch, head):
         """One ShellCheck spawn still elevates, behind a whitelisted head too.
 
-        `rm -r$''f /` matches `recursive_delete` at HIGH; only ShellCheck reads
+        `rm -r$''f /usr` matches `recursive_delete` at HIGH; only ShellCheck reads
         the `$''` splice and raises it to BLOCKED. Behind `ls` no pass would
         spawn ShellCheck on its own, so this pins the escalation's own spawn.
+        (`/` as the target no longer works as the fixture: system_destruction's
+        recursive-flag fragment stops at `-r` and its span takes the splice, so
+        the rules block that spelling themselves and the spawn is skipped.)
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
 
-        result = validate_command(f"{head} <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
+        result = validate_command(f"{head} <<'EOF'\nx\nEOF\nrm -r$''f /usr", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.message == "Alongside heredoc: ShellCheck: deletes a system directory"
@@ -1283,9 +1286,9 @@ class TestHeredocSurroundings:
         `_shellcheck` through that re-entry would drop this to HIGH.
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
-        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -r$''f /" else [])
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -r$''f /usr" else [])
 
-        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -r$''f /\"", config_path=safety_rules_path)
+        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -r$''f /usr\"", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ShellCheck: deletes a system directory" in result.message

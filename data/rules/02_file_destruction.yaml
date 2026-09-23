@@ -1,5 +1,5 @@
 # Category: File Destruction
-# Risk Levels: BLOCKED, HIGH
+# Risk Levels: BLOCKED, HIGH, MEDIUM
 # Description: Commands that can destroy files and directory trees
 
 rules:
@@ -10,21 +10,52 @@ rules:
     patterns: [':\(\)\{.{0,200}:\|:&\};:', ':\(\)\s*\{.{0,200}:\s*\|\s*:\s*&\s*\}\s*;?\s*:']
     alternatives: ["NEVER run fork bombs"]
 
+  # The recursive flag, every spelling rm accepts, reused verbatim by recursive_delete
+  # and hidden_glob_destruction below:
+  #   -(?<![\w-]-)(?:(?=[a-zA-Z]*[rR])[a-zA-Z]+(?![a-zA-Z])|-r)
+  # A short bundle with r or R anywhere in it (-rf, -fr, -vRf), or any --r… prefix
+  # (getopt_long takes an unambiguous prefix; --recursive is rm's only long option on
+  # r). The dash may not follow a word char or another dash: --force's second dash and
+  # my-r-file's hyphen are out; a quote or brace before it is in, because bash hands rm
+  # the bare -rf from $'-rf' and {-rf,}. No -f required: rm -r ~ deletes every writable
+  # file. Linear: the lookahead decides and [a-zA-Z]+ then takes the whole bundle, so a
+  # tail that fails cannot re-enter the token (`[a-zA-Z]*[rR]` had one way per r:
+  # hidden_glob_destruction on `rm x -` + 40,000 r cost 11.5 s, now under 2 ms). The
+  # lookbehind sits after the literal dash so the literal fails first (27 vs 56 ms
+  # for recursive_delete on 8,000 `x.rm` operands, one \brm head each). Heads before
+  # a span are one \s, not \s+: a \s+ head gives blanks back one at a time and re-runs
+  # the span each time (system_destruction: 500 ms vs 6 ms on `rm` + 500,000 blanks).
+  # Spans stop at a newline as at `;`.
   - name: system_destruction
     description: Complete filesystem destruction
     risk_level: BLOCKED
-    patterns: ['\brm\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]{0,100}\s+(\/|\/\*|\$HOME|~)(\s|$)', '\brm\s+(\/|\/\*)\s+[^;|&]{0,100}(-rf|-fr|-r\s+-f|-f\s+-r)']
+    # Targets: `/`, `/*`, `/*/`; `$HOME`, `${HOME}` or `~` bare, with a trailing `/`,
+    # or with `/*`. `~/` is `~`; `~/*` takes every non-hidden entry: same rating, not
+    # the same delete. Second pattern: target first, flag after; GNU rm permutes, so
+    # `rm -f ~ -r` and `rm / -rf` recurse, and the lazy span before the target lets
+    # the target sit behind other options (cost: 170 ms on 8,000 `rm / -x` heads,
+    # 64 KB, linear; 28 ms on 8,000 `-x.rm` heads).
+    patterns:
+      - '\brm\s[^;|&\n]{0,100}-(?<![\w-]-)(?:(?=[a-zA-Z]*[rR])[a-zA-Z]+(?![a-zA-Z])|-r)[^;|&\n]{0,100}\s+(?:\/(?:\*\/?)?|(?:\$HOME|\$\{HOME\}|~)(?:\/\*?)?)(?:\s|$)'
+      - '\brm\s[^;|&\n]{0,100}?(?<=\s)(?:\/(?:\*\/?)?|(?:\$HOME|\$\{HOME\}|~)(?:\/\*?)?)\s[^;|&\n]{0,100}-(?<![\w-]-)(?:(?=[a-zA-Z]*[rR])[a-zA-Z]+(?![a-zA-Z])|-r)'
     alternatives: ["Specify exact files instead"]
 
   - name: hidden_glob_destruction
-    description: rm -rf .* can delete parent directory via .. glob expansion
+    description: rm -rf .* deletes every dotfile (.git, .ssh); the glob also offers . and .., which rm refuses
     risk_level: BLOCKED
     patterns:
-      # rm with recursive flags and .* glob
-      - '\brm\s+[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]*\s+\.\*(\s|$)'
-      - '\brm\s+\.\*[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)'
-      # Direct .* at end of rm command
-      - '\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?\.\*\s*$'
+      # rm with a recursive flag (the system_destruction fragment) and a .* glob.
+      # The first pattern's unbounded spans are its cost: with N flag tokens on one
+      # line every recursive hit rescans the tail for `.*`, so it is quadratic in N,
+      # as it was with the literal `-rf` group. The second has one span and ends on
+      # the flag, so it is linear. The first head is one `\s` for the reason given on
+      # system_destruction: with `\s+` before an unbounded span, `rm` + 50,000 blanks
+      # cost 7 s.
+      - '\brm\s[^;|&]*-(?<![\w-]-)(?:(?=[a-zA-Z]*[rR])[a-zA-Z]+(?![a-zA-Z])|-r)[^;|&]*\s+\.\*(\s|$)'
+      - '\brm\s+\.\*[^;|&]*-(?<![\w-]-)(?:(?=[a-zA-Z]*[rR])[a-zA-Z]+(?![a-zA-Z])|-r)'
+      # Bare `rm .*` at the end of the command. With a recursive flag in front the
+      # first pattern above already matches.
+      - '\brm\s+\.\*\s*$'
     alternatives:
       - "On many shells, .* expands to include . and .."
       - "Use 'rm -rf .[^.]*' to exclude . and .."
@@ -34,7 +65,15 @@ rules:
   - name: recursive_delete
     description: Recursive delete can destroy directory trees
     risk_level: HIGH
-    patterns: ['\brm\s+-r', '\bfind.{0,200}-delete']
+    # The recursive flag (system_destruction fragment) anywhere in the first 300
+    # chars after `rm`: GNU rm permutes arguments, so `rm dir -r` recurses too. The
+    # span is lazy and bounded, so a head that never finds the flag costs at most
+    # 300 steps and `\brm` heads add up linearly (8,000 `-x.rm` flag tokens on one
+    # line, one head each: 50 ms; 16,000: 105 ms). The unbounded flag-run alternative
+    # `(?:-\S*\s+)*` was measured quadratic on that shape (4.3 s), because every head
+    # rescans the whole run. It stops at a newline like `;`: a bare newline ends the
+    # command.
+    patterns: ['\brm\s[^;|&\n]{0,300}?-(?<![\w-]-)(?:(?=[a-zA-Z]*[rR])[a-zA-Z]+(?![a-zA-Z])|-r)', '\bfind.{0,200}-delete']
     alternatives: ["Use rm -ri for interactive"]
 
   - name: find_exec_rm
@@ -70,3 +109,13 @@ rules:
     risk_level: MEDIUM
     patterns: ['\btar\s+.{0,100}(-x|--extract).{0,100}/', '\bunzip\s+.{0,100}-o', '\bgunzip\s+.{0,100}-f', '\b7z\s+x\s+.{0,100}-y', '\brar\s+x\s+.{0,100}-o\+']
     alternatives: ["Extract to safe directory", "Review archive contents first", "Use sandboxed extraction"]
+
+  - name: unlink_delete
+    description: unlink deletes a file without backup
+    risk_level: MEDIUM
+    # `\b`, not `^`: `/usr/bin/unlink x` and `env unlink x` are the same delete. `\S`:
+    # an operand is required; bare `unlink` deletes nothing. Over-reaches onto
+    # `npm unlink <pkg>` and `unlink --help`, accepted at MEDIUM. 14_self_protection's
+    # BLOCKED `unlink` on schlock's config paths still wins (highest rule returns).
+    patterns: ['\bunlink\s+\S']
+    alternatives: ["Backup first"]

@@ -190,3 +190,52 @@ class TestBoundedQuantifierEdgeCases:
             else:
                 # HIGH is allowed but should have high risk level
                 assert result.risk_level.value >= 3, f"Should be HIGH risk: {cmd}"
+
+
+class TestRecursiveFlagPatternsAreLinear:
+    r"""The rm rules that read the recursive flag stay linear on the shapes that hurt them.
+
+    Regex layer, one rule at a time: the whole validator spends longer than these
+    budgets on other patterns for the same inputs. Each row names the construct it
+    pins and the form it rejects, measured in a fresh process:
+
+    - blank run: a `\s+` head gives blanks back one at a time and re-runs the span
+      each time. At 1,000,000 blanks the `\s+` form costs 600 ms (system_destruction)
+      and 4,300 ms (recursive_delete) against this budget; the `\s` form under 30 ms.
+    - letter run: `[a-zA-Z]*[rR]` had one way to match per `r` in the bundle, so a
+      tail that fails re-enters the token; hidden_glob_destruction cost 11.5 s on
+      40,000 `r`. The lookahead-then-`[a-zA-Z]+` form consumes the bundle once.
+    - rm heads: `\brm` anchors inside every `-x.rm`, and the unbounded flag-run form
+      `(?:-\S*\s+)*` let each head rescan the whole run: 4.3 s at 8,000 heads. The
+      bounded lazy span costs each head at most its bound. hidden_glob_destruction
+      is not on this row: its unbounded spans were quadratic there before this
+      change and still are.
+    """
+
+    RM_RULES = ["recursive_delete", "system_destruction", "hidden_glob_destruction"]
+    ROWS = [
+        *[
+            (rule, label, text)
+            for rule in RM_RULES
+            for label, text in (
+                ("flag run", "rm " + "-f " * 10_000 + "x"),
+                ("blank run", "rm" + " " * 1_000_000),
+                ("letter run", "rm x -" + "r" * 40_000),
+            )
+        ],
+        ("recursive_delete", "rm heads", "rm -f " + "-x.rm " * 8_000),
+        ("system_destruction", "rm heads", "rm -f " + "-x.rm " * 8_000),
+        ("unlink_delete", "flag run", "unlink " + "-f " * 10_000 + "x"),
+        ("unlink_delete", "blank run", "unlink" + " " * 1_000_000),
+    ]
+
+    @pytest.mark.parametrize(("rule", "label", "text"), ROWS, ids=[f"{rule}-{label}" for rule, label, _ in ROWS])
+    def test_adversarial_shape_is_fast(self, safety_rules_path, rule, label, text):
+        engine = RuleEngine(safety_rules_path)
+
+        start = time.perf_counter()
+        for pattern in engine.compiled_patterns[rule]:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.25, f"{rule} on {label} took {elapsed:.3f}s"

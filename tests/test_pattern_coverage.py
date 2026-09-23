@@ -45,16 +45,23 @@ class TestBlockedPatternCoverage:
             "rm -rf $HOME",
             "rm -rf ~",
             "rm -fr $HOME",
+            "rm -R /",  # BSD spelling
+            "rm --recursive $HOME",
+            "rm -Rf ~",
+            "rm -r ~",  # -f only silences prompts
         ]
         for cmd in dangerous:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert not result.allowed, f"System destruction not blocked: {cmd}"
             assert result.risk_level == RiskLevel.BLOCKED
+            # the rule, not ShellCheck's SC2114, which rates several of these on its own
+            assert "system_destruction" in result.matched_rules, (cmd, result.matched_rules)
 
         # Should NOT block
         safe = [
             "rm -rf /tmp/test",  # Specific path
             "rm -rf ./node_modules",  # Relative path
+            "rm -rf ~/.cache",  # Under home, not home
             "rm file.txt",  # Single file
         ]
         for cmd in safe:
@@ -233,12 +240,16 @@ class TestHighPatternCoverage:
         dangerous = [
             "rm -r directory",
             "rm -rf test",
+            "rm -R directory",  # BSD spelling
+            "rm -fr test",  # recursion behind another flag
+            "rm --recursive test",
             "find . -name '*.tmp' -delete",
             "find /tmp -delete",
         ]
         for cmd in dangerous:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level in [RiskLevel.HIGH, RiskLevel.BLOCKED], f"Recursive delete not HIGH/BLOCKED: {cmd}"
+            assert "recursive_delete" in result.matched_rules, (cmd, result.matched_rules)
 
     def test_git_force_push_patterns(self, safety_rules_path):
         """Test git_force_push pattern matching."""
