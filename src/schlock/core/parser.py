@@ -139,7 +139,11 @@ _apply_andor_substitution_correction()
 # its stdin as a command script - a heredoc or here-string included. LAB-2754 already
 # put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
 # the rbash drift with a different interpreter.
-_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
+#
+# `source`/`.` are here because `source /dev/stdin <<EOF` runs the body as bash in the
+# current shell (LAB-3522). Public because the validator re-validates a here-string only
+# for these same interpreters: a here-string is stdin exactly as a heredoc is.
+HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh", "source", "."})
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -153,6 +157,8 @@ STDIN_EXEC_INTERPRETERS = frozenset(
         "rbash",  # restricted bash still execs its stdin; `rbash -c` is already in _SHELL_COMMANDS
         "csh",  # execs stdin as a script like every other shell here; `csh -c` is in _SHELL_COMMANDS
         "tcsh",  # same as csh - tcsh is its interactive superset, not a different stdin model
+        "source",  # `source /dev/stdin` runs stdin as bash; `source file.sh` is a positional (LAB-3522)
+        ".",
         "python",
         "python2",
         "python3",
@@ -215,6 +221,15 @@ _INLINE_CODE_FLAGS = {
     "powershell": frozenset({"-c", "-Command", "-EncodedCommand"}),
     # tclsh/wish/awk family: program is a positional file/arg -> no inline-code flag needed
 }
+
+
+def has_expansion(word: str) -> bool:
+    """True if `word` still holds a `$` or backtick expansion bashlex left unexpanded.
+
+    Such a word is not an unambiguous operand: `"$@"` expands to nothing in a Claude Code Bash
+    call, and an unquoted `$X` can word-split into options (LAB-3522).
+    """
+    return "$" in word or "`" in word
 
 
 # Tokens that explicitly designate STDIN as the program source.
@@ -340,7 +355,8 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     Fail-CLOSED model (a security check must not guess flag arity): the interpreter is exempt
     (returns False) only when a program source is UNAMBIGUOUS —
       - an inline-code flag valid for this interpreter (-c / -e / -m / ...), separate or attached; or
-      - a positional (non-dash) script token appearing BEFORE any option flag.
+      - a positional (non-dash) script token appearing BEFORE any option flag, and holding no
+        unexpanded `$`/backtick: `bash "$@"` is a bare bash when `$@` is empty (LAB-3522).
     Once an option flag is seen, a following non-dash token is treated as that flag's VALUE
     (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
     (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
@@ -356,10 +372,11 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
         if arg in _STDIN_PATHS:
             return True
         if not arg.startswith("-"):
-            # A leading positional (before any option) is a script file -> runs it.
+            # A leading literal positional (before any option) is a script file -> runs it.
+            # A leading expansion may be nothing or options, so it is no program source at all.
             # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
             if not saw_option:
-                return False
+                return has_expansion(arg)
             continue
         saw_option = True
     return True
@@ -754,7 +771,7 @@ class BashCommandParser:
         fail closed on a legitimate command.
         """
         cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
-        executes_body = cmd_name in _HEREDOC_SHELL_COMMANDS
+        executes_body = cmd_name in HEREDOC_SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1113,7 +1130,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
+                        is_shell = parent_cmd in HEREDOC_SHELL_COMMANDS if parent_cmd else False
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes

@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser
+from .parser import HEREDOC_SHELL_COMMANDS, WRAPPER_COMMANDS, BashCommandParser, has_expansion
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -596,8 +596,9 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
             # For a shell, a leading operand is the script to run, so no -c can follow it. For
             # `su`/`sg`/`runuser` it is a user or group and options continue after it. Once an
             # option has been seen a bare token is that option's value either way - keep
-            # scanning. Same reading as parser._reads_stdin_as_program.
-            if i == 0 and operand_ends_options:
+            # scanning. A leading expansion is no script (`bash "$@" -c PROG` runs PROG), so it
+            # ends nothing. Same reading as parser._reads_stdin_as_program.
+            if i == 0 and operand_ends_options and not has_expansion(word):
                 return None
             continue
         if word.startswith("--") or "c" not in word[1:]:
@@ -2356,12 +2357,13 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # LAB-2768: here-strings (`bash <<< PROG`) execute PROG the same way `bash -c PROG`
             # does, but the payload rides a redirect node the extractor above skips. Surface it
             # here; only SHELL here-strings are re-validated as bash (a python/perl here-string is
-            # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
+            # not bash and would be nonsense to re-check) - the heredoc set, which also admits
+            # `source`/`.` (LAB-3522). Fed into the Step 5c re-entry below.
             herestring_payloads = list(
                 dict.fromkeys(
                     prog
                     for name, prog in parser.extract_stdin_program_redirects(ast)
-                    if name in _SHELL_COMMANDS and prog.strip()
+                    if name in HEREDOC_SHELL_COMMANDS and prog.strip()
                 )
             )
 
