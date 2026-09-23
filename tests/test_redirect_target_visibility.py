@@ -58,6 +58,11 @@ def _risk(command, rules):
     return validate_command(command, config_path=rules).risk_level
 
 
+def _reconstruct(command):
+    parser = BashCommandParser()
+    return parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))[0]
+
+
 class TestQuotedRedirectTargetIsVisible:
     """AC-1: a quoted target classifies exactly as its unquoted control does."""
 
@@ -308,11 +313,9 @@ class TestDataOperandsStayOut:
 class TestDollarPrefixedQuoteForms:
     """`$'…'` and `$"…"` are a third way to spell a hidden target.
 
-    bashlex reads the `$` as a PARAMETER glued to literal text, so the word arrives
-    as `$/dev/sda` and matches no path rule. Pre-existing, and it survived the
-    original fix for `"…"` — found by adversarial review. The marker can sit at any
-    offset in the target, not just the first, and bashlex's own quote removal also
-    stops after an empty leading `""` — found by CodeRabbit.
+    bashlex keeps the `$` of each marker in the word, at any offset, and its quote
+    removal breaks on adjacent quoted runs, so the word matches no path rule. Found by
+    adversarial review, then by CodeRabbit for markers past the first character.
     """
 
     @pytest.mark.parametrize(
@@ -320,9 +323,8 @@ class TestDollarPrefixedQuoteForms:
         [
             ("echo x > $'/dev/sda'", "disk_destruction_dd"),
             ('echo x > $"/dev/sda"', "disk_destruction_dd"),
-            # The original form already reads `> /dev/` here, so its rule is credited.
-            ("echo a > /dev/$'sda'", "protect_system_files"),
-            ("echo a > /dev/s$'da'", "protect_system_files"),
+            ('echo x > ""$"/dev/sda"', "disk_destruction_dd"),
+            ("echo x > $''$'/dev/sda'", "disk_destruction_dd"),
             ('echo a > "/dev/"$"sda"', "disk_destruction_dd"),
             ("echo a > /$'dev'/sda", "disk_destruction_dd"),
             ("echo a > $'/'$'dev/sda'", "disk_destruction_dd"),
@@ -330,6 +332,9 @@ class TestDollarPrefixedQuoteForms:
             ("echo a > \"\"'/dev/sda'", "disk_destruction_dd"),
             ("echo a > \"\"$'/dev/sda'", "disk_destruction_dd"),
             ("echo a > /e$'tc'/passwd", "protect_system_files"),
+            # A `$` inside a quoted run is literal, not a marker: these name `/dev/nul$l`.
+            ("echo x > '/dev/nul$'l", "protect_system_files"),
+            ('echo x > "/dev/nul$"l', "protect_system_files"),
         ],
     )
     def test_dollar_quoted_target_is_blocked(self, command, rule, safety_rules_path):
@@ -340,24 +345,41 @@ class TestDollarPrefixedQuoteForms:
         ["$'/dev/sda'", "/dev/$'sda'", "/dev/s$'da'", '"/dev/"$"sda"', "/$'dev'/sda", "'/'$'dev/sda'", "\"\"'/dev/sda'"],
     )
     def test_target_reconstructs_unquoted(self, target):
-        command = f"echo a > {target}"
-        parser = BashCommandParser()
-        assert parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))[0] == "echo a > /dev/sda"
+        assert _reconstruct(f"echo a > {target}") == "echo a > /dev/sda"
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            # Not a marker: a real expansion, a `$` in quotes, and the PID.
+            ("echo x > $HOME/out.txt", "echo x > $HOME/out.txt"),
+            ("echo x > '$'\"/dev/sda\"", "echo x > $/dev/sda"),
+            ("echo x > $$'/dev/sda'", "echo x > $$/dev/sda"),
+            # An escaped quote would shift the scan's quoted runs, so it is not rebuilt.
+            ('echo a > "\\"$\'x\'"', "echo a > \"$'x'"),
+            # A span shlex splits is not rebuilt from its first fragment.
+            ("echo a > $'/dev/sda'$(echo a b)", "echo a > /dev/sda$(echo a b)"),
+        ],
+    )
+    def test_only_markers_are_dropped(self, command, expected):
+        assert _reconstruct(command) == expected
 
     @pytest.mark.parametrize(
         ("command", "rule"),
         [
-            # A backslash (possible ANSI-C escape) or a multi-word span skips the rebuild.
+            # A backslash or a multi-word span skips the rebuild; bashlex's parts still
+            # locate the leading markers, even behind an empty fragment.
             ("echo a > $'/etc/passwd\\x00'", "protect_system_files"),
             ("echo a > $'/dev/sda'$(echo a b)", "disk_destruction_dd"),
+            ("echo a > ''$'/dev/'\\sda", "disk_destruction_dd"),
+            ("echo a > ''$'/dev/sda'${x:+ }", "disk_destruction_dd"),
         ],
     )
-    def test_unrebuilt_target_still_loses_its_leading_marker(self, command, rule, safety_rules_path):
+    def test_unrebuilt_target_still_loses_its_leading_markers(self, command, rule, safety_rules_path):
         assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
 
-    def test_ordinary_parameter_target_is_not_stripped(self, safety_rules_path):
-        """Only a dollar-QUOTE form loses its `$`; a real expansion keeps it."""
-        assert _risk("echo x > $HOME/out.txt", safety_rules_path) is RiskLevel.SAFE
+    def test_real_expansion_after_a_marker_keeps_its_dollar(self, safety_rules_path):
+        """Only the marker's `$` goes; `$HOME` behind it stays an expansion."""
+        assert _verdict('echo a >> $"$HOME"/.bash\\rc', safety_rules_path) == (RiskLevel.HIGH, ("dotfile_persistence",))
 
 
 class TestNormalisedDescriptorDoesNotInventAGap:
@@ -445,25 +467,6 @@ class TestHeredocSuppressionCoversTheBodyNotTheWord:
         """The original reason the suppression exists must survive the narrowing."""
         with_redirect = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
         assert _verdict(with_redirect, safety_rules_path) == (RiskLevel.MEDIUM, ("chmod_exec",))
-
-
-class TestConcatenatedDollarQuoteForms:
-    """The `$` strip is driven by bashlex's parameter parts, not by source position.
-
-    A leading empty fragment moves the `$` off the start of the target and defeats a
-    positional test while the one-character parameter part is still there.
-    """
-
-    @pytest.mark.parametrize(
-        "command",
-        ["echo x > $'/dev/sda'", 'echo x > $"/dev/sda"', 'echo x > ""$"/dev/sda"', "echo x > $''$'/dev/sda'"],
-    )
-    def test_concatenated_dollar_quote_is_blocked(self, command, safety_rules_path):
-        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ("disk_destruction_dd",))
-
-    def test_wide_parameter_is_never_stripped(self, safety_rules_path):
-        """`$HOME` is five characters wide, so it is an expansion, not a quote marker."""
-        assert _risk("echo x > $HOME/out.txt", safety_rules_path) is RiskLevel.SAFE
 
 
 class TestHeredocSuppressionRequiresProvenance:

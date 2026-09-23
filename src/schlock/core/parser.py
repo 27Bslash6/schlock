@@ -4,7 +4,9 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks.
+Regex-based parsing is explicitly NOT supported due to security risks. The one
+regex here (_QUOTED_RUN_OR_DOLLAR_MARKER) only re-reads the quoting of a single
+redirect target whose boundaries bashlex has already fixed; see _redirect_words.
 """
 
 import bisect
@@ -166,10 +168,11 @@ _DATA_REDIRECT_OPERATORS = frozenset({"<<", "<<-", "<<<"})
 # reads `>& word` as `&> word` when no fd is given.
 _OPERATOR_ALIASES = {">|": ">", ">&": "&>"}
 
-# The `$` that opens `$'…'` / `$"…"` outside any quotes (group 1), in a span with no
-# backslash. Quoted runs are matched first so a `$` inside them is consumed, not taken
-# as a marker.
-_DOLLAR_QUOTE_MARKER = re.compile(r"""'[^']*'|"[^"]*"|(\$)(?=['"])""")
+# A quoted run or a `$$` (group 1, kept) or the `$` that opens `$'…'` / `$"…"` outside
+# any quotes (dropped by `.sub(r"\1", …)`). Matching the runs first consumes a `$`
+# inside them, and `$$` is the PID, so neither is taken for a marker. No escape
+# handling: only apply it to a span with no backslash.
+_QUOTED_RUN_OR_DOLLAR_MARKER = re.compile(r"""('[^']*'|"[^"]*"|\$\$)|\$(?=['"])""")
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -473,28 +476,43 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
         return []
 
     # bashlex keeps the `$` of `$'…'` / `$"…"` in the word at whatever offset it sits
-    # (`/$'dev'/sda` → `/$dev/sda`), so the target matches no path rule - a third way
-    # to spell a hidden target, alongside the `"…"` this ticket fixed. Its quote
-    # removal also breaks on adjacent quoted runs (`""'/dev/sda'` → `'/dev/sda'`), and
-    # after one (`'/'$'dev/sda'`) it emits no part for the marker at all, so neither
-    # the word nor its parts can be trusted. Rebuild the word from the SOURCE span:
-    # drop every marker, then let shlex do POSIX quote removal. A real expansion
-    # (`$HOME`) is not followed by a quote, so it is kept.
-    #
-    # With no backslash in the span that IS bash's reading. A backslash may be an
-    # ANSI-C escape (`$'\x2fdev'`) that needs decoding shlex does not do, so such a
-    # span, like one shlex cannot read as a single word (whitespace inside `$(…)`),
-    # keeps bashlex's word, less a leading marker.
+    # (`/$'dev'/sda` → `/$dev/sda`), and its quote removal breaks on adjacent quoted
+    # runs (`""'/dev/sda'` → `'/dev/sda'`), so the target matches no path rule. Where it
+    # can, rebuild the word from the SOURCE span: drop every marker outside quotes, then
+    # let shlex do POSIX quote removal. That is bash's reading of the span's top-level
+    # quoting; shlex also removes quotes nested inside `$(…)` / `${…}`, which bash keeps.
+    # A backslash anywhere disables the rebuild: the marker scan has no escape handling,
+    # so `\"` would shift every quoted run after it, and inside `$'…'` a backslash may be
+    # an ANSI-C escape that shlex cannot decode.
     target_pos = getattr(target, "pos", None)
     span = command[target_pos[0] : target_pos[1]] if command is not None and target_pos else ""
     rebuilt: list[str] = []
     if span and "\\" not in span:
         with contextlib.suppress(ValueError):
-            rebuilt = shlex.split(_DOLLAR_QUOTE_MARKER.sub(lambda m: "" if m.group(1) else m.group(0), span))
+            rebuilt = shlex.split(_QUOTED_RUN_OR_DOLLAR_MARKER.sub(r"\1", span))
     if len(rebuilt) == 1:
         word = rebuilt[0]
-    elif span.startswith(("$'", '$"')) and word.startswith("$"):
-        word = word[1:]
+    elif command is not None:
+        # No rebuild (a backslash, or a span shlex cannot read as one word, such as
+        # whitespace inside `$(…)`): keep bashlex's word less its leading markers. Drive
+        # the strip off bashlex's one-character PARAMETER parts, not off the first source
+        # characters: a leading empty fragment (`''$'/dev/'\sda`) moves the `$` off the
+        # start and defeats a positional test, while the part is still there. A real
+        # expansion is wider than one character (`$HOME` spans five), so it is never
+        # stripped. This assumes bashlex left the markers in the word: a word decoded
+        # before it gets here has none, and the strip would eat a real `$` instead.
+        for part in sorted(getattr(target, "parts", None) or [], key=lambda x: getattr(x, "pos", (0,))[0]):
+            pos = getattr(part, "pos", None)
+            is_dollar_quote = (
+                getattr(part, "kind", None) == "parameter"
+                and pos
+                and pos[1] - pos[0] == 1
+                and command[pos[1] : pos[1] + 1] in ("'", '"')
+            )
+            if is_dollar_quote and word.startswith("$"):
+                word = word[1:]
+            else:
+                break
 
     # Did the SOURCE glue the operator to its target? Read the character before the
     # target rather than computing where the operator ended: bashlex NORMALISES the
