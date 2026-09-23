@@ -671,6 +671,12 @@ class TestHereStringPayloadExtraction:
         # `timeout 5 bash -c "echo hi" <<< X`: bash runs the -c program; the here-string is inert.
         assert self._extract('timeout 5 bash -c "echo hi" <<< "rm -rf /"') == []
 
+    def test_csh_and_tcsh_dash_c_means_here_string_is_inert_data(self):
+        # LAB-4691: csh/tcsh -c runs the -c program, exactly like bash -c; the here-string is
+        # data on a stdin nothing reads.
+        assert self._extract('csh -c "echo safe" <<< "rm -rf /"') == []
+        assert self._extract('tcsh -c "echo safe" <<< "rm -rf /"') == []
+
     def test_here_string_off_a_non_stdin_redirect_is_ignored(self):
         # A plain input redirect (`< file`) is not a here-string; nothing to surface.
         assert self._extract("bash < script.sh") == []

@@ -193,6 +193,8 @@ _INLINE_CODE_FLAGS = {
     "ash": frozenset({"-c"}),
     "fish": frozenset({"-c"}),
     "rbash": frozenset({"-c"}),
+    "csh": frozenset({"-c"}),
+    "tcsh": frozenset({"-c"}),
     "python": frozenset({"-c", "-m"}),
     "python2": frozenset({"-c", "-m"}),
     "python3": frozenset({"-c", "-m"}),
