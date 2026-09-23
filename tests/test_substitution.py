@@ -1651,12 +1651,20 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git send-email --sendmail 'rm -rf /' HEAD~1)\"",
             "echo \"$(sort --compress 'rm -rf /' f)\"",
             "echo \"$(sdiff --diff 'rm -rf /' a b)\"",
-            # documented short form, and an alias spelling Getopt::Long also accepts
+            # documented short form, alone or ending a cluster of boolean flags
             "echo \"$(git clone -u 'rm -rf /' https://x/y)\"",
-            "echo \"$(git send-email --tocmd 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git clone -qu 'rm -rf /' https://x/y)\"",
+            "echo \"$(git difftool -yx 'rm -rf /' HEAD)\"",
+            # send-email keeps Getopt::Long's defaults: any case, and `-`/`+` as long prefixes
+            "echo \"$(git send-email --SENDMAIL-CMD 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git send-email -to-cmd 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git send-email +Header 'rm -rf /' HEAD~1)\"",
             # the subcommand sits behind git's own value-taking options
             "echo \"$(git -C /repo --git-dir /repo/.git fetch --upload 'rm -rf /' .)\"",
             "echo \"$(git -c color.ui=never clone -u 'rm -rf /' https://x/y)\"",
+            "echo \"$(git --shallow-file /x difftool -x 'rm -rf /' HEAD)\"",
+            # the exact floor, for a command no key reaches
+            "echo \"$(git daemon --access-hook 'rm -rf /')\"",
         ],
     )
     def test_abbreviated_and_short_exec_options_suppress_nothing(self, command):
@@ -1673,6 +1681,7 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
             # a complete option is not an abbreviation of the longer one it prefixes
             "echo \"$(git send-email --to 'Ray Walker' --cc 'a b' --subject 'rm -rf / fix' p)\"",
+            "echo \"$(git send-email -TO 'Ray Walker' --subject 'rm -rf / fix' p)\"",
             # `-u` is `--upload-pack` on clone only; on fetch it is --update-head-ok
             "echo \"$(git fetch -u origin --negotiation-tip 'rm -rf /')\"",
         ],

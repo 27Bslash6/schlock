@@ -798,7 +798,10 @@ def _command_tokens(node: Any) -> list[tuple[str, bool]]:
 
 
 # Shapes that hand one of their own arguments to a shell. These take the command as a SEPARATE
-# word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD.
+# word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD. Matched
+# exactly and against EVERY command: the floor under the keyed table below, for the spellings no
+# key reaches (`git daemon --access-hook`, `--pager`, a git subcommand the walk misreads). The
+# overlap with the table is deliberate.
 _ARGUMENT_EXECUTING_FLAGS = frozenset(
     {
         "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
@@ -814,7 +817,8 @@ _ARGUMENT_EXECUTING_FLAGS = frozenset(
 # `git log --author` resolved to `--authors-prog`, which only `git svn` has (LAB-4268).
 # Short forms are keyed for the same reason: `-u` is `--upload-pack` on clone but
 # `--update-head-ok` on fetch, and `-x` runs a command on rebase and difftool while `grep -x`,
-# `diff -x` and `git clean -x` mean something ordinary.
+# `diff -x` and `git clean -x` mean something ordinary. `git svn` is GNU-style Getopt::Long;
+# `git send-email` keeps Getopt::Long's defaults, see _names_option.
 _ARGUMENT_EXECUTING_OPTIONS = {
     "sort": frozenset({"--compress-program"}),
     "sdiff": frozenset({"--diff-program"}),
@@ -827,9 +831,7 @@ _ARGUMENT_EXECUTING_OPTIONS = {
     "git archive": frozenset({"--exec"}),
     "git rebase": frozenset({"-x", "--exec"}),
     "git difftool": frozenset({"-x", "--extcmd"}),
-    "git send-email": frozenset(
-        {"--to-cmd", "--tocmd", "--cc-cmd", "--cccmd", "--header-cmd", "--headercmd", "--sendmail-cmd", "--sendmailcmd"}
-    ),
+    "git send-email": frozenset({"--to-cmd", "--cc-cmd", "--header-cmd", "--sendmail-cmd"}),
     "git svn": frozenset({"--authors-prog"}),
 }
 # A complete option beats the longer one it happens to prefix: send-email's `--to` names a
@@ -837,9 +839,10 @@ _ARGUMENT_EXECUTING_OPTIONS = {
 _COMPLETE_OPTIONS = {"git send-email": frozenset({"--to", "--cc"})}
 # git's own options that take their value as the NEXT word. git matches these exactly.
 _GIT_OPTIONS_WITH_VALUE = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"}
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source", "--shallow-file"}
 )
-# Sub-subcommands and a script, so positional words rather than options.
+# `submodule foreach` and `bisect run` take the command as a positional word; `filter-branch` is
+# caught by name alone, since every one of its filters executes.
 _ARGUMENT_EXECUTING_GIT = (
     ("submodule", "foreach"),
     ("bisect", "run"),
@@ -857,14 +860,23 @@ def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
     return args[index], args[index + 1 :]
 
 
-def _names_option(word: str, options: frozenset[str], complete: frozenset[str]) -> bool:
-    """Does ``word`` spell one of ``options`` as a prefix-resolving option parser reads it?"""
+def _names_option(word: str, command: str) -> bool:
+    """Does ``word`` spell one of ``command``'s exec options the way its option parser reads it?"""
+    options = _ARGUMENT_EXECUTING_OPTIONS[command]
     name = word.partition("=")[0]
+    if command == "git send-email" and name[:1] in ("-", "+"):
+        # Getopt::Long's defaults, which send-email never overrides: case-insensitive, and `-`
+        # or `+` introduce a long option just as `--` does.
+        name = "--" + name.lstrip("-+").lower()
     if name in options:
         return True
-    if not name.startswith("--") or len(name) <= 2 or name in complete:
-        return False
-    return any(option.startswith(name) for option in options)
+    if name.startswith("--"):
+        if len(name) <= 2 or name in _COMPLETE_OPTIONS.get(command, ()):
+            return False
+        return any(option.startswith(name) for option in options)
+    # A short option may end a cluster of boolean flags (`-qu 'cmd'`). Finding the letter anywhere
+    # in the word can only over-match, as for sort's `-o` above.
+    return name.startswith("-") and any(len(option) == 2 and option[1] in name[1:] for option in options)
 
 
 def _runs_an_exec_option(words: list[str]) -> bool:
@@ -879,11 +891,7 @@ def _runs_an_exec_option(words: list[str]) -> bool:
         if command == "git":
             subcommand, args = _git_subcommand(args)
             command = f"git {subcommand}"
-        options = _ARGUMENT_EXECUTING_OPTIONS.get(command)
-        if options is None:
-            continue
-        complete = _COMPLETE_OPTIONS.get(command, frozenset())
-        if any(_names_option(arg, options, complete) for arg in args):
+        if command in _ARGUMENT_EXECUTING_OPTIONS and any(_names_option(arg, command) for arg in args):
             return True
     return False
 
