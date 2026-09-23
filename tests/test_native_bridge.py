@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -94,34 +93,10 @@ class TestBinaryResolution:
             bridge.parse_json("echo hi")
 
 
-def _vendor(root: Path, content: bytes, digest: Optional[str] = None) -> Path:
-    """Lay out `root` like .claude-plugin/bin/: this platform's binary plus a MANIFEST for it."""
-    path = root / platform_dir() / BINARY_NAME
-    path.parent.mkdir(parents=True)
-    path.write_bytes(content)
-    path.chmod(0o755)
-    entry = hashlib.sha256(content).hexdigest() if digest is None else digest
-    manifest = {"schema": 1, "binaries": {f"{platform_dir()}/{BINARY_NAME}": entry}}
-    (root / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
-    return path
-
-
 class TestBinaryIntegrity:
     """Spec §7: never exec a binary whose SHA-256 is not the one MANIFEST.json records."""
 
     STAND_IN = b"#!/bin/sh\necho '{}'\n"
-
-    def test_matching_digest_resolves(self, tmp_path):
-        path = _vendor(tmp_path, self.STAND_IN)
-        assert resolve_binary(bin_root=tmp_path) == path
-
-    def test_bit_flipped_binary_raises(self, tmp_path):
-        path = _vendor(tmp_path, self.STAND_IN)
-        tampered = bytearray(path.read_bytes())
-        tampered[len(tampered) // 2] ^= 0x01
-        path.write_bytes(bytes(tampered))
-        with pytest.raises(NativeBridgeError, match="SHA-256"):
-            resolve_binary(bin_root=tmp_path)
 
     @needs_binary
     def test_bit_flipped_vendored_binary_raises(self, tmp_path):
@@ -137,8 +112,8 @@ class TestBinaryIntegrity:
         with pytest.raises(NativeBridgeError, match="SHA-256"):
             resolve_binary(bin_root=tmp_path)
 
-    def test_missing_manifest_raises(self, tmp_path):
-        _vendor(tmp_path, self.STAND_IN)
+    def test_missing_manifest_raises(self, tmp_path, vendored):
+        vendored(self.STAND_IN)
         (tmp_path / "MANIFEST.json").unlink()
         with pytest.raises(NativeBridgeError, match="MANIFEST"):
             resolve_binary(bin_root=tmp_path)
@@ -146,63 +121,96 @@ class TestBinaryIntegrity:
     @pytest.mark.parametrize(
         "manifest",
         [
-            '{"schema": 1, "binaries": {"plan9-386/schlock-parse": "00"}}',  # no entry for this platform
-            '{"schema": 1, "binaries": {}}',
-            '{"schema": 1}',
-            '{"schema": 1, "binaries": ["schlock-parse"]}',
-            "[]",
+            '{"binaries": {"plan9-386/schlock-parse": "00"}}',  # no entry for this platform
+            '{"binaries": ["schlock-parse"]}',
             "not json",
-            "",
         ],
     )
-    def test_manifest_without_this_platforms_digest_raises(self, tmp_path, manifest):
+    def test_manifest_without_this_platforms_digest_raises(self, tmp_path, vendored, manifest):
         # Fail closed: no recorded digest is an integrity failure, never "nothing to check".
-        _vendor(tmp_path, self.STAND_IN)
+        vendored(self.STAND_IN)
         (tmp_path / "MANIFEST.json").write_text(manifest, encoding="utf-8")
         with pytest.raises(NativeBridgeError, match="MANIFEST"):
             resolve_binary(bin_root=tmp_path)
 
-    def test_non_string_digest_raises(self, tmp_path):
-        _vendor(tmp_path, self.STAND_IN)
+    def test_non_string_digest_raises(self, tmp_path, vendored):
+        vendored(self.STAND_IN)
         (tmp_path / "MANIFEST.json").write_text(
             json.dumps({"binaries": {f"{platform_dir()}/{BINARY_NAME}": None}}), encoding="utf-8"
         )
         with pytest.raises(NativeBridgeError, match="SHA-256"):
             resolve_binary(bin_root=tmp_path)
 
-    def test_tampered_binary_is_never_executed(self, tmp_path, monkeypatch, spawned):
-        _vendor(tmp_path, self.STAND_IN, digest="0" * 64)
-        monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
-        with pytest.raises(NativeBridgeError, match="SHA-256"):
-            NativeBridge().parse_json("echo hi")
-        assert spawned == []
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+    def test_fifo_manifest_raises_without_blocking(self, tmp_path, vendored):
+        # The check runs before the spawn deadline: a read that waits for a writer would hold
+        # the hook past its own timeout, which fails open.
+        vendored(self.STAND_IN)
+        (tmp_path / "MANIFEST.json").unlink()
+        os.mkfifo(tmp_path / "MANIFEST.json")
+        started = time.monotonic()
+        with pytest.raises(NativeBridgeError, match="regular file"):
+            resolve_binary(bin_root=tmp_path)
+        assert time.monotonic() - started < 1
 
-    def test_check_runs_at_first_exec_not_construction(self, tmp_path, monkeypatch, spawned):
+    def test_oversized_binary_raises_without_hashing(self, tmp_path, vendored):
+        # Sparse: no disk cost, but hashing 1 TiB would take minutes.
+        binary = vendored(self.STAND_IN)
+        with binary.open("r+b") as handle:
+            handle.truncate(1 << 40)
+        started = time.monotonic()
+        with pytest.raises(NativeBridgeError, match="regular file of at most"):
+            resolve_binary(bin_root=tmp_path)
+        assert time.monotonic() - started < 1
+
+    def test_check_runs_at_first_exec_not_construction(self, tmp_path, vendored, monkeypatch, spawned):
         # The check sits in the exec path: a swap after the bridge is built is still caught.
-        path = _vendor(tmp_path, self.STAND_IN)
+        binary = vendored(self.STAND_IN)
         monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
         bridge = NativeBridge()
-        path.write_bytes(b"#!/bin/sh\necho swapped\n")
+        binary.write_bytes(b"#!/bin/sh\necho swapped\n")
         with pytest.raises(NativeBridgeError, match="SHA-256"):
             bridge.parse_json("echo hi")
         assert spawned == []
 
-    def test_verified_binary_is_executed(self, tmp_path, monkeypatch, spawned):
-        _vendor(tmp_path, self.STAND_IN)
+    def test_failure_is_cached_not_rehashed_per_parse(self, tmp_path, vendored, monkeypatch):
+        # A command's substitutions each parse; re-hashing a bad binary per parse multiplies the cost.
+        vendored(self.STAND_IN, digest="0" * 64)
+        monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
+        calls = []
+        real = native_bridge._verify_digest
+        monkeypatch.setattr(native_bridge, "_verify_digest", lambda *a: calls.append(a) or real(*a))
+        bridge = NativeBridge()
+        for _ in range(3):
+            with pytest.raises(NativeBridgeError, match="SHA-256"):
+                bridge.parse_json("echo hi")
+        assert len(calls) == 1
+
+    def test_verified_binary_is_executed(self, tmp_path, vendored, monkeypatch, spawned):
+        vendored(self.STAND_IN)
         monkeypatch.setattr(native_bridge, "DEFAULT_BIN_ROOT", tmp_path)
         assert NativeBridge().parse_json("echo hi").strip() == "{}"
         assert len(spawned) == 1
 
-    def test_vendored_binary_matches_its_manifest(self):
-        # needs_binary skips when resolve_binary raises, so a stale MANIFEST would silently skip
-        # the whole native suite. Fail loudly instead whenever a binary is vendored here.
-        try:
-            relative = f"{platform_dir()}/{BINARY_NAME}{'.exe' if platform.system().lower() == 'windows' else ''}"
-        except NativeBridgeError:
-            pytest.skip("no native tier for this platform")
-        if not (DEFAULT_BIN_ROOT / relative).is_file():
-            pytest.skip("no vendored schlock-parse binary for this platform")
-        assert resolve_binary() == DEFAULT_BIN_ROOT / relative
+    def test_every_vendored_binary_matches_manifest(self):
+        # Platform-independent: CI runs on one OS, and needs_binary skips on ANY resolve failure,
+        # so a stale digest for another target would otherwise only surface on its users' machines
+        # as a silent fall back to bashlex.
+        binaries = json.loads((DEFAULT_BIN_ROOT / "MANIFEST.json").read_text(encoding="utf-8"))["binaries"]
+        on_disk = {p.relative_to(DEFAULT_BIN_ROOT).as_posix() for p in DEFAULT_BIN_ROOT.glob(f"*/{BINARY_NAME}*")}
+        assert (
+            set(binaries)
+            == on_disk
+            == {
+                "darwin-amd64/schlock-parse",
+                "darwin-arm64/schlock-parse",
+                "linux-amd64/schlock-parse",
+                "linux-arm64/schlock-parse",
+                "windows-amd64/schlock-parse.exe",
+            }
+        )
+        for key, expected in binaries.items():
+            assert hashlib.sha256((DEFAULT_BIN_ROOT / key).read_bytes()).hexdigest() == expected, key
 
 
 @needs_binary

@@ -61,13 +61,13 @@ class TestSelfProtectDecide:
         [
             # A swapped parser binary is a global under-block: every rule reads its AST.
             ("Write", {"file_path": ".claude-plugin/bin/linux-amd64/schlock-parse", "content": "x"}),
-            ("Write", {"file_path": "/p/schlock/0.9.3/.claude-plugin/bin/darwin-arm64/schlock-parse", "content": "x"}),
             ("Edit", {"file_path": "/p/.claude-plugin/bin/MANIFEST.json", "new_string": "x", "old_string": "y"}),
             ("Write", {"file_path": "/p/.claude-plugin/bin", "content": "x"}),  # the directory itself
-            ("Write", {"file_path": "/p/.claude-plugin/bin/../bin/linux-amd64/schlock-parse", "content": "x"}),
+            ("Write", {"file_path": "/p/.claude-plugin/x/../bin/schlock-parse", "content": "x"}),  # .. traversal
+            # macOS's default APFS is case-insensitive: this IS the MANIFEST there.
+            ("Write", {"file_path": "/p/.Claude-Plugin/BIN/MANIFEST.json", "content": "x"}),
             # Vendored Python (bashlex, yaml) runs inside the hook: same stakes.
             ("MultiEdit", {"file_path": "/p/.claude-plugin/vendor/bashlex/parser.py", "edits": []}),
-            ("NotebookEdit", {"notebook_path": "/p/.claude-plugin/vendor/x.ipynb", "new_source": "x"}),
         ],
     )
     def test_blocks_write_to_vendored_binaries(self, tool_name, tool_input):

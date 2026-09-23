@@ -19,22 +19,19 @@ Three invariants carry the security weight here:
    with a trailing `; rm -rf /` silently dropped, so every non-zero exit raises
    and the accumulated output is discarded (spec §3.1, §11 finding 10).
 3. **Never exec an unverified binary.** A swapped `schlock-parse` that emits a
-   benign AST defeats every rule at once, so the resolved binary's SHA-256 must
-   equal the digest `MANIFEST.json` records for this platform before the first
-   spawn; a mismatch, or no digest at all, raises → bashlex with a warning
-   (spec §6 row 2, §7).
+   benign AST defeats every rule at once, so before the first spawn the binary's
+   SHA-256 must equal the digest `MANIFEST.json` records for this platform; a
+   mismatch, or no digest at all, raises `NativeBridgeError` and
+   `parser.TieredParser` moves to its next tier (spec §6 row 2, §7). Both files
+   are read only as bounded regular files: the check runs before the spawn
+   deadline, and a hook held past its own timeout fails open.
 
-What the hash check does NOT catch, and what does (spec §7):
-- A malicious commit that updates the binary AND its MANIFEST entry together —
-  the hash then matches. The CI job that rebuilds from pinned source and asserts
-  byte-equality with the committed binary (spec §9 T9) covers that.
-- A write that lands both files in the installed plugin. The MANIFEST sits in the
-  same `.claude-plugin/bin/` the self-protection layers block writes to
-  (validator SELF_PROTECTION_PATHS, hooks/self_protect.py, the
-  schlock_plugin_binary_write rule); the hash check is the backstop for a swap
-  that got past them, not a replacement for them.
-- A swap racing the gap between hashing and spawning. The check is on the file at
-  rest; a concurrent writer is already running code outside schlock.
+Layering (spec §7): the hash check proves the binary is the one MANIFEST names,
+not that MANIFEST is honest — a commit updating both would still match. The CI
+rebuild from pinned source, asserting byte-equality with the committed binaries,
+is what establishes that. Keeping writes out of `.claude-plugin/bin/` is the
+self-protection layers' job (validator SELF_PROTECTION_PATHS,
+hooks/self_protect.py, the schlock_plugin_binary_write rule).
 """
 
 import contextlib
@@ -43,10 +40,11 @@ import json
 import os
 import platform
 import signal
+import stat
 import subprocess
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Optional
 
 from schlock.exceptions import ParseError
 
@@ -76,6 +74,12 @@ MAX_AST_JSON_SIZE = 12 * 1024 * 1024
 
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_STDERR_BYTES = 8 * 1024
+
+# Read bounds for the integrity check (spec §7). It runs before the spawn deadline, so a FIFO
+# or a sparse multi-GiB file standing in for either file would otherwise hold the hook past
+# its own timeout. The real binaries are ~2.4 MB; the MANIFEST is under 1 KB.
+_MAX_BINARY_SIZE = 16 * 1024 * 1024
+_MAX_MANIFEST_SIZE = 64 * 1024
 
 # The GOOS/GOARCH pairs T1 cross-compiles (spec §7). Anything else has no native
 # tier at all — resolution raises so the caller falls back rather than guessing.
@@ -136,6 +140,18 @@ def resolve_binary(bin_root: Optional[Path] = None) -> Path:
     return path
 
 
+def _open_bounded(path: Path, limit: int) -> BinaryIO:
+    """Open `path` for reading only if it is a regular file of at most `limit` bytes."""
+    # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer. It does not
+    # change reads from a regular file.
+    handle = os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), "rb")
+    info = os.fstat(handle.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        handle.close()
+        raise NativeBridgeError(f"{path} is not a regular file of at most {limit} bytes; refusing to trust it")
+    return handle
+
+
 def _verify_digest(path: Path, manifest: Path, key: str) -> None:
     """Raise unless `path`'s SHA-256 is the digest `manifest` records under `key` (spec §7).
 
@@ -143,16 +159,19 @@ def _verify_digest(path: Path, manifest: Path, key: str) -> None:
     an integrity failure, never "nothing to check".
     """
     try:
-        expected = json.loads(manifest.read_text(encoding="utf-8"))["binaries"][key]
+        with _open_bounded(manifest, _MAX_MANIFEST_SIZE) as handle:
+            expected = json.loads(handle.read(_MAX_MANIFEST_SIZE))["binaries"][key]
     except (OSError, ValueError, LookupError, TypeError) as exc:
         raise NativeBridgeError(f"no MANIFEST SHA-256 for {key} in {manifest}: {exc!r}; refusing to execute {path}")
     digest = hashlib.sha256()
     try:
-        # Chunked, not read_bytes(): copying 2.4 MB into a fresh hook process's heap cost
-        # ~1 ms of the ~2.6 ms check (measured cold, median).
-        with path.open("rb") as binary:
-            for chunk in iter(lambda: binary.read(_READ_CHUNK_SIZE), b""):
+        # Chunked: read_bytes() made the check ~2.6 ms cold, chunked it is ~1.7 ms. The
+        # `remaining` cap also bounds a file that reports a small size and reads on and on.
+        with _open_bounded(path, _MAX_BINARY_SIZE) as binary:
+            remaining = _MAX_BINARY_SIZE + 1
+            while remaining > 0 and (chunk := binary.read(min(_READ_CHUNK_SIZE, remaining))):
                 digest.update(chunk)
+                remaining -= len(chunk)
     except OSError as exc:
         raise NativeBridgeError(f"cannot hash native parser binary {path}: {exc}")
     actual = digest.hexdigest()
@@ -196,20 +215,26 @@ class NativeBridge:
         timeout: float = NATIVE_TIMEOUT,
     ):
         self._binary_path = binary_path
+        self._resolve_error: Optional[NativeBridgeError] = None
         self._max_ast_json_size = max_ast_json_size
         self._timeout = timeout
 
     def _binary(self) -> Path:
         # Resolved — and SHA-256-verified against MANIFEST.json — lazily at the first exec,
-        # and cached on success only, so a missing or tampered binary keeps raising
-        # (→ bashlex with a warning, spec §6 row 2) instead of caching a lie.
+        # then cached either way: a missing or tampered binary keeps raising the same error
+        # (spec §6 row 2) without being re-hashed on every parse() of a command.
         # ponytail: verified once per bridge, i.e. once per hook process (T8 holds one), not
-        # once per spawn. The check costs ~1.7 ms cold against a ~2-3 ms spawn; a swap
-        # between two spawns inside one short-lived hook needs a concurrent writer, which
-        # already runs code outside schlock. Re-verify per spawn if the bridge goes long-lived.
-        if self._binary_path is None:
-            self._binary_path = resolve_binary()
-        return self._binary_path
+        # once per spawn — it guards the file at rest. Re-verify per spawn if the bridge ever
+        # becomes long-lived.
+        if self._binary_path is not None:
+            return self._binary_path
+        if self._resolve_error is None:
+            try:
+                self._binary_path = resolve_binary()
+                return self._binary_path
+            except NativeBridgeError as exc:
+                self._resolve_error = exc
+        raise self._resolve_error
 
     def parse(self, command: str) -> "list":
         """Parse `command` into bashlex-shaped `AstView` nodes (spec §3.2).

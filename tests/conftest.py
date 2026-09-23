@@ -1,12 +1,15 @@
 """Pytest configuration and shared fixtures."""
 
+import hashlib
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
-from schlock.core import validator
+from schlock.core import native_bridge, validator
 from schlock.core.cache import ValidationCache
 from schlock.core.parser import BashCommandParser
 from schlock.core.validator import clear_caches
@@ -92,6 +95,27 @@ def fake_binary(tmp_path):
         script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
         script.chmod(0o755)
         return script
+
+    return _make
+
+
+@pytest.fixture
+def vendored(tmp_path):
+    """Factory: lay out `tmp_path` like .claude-plugin/bin/ — this platform's binary + a MANIFEST.
+
+    The MANIFEST records `digest`, or the real SHA-256 of `content` when omitted. Returns the
+    binary's path; pass `tmp_path` as the bin root (or patch DEFAULT_BIN_ROOT to it).
+    """
+
+    def _make(content: bytes, digest: Optional[str] = None) -> Path:
+        key = f"{native_bridge.platform_dir()}/{native_bridge.BINARY_NAME}"
+        binary = tmp_path / key
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(content)
+        binary.chmod(0o755)
+        entry = hashlib.sha256(content).hexdigest() if digest is None else digest
+        (tmp_path / native_bridge.MANIFEST_NAME).write_text(json.dumps({"binaries": {key: entry}}), encoding="utf-8")
+        return binary
 
     return _make
 

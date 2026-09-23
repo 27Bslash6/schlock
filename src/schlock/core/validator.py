@@ -811,24 +811,31 @@ _SELF_PROTECTION_READ_ALLOWLIST = frozenset(
     }
 )
 
-# Pre-compiled regex for redirect operators targeting config paths
-_SELF_PROTECTION_REDIRECT_PATTERNS = [re.compile(r">>?\s*\S*" + re.escape(path)) for path in SELF_PROTECTION_PATHS]
+# Pre-compiled regex for redirect operators targeting protected paths; the lookahead is
+# _matches_protected_path's after-boundary, so `> .claude-plugin/binary.md` is not a hit.
+_SELF_PROTECTION_REDIRECT_PATTERNS = [
+    re.compile(r">>?\s*\S*" + re.escape(path) + r"""(?=[\s"'(),;|&>/]|$)""") for path in SELF_PROTECTION_PATHS
+]
+
+# `//` and `/./` runs, which name the same path as a single `/` (`.claude-plugin//bin`).
+_PATH_RESPELLING_RE = re.compile(r"/(?:\.?/)+")
 
 # Pre-compiled regex for splitting command strings into segments
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
 
 
 def _check_self_protection(command: str) -> Optional[ValidationResult]:
-    """Allowlist-based check preventing modification of schlock configuration files.
+    """Allowlist-based check preventing modification of schlock's protected paths.
 
-    SECURITY CRITICAL: Uses an allowlist approach — when a config path is detected
-    in a command, only known read-only commands are permitted. All other commands
-    are blocked. This prevents bypass via obscure write commands (ln, dd, rsync, etc.)
-    that a denylist would miss.
+    SECURITY CRITICAL: Uses an allowlist approach — when a protected path (config file or
+    vendored parser/deps directory) is detected in a command, only known read-only commands
+    are permitted. All other commands are blocked. This prevents bypass via obscure write
+    commands (ln, dd, rsync, etc.) that a denylist would miss.
 
     Defense-in-depth: This is layer 2 of 3. Even if YAML rules (layer 1) are corrupted
     or the hook file_path check (layer 3) is bypassed, this hardcoded check blocks
-    config tampering.
+    tampering. validate_command runs it on the whole command and again on every parsed
+    segment, since the regex split below does not separate `&` or newline-chained commands.
 
     Known limitation: Variable indirection (e.g., f=config.yaml; rm "$f") can bypass
     this check because the expanded path doesn't appear in the command string. Mitigated
@@ -840,13 +847,17 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
     Returns:
         ValidationResult blocking the command if it targets schlock config, None otherwise
     """
-    # Fast path: skip if command doesn't reference any config path
-    if not _matches_protected_path(command):
+    # Detection-only copy, case-folded (APFS and NTFS are case-insensitive by default) with
+    # `//` and `/./` collapsed, so a respelling of a protected path still matches.
+    probe = _PATH_RESPELLING_RE.sub("/", command.lower())
+
+    # Fast path: skip if command doesn't reference any protected path
+    if not _matches_protected_path(probe):
         return None
 
     # Check 1: Block any redirect operators (> or >>) targeting config files
     for pattern in _SELF_PROTECTION_REDIRECT_PATTERNS:
-        if pattern.search(command):
+        if pattern.search(probe):
             return _make_self_protection_result(command)
 
     # Check 2: Allowlist — verify all commands touching config paths are read-only
@@ -860,7 +871,7 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
     # - Only variable indirection (f=config; rm "$f") bypasses this check,
     #   which AST parsing also can't solve (bashlex doesn't resolve variables).
     #   Mitigated by YAML rules (layer 1) and hook file_path checks (layer 3).
-    segments = _SEGMENT_SPLIT_RE.split(command)
+    segments = _SEGMENT_SPLIT_RE.split(probe)
     for raw_segment in segments:
         segment = raw_segment.strip()
         if not segment:
@@ -891,7 +902,7 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
 
 def _make_self_protection_result(command: str) -> ValidationResult:
     """Create a BLOCKED ValidationResult for self-protection violations."""
-    logger.warning(f"Self-protection: blocked config modification attempt: {command[:100]}")
+    logger.warning(f"Self-protection: blocked protected-path modification attempt: {command[:100]}")
     return ValidationResult(
         allowed=False,
         risk_level=RiskLevel.BLOCKED,
@@ -899,6 +910,7 @@ def _make_self_protection_result(command: str) -> ValidationResult:
         alternatives=[
             "Edit schlock configuration manually outside of Claude Code",
             "Use /schlock:setup to configure schlock interactively",
+            "Restore vendored parser files by reinstalling: /plugin install schlock@schlock",
         ],
         exit_code=1,
         error=None,
@@ -2408,6 +2420,14 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 
             # If we have multiple segments, validate each one
             if len(segments) > 1:
+                # Self-protection again, per parsed segment and ahead of the whitelist (Step 3's
+                # guarantee): its regex split keeps `ls & cp x .claude-plugin/bin/...` and
+                # newline-chained commands as one read-only-looking segment; the AST does not.
+                for segment in segments:
+                    protected = _check_self_protection(segment.text)
+                    if protected is not None:
+                        return protected
+
                 # Full-command whitelist check before segment validation.
                 # Per-segment validation cannot detect safe multi-command patterns
                 # (e.g., "gh auth token | docker login ... --password-stdin") because
