@@ -320,20 +320,6 @@ def _command_nodes(node: Any) -> "list[Any]":
     return found
 
 
-def _first_command_node(node: Any) -> Optional[Any]:
-    """Return the first `command`-kind node reachable from `node`, in source order, else None.
-
-    Used to classify a subshell/group pipeline stage (`(bash)`, `{ bash; }`): the piped data lands
-    on the FIRST command inside the group (its stdin sink). Inner *pipelines* within the group are
-    handled separately by the recursive walk, so first-command is the right target here (#97) -
-    unlike a here-string's shared fd, which any command in the group may read (`_command_nodes`).
-
-    Expressed via `_command_nodes` so the two security-critical traversals share ONE walk skeleton:
-    a future bashlex child-attr change cannot leave one of them silently under-scanning (LAB-2768).
-    """
-    return next(iter(_command_nodes(node)), None)
-
-
 def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     """True if interpreter `cmd_name` would execute its STDIN as a program given `args`.
 
@@ -446,7 +432,7 @@ def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
       done <<< X`): the here-string feeds the GROUP's stdin, which bashlex hangs on `.redirects`.
       ANY bare interpreter in the group can consume it - an earlier command that does not read stdin
       (`true`, `echo`) simply leaves it for the next command (all verified against real bash). So we
-      must check every command in the group, not just the first: checking only `_first_command_node`
+      must check every command in the group, not just the first: checking only the first command
       missed `{ true; bash; } <<< "rm -rf /"` (CodeRabbit CWE-78 Critical on #151). Over-approximate
       to every command - the safe direction, since surfacing re-validates the payload: a benign
       here-string still passes, only a dangerous one blocks. (A rare over-block, e.g. `{ cat; bash;
@@ -1417,25 +1403,29 @@ class BashCommandParser:
             if not hasattr(node, "parts"):
                 return
 
-            # Extract (command name, args) per command stage, in order.
+            # Per stage, the (command name, args) of every command that can read the pipe, in order.
             stages = []
             for part in node.parts:
                 kind = getattr(part, "kind", None)
-                # A subshell/group stage (`(bash)`, `{ bash; }`) receives the pipe on its first
-                # inner command - classify by that command so a wrapped shell sink is not missed
-                # (#97). Inner pipelines within the group are caught separately by the recursive walk.
-                stage_node = part if kind == "command" else (_first_command_node(part) if kind == "compound" else None)
-                if stage_node is not None:
-                    cmd_name = self._get_command_name(stage_node)
-                    if cmd_name:
-                        # Resolve multicall wrappers (busybox/toybox) to their applet so the
-                        # stage is classified by what actually runs (`busybox sh` -> `sh`).
-                        stages.append(_resolve_multicall(cmd_name, _stage_args(stage_node)))
+                # A subshell/group/loop stage shares the pipe with EVERY inner command: one that does
+                # not read stdin leaves it for the next, so `{ true; bash; }` and the body of
+                # `while :; do bash; done` run the piped data (#97, LAB-3006; verified in real bash).
+                # Over-approximating to every command is the fail-closed direction, as for `<<<`
+                # (`_here_string_program`). Inner pipelines are also caught by the recursive walk.
+                commands = [part] if kind == "command" else (_command_nodes(part) if kind == "compound" else [])
+                # Resolve multicall wrappers (busybox/toybox) to their applet so the stage is
+                # classified by what actually runs (`busybox sh` -> `sh`).
+                resolved = [
+                    _resolve_multicall(cmd_name, _stage_args(c)) for c in commands if (cmd_name := self._get_command_name(c))
+                ]
+                if resolved:
+                    stages.append(resolved)
 
             if len(stages) < 2:
                 return
 
-            names = [s[0] for s in stages]
+            # The download->shell rule keys on each stage's FIRST command, as before.
+            names = [stage[0][0] for stage in stages]
 
             # (1) Existing remote-code-execution pattern: download tool -> shell interpreter.
             first_cmd = names[0]
@@ -1447,7 +1437,7 @@ class BashCommandParser:
 
             # (2) Generalized pipe-to-shell: ANY downstream stage that executes its stdin as a
             # program (no program-source arg) is RCE on the piped data, regardless of producer.
-            for name, stage_args in stages[1:]:
+            for name, stage_args in (sink for stage in stages[1:] for sink in stage):
                 if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, stage_args):
                     dangers.append(f"data piped into shell interpreter: {name}")
                     break

