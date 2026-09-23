@@ -649,6 +649,15 @@ class TestHereStringPayloadExtraction:
         assert self._extract('if true; then bash; fi <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('for i in 1; do bash; done <<< "rm -rf /"') == [("bash", "rm -rf /")]
 
+    def test_compound_non_shell_interpreter_does_not_shadow_a_later_shell(self):
+        # LAB-3006 adversarial HIGH: `python3 --version` fails closed as a stdin reader, so a
+        # first-match return surfaced only ("python3", X), the caller dropped it as non-shell, and
+        # the later `bash` that actually runs X was never re-validated. Every sink is surfaced.
+        assert self._extract('{ python3 --version; bash; } <<< "rm -rf /"') == [
+            ("python3", "rm -rf /"),
+            ("bash", "rm -rf /"),
+        ]
+
     def test_compound_without_an_interpreter_surfaces_nothing(self):
         # Only a stdin-executing interpreter is a sink; `cat`/`read` consume stdin but never run it.
         assert self._extract('{ true; cat; } <<< "some text"') == []
@@ -746,6 +755,12 @@ class TestHereStringDelegationEvasion:
             '{ echo pre; bash; } <<< "rm -rf /"',
             'while :; do bash; done <<< "rm -rf /"',
             'if true; then bash; fi <<< "rm -rf /"',
+            # A non-shell interpreter ahead of the shell must not shadow it (LAB-3006 adversarial
+            # HIGH; pre-fix HIGH / allowed=True). `python3 --version` exits without reading stdin.
+            '{ python3 --version; bash; } <<< "chmod -R 777 /"',
+            'while :; do python3 --version; bash; done <<< "chmod -R 777 /"',
+            'if true; then python3 -V; bash; fi <<< "chmod -R 777 /"',
+            '{ node -v; sh; } <<< "rm -rf /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
             # LAB-4442: same drift as rbash, for csh/tcsh.

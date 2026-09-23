@@ -300,7 +300,7 @@ def _command_nodes(node: Any) -> "list[Any]":
     (`{ true; bash; }`, a while/for/if body) is still seen. Stops at each command without
     descending into its own parts (word-level substitutions are not group stdin consumers).
 
-    The ONE walk skeleton for both stdin-sink surfaces - `_here_string_program` and the pipe-to-shell
+    The ONE walk skeleton for both stdin-sink surfaces - `_here_string_programs` and the pipe-to-shell
     `check_pipeline` - so a future bashlex child-attr change cannot leave one silently under-scanning
     (LAB-2768, LAB-3006).
     """
@@ -425,8 +425,8 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     return None
 
 
-def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
-    """Return (interpreter, here-string) if `node` runs its `<<<` here-string as a program.
+def _here_string_programs(node: Any) -> "list[tuple[str, str]]":
+    """Every (interpreter, here-string) pair for a stdin sink that runs `node`'s `<<<` here-string.
 
     A `<<<` redirect feeds its word to a command's stdin; a bare interpreter runs that stdin as a
     program. The redirect attaches in two places:
@@ -441,6 +441,9 @@ def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
       to every command - the safe direction, since surfacing re-validates the payload: a benign
       here-string still passes, only a dangerous one blocks. (A rare over-block, e.g. `{ cat; bash;
       } <<< X` where `cat` actually consumes the here-string, is acceptable and fails closed.)
+      Every sink is returned, not the first: `python3 --version` fails closed as a stdin reader, so a
+      first-match return let it shadow the later `bash` that runs X (`{ python3 --version; bash; }
+      <<< X`), and the caller drops non-shell payloads (LAB-3006).
 
     `_reads_stdin_as_program` only decides flag arity; membership in STDIN_EXEC_INTERPRETERS is the
     caller's to check, exactly as the pipe-to-shell walk does at check_pipeline.
@@ -449,18 +452,16 @@ def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
     if kind == "command":
         here_string = _stdin_here_string(getattr(node, "parts", []))
         if here_string is None:
-            return None
-        return _classify_sink(node, here_string)
+            return []
+        found = _classify_sink(node, here_string)
+        return [found] if found is not None else []
 
     if kind == "compound":
         here_string = _stdin_here_string(getattr(node, "redirects", []))
         if here_string is None:
-            return None
-        for sink in _command_nodes(node):
-            found = _classify_sink(sink, here_string)
-            if found is not None:
-                return found
-    return None
+            return []
+        return [found for sink in _command_nodes(node) if (found := _classify_sink(sink, here_string)) is not None]
+    return []
 
 
 class CommandSegment(NamedTuple):
@@ -705,11 +706,9 @@ class BashCommandParser:
             if not hasattr(node, "kind"):
                 return
             # `<<<` rides a command node's `.parts` (`bash <<< X`) or a compound node's `.redirects`
-            # (`( bash ) <<< X`); _here_string_program handles both and finds the stdin sink.
+            # (`( bash ) <<< X`); _here_string_programs handles both and finds every stdin sink.
             if node.kind in ("command", "compound"):
-                found = _here_string_program(node)
-                if found is not None:
-                    results.append(found)
+                results.extend(_here_string_programs(node))
             for attr in ["parts", "command", "list", "pipe", "compound"]:
                 child = getattr(node, attr, None)
                 if isinstance(child, list):
