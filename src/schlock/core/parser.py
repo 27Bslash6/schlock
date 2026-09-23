@@ -417,12 +417,13 @@ def _is_decoder(name: str) -> bool:
 
 
 def _is_decode_flag(arg: str) -> bool:
-    """`-d`, `-D` (BSD), a bundle carrying either (`-di`), a `--decode` prefix, or an expansion.
+    """`-d`, `-D` (BSD), a bundle carrying either (`-di`), a `--decode` prefix, or a word bash rewrites.
 
-    An expansion (`base64 $F x`) is read as a decode flag because its value is unknowable here,
-    and the only cost of guessing wrong is blocking an encode whose output is run as a command.
+    A word bash rewrites (`$F`, `` `echo -d` ``, `{-d,f}`, `[-]d`, `~-`) is read as a decode flag
+    because its value is unknowable here, and the only cost of guessing wrong is blocking an
+    encode whose output is run as a command.
     """
-    if "$" in arg:
+    if any(c in arg for c in "$`{*?[~"):
         return True
     if arg.startswith("--"):
         return arg != "--" and "--decode".startswith(arg)
@@ -436,7 +437,8 @@ def _runs_decode(node: Any) -> bool:
     (`env base64 -d`, `busybox base64 -d`) is not a way around it.
     """
     if getattr(node, "kind", None) == "command":
-        # Basename only the name: an argument keeps its `$` (`${D%/}`) and its path (`/tmp/-d`).
+        # Basename only to find the decoder: its arguments stay raw, so `${D%/}` keeps its `$`
+        # and `/tmp/-d` stays a file.
         words = _command_words(node)
         at = next((i for i, w in enumerate(words) if _is_decoder(w.split("/")[-1])), None)
         if at is not None and any(_is_decode_flag(w) for w in words[at + 1 :]):

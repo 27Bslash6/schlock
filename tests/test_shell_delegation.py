@@ -855,6 +855,13 @@ class TestBase64DecodeAtCommandPosition:
             "$(base64 $F x)",
             '$(base64 "$F" x)',
             "$(base64 ${D%/} x)",
+            "$(base64 {-d,x})",
+            "$(base64 {x/-d,-d})",
+            "$(base64 `echo -d` x)",
+            "$(base64 `basename /x/-d` x)",
+            "$(base64 [-]d x)",
+            "$(base64 ?d x)",
+            "$(base64 ~- x)",
             "$(/usr/bin/bas?64 -d x)",
             "$(/usr/bin/base6[4] -d x)",
             # The other coreutils base-N decoders.
