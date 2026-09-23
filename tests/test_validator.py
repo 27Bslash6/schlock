@@ -1969,6 +1969,52 @@ class TestHeredocSurroundings:
         assert "rm -rf /" in neutered
 
     @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ` <<b `\nrm -rf /\nb",
+            "echo `cat <<b`\nrm -rf /\nb",
+            "echo `cat <<'b'` c\nrm -rf /\nb",
+            "echo `echo $(cat <<b)`\nrm -rf /\nb",  # the backtick is not the innermost context
+            "x=$(echo `cat <<b`)\nrm -rf /\nb",  # nor the outermost
+            "echo `cat <<b\n`\nrm -rf /\nb\n`",  # closes on a later line: parsed clean, and was allowed
+        ],
+    )
+    def test_a_heredoc_inside_a_backtick_is_refused(self, command):
+        """Bash ends a backtick at its first unescaped `` ` `` and reads the heredoc body from that text alone (LAB-4275).
+
+        Every row was run through real bash with `touch CANARY` for `rm -rf /`,
+        and every one ran it: the lines after the backtick are the outer
+        script's, not a body. This read them as the body and deleted them. The
+        last row then parsed clean and was allowed LOW with ShellCheck off; the
+        rest were denied only because bashlex choked on the same construct - a
+        correlated backstop, not a guard. Pinned on the refusal's own message so
+        that a bashlex failure downstream cannot pass for it.
+        """
+        with pytest.raises(ParseError, match="inside a backtick"):
+            val_module._neuter_heredocs(command)
+
+    def test_a_heredoc_inside_a_backtick_is_denied_end_to_end(self, safety_rules_path, no_shellcheck):
+        """The row that got through: allowed LOW, the `rm` deleted before validation."""
+        result = validate_command("echo `cat <<b\n`\nrm -rf /\nb\n`", config_path=safety_rules_path)
+
+        assert not result.allowed
+        assert "inside a backtick" in result.message
+
+    @pytest.mark.parametrize(
+        "line,delimiters",
+        [
+            ("x=`date`; cat <<'E'", ["E"]),  # a closed backtick earlier on the line
+            ("x=$(cat <<'E'", ["E"]),  # `$(…)` re-lexes as shell and bash reads its body below
+            ('echo "`cat <<b`" <<E', ["E"]),  # in `"…"` a backtick is a frame; bash ends `<<b` at the substitution's end
+        ],
+    )
+    def test_openers_outside_a_backtick_are_still_found(self, line, delimiters):
+        """The refusal is for an opener a backtick context encloses, not for any backtick on the line."""
+        _, openers = val_module._rewrite_openers(line, val_module._ScanState(), 0, val_module._DoubleParen(line))
+
+        assert [delimiter for delimiter, _, _ in openers] == delimiters
+
+    @pytest.mark.parametrize(
         "opener,tail",
         [
             ("$(", "x=$(echo"),
