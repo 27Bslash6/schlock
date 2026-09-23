@@ -2016,6 +2016,46 @@ class TestAmplifiedHighMeansOneThing:
         assert (result.risk_level, result.message) == (RiskLevel.BLOCKED, "Cannot determine command in substitution")
 
 
+@pytest.mark.usefixtures("no_shellcheck")
+class TestSelfProtectionReachesInsideASubstitution:
+    """The config-write backstop judges each substitution's own command (LAB-4223 review).
+
+    It allowlists a segment by its first word, so `cat "$(tar -xf e.tar …/schlock-config.yaml)"`
+    passed as a `cat`. Only Layer 4's flat BLOCKED for an amplified MEDIUM stood behind it, and
+    rating that HIGH let permissive extract a tarball over schlock's own config.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'cat "$(tar -xf e.tar ~/.claude/hooks/schlock-config.yaml)"',
+            'ls "$(unzip -o e.zip ~/.config/schlock/config.yaml)"',
+            'cat "$(tar -xzf e.tgz -C / .claude/hooks/schlock-config.yaml)"',
+            "cat `tar -xf e.tar ~/.claude/hooks/schlock-config.yaml`",
+            'cat "$(frob ~/.claude/hooks/schlock-config.yaml)"',  # unknown writer, was HIGH
+            'cat "$(date; tar -xf e.tar ~/.claude/hooks/schlock-config.yaml)"',  # a list segment
+            'cat "$(echo $(tar -xf e.tar ~/.claude/hooks/schlock-config.yaml))"',  # nested
+        ],
+    )
+    def test_denied(self, command):
+        result = validate_command(command)
+        assert (result.allowed, result.risk_level, result.matched_rules) == (
+            False,
+            RiskLevel.BLOCKED,
+            ["self_protection:config_write"],
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'cat "$(git rev-parse --show-toplevel)/.claude/hooks/schlock-config.yaml"',
+            'cat "$(cat ~/.claude/hooks/schlock-config.yaml)"',
+        ],
+    )
+    def test_a_read_that_uses_a_substitution_stays_allowed(self, command):
+        assert validate_command(command).allowed is True
+
+
 class TestSubstitutionWriteAndWordlessShapes:
     """Shapes that write, or that have no command word at all, must not read SAFE."""
 

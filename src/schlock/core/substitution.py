@@ -1832,6 +1832,20 @@ class SubstitutionValidator:
                 depth_exceeded=True,
             )
 
+        # The config-write backstop allowlists a segment by its first word, so the `cat` in
+        # `cat "$(tar -xf e.tar …/schlock-config.yaml)"` vouched for the extraction. Judge the
+        # substitution's own command too, here where every tier and every recursion passes.
+        from .validator import _check_self_protection  # noqa: PLC0415 - validator imports this module
+
+        protected = sub_node.inner_command and _check_self_protection(sub_node.inner_command)
+        if protected:
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=protected.message.removeprefix("BLOCKED: "),
+                matched_rules=list(protected.matched_rules),
+            )
+
         # Command list: $(a && b), $(a; b), $(a & b), $(a || b). Validate each segment
         # independently and combine. Done BEFORE the whitelist fast path because a list's
         # base_command is just its FIRST segment's command — fast-pathing the whole chain on that

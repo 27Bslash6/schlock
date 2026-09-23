@@ -222,6 +222,15 @@ class TestAmplifiedMediumSubstitutionThroughTheHook:
         event = json.loads(line)
         assert (event["risk_level"], event["violations"], event["decision"]) == ("MEDIUM", ["git_commit"], action)
 
+    @pytest.mark.parametrize("preset", ["paranoid", "balanced", "permissive"])
+    def test_config_extraction_in_a_substitution_is_denied_on_every_preset(self, preset, monkeypatch):
+        """`tar` over schlock's config is BLOCKED bare; wrapped in `cat "$(…)"` it must not become runnable."""
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+        command = 'cat "$(tar -xf e.tar ~/.claude/hooks/schlock-config.yaml)"'
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
 
 class TestValidatorSingleton:
     """Test validator singleton pattern."""
