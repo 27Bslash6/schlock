@@ -31,7 +31,9 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
+from schlock.integrations.audit import AuditLogger
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
+from schlock.setup.config_writer import RISK_PRESETS
 
 
 @pytest.fixture(autouse=True)
@@ -195,6 +197,30 @@ class TestHookHandler:
         output = response["hookSpecificOutput"]
         assert output["permissionDecision"] == "deny"
         assert output["permissionDecisionReason"].startswith("BLOCKED: Command exceeds size limit")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAmplifiedMediumSubstitutionThroughTheHook:
+    """`git commit` in a substitution is the LOW rule `git_commit` amplified to MEDIUM (LAB-4223).
+
+    It read SAFE with no rule, so paranoid never asked and the audit line claimed no rule matched.
+    """
+
+    COMMAND = 'echo "$(git commit -m evil)"'
+
+    @pytest.mark.parametrize(("preset", "action"), [("paranoid", "ask"), ("balanced", "allow"), ("permissive", "allow")])
+    def test_preset_action_and_audit_line(self, preset, action, tmp_path, monkeypatch):
+        log_file = tmp_path / "audit.jsonl"
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": self.COMMAND}})
+
+        assert response["hookSpecificOutput"]["permissionDecision"] == action
+        (line,) = log_file.read_text().splitlines()
+        event = json.loads(line)
+        assert (event["risk_level"], event["violations"], event["decision"]) == ("MEDIUM", ["git_commit"], action)
 
 
 class TestValidatorSingleton:

@@ -1593,7 +1593,8 @@ class SubstitutionValidator:
 
         Returns:
             BLOCKED for dangerous or suspicious structure, else the worst nested denial at its
-            own level (an unknown `$(x=1)` is HIGH), or None if everything passes.
+            own level (an unknown `$(x=1)` is HIGH), else the worst allowed nested rule match
+            (LAB-4223), or None if everything passes.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
@@ -1628,8 +1629,7 @@ class SubstitutionValidator:
                 inner_results=[worst],
                 matched_rules=worst.matched_rules,
             )
-
-        return None
+        return max((r for r in nested_results if r.risk_level > RiskLevel.SAFE), key=lambda r: r.risk_level, default=None)
 
     def _check_vetted(self, sub_node: SubstitutionNode, depth: int) -> SubstitutionValidationResult | None:
         """Structural, nested and YAML-rule checks for a vetted command, joined at the worst.
@@ -1640,7 +1640,7 @@ class SubstitutionValidator:
         to the rule verdict, which names the command's own risk.
 
         Returns:
-            The worst denial, or None if every check passes.
+            The worst denial, else the worst allowed rule match, or None if every check passes.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
@@ -1749,7 +1749,6 @@ class SubstitutionValidator:
         risk_order = [RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.BLOCKED]
 
         inner_results: list[SubstitutionValidationResult] = []
-        max_risk = RiskLevel.SAFE
         all_whitelisted = True
         worst_denial: SubstitutionValidationResult | None = None
 
@@ -1772,8 +1771,6 @@ class SubstitutionValidator:
                 if worst_denial is None or risk_order.index(result.risk_level) > risk_order.index(worst_denial.risk_level):
                     worst_denial = result
                 continue
-            if risk_order.index(result.risk_level) > risk_order.index(max_risk):
-                max_risk = result.risk_level
             all_whitelisted = all_whitelisted and result.whitelisted
 
         # Cross-segment defense-in-depth: re-match the full rendered text against the rules.
@@ -1789,12 +1786,23 @@ class SubstitutionValidator:
                 inner_results=inner_results,
                 matched_rules=worst_denial.matched_rules,
             )
-        if blocked:
+        if blocked and not blocked.allowed:
             return blocked
 
+        # Allowed: rated at the worst segment or cross-segment rule match, which names its rule.
+        flagged = [r for r in (*inner_results, blocked) if r and r.risk_level > RiskLevel.SAFE]
+        worst = max(flagged, key=lambda r: r.risk_level, default=None)
+        if worst is not None:
+            return SubstitutionValidationResult(
+                allowed=True,
+                risk_level=worst.risk_level,
+                message=worst.message,
+                inner_results=inner_results,
+                matched_rules=worst.matched_rules,
+            )
         return SubstitutionValidationResult(
             allowed=True,
-            risk_level=max_risk,
+            risk_level=RiskLevel.SAFE,
             message=success_message,
             whitelisted=all_whitelisted,
             inner_results=inner_results,
@@ -1846,9 +1854,9 @@ class SubstitutionValidator:
         #
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):
-            blocked = self._check_vetted(sub_node, depth)
-            if blocked:
-                return blocked
+            verdict = self._check_vetted(sub_node, depth)
+            if verdict:
+                return verdict
             return SubstitutionValidationResult(
                 allowed=True,
                 risk_level=RiskLevel.SAFE,
@@ -1861,9 +1869,9 @@ class SubstitutionValidator:
         # e.g., kubectl: "get pods" is safe, "get secrets" fails the structural check, and
         # "describe pod x ~/.ssh/id_rsa" passes it but not the YAML rules.
         if sub_node.base_command in CONTEXTUAL_SUBSTITUTION_COMMANDS:
-            blocked = self._check_vetted(sub_node, depth)
-            if blocked:
-                return blocked
+            verdict = self._check_vetted(sub_node, depth)
+            if verdict:
+                return verdict
 
             # Passed structural checks AND YAML rules — safe in substitution
             return SubstitutionValidationResult(
@@ -1908,39 +1916,22 @@ class SubstitutionValidator:
             if worst.risk_level == RiskLevel.BLOCKED:
                 return nested_denial
 
-        # Layer 4: Validate inner command against YAML rules
-        # NO literal_ranges here, deliberately: this tier judges commands the whitelist does not
-        # recognise, and "the quoted argument is data" is only true of a command we have vetted.
-        # An unknown binary may hand its argument straight to a shell — `ssh host 'rm -rf /'` is
-        # the plain case — so the tier that exists to fail closed must keep reading quoted text as
-        # code. Vetted readers get the suppression in _check_inner_rules instead.
-        if sub_node.inner_command:
-            rule_match = self.rule_engine.match_command(sub_node.inner_command)
-            if rule_match and rule_match.matched:
-                matched_rules = [rule_match.rule.name] if rule_match.rule else []
-                # Amplify risk by +1 level for substitution context
-                amplified_risk = self._amplify_risk(rule_match.risk_level)
-                if amplified_risk == RiskLevel.BLOCKED:
-                    return SubstitutionValidationResult(
-                        allowed=False,
-                        risk_level=RiskLevel.BLOCKED,
-                        message=f"Inner command blocked: {rule_match.message}",
-                        inner_results=inner_results,
-                        matched_rules=matched_rules,
-                    )
-                if amplified_risk == RiskLevel.HIGH:
-                    # HIGH in substitution context - treat as blocked for safety
-                    # Could be configurable based on risk tolerance
-                    return SubstitutionValidationResult(
-                        allowed=False,
-                        risk_level=RiskLevel.BLOCKED,
-                        message=f"High-risk command in substitution context: {rule_match.message}",
-                        inner_results=inner_results,
-                        matched_rules=matched_rules,
-                    )
+        # Layer 4: Validate inner command against YAML rules, unvetted: this tier judges commands
+        # the whitelist does not recognise, and "the quoted argument is data" is only true of a
+        # command we have vetted. An unknown binary may hand its argument straight to a shell -
+        # `ssh host 'rm -rf /'` is the plain case - so the tier that exists to fail closed must
+        # keep reading quoted text as code.
+        #
+        # An amplified HIGH stays HIGH, as on the vetted tiers (LAB-4223). Flattening it to
+        # BLOCKED here made one rule match deny on this tier and prompt on the others, and it is
+        # the same level as this tier's own floor below for an unknown command. It is held past
+        # the no-base-command check, which is BLOCKED and must not be pre-empted by a HIGH.
+        ruled = self._check_inner_rules(sub_node, inner_results, vetted=False)
+        if ruled and ruled.risk_level == RiskLevel.BLOCKED:
+            return ruled
 
         # No determinable base command: fail-closed BLOCKED. Ordered BEFORE the held nested
-        # denial, which is at most HIGH, so returning the denial first would downgrade it
+        # denial and rule match, each at most HIGH, so returning either first would downgrade it
         # (LAB-4149).
         if not sub_node.base_command:
             return SubstitutionValidationResult(
@@ -1949,6 +1940,8 @@ class SubstitutionValidator:
                 message="Cannot determine command in substitution",
             )
 
+        if ruled and not ruled.allowed:
+            return ruled
         if nested_denial is not None:
             return nested_denial
 
@@ -1965,6 +1958,8 @@ class SubstitutionValidator:
         self,
         sub_node: SubstitutionNode,
         inner_results: list[SubstitutionValidationResult] | None = None,
+        *,
+        vetted: bool = True,
     ) -> SubstitutionValidationResult | None:
         """Run the YAML rule engine over a substitution's inner command.
 
@@ -1983,26 +1978,30 @@ class SubstitutionValidator:
         sees it and a reader searching for a dangerous string matches the string it is
         searching for — ``grep -rn 'rm -rf' src/`` went from SAFE to an un-promptable BLOCKED,
         a four-level jump on an ordinary recursive grep (LAB-4234). ``literal_ranges`` is what
-        tells the engine which stretches were quoted arguments. It is passed HERE and not at
-        Layer 4 because this tier only ever judges commands the whitelist vetted: their quoted
-        arguments really are data, whereas an unknown binary may hand its own straight to a
-        shell.
+        tells the engine which stretches were quoted arguments. Only a ``vetted`` command gets
+        them: its quoted arguments really are data, whereas an unknown binary (Layer 4) may hand
+        its own straight to a shell.
+
+        This is the ONE place a rule match becomes a substitution verdict, so an amplified HIGH
+        means the same thing on every tier (LAB-4223). A match below HIGH is still returned,
+        allowed: it denies nothing, but it decides the level, and dropping it made
+        ``$(git commit)`` read SAFE with no rule - paranoid (MEDIUM = ask) never prompted and
+        the audit log said no rule matched.
 
         Returns:
-            A denial result if a rule matches at amplified HIGH or above, else None.
+            The rule match at its amplified level - a denial at HIGH and above - else None.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
         if not sub_node.inner_command or self.rule_engine is None:
             return None
-        rule_match = self.rule_engine.match_command(sub_node.inner_command, string_literals=sub_node.literal_ranges)
+        literals = sub_node.literal_ranges if vetted else None
+        rule_match = self.rule_engine.match_command(sub_node.inner_command, string_literals=literals)
         if not (rule_match and rule_match.matched):
             return None
         amplified_risk = self._amplify_risk(rule_match.risk_level)
-        if amplified_risk not in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-            return None
         return SubstitutionValidationResult(
-            allowed=False,
+            allowed=amplified_risk not in (RiskLevel.BLOCKED, RiskLevel.HIGH),
             risk_level=amplified_risk,
             message=f"Inner command blocked: {rule_match.message}"
             if amplified_risk == RiskLevel.BLOCKED

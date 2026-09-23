@@ -1877,9 +1877,9 @@ class TestSubstitutionDenialNamesItsRule:
             # _check_inner_rules, on a vetted reader: amplified HIGH, amplified BLOCKED.
             ('echo "$(git push)"', RiskLevel.HIGH, "git_push"),
             ('echo "$(printenv GITHUB_TOKEN)"', RiskLevel.BLOCKED, "environment_credential_extraction"),
-            # Layer 4, on an unrecognised command: BLOCKED, and amplified HIGH reported BLOCKED.
+            # Layer 4, on an unrecognised command: amplified BLOCKED, amplified HIGH.
             ('echo "$(chmod 777 /etc/shadow)"', RiskLevel.BLOCKED, "chmod_777"),
-            ('echo "$(chmod +x script.sh)"', RiskLevel.BLOCKED, "chmod_exec"),
+            ('echo "$(chmod +x script.sh)"', RiskLevel.HIGH, "chmod_exec"),
             # Nested, through the vetted tier and through Layer 3.
             ('echo "$(echo $(x=1) $(printenv GITHUB_TOKEN))"', RiskLevel.BLOCKED, "environment_credential_extraction"),
             ('echo "$(foo $(git push))"', RiskLevel.HIGH, "git_push"),
@@ -1924,6 +1924,107 @@ class TestSubstitutionDenialNamesItsRule:
         result = validate_command("ls $(git push) $(rm -r d)")
         assert result.risk_level == RiskLevel.BLOCKED
         assert "git_push" not in result.matched_rules
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAllowedRuleMatchIsRecorded:
+    """A rule that matches inside a substitution below the denial line still decides the level (LAB-4223).
+
+    `git commit` is the LOW rule `git_commit`, amplified to MEDIUM in a substitution. MEDIUM
+    denies nothing, so the match used to be dropped and the command read SAFE with no rule:
+    paranoid (MEDIUM = ask) never prompted, and the audit log recorded no rule at all.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(git commit -m evil)"',  # Layer 1, vetted reader
+            'echo "$(date; git commit -m x)"',  # a list segment
+            'echo "$(git commit -m x | cat)"',  # a pipeline stage
+            'echo "$(echo $(git commit -m x))"',  # nested inside a vetted reader
+        ],
+    )
+    def test_amplified_medium_is_allowed_and_named(self, command):
+        result = validate_command(command)
+        assert (result.allowed, result.exit_code, result.risk_level, result.matched_rules) == (
+            True,
+            0,
+            RiskLevel.MEDIUM,
+            ["git_commit"],
+        )
+        assert "Committing changes" in result.message
+
+    def test_a_denial_still_outranks_it(self):
+        result = validate_command('echo "$(git commit -m x) $(git push)"')
+        assert (result.allowed, result.risk_level, result.matched_rules) == (False, RiskLevel.HIGH, ["git_push"])
+
+    def test_a_tie_with_the_command_stays_allowed_and_names_both(self):
+        """`rm file.txt` is the MEDIUM rule `single_delete`; the substitution beside it is MEDIUM too."""
+        result = validate_command("rm file.txt $(git commit -m x)")
+        assert (result.allowed, result.exit_code, result.risk_level, result.matched_rules) == (
+            True,
+            0,
+            RiskLevel.MEDIUM,
+            ["single_delete", "git_commit"],
+        )
+
+    def test_is_not_cached_ahead_of_the_join(self):
+        """The pre-join verdict is SAFE; caching it would serve SAFE to the second identical call."""
+        command = 'echo "$(git commit -m evil)"'
+        assert validate_command(command).risk_level == RiskLevel.MEDIUM
+        assert validate_command(command).risk_level == RiskLevel.MEDIUM
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAmplifiedHighMeansOneThing:
+    """An amplified HIGH is HIGH at every tier (LAB-4223).
+
+    Layer 4 used to flatten it to BLOCKED while the vetted tiers kept HIGH, so the same rule
+    match denied outright on one tier and prompted on another. The vetted tiers are right: the
+    amplifier claims +1, and Layer 4's own floor for an unrecognised command is already HIGH.
+    """
+
+    def test_the_same_rule_match_rates_the_same_on_both_tiers(self, monkeypatch):
+        command = 'echo "$(git push)"'  # git_push is MEDIUM -> amplified HIGH
+        vetted = validate_command(command)
+        monkeypatch.setattr(SubstitutionValidator, "is_whitelisted", lambda self, name: False)
+        validator_module.clear_caches()
+        unvetted = validate_command(command)  # git now reaches Layer 4
+        assert (vetted.risk_level, vetted.matched_rules) == (RiskLevel.HIGH, ["git_push"])
+        assert (unvetted.risk_level, unvetted.matched_rules) == (RiskLevel.HIGH, ["git_push"])
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ('echo "$(chmod +x script.sh)"', "chmod_exec"),
+            ('echo "$(brew install jq)"', "homebrew_install"),
+            ('echo "$(tar -xf a.tar -C /x)"', "archive_operations"),
+        ],
+    )
+    def test_layer_4_rates_an_amplified_medium_rule_high(self, command, rule):
+        result = validate_command(command)
+        assert (result.allowed, result.risk_level, result.matched_rules) == (False, RiskLevel.HIGH, [rule])
+        assert not result.message.startswith("BLOCKED")
+
+    def test_layer_4_still_blocks_an_amplified_high_rule(self):
+        result = validate_command('echo "$(chmod 777 /etc/shadow)"')
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.BLOCKED, ["chmod_777"])
+
+    def test_an_amplified_high_does_not_preempt_the_no_command_block(self, validator):
+        """A node with no base command is fail-closed BLOCKED; a HIGH rule match must not return first.
+
+        No parsed input reaches this today, so it is pinned on a synthetic node: the flat BLOCKED
+        this tier used to return made the order irrelevant, and a HIGH returned ahead of the
+        check would downgrade it.
+        """
+        node = SubstitutionNode(
+            substitution_type=SubstitutionType.COMMAND,
+            inner_command="chmod +x a",
+            base_command=None,
+            ast_node=None,
+        )
+        result = validator.validate_substitution(node)
+        assert (result.risk_level, result.message) == (RiskLevel.BLOCKED, "Cannot determine command in substitution")
 
 
 class TestSubstitutionWriteAndWordlessShapes:
