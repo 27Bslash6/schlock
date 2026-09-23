@@ -967,8 +967,10 @@ class TestShellFunctionStdinSink:
         assert ("bash", "rm -rf /") in self._here('f() { bash; python3 --version; }; f <<< "rm -rf /"')
         assert ("bash", "rm -rf /") in self._here('f() { python3 --version; }; { f; bash; } <<< "rm -rf /"')
         assert ("bash", "rm -rf /") in self._here('f() { bash; }; { python3 --version; f; } <<< "rm -rf /"')
+
+    def test_wrapper_non_shell_operand_in_a_body_does_not_shadow_the_shell(self):
         # One body command, two interpreter operands: the function table must keep every one the
-        # wrapper scan returns, or `python3` (an `env -u` value) shadows the bash that runs X (LAB-3006).
+        # wrapper scan returns, or `python3` (an option value) shadows the bash that runs X (LAB-3006).
         assert ("bash", "rm -rf /") in self._here('f() { env -u python3 -i bash; }; f <<< "rm -rf /"')
         assert ("bash", "rm -rf /") in self._here('f() { strace -o python3 -f bash; }; f <<< "rm -rf /"')
 
