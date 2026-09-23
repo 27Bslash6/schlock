@@ -651,7 +651,7 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
 # dequotes it wrongly (`$'rm\t-rf\t/'` -> `$rmt-rft/`), so every check keyed on word text - the
 # `-c` / `watch` / `<<<` payloads, a pipe-to-shell interpreter name - judged a string bash never
 # runs. Each expected value below is what bash 5.3 produced (`printf '%s' WORD | od -c`); the
-# oracle test re-asks the real binary wherever one is installed.
+# oracle test re-asks the real binary wherever bash 4.2+ is installed.
 _ANSI_C_DECODES = [
     (r"$'rm\t-rf\t/'", "rm\t-rf\t/"),
     (r"$'\x2drf'", "-rf"),
@@ -691,17 +691,28 @@ def _echo_arg(command: str) -> str:
     return args[0]
 
 
+@pytest.fixture(scope="module")
+def real_bash() -> str:
+    """The installed bash, skipped when it predates `\\u` / `\\U` (bash 4.2): macOS's /bin/bash 3.2 reads them literally."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("no bash to ask")
+    version = subprocess.run(  # noqa: S603
+        [bash, "-c", 'printf "%s %s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}"'], capture_output=True, text=True, check=True
+    ).stdout.split()
+    if tuple(int(part) for part in version) < (4, 2):
+        pytest.skip("bash < 4.2 has no \\u / \\U escapes")
+    return bash
+
+
 class TestAnsiCWordDecoding:
     @pytest.mark.parametrize(("word", "expected"), _ANSI_C_DECODES)
     def test_word_text_is_what_bash_runs(self, word, expected):
         assert _echo_arg(f"echo {word}") == expected
 
     @pytest.mark.parametrize(("word", "expected"), _ANSI_C_DECODES)
-    def test_expected_values_match_real_bash(self, word, expected):
-        bash = shutil.which("bash")
-        if bash is None:
-            pytest.skip("no bash to ask")
-        ran = subprocess.run([bash, "-c", f"printf %s {word}"], capture_output=True, check=True)  # noqa: S603
+    def test_expected_values_match_real_bash(self, real_bash, word, expected):
+        ran = subprocess.run([real_bash, "-c", f"printf %s {word}"], capture_output=True, check=True)  # noqa: S603
         assert ran.stdout == expected.encode()
 
     @pytest.mark.parametrize(
