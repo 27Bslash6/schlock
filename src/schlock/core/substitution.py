@@ -770,12 +770,15 @@ def _hides_a_glued_git_payload(words: list[str]) -> bool:
 
     Scoped to git: it is the one vetted command that executes a glued short-option value
     (`difftool -x`, `rebase -x`, `clone -u`), and on a reader the same shape is data —
-    `date -d'1 day ago'` must stay SAFE. Every word is scanned, `--` included, because a
-    value-taking option swallows it: `git --namespace -- difftool -x'…'` still runs the payload.
+    `date -d'1 day ago'` must stay SAFE. Only the words after git are scanned: git parses
+    nothing before itself, and `grep -e'-o json' vendor/git` is a reader. `--` does not end
+    the scan, because a value-taking option swallows it: `git --namespace -- difftool -x'…'`
+    still runs the payload.
     """
-    if not any(word.rsplit("/", 1)[-1] == "git" for word in words):
+    start = next((index for index, word in enumerate(words) if word.rsplit("/", 1)[-1] == "git"), None)
+    if start is None:
         return False
-    return any(_GLUED_MULTIWORD_OPTION.match(word) for word in words)
+    return any(_GLUED_MULTIWORD_OPTION.match(word) for word in words[start + 1 :])
 
 
 def _is_opaque_argument(part: Any) -> bool:

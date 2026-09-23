@@ -1744,6 +1744,8 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(date -d'1 day ago' +%F)\"",
             "echo \"$(date -d '-1 day' +%F)\"",
             "echo \"$(sed -e's/ /_/g' f)\"",
+            # git as data before the glued word: git parses nothing that precedes it
+            "echo \"$(grep -rn -e'-o json' vendor/git)\"",
             # the two spellings the denial message points at
             "echo \"$(git log -S 'foo bar')\"",
             "echo \"$(git log --format='%h %s')\"",
