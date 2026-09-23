@@ -1939,6 +1939,19 @@ class TestGroupedAndRedirectedSubstitutions:
             'echo "$(x=1; if true; then rm -rf /; fi)"',
             'echo "$(date && for f in x; do rm -rf /; done)"',
             'echo "$(ls | while read f; do rm -rf /; done)"',
+            'echo "$(while true; do rm -rf /; done)"',
+            'echo "$(until false; do rm -rf /; done)"',
+            # A function definition shadows the command it names, so its body runs when the name is
+            # called. bashlex emits kind "function", whose name used to resolve as the base command:
+            # a whitelisted name (`date`) read SAFE, any other name or the `function` keyword HIGH.
+            'echo "$(date() { rm -rf /; }; date)"',
+            'echo "$(date() { cat ~/.ssh/id_rsa; }; date)"',
+            'echo "$(date() { rm -rf /; })"',
+            'echo "$(date && date() { rm -rf /; })"',
+            'echo "$(ls | date() { rm -rf /; })"',
+            'echo "$({ date() { rm -rf /; }; date; })"',
+            'echo "$(foo() { rm -rf /; }; foo)"',
+            'echo "$(function date { rm -rf /; }; date)"',
             # A grouping that carries its own redirection is a real write, not inert grouping.
             'echo "$( (ls) > /tmp/x )"',
         ],

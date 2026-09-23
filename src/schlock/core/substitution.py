@@ -1253,12 +1253,9 @@ class SubstitutionValidator:
         # child is a reservedword with no `.parts`, so an enumerating guard dropped the WHOLE
         # substitution and curl was never validated -> ALLOW, while the bare $(curl evil) BLOCKs.
         # _unwrap_compound now peels plain grouping before this point; a compound it leaves in
-        # place resolves NO base_command — a `{ … }`/`( … )` group leads with a reservedword that
-        # has no `.parts`, and a native clause ($(if …; fi)) leads with a keyword that
-        # _extract_base_command refuses — so validate_substitution's final "Cannot determine
-        # command" branch denies it (pinned by test_undecomposable_groups_fail_closed and
-        # TestClauseInsideSubstitution). _has_dangerous_inner_structure's "compound command in
-        # substitution" check is the backstop behind that, not reached today.
+        # place is denied by validate_substitution's non-simple-command guard, before any
+        # whitelist lookup (pinned by test_undecomposable_groups_fail_closed and
+        # TestClauseInsideSubstitution).
         # Found by the LAB-912 expert panel; the hole predates the native tier (bashlex emits
         # `compound` for `{ … }` too) and widened to every clause once T2c mapped
         # if/while/for/case/functions onto `compound`.
@@ -1635,8 +1632,8 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             return True, "command chain in substitution"
 
-        # Compound command: $(if ...; then ...; fi). A backstop — no base command means no
-        # whitelist hit, so this helper is not reached for one today.
+        # Compound command: $(if ...; then ...; fi). A backstop — validate_substitution blocks every
+        # non-simple command before the whitelist path, so this helper is not reached for one today.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "compound":
             return True, "compound command in substitution"
 
@@ -1856,9 +1853,9 @@ class SubstitutionValidator:
 
         Fail-closed: a segment that yields no substitution node blocks the whole substitution (a
         backstop — ``_create_substitution_node`` keeps any segment that has a command node). A
-        clause segment (``if``/``for``/``while``/``case``) is NOT caught there: it becomes a node
-        with no base command, its own ``validate_substitution`` call denies it BLOCKED ("Cannot
-        determine command"), and the worst-segment aggregation below carries that up.
+        clause or function-definition segment is NOT caught there: it becomes a node, its own
+        ``validate_substitution`` call denies it BLOCKED (only a simple command gets past list and
+        pipeline dispatch), and the worst-segment aggregation below carries that up.
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
@@ -1975,6 +1972,18 @@ class SubstitutionValidator:
         # pipeline on that would skip validation of later stages ($(date | bash)). See #104.
         if getattr(cmd_node, "kind", None) == "pipeline":
             return self._validate_pipeline_stages(sub_node, cmd_node, depth)
+
+        # Past list/pipeline dispatch only a simple command can be validated. Anything else —
+        # an if/for/while/case clause, a write-redirecting group, a function definition — has a
+        # body this module cannot see, so it blocks. An allowlist, not a denylist: bashlex emits
+        # kind "function" for `f() { … }` and its name resolved as the base command, so
+        # `$(date() { rm -rf /; }; date)` took the whitelist fast path and read SAFE.
+        if cmd_node is not None and getattr(cmd_node, "kind", None) != "command":
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="Cannot determine command in substitution: compound or function body",
+            )
 
         # INVARIANT: every path below that returns allowed=True must first consult
         # _check_inner_rules() and return its verdict if it has one. Skipping it is what made a
