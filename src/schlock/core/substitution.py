@@ -757,12 +757,25 @@ def dangerous_write_arg(base_command: str, args: list[str]) -> str | None:
 # and reads the right-hand side, and only that side was ever quoted. See _is_opaque_argument.
 _STRUCTURED_WORD = re.compile(r"^\S*=")
 
-# A short option with a multi-word value glued on, e.g. `-x'rm -rf /'`. Dequoted it renders as
-# `-xrm -rf /`: the value's first word fuses with the flag, so no `\b`-anchored rule can see it,
-# and where the value starts inside a cluster (`-yx…`) is unknowable without per-command option
-# tables. Unreadable, so denied (LAB-4265). A second word is required: `cut -d' '` glues on a
-# lone separator, not a payload.
+# A dash-leading word holding a second word, e.g. `-x'rm -rf /'`. Dequoted it renders `-xrm -rf /`:
+# the payload's first word fuses with the flag, so no `\b`-anchored rule can see it, and where a
+# cluster's value starts (`-yx…`) is git's option table to know, not ours. Quoting the dash changes
+# nothing — `'-xrm -rf /'` is the same argv — so the shape is tested on the word (LAB-4265).
+# A second word is required: `-d' '` glues on a lone separator, not a payload.
 _GLUED_MULTIWORD_OPTION = re.compile(r"^-[^-\s]\S*\s+\S")
+
+
+def _hides_a_glued_git_payload(words: list[str]) -> bool:
+    """Could git be running a command glued onto one of its short options, unreadably?
+
+    Scoped to git: it is the one vetted command that executes a glued short-option value
+    (`difftool -x`, `rebase -x`, `clone -u`), and on a reader the same shape is data —
+    `date -d'1 day ago'` must stay SAFE. Every word is scanned, `--` included, because a
+    value-taking option swallows it: `git --namespace -- difftool -x'…'` still runs the payload.
+    """
+    if not any(word.rsplit("/", 1)[-1] == "git" for word in words):
+        return False
+    return any(_GLUED_MULTIWORD_OPTION.match(word) for word in words)
 
 
 def _is_opaque_argument(part: Any) -> bool:
@@ -1548,9 +1561,6 @@ class SubstitutionValidator:
                 if hasattr(part, "word"):
                     args.append(part.word)
 
-            if any(_GLUED_MULTIWORD_OPTION.match(arg) for arg in _options_before_double_dash(args[1:])):
-                return True, "multi-word value glued to a short option is unreadable; put a space after the option"
-
             if base_command == "git" and args:
                 git_reason = dangerous_git_config(args)
                 if git_reason:
@@ -1846,6 +1856,17 @@ class SubstitutionValidator:
         # pipeline on that would skip validation of later stages ($(date | bash)). See #104.
         if getattr(cmd_node, "kind", None) == "pipeline":
             return self._validate_pipeline_stages(sub_node, cmd_node, depth)
+
+        # Before any tier: an unknown wrapper (`timeout 5 git …`) must not reach Layer 4 with
+        # the payload still fused to its flag, where no rule can read it (LAB-4265).
+        words = [part.word for part in getattr(cmd_node, "parts", None) or [] if hasattr(part, "word")]
+        if _hides_a_glued_git_payload(words):
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="Unreadable git option in substitution: a dash-leading argument holds a second word. "
+                "Put a space between a short option and its value, or use --option=value",
+            )
 
         # INVARIANT: every path below that returns allowed=True must first pass
         # _check_inner_rules(). Skipping it is what made a whitelisted command get a
