@@ -26,6 +26,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+from .parser import EXEC_CHILD_ATTRS, _resolve_multicall
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -1033,7 +1035,7 @@ class SubstitutionValidator:
             # Recurse into child nodes. "redirects"/"output" reach process substitutions used as
             # redirection targets — `cat < <(git push)`, `echo x > >(cmd)` — which hang off
             # RedirectNode.output and were otherwise never extracted, so no tier ever saw them.
-            for attr in ["parts", "command", "list", "pipe", "compound", "redirects", "output"]:
+            for attr in EXEC_CHILD_ATTRS:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -1393,6 +1395,19 @@ class SubstitutionValidator:
         if not base_command:
             return False
         return base_command in DANGEROUS_SUBSTITUTION_COMMANDS
+
+    @staticmethod
+    def _program_name(sub_node: SubstitutionNode) -> str | None:
+        """Basename of the program the substitution runs, resolved through busybox/toybox.
+
+        That is the first word after any `VAR=value` prefix, which base_command is not: it keeps
+        the prefix, so `$(X=/bin/rm ls)` must not read as `rm` nor `$(X=1 sh -c id)` as `X=1`.
+        """
+        if not sub_node.base_command:
+            return None
+        parts = getattr(getattr(sub_node.ast_node, "command", None), "parts", None) or []
+        words = [p.word for p in parts if getattr(p, "kind", None) == "word"] or [sub_node.base_command]
+        return _resolve_multicall(words[0].rsplit("/", 1)[-1], words[1:])[0]
 
     def has_suspicious_ast_patterns(self, node: Any) -> tuple[bool, str]:
         """Check for suspicious AST patterns that indicate bypass attempts.
@@ -1869,8 +1884,10 @@ class SubstitutionValidator:
                 message=f"Contextual whitelist: {sub_node.base_command}",
             )
 
-        # Layer 1c: Blacklist check
-        if self.is_blacklisted(sub_node.base_command):
+        # Layer 1c: Blacklist check, on the program that actually runs: `/bin/sh` and
+        # `busybox sh` are `sh` (LAB-4838). Blacklist only - here normalising can only raise a
+        # verdict, where on the whitelist it would let a local `./date` pass as `date`.
+        if self.is_blacklisted(self._program_name(sub_node)):
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,

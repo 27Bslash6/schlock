@@ -638,7 +638,7 @@ def _shell_delegated_payloads(
     `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
     <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
 
-    Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
+    Here-strings (`bash <<< "..."`) are a redirect word, not an argument, so they
     are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
     Step 5c re-entry as these payloads (LAB-2768).
 
