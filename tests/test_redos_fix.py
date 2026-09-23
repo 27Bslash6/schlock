@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from schlock.core import validator
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import validate_command
 
@@ -57,18 +58,28 @@ class TestReDoSFix:
         # This is acceptable tradeoff - DoS protection > catching every variant
         # The important thing is that it completes quickly
 
-    def test_redos_rm_pathological(self, safety_rules_path):
-        """Test original ReDoS attack vector: rm with many flags."""
-        # Pathological input: rm -x -x -x ... -x -rf /
-        # With greedy .* this causes catastrophic backtracking
+    def test_redos_rm_pathological(self, safety_rules_path, monkeypatch):
+        """rm with 5000 flags: schlock's parse and rule layer must stay linear.
+
+        ShellCheck is forced off, so the 0.7s budget covers schlock's own parsing and
+        rule matching only, most of it bashlex parsing the 5000 words. ShellCheck is an
+        optional subprocess; it was over half the measured time and left the budget
+        about 1.3x headroom wherever it is installed.
+
+        ``-x`` matches no rm rule's flag group, so an unbounded span in those rules
+        still makes one linear pass over this input. This bounds the whole pass; it
+        does not pin any one pattern's quantifiers.
+        """
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
         command = "rm " + "-x " * 5000 + "-rf /"
 
         start = time.time()
         validate_command(command, config_path=safety_rules_path)  # Result unused - testing timing
         elapsed = time.time() - start
+        # Verdicts computed with ShellCheck off must not leak into later tests.
+        validator._global_cache.clear()
 
         # PRIMARY GOAL: Must complete quickly (DoS protection)
-        # With 60+ patterns + ShellCheck, ~500ms is expected linear time
         assert elapsed < 0.7, f"ReDoS in rm pattern: took {elapsed:.3f}s"
 
         # With bounded quantifiers {0,100}, 5000 flags exceeds bounds
