@@ -814,3 +814,66 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+class TestBase64DecodeAtCommandPosition:
+    """LAB-4702: a `$(base64 -d …)` run as a command is BLOCKED however it reaches the shell.
+
+    Pre-fix on `main` @ `1871815`, ShellCheck absent: only `bash <<< "$(base64 -d x)"` was
+    BLOCKED, by the line-bound `base64_shell_execution` regex. A real newline in the payload
+    dropped the here-string spellings to HIGH / allowed=False and the `-c` spellings to
+    HIGH / allowed=True, and the bare `$(base64 -d x)` was HIGH - the substitution validator
+    scored the decode as merely an unknown command. The fix is positional, not a wider regex:
+    the decode is dangerous where its output becomes the command name, and only there.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The ticket's table.
+            'bash <<< "$(base64 -d x)"',
+            "bash <<< $'\n$(base64 -d x)'",
+            'bash <<< "\n$(base64 -d x)"',
+            "bash -c '$(base64 -d x)'",
+            "bash -c '\n$(base64 -d x)'",
+            # Directly, and the other spellings of the same command word.
+            "$(base64 -d x)",
+            "`base64 -d x`",
+            '"$(base64 -d x)"',
+            "X=1 $(base64 -d x)",
+            "ls; $(base64 -d x)",
+            "$(echo aGk= | base64 -d)",
+            "$(base64 --decode x | gunzip)",
+            "$(echo $(base64 -d x))",
+            # Flag and name spellings.
+            "$(base64 -D x)",
+            "$(base64 -di x)",
+            "$(base64 --dec x)",
+            "$(/usr/bin/base64 -d x)",
+            "$(env base64 -d x)",
+        ],
+    )
+    def test_decode_run_as_a_command_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("command", ["bash <<< $'\necho hi'", "bash -c '\nls'"])
+    def test_newline_payload_without_a_decode_stays_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The decode's output is data here, not a command: HIGH (unknown), as before.
+            "echo $(base64 -d x)",
+            "x=$(base64 -d x)",
+            'TOKEN=$(echo "$S" | base64 -d)',
+            # Encoding at command position is not the decode-and-execute shape.
+            "$(base64 x)",
+        ],
+    )
+    def test_decode_as_data_is_not_escalated(self, command):
+        assert validate_command(command).risk_level == RiskLevel.HIGH

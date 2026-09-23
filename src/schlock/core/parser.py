@@ -402,6 +402,47 @@ def _command_words(node: Any) -> "list[str]":
     return words
 
 
+def _is_base64_decode_flag(arg: str) -> bool:
+    """`-d`, `-D` (BSD), bundled short flags carrying either (`-di`), or a `--decode` prefix."""
+    if arg.startswith("--"):
+        return len(arg) > 2 and "--decode".startswith(arg)  # noqa: PLR2004 - bare `--` is not a flag
+    return arg.startswith("-") and ("d" in arg or "D" in arg)
+
+
+def _runs_base64_decode(node: Any) -> bool:
+    """True if a `base64 … -d` runs anywhere under `node`, nested substitutions included.
+
+    Matches `base64` anywhere in a command's words, not only as its name, so a wrapper
+    (`env base64 -d`, `busybox base64 -d`) is not a way around it.
+    """
+    if getattr(node, "kind", None) == "command":
+        names = [w.split("/")[-1] for w in _command_words(node)]
+        if "base64" in names and any(_is_base64_decode_flag(w) for w in names[names.index("base64") + 1 :]):
+            return True
+    for attr in ("parts", "command", "list", "pipe", "compound"):
+        child = getattr(node, attr, None)
+        children = child if isinstance(child, list) else [child] if child is not None else []
+        if any(_runs_base64_decode(c) for c in children):
+            return True
+    return False
+
+
+def _command_word_decodes_base64(node: Any) -> bool:
+    """True if a command node's NAME is produced by a substitution that decodes base64.
+
+    `$(base64 -d x)` runs the decoded bytes as a command — the decode-and-execute shape
+    `base64_shell_execution` exists for, reached without any `| sh` or `<<<` for a regex to see.
+    The substitution validator alone rates it an unknown command (HIGH), because it does not
+    know where the substitution sits, and position is the whole difference: the same decode in
+    an argument or assignment (`TOKEN=$(echo "$S" | base64 -d)`) only produces data (LAB-4702).
+    """
+    for part in getattr(node, "parts", []):
+        if getattr(part, "kind", None) in ("assignment", "redirect"):
+            continue
+        return _runs_base64_decode(part)
+    return False
+
+
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
 
@@ -1296,6 +1337,9 @@ class BashCommandParser:
                 # SECURITY: kubectl exec, docker exec use "exec" as argument
                 # We must NOT flag those - they're container tools, not shell exec.
                 if node.kind == "command":
+                    if _command_word_decodes_base64(node):
+                        dangers.append("base64-decoded output executed as a command")
+
                     cmd_name = self._get_command_name(node)
 
                     # Direct eval/exec invocation
