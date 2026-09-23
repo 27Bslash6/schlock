@@ -58,20 +58,26 @@ class TestReDoSFix:
         # This is acceptable tradeoff - DoS protection > catching every variant
         # The important thing is that it completes quickly
 
-    def test_redos_rm_pathological(self, safety_rules_path, monkeypatch):
-        """rm with 5000 flags: schlock's parse and rule layer must stay linear.
+    @pytest.mark.parametrize(
+        "command",
+        [
+            pytest.param("rm " + "-x " * 5000 + "-rf /", id="unmatched-flags"),
+            pytest.param("rm " + "-rf\\; " * 5000 + "x", id="separator-flags"),
+        ],
+    )
+    def test_redos_rm_pathological(self, safety_rules_path, monkeypatch, command):
+        """rm with 5000 flags: schlock's parse and rule pass must stay linear.
 
-        ShellCheck is forced off, so the 0.7s budget covers schlock's own parsing and
-        rule matching only, most of it bashlex parsing the 5000 words. ShellCheck is an
-        optional subprocess; it was over half the measured time and left the budget
-        about 1.3x headroom wherever it is installed.
+        ShellCheck is forced off and the rules load before the clock starts, so the 0.7s
+        budget covers schlock's own parsing and rule matching. ShellCheck is an optional
+        subprocess and was over half the measured time.
 
-        ``-x`` matches no rm rule's flag group, so an unbounded span in those rules
-        still makes one linear pass over this input. This bounds the whole pass; it
-        does not pin any one pattern's quantifiers.
+        ``-x`` bounds the whole pass. ``-rf\\;`` feeds the rm rules' flag group on every
+        token, but each ``;`` stops their ``[^;|&]`` spans and ``x`` completes no match:
+        a span widened to ``.*`` backtracks across every later token and goes quadratic.
         """
         monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
-        command = "rm " + "-x " * 5000 + "-rf /"
+        validate_command("true", config_path=safety_rules_path)  # load the rules untimed
 
         start = time.time()
         validate_command(command, config_path=safety_rules_path)  # Result unused - testing timing
@@ -79,12 +85,7 @@ class TestReDoSFix:
         # Verdicts computed with ShellCheck off must not leak into later tests.
         validator._global_cache.clear()
 
-        # PRIMARY GOAL: Must complete quickly (DoS protection)
-        assert elapsed < 0.7, f"ReDoS in rm pattern: took {elapsed:.3f}s"
-
-        # With bounded quantifiers {0,100}, 5000 flags exceeds bounds
-        # Pattern may not match, but that's acceptable for DoS protection
-        # The fix is about speed, not catching every variant
+        assert elapsed < 0.7, f"validating took {elapsed:.3f}s (budget 0.7s)"
 
     def test_redos_git_pathological(self, safety_rules_path):
         """Test git force push with pathological input."""
