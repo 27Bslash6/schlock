@@ -8,7 +8,10 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import bisect
+import contextlib
 import logging
+import re
+import shlex
 from typing import Any, NamedTuple, Optional
 
 import bashlex
@@ -162,6 +165,10 @@ _DATA_REDIRECT_OPERATORS = frozenset({"<<", "<<-", "<<<"})
 # noclobber overridden - strictly more dangerous, never less - and bash itself
 # reads `>& word` as `&> word` when no fd is given.
 _OPERATOR_ALIASES = {">|": ">", ">&": "&>"}
+
+# The `$` that opens `$'…'` / `$"…"` outside any quotes (group 1). Escapes and quoted
+# runs are matched first so a `$` inside them is consumed, not taken as a marker.
+_DOLLAR_QUOTE_MARKER = re.compile(r"""\\.|'[^']*'|"(?:[^"\\]|\\.)*"|(\$)(?=['"])""", re.DOTALL)
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -464,26 +471,22 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
         # `2>&-` closes an fd - bashlex leaves `output` a bare `-` string.
         return []
 
-    # bashlex reads the `$` of `$'…'` / `$"…"` as a one-character PARAMETER part glued
-    # to literal text, so the word arrives as `$/dev/sda` and matches no path rule - a
-    # third way to spell a hidden target, alongside the `"…"` this ticket fixed. Drive
-    # the strip off those parts rather than off the first two source characters: a
-    # leading empty fragment (`> ""$"/dev/sda"`) moves the `$` off the start and
-    # defeats a positional test, while the part is still there. A real expansion is
-    # wider than one character (`$HOME` spans five), so it is never stripped.
-    if command is not None:
-        for part in sorted(getattr(target, "parts", None) or [], key=lambda x: getattr(x, "pos", (0,))[0]):
-            pos = getattr(part, "pos", None)
-            is_dollar_quote = (
-                getattr(part, "kind", None) == "parameter"
-                and pos
-                and pos[1] - pos[0] == 1
-                and command[pos[1] : pos[1] + 1] in ("'", '"')
-            )
-            if is_dollar_quote and word.startswith("$"):
-                word = word[1:]
-            else:
-                break
+    # bashlex keeps the `$` of `$'…'` / `$"…"` in the word at whatever offset it sits
+    # (`/$'dev'/sda` → `/$dev/sda`), so the target matches no path rule - a third way
+    # to spell a hidden target, alongside the `"…"` this ticket fixed. Its quote
+    # removal also breaks on adjacent quoted runs (`""'/dev/sda'` → `'/dev/sda'`), and
+    # after one (`'/'$'dev/sda'`) it emits no part for the marker at all, so neither
+    # the word nor its parts can be trusted. Rebuild the word from the SOURCE span:
+    # drop every marker, then let shlex do POSIX quote removal. A real expansion
+    # (`$HOME`) is not followed by a quote, so it is kept. A span shlex cannot read as
+    # one word (whitespace inside `$(…)`, an ANSI-C `\'`) keeps bashlex's word.
+    target_pos = getattr(target, "pos", None)
+    if command is not None and target_pos:
+        span = _DOLLAR_QUOTE_MARKER.sub(lambda m: "" if m.group(1) else m.group(0), command[target_pos[0] : target_pos[1]])
+        with contextlib.suppress(ValueError):
+            unquoted = shlex.split(span)
+            if len(unquoted) == 1:
+                word = unquoted[0]
 
     # Did the SOURCE glue the operator to its target? Read the character before the
     # target rather than computing where the operator ended: bashlex NORMALISES the
@@ -494,7 +497,6 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     # filesystem wiping. Reconstruction resolves quoting and escapes; it must never
     # re-space. Found by adversarial review (Helly R) - the fd matrix that cleared the
     # arithmetic used 0/1/2/3/10, none of them zero-padded.
-    target_pos = getattr(target, "pos", None)
     glued = bool(
         target_pos and command is not None and 0 < target_pos[0] <= len(command) and not command[target_pos[0] - 1].isspace()
     )

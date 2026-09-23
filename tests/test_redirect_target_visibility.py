@@ -246,6 +246,8 @@ class TestOrdinaryRedirectsAreUnaffected:
             "cmd >> out.log",
             "cmd 2>&1",
             "cmd &> /dev/null",
+            # Split quoting still names /dev/null, so the carve-out holds.
+            "echo x > \"/dev/\"'null'",
         ],
     )
     def test_verdict_is_safe(self, command, safety_rules_path):
@@ -308,12 +310,39 @@ class TestDollarPrefixedQuoteForms:
 
     bashlex reads the `$` as a PARAMETER glued to literal text, so the word arrives
     as `$/dev/sda` and matches no path rule. Pre-existing, and it survived the
-    original fix for `"…"` — found by adversarial review.
+    original fix for `"…"` — found by adversarial review. The marker can sit at any
+    offset in the target, not just the first, and bashlex's own quote removal also
+    stops after an empty leading `""` — found by CodeRabbit.
     """
 
-    @pytest.mark.parametrize("command", ["echo x > $'/dev/sda'", 'echo x > $"/dev/sda"'])
-    def test_dollar_quoted_target_is_blocked(self, command, safety_rules_path):
-        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ("disk_destruction_dd",))
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("echo x > $'/dev/sda'", "disk_destruction_dd"),
+            ('echo x > $"/dev/sda"', "disk_destruction_dd"),
+            # The original form already reads `> /dev/` here, so its rule is credited.
+            ("echo a > /dev/$'sda'", "protect_system_files"),
+            ("echo a > /dev/s$'da'", "protect_system_files"),
+            ('echo a > "/dev/"$"sda"', "disk_destruction_dd"),
+            ("echo a > /$'dev'/sda", "disk_destruction_dd"),
+            ("echo a > $'/'$'dev/sda'", "disk_destruction_dd"),
+            ("echo a > '/'$'dev/sda'", "disk_destruction_dd"),
+            ("echo a > \"\"'/dev/sda'", "disk_destruction_dd"),
+            ("echo a > \"\"$'/dev/sda'", "disk_destruction_dd"),
+            ("echo a > /e$'tc'/passwd", "protect_system_files"),
+        ],
+    )
+    def test_dollar_quoted_target_is_blocked(self, command, rule, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
+
+    @pytest.mark.parametrize(
+        "target",
+        ["$'/dev/sda'", "/dev/$'sda'", "/dev/s$'da'", '"/dev/"$"sda"', "/$'dev'/sda", "'/'$'dev/sda'", "\"\"'/dev/sda'"],
+    )
+    def test_target_reconstructs_unquoted(self, target):
+        command = f"echo a > {target}"
+        parser = BashCommandParser()
+        assert parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))[0] == "echo a > /dev/sda"
 
     def test_ordinary_parameter_target_is_not_stripped(self, safety_rules_path):
         """Only a dollar-QUOTE form loses its `$`; a real expansion keeps it."""
