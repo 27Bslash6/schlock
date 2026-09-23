@@ -2649,6 +2649,14 @@ class TestSiblingSubstitutionsRateTheWorst:
         assert result.risk_level == RiskLevel.HIGH
         assert "x=1" in result.message
 
+    def test_a_tie_with_the_rules_names_the_rule(self, safety_rules_path):
+        """Nested `$(x=1)` HIGH vs the amplified MEDIUM `git push` rule: the rule names it."""
+        result = validate_command('echo "$(git push $(x=1))"', config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed is False
+        assert "x=1" not in result.message
+
     def test_whitelisted_siblings_stay_safe(self, safety_rules_path):
         result = validate_command('echo "$(echo a) $(echo b)"', config_path=safety_rules_path)
 
@@ -2663,6 +2671,9 @@ class TestSiblingSubstitutionsRateTheWorst:
             'echo "$(tar czf /tmp/x.tar.gz ~/.ssh/id_rsa $(x=1))"',
             # Layer 1b: contextual command whose danger only a YAML rule knows.
             'echo "$(kubectl create clusterrolebinding x --clusterrole=cluster-admin --user=y $(x=1))"',
+            # Layer 1: the same, for a whitelisted base command.
+            'echo "$(git push --force $(x=1))"',
+            'echo "$(cat ~/.aws/credentials $(x=1))"',
             # Fail-closed hard block: the substitution's base command cannot be
             # determined, which outranks the held HIGH denial from the nested `$(x=1)`.
             'echo "$(<input /tmp/exploit.sh $(x=1))"',

@@ -1840,10 +1840,7 @@ class SubstitutionValidator:
         #
         # Layer 1: Whitelist check (fast path) - WITH STRUCTURAL VALIDATION
         if self.is_whitelisted(sub_node.base_command):
-            blocked = self._check_structural_and_nested(sub_node, depth)
-            if blocked:
-                return blocked
-            blocked = self._check_inner_rules(sub_node)
+            blocked = self._check_vetted(sub_node, depth)
             if blocked:
                 return blocked
             return SubstitutionValidationResult(
