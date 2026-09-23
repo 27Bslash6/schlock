@@ -750,6 +750,7 @@ class TestAnsiCWordDecoding:
         "word",
         [
             r"$'\cA'",  # control-character edge cases nothing benign needs
+            r"$'\x{72}\x{6d}'",  # bash 5.3 decodes braced hex, older bash does not
             r"$'\c'",
             r"$'\U110000'",  # past Unicode: bash emits invalid UTF-8
             r"$'\UD800'",  # a surrogate: likewise
@@ -778,6 +779,13 @@ class TestAnsiCWordDecoding:
         with pytest.raises(ParseError, match="ANSI-C"):
             parser_mod._dequote(span, 0, len(span), {})
 
+    @pytest.mark.parametrize("tail", ["\\x", "\\\nx"])
+    def test_dequote_never_reads_past_its_span(self, tail):
+        # A span that drifted short must fail closed, not borrow the next character.
+        src = "$'a'" + tail
+        with pytest.raises(ParseError, match="ANSI-C"):
+            parser_mod._dequote(src, 0, 5, {})
+
     @pytest.mark.parametrize(
         ("word", "expected"),
         [
@@ -791,8 +799,8 @@ class TestAnsiCWordDecoding:
         assert _echo_arg(f"echo {word}") == expected
 
     def test_commands_without_ansi_c_quotes_are_untouched(self):
-        # The gate is the literal `$'`: bashlex's own dequoting stands everywhere else, quirks
-        # included (bash prints `a\\qb` here; changing that is not this decoder's business).
+        # Without a `$'` or `$"` opener (`_holds_dollar_quote`) bashlex's own dequoting stands,
+        # quirks included (bash prints a\qb here; changing that is not this decoder's business).
         command = """echo "a\\qb" 'c' d\\e"""
         [raw] = bashlex.parse(command)
         assert parser_mod.BashCommandParser().extract_commands_with_args([raw]) == [("echo", ["aqb", "c", "de"])]
