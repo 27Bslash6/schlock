@@ -810,6 +810,93 @@ _SELF_PROTECTION_REDIRECT_PATTERNS = [re.compile(r">>?\s*\S*" + re.escape(path))
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
 
 
+# SELF-PROTECTION: Directories that hold schlock configuration files. Extracting an archive
+# into one overwrites the config without the config file name ever appearing in the command,
+# so the file-name fast path above cannot see it.
+SELF_PROTECTION_DIRS = (".claude/hooks", ".config/schlock")
+_CONFIG_DIR_RE = re.compile(r"(?:^|/)(?:" + "|".join(map(re.escape, SELF_PROTECTION_DIRS)) + r")(?:/|$)")
+# Leading option name, so "-C.claude/hooks", "-o.claude/hooks", "--directory=x" yield the path
+_OPTION_PREFIX_RE = re.compile(r"^--?[A-Za-z-]*=?")
+_TAR_NAMES = frozenset({"tar", "gtar", "bsdtar"})
+_UNZIP_NAMES = frozenset({"unzip"})
+_7Z_NAMES = frozenset({"7z", "7za", "7zr", "7zz"})
+# Short options that take an argument (tar -Cdir / -f a.tar; unzip -ddir / -P pw / -x list)
+_TAR_ARG_OPTS = frozenset("bCfFgHIKLNTVX")
+_UNZIP_ARG_OPTS = frozenset("dPx")
+# Modes that never write into the target directory
+_TAR_READ_MODES = frozenset("Acdrtu")
+_TAR_READ_LONG = frozenset(
+    {"--list", "--create", "--diff", "--compare", "--append", "--update", "--catenate", "--concatenate", "--delete"}
+)
+_UNZIP_READ_OPTS = frozenset("cltpvzZ")  # list, test, stdout, comment, zipinfo
+
+
+def _short_flags(args: list[str], arg_opts: frozenset[str]) -> str:
+    """Letters of the short-option clusters in args, skipping option arguments.
+
+    A cluster ends at an option that takes an argument ("-Cdir"); when that option ends the
+    cluster ("-C dir", "-xf a.tar") the next word is its argument, so a value such as
+    "-f -t" is never read as a mode flag.
+    """
+    flags = ""
+    words = iter(args)
+    for word in words:
+        if not word.startswith("-") or word.startswith("--"):
+            continue
+        for i, ch in enumerate(word[1:], 1):
+            flags += ch
+            if ch in arg_opts:
+                if i == len(word) - 1:
+                    next(words, None)
+                break
+    return flags
+
+
+def _tar_extracts(args: list[str]) -> bool:
+    """True unless tar visibly runs a mode that cannot write into its -C directory.
+
+    Inverted on purpose: an invocation with no visible mode (supplied via TAR_OPTIONS, or an
+    abbreviated long option) counts as an extraction. A valid tar always names a mode, so
+    this only costs verdicts on commands that would fail anyway.
+    """
+    flags = _short_flags(args, _TAR_ARG_OPTS)
+    if args and args[0].isalpha():  # old-style: "tar xf a.tar"
+        flags += args[0]
+    long_opts = {arg.split("=", 1)[0] for arg in args if arg.startswith("--")}
+    if "x" in flags or "--get" in long_opts or any(opt.startswith("--ext") for opt in long_opts):
+        return True
+    return not (set(flags) & _TAR_READ_MODES or long_opts & _TAR_READ_LONG)
+
+
+def _extracts_into_config_dir(command: str) -> bool:
+    """Detect an archive extraction (tar/bsdtar, unzip, 7z) that names a config directory.
+
+    Any argument naming the directory counts — the target option ("-C dir", "--directory=dir",
+    "-d dir", "-odir") and a member filter alike ("tar -xf a.tar .claude/hooks" recreates the
+    directory under the cwd). The extractor may appear anywhere in a segment, so wrappers
+    (sudo, xargs, bash -c '...', $(...)) do not hide it.
+    """
+    if not any(path in command for path in SELF_PROTECTION_DIRS):
+        return False
+    for segment in _SEGMENT_SPLIT_RE.split(command):
+        words = [word.strip("\"'`$(){};") for word in segment.split()]
+        for idx, word in enumerate(words):
+            name = word.rsplit("/", 1)[-1]
+            args = words[idx + 1 :]
+            if name in _TAR_NAMES:
+                extracts = _tar_extracts(args)
+            elif name in _UNZIP_NAMES:
+                extracts = not set(_short_flags(args, _UNZIP_ARG_OPTS)) & _UNZIP_READ_OPTS
+            elif name in _7Z_NAMES:
+                command_word = next((arg for arg in args if not arg.startswith("-")), "")
+                extracts = command_word.lower() in ("x", "e")
+            else:
+                continue
+            if extracts and any(_CONFIG_DIR_RE.search(_OPTION_PREFIX_RE.sub("", arg, count=1)) for arg in args):
+                return True
+    return False
+
+
 def _check_self_protection(command: str) -> Optional[ValidationResult]:
     """Allowlist-based check preventing modification of schlock configuration files.
 
@@ -832,6 +919,11 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
     Returns:
         ValidationResult blocking the command if it targets schlock config, None otherwise
     """
+    # Check 0: archive extraction into a config directory. Runs before the fast path because
+    # the command names only the directory, never the config file.
+    if _extracts_into_config_dir(command):
+        return _make_self_protection_result(command)
+
     # Fast path: skip if command doesn't reference any config path
     if not _matches_protected_path(command):
         return None

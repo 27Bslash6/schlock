@@ -836,6 +836,107 @@ rules:
         assert any(r.name == "schlock_config_write" for r in engine.rules)
 
 
+class TestSelfProtectionArchiveExtraction:
+    """LAB-4830: extracting an archive into a config directory overwrites the config file
+    without its name ever appearing in the command, so layer 2 keys on the directory too."""
+
+    @pytest.fixture(autouse=True)
+    def _hermetic(self, tmp_path, monkeypatch):
+        """No real user config and no ShellCheck: verdicts come from rules alone."""
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        clear_caches()
+        yield
+        clear_caches()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Measured MEDIUM (allowed) before the fix
+            "tar -xf evil.tar -C .claude/hooks",
+            "tar -xf evil.tar -C ~/.claude/hooks",
+            "unzip -o evil.zip -d ~/.claude/hooks",
+            "tar -xf evil.tar -C ~/.config/schlock",
+            "tar --extract -f evil.tar --directory=.claude/hooks",
+            "tar -xf evil.tar --directory .config/schlock",
+            "unzip -o evil.zip -d .config/schlock",
+            "7z x evil.7z -o.claude/hooks -y",
+            'tar -xzf evil.tgz -C "$HOME/.config/schlock"',
+            "tar -xf evil.tar -C ./.claude/hooks",
+            # Measured SAFE before the fix: the YAML rule is order- and spelling-sensitive
+            "tar -C .claude/hooks -xf evil.tar",
+            "tar xf evil.tar -C .claude/hooks/",
+            "bsdtar -xf evil.tar -C .claude/hooks",
+            # Other spellings of the same operation
+            "tar -xf evil.tar -C.claude/hooks",
+            "tar -xf evil.tar -C /home/u/project/.claude/hooks/",
+            "unzip evil.zip -d.claude/hooks",
+            "7z e evil.7z -o/home/u/.config/schlock",
+            "sudo tar -xf evil.tar -C .claude/hooks",
+            "ls && tar -xf evil.tar -C .claude/hooks",
+            "echo $(tar -xf evil.tar -C .claude/hooks)",
+            "bash -c 'tar -xf evil.tar -C .claude/hooks'",
+            # Member filter: extracts .claude/hooks/* into the project root
+            "tar -xf evil.tar .claude/hooks",
+            # No visible mode (supplied via TAR_OPTIONS) counts as an extraction
+            "TAR_OPTIONS=-x tar -f evil.tar -C .claude/hooks",
+            # An option value that looks like a read-only mode must not mask the extraction
+            "TAR_OPTIONS=-x tar -f -t -C .claude/hooks",
+            "unzip -P -l evil.zip -d .claude/hooks",
+        ],
+    )
+    def test_extraction_into_config_dir_is_blocked(self, command):
+        """AC-1: extraction naming a config directory is BLOCKED by the hard-coded layer."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -xf release.tar -C /opt/app",
+            "unzip -o release.zip -d ./build",
+            # Look-alike paths are not config directories
+            "tar -xf evil.tar -C .claude/hooks-backup",
+            "tar -xf .claude/hooks.tar -C /tmp/out/",
+        ],
+    )
+    def test_extraction_elsewhere_keeps_its_verdict(self, command):
+        """AC-2: extraction outside the config directories stays MEDIUM archive_operations."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.MEDIUM
+        assert result.matched_rules == ["archive_operations"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -tf evil.tar -C .claude/hooks",
+            "unzip -l evil.zip -d .claude/hooks",
+            "tar -cf backup.tar .claude/hooks",
+            "tar -cf backup.tar -C .claude/hooks .",
+            "7z l evil.7z -o.claude/hooks",
+        ],
+    )
+    def test_read_only_or_lookalike_stays_safe(self, command):
+        """AC-2: read-only archive operations naming a config directory stay SAFE."""
+        result = validate_command(command)
+        assert result.allowed, f"Should allow: {command}"
+        assert result.risk_level == RiskLevel.SAFE
+
+    def test_extraction_block_ignores_overrides(self, tmp_path, monkeypatch):
+        """AC-3: the block survives a user config that disables archive_operations."""
+        config = tmp_path / ".config" / "schlock" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("rule_overrides:\n  archive_operations:\n    enabled: false\n")
+        monkeypatch.chdir(tmp_path)
+        clear_caches()
+        assert validate_command("tar -xf release.tar -C /opt/app").risk_level == RiskLevel.SAFE
+        result = validate_command("tar -xf evil.tar -C .claude/hooks")
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
+
+
 class TestMultiSegmentWhitelistBypass:
     """LAB-2752: a whitelisted PREFIX must not vouch for a whole chained command.
 
