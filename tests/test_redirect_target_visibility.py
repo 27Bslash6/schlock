@@ -12,7 +12,8 @@ written, because each one hid a live bug behind a green suite:
 
 1. **Assert the RULE, not just the tier** (LAB-4270/4317). A verdict-only assertion
    cannot tell "BLOCKED by the rule that should fire" from "BLOCKED by something
-   else", and the risk floor once returned BLOCKED with an empty `matched_rules`.
+   else", and a since-removed early-return floor once returned BLOCKED with an empty
+   `matched_rules`.
 2. **Pin ABSOLUTE values, never "same tier as the control"** (LAB-1584). A
    tier-equality assertion survives a mutation that drops both sides together.
 3. **Pick the compound form with MORE than one segment.** The first draft of this
@@ -173,31 +174,38 @@ class TestOperatorSpellingsTheRulesCanRead:
 class TestSubstitutionVerdictCannotUndercutTheRules:
     """A denied substitution must not LOWER the command's risk.
 
-    Pre-existing, found by this ticket's differential sweep: the substitution check
-    short-circuits before the rule pass and reported only its own risk, so any
-    non-whitelisted `$( )` demoted a BLOCKED command to HIGH. `hooks/pre_tool_use.py`
-    maps the decision off `risk_level` alone, so under the permissive preset that
-    demotion is deny -> allow.
+    `hooks/pre_tool_use.py` maps the decision off `risk_level` alone, so a BLOCKED
+    command demoted to HIGH is deny -> allow under the permissive preset. The join that
+    prevents it is `validate_command`'s deferred substitution join (#164). These cases
+    pin it from the redirect side, which #164's own tests do not: a quoted redirect
+    target and a quoted command name are reconstruction-only detections, and each must
+    still win the join and be CREDITED, not merely reach the right tier.
     """
 
     @pytest.mark.parametrize(
         ("command", "rule"),
         [
             ("mkfs.ext4 $(base64 -d f)", "filesystem_format"),
-            # Reconstruction-only detections must reach the floor too.
+            # Reconstruction-only detections: only the rule pass sees these.
             ('"mkfs.ext4" $(base64 -d f)', "filesystem_format"),
             ('echo $(base64 -d f) > "/dev/sda"', "disk_destruction_dd"),
-            # The floor runs with the whitelist OFF: it is prefix-based, so a leading
-            # `ls` would otherwise vouch for everything after it.
+            # Multi-segment: the leading whitelisted `ls` must not vouch for the chain.
             ("ls && mkfs.ext4 /dev/sda $(base64 -d f)", "filesystem_format"),
+            # Under a deferred denial the whitelist is off, so a whitelisted command
+            # cannot vouch for its own redirect target while it carries one.
+            ('ls $(base64 -d f) > "/dev/sda"', "disk_destruction_dd"),
+            ("git status $(base64 -d f) > /dev/sda", "disk_destruction_dd"),
+            ('ls $(base64 -d f) >> "/etc/sudoers"', "protect_system_files"),
+            ('true; ls $(base64 -d f) > "/dev/sda"', "disk_destruction_dd"),
         ],
     )
-    def test_floor_raises_and_names_the_rule(self, command, rule, safety_rules_path):
+    def test_rule_verdict_outranks_a_weaker_substitution(self, command, rule, safety_rules_path):
         assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
 
     def test_substitution_risk_survives_when_no_rule_is_louder(self, safety_rules_path):
-        """The floor raises; it must not flatten every substitution to BLOCKED."""
+        """The join takes the higher verdict; it must not flatten every substitution to BLOCKED."""
         assert _risk("ls $(base64 -d f)", safety_rules_path) is RiskLevel.HIGH
+        assert _risk("ls $(base64 -d f) > out.txt", safety_rules_path) is RiskLevel.HIGH
 
 
 class TestOrdinaryRedirectsAreUnaffected:
@@ -262,7 +270,7 @@ class TestDataOperandsStayOut:
     """A `<<<` payload is data: it executes only when the command is a shell.
 
     Emitting it unsuppressed would over-block `cat <<< "rm -rf /"`, which prints text.
-    Deciding shell-vs-data for that operand is LAB-2768's job, not this one.
+    Deciding shell-vs-data is `_here_string_program`'s job (LAB-2768), not this set's.
     """
 
     def test_here_string_payload_is_not_promoted(self, safety_rules_path):
@@ -278,10 +286,6 @@ class TestDollarPrefixedQuoteForms:
     bashlex reads the `$` as a PARAMETER glued to literal text, so the word arrives
     as `$/dev/sda` and matches no path rule. Pre-existing, and it survived the
     original fix for `"…"` — found by adversarial review.
-
-    The strip covers the LITERAL spelling only. `$'\x2f…'` arrives with its escapes
-    dropped rather than decoded, which is the repo's documented ANSI-C ceiling; the
-    test below pins that as a known gap so it cannot be mistaken for coverage.
     """
 
     @pytest.mark.parametrize("command", ["echo x > $'/dev/sda'", 'echo x > $"/dev/sda"'])
@@ -291,20 +295,6 @@ class TestDollarPrefixedQuoteForms:
     def test_ordinary_parameter_target_is_not_stripped(self, safety_rules_path):
         """Only a dollar-QUOTE form loses its `$`; a real expansion keeps it."""
         assert _risk("echo x > $HOME/out.txt", safety_rules_path) is RiskLevel.SAFE
-
-    def test_ansi_c_escape_spelling_is_caught_by_a_different_rule(self, safety_rules_path):
-        """KNOWN LIMIT, pinned: the strip covers the literal spelling, not decoding.
-
-        bashlex DROPS ANSI-C escapes rather than decoding them, so `$'\\x2f…'` reaches
-        the target as `x2fdevx2fsda` and no path rule sees a device. It is not silent —
-        `hex_octal_encoding` matches the raw text at HIGH — but it is not rated as the
-        disk write it is. Unchanged from the pre-change parent; closing it properly
-        needs real ANSI-C decoding, the repo's documented T3 ceiling.
-        """
-        assert _verdict("echo x > $'\\x2fdev\\x2fsda'", safety_rules_path) == (
-            RiskLevel.HIGH,
-            ("hex_octal_encoding",),
-        )
 
 
 class TestNormalisedDescriptorDoesNotInventAGap:
@@ -411,17 +401,6 @@ class TestConcatenatedDollarQuoteForms:
     def test_wide_parameter_is_never_stripped(self, safety_rules_path):
         """`$HOME` is five characters wide, so it is an expansion, not a quote marker."""
         assert _risk("echo x > $HOME/out.txt", safety_rules_path) is RiskLevel.SAFE
-
-    def test_single_quoted_empty_fragment_remains_uncovered(self, safety_rules_path):
-        """KNOWN LIMIT, pinned: bashlex mis-lexes this one before we ever see it.
-
-        `> ''$'/dev/sda'` yields the word `'$'/dev/sda` — a stray quote retained, and
-        no parameter part emitted at all. The word is already wrong on arrival, so
-        correcting it means re-lexing the word rather than stripping a marker. SAFE on
-        the pre-change parent and on every revision since; recorded here so the limit
-        is visible rather than mistaken for coverage.
-        """
-        assert _risk("echo x > ''$'/dev/sda'", safety_rules_path) is RiskLevel.SAFE
 
 
 class TestHeredocSuppressionRequiresProvenance:

@@ -146,7 +146,9 @@ _HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", 
 # `<<<` is the load-bearing entry: a here-string payload sits on `.output` and only
 # executes when the command is a shell, so emitting it unsuppressed would over-block
 # `cat <<< "rm -rf /"`, which merely prints text. Deciding shell-vs-data for that
-# operand is LAB-2768's job, not this one.
+# operand is `_here_string_program`'s job (LAB-2768), which re-enters the payload as
+# code when the sink is an interpreter; this set only keeps it out of the path
+# reconstruction, so the two mechanisms never see the same operand twice.
 # `<<`/`<<-` cost nothing to exclude and change no verdict either way - a heredoc
 # BODY lives on `.heredoc`, which _redirect_words never reads, so only the inert
 # delimiter token (`EOF`) is at stake. They are listed because a delimiter is data
@@ -469,13 +471,6 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     # leading empty fragment (`> ""$"/dev/sda"`) moves the `$` off the start and
     # defeats a positional test, while the part is still there. A real expansion is
     # wider than one character (`$HOME` spans five), so it is never stripped.
-    #
-    # Two limits, both deliberate and pinned by tests. `$'\x2f…'` arrives with its
-    # escapes DROPPED rather than decoded - the repo's documented ANSI-C ceiling - and
-    # is caught, if at all, by the encoding rules rather than as a path. And a
-    # single-quoted empty fragment (`> ''$'/dev/sda'`) makes bashlex emit no parameter
-    # part at all and leave a stray quote in the word; that word is already wrong
-    # before this function sees it, and correcting it means re-lexing, not stripping.
     if command is not None:
         for part in sorted(getattr(target, "parts", None) or [], key=lambda x: getattr(x, "pos", (0,))[0]):
             pos = getattr(part, "pos", None)

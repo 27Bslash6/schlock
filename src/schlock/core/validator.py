@@ -1029,6 +1029,14 @@ def _match_original_and_reconstructed(
                         what saves the body is that bashlex parks it on
                         `redirect.heredoc` while `_redirect_words` reads only
                         `redirect.output`, which holds the delimiter.
+        use_whitelist: Whether the whitelist may short-circuit ANY of the three forms.
+                       One switch for all three, deliberately: the whitelist is
+                       prefix-based, so a caller that needs it off (the compound
+                       whole-command pass, where a leading `ls` would otherwise
+                       vouch for a later redirect) needs it off for the original
+                       form too. Applying it to the reconstructions alone worked
+                       only because a compound's reconstruction never equals its
+                       source, which is an accident of shape, not a guarantee.
 
     Returns:
         The higher-risk of the two matches.
@@ -1037,6 +1045,7 @@ def _match_original_and_reconstructed(
         command,
         string_literals=string_literals,
         heredoc_ranges=heredoc_ranges,
+        use_whitelist=use_whitelist,
     )
 
     # Three forms, highest risk wins. The two reconstructions are NOT a before/after
@@ -2426,7 +2435,11 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # its prefix (is_fully_whitelisted, not is_whitelisted). A prefix match
                 # would let the whitelisted "ls" in "ls; rm -rf /" vouch for every later
                 # segment and skip the loop below entirely.
-                if engine.is_fully_whitelisted(command):
+                # Under a deferred substitution denial the whitelist can only LOWER the
+                # result side - the join replaces any allowed result with the denial - so
+                # it is switched off there and can never mask a louder rule verdict
+                # (LAB-2760: `ls $(x) > "/dev/sda"` otherwise joins HIGH, not BLOCKED).
+                if not _deferred and engine.is_fully_whitelisted(command):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -2459,6 +2472,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         string_literals=segment.string_literals,
                         heredoc_ranges=segment.heredoc_ranges,
                         quote_source=command,
+                        use_whitelist=not _deferred,
                     )
 
                     if seg_match.matched and seg_match.rule:
@@ -2477,8 +2491,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # is the only one that sees them, so it runs ALWAYS, not just when
                 # no segment matched: `{ rm -f foo; echo a; } > "/dev/sda"` matches
                 # on a segment and would otherwise skip the fallback entirely.
-                # Whitelist OFF for the reason stated below - it is prefix-based,
-                # and this is a floor that can only raise.
+                # Whitelist OFF: it is prefix-based, so a leading `ls` would vouch
+                # for a later redirect. Safe to turn off here because this pass can
+                # only raise the verdict, never lower it.
                 if has_compound_redirects(ast):
                     whole = _match_original_and_reconstructed(
                         engine,
@@ -2526,6 +2541,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     string_literals=string_literals,
                     quote_source=command,
                     heredoc_ranges=heredoc_ranges,
+                    use_whitelist=not _deferred,
                 )
         except ConfigurationError as e:
             return ValidationResult(

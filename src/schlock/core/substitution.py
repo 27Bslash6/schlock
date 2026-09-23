@@ -1036,9 +1036,7 @@ class SubstitutionValidator:
             # tier ever saw them (LAB-2760/LAB-4114). bashlex parks a simple command's
             # target under `redirect.output.parts`; a COMPOUND (`{ …; } > "$(…)"`) hangs
             # its redirections off `redirects` and never `parts`, so `output` alone
-            # reaches the simple form and misses every compound one. The two attributes
-            # are disjoint by node kind (`redirects` only on `compound`, `output` only on
-            # `redirect`), so their order here is inert. An fd-duplication target is an
+            # reaches the simple form and misses every compound one. An fd-duplication target is an
             # int with no `kind` and falls straight back out of visit(). `heredoc` stays
             # off the list: its body has its own mechanism.
             for attr in ["parts", "command", "list", "pipe", "compound", "output", "redirects"]:
