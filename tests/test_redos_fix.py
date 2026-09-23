@@ -72,9 +72,10 @@ class TestReDoSFix:
         budget covers schlock's own parsing and rule matching. ShellCheck is an optional
         subprocess and was over half the measured time.
 
-        ``-x`` bounds the whole pass. ``-rf\\;`` feeds the rm rules' flag group on every
-        token, but each ``;`` stops their ``[^;|&]`` spans and ``x`` completes no match:
-        a span widened to ``.*`` backtracks across every later token and goes quadratic.
+        ``-x`` bounds the whole pass. Every ``-rf\\;`` token matches the rm rules' flag
+        group, but each ``;`` stops their ``[^;|&]`` spans, and the trailing ``x`` is not
+        a target those rules accept. A span widened to ``.*`` therefore backtracks across
+        every later token and goes quadratic.
         """
         monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
         validate_command("true", config_path=safety_rules_path)  # load the rules untimed
