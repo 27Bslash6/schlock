@@ -18,6 +18,7 @@ import yaml
 from schlock.exceptions import ConfigurationError, ParseError
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 from schlock.integrations.shellcheck import (
+    ShellCheckSeverity,
     get_security_findings,
     is_shellcheck_available,
     run_shellcheck,
@@ -3102,8 +3103,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # SC2086), hard-blocking `tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT`. So it re-enters
         # without ShellCheck and Step 6 ShellChecks it appended to this command instead, which
         # is where it runs; ShellCheck's own look inside a trap string checks variable use only.
-        # ponytail: a handler's own handlers (`trap "trap '…' INT" EXIT`) get rules only, since
-        # the handler re-enters without ShellCheck; chase them up if nested traps ever matter.
+        # A call that skips Step 6 (a nested handler, a heredoc-fallback segment) has no run to
+        # append to, so there a handler gets its own ShellCheck, the stricter reading.
         payloads: list[str] = []
         trap_handlers: list[str] = []
         if match.risk_level < RiskLevel.BLOCKED:
@@ -3117,7 +3118,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             delegated = _shell_delegated_payloads(commands_with_args, trap_handlers=trap_handlers)
             payloads = list(dict.fromkeys(delegated + stdin_payloads))
             trap_handlers = list(dict.fromkeys(trap_handlers))
-        for payload, own_shellcheck in [(p, True) for p in payloads] + [(h, False) for h in trap_handlers]:
+        for payload, own_shellcheck in [(p, True) for p in payloads] + [(h, not _shellcheck) for h in trap_handlers]:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
                 # shell quoting collapses before the payload can nest this far.
@@ -3159,6 +3160,15 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # parse noise instead of findings - silently emptying this whole tier for
             # the commands normalisation exists to rescue (LAB-3094).
             findings = run_shellcheck("\n".join([parse_target, *trap_handlers]))
+            # ShellCheck gives up on a file it cannot parse and reports only SC1xxx parse errors,
+            # none of them security codes. A handler bashlex accepts but ShellCheck cannot parse
+            # (`trap '[ a' USR2`) would so silence the whole command, so that is no verdict.
+            if (
+                trap_handlers
+                and findings
+                and any(1000 <= f.code < 2000 and f.level is ShellCheckSeverity.ERROR for f in findings)
+            ):
+                findings = None
             # A run with no verdict is refused in three cases, and read as clean otherwise:
             # - a payload re-entered from Step 5c (`bash -c "…"`): this is its only
             #   ShellCheck, since no outer spawn reads inside a `-c` string (LAB-4586);

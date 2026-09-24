@@ -27,7 +27,7 @@ from schlock.core.validator import (
     clear_caches,
     validate_command,
 )
-from schlock.integrations.shellcheck import is_shellcheck_available
+from schlock.integrations.shellcheck import ShellCheckFinding, ShellCheckSeverity, is_shellcheck_available
 
 
 @pytest.fixture(autouse=True)
@@ -731,6 +731,19 @@ class TestTrapHandlerShellCheck:
         self._spy(monkeypatch, None)
         assert validate_command("trap 'echo done' EXIT").risk_level == RiskLevel.BLOCKED
 
+    def test_a_parse_error_on_a_command_with_a_handler_fails_closed(self, monkeypatch):
+        # ShellCheck abandons a file it cannot parse. With a handler appended, a handler it cannot
+        # parse (`[ a`) would otherwise silence every finding on the command around it.
+        parse_error = ShellCheckFinding(1073, ShellCheckSeverity.ERROR, "Couldn't parse", 2, 1, 2, 4)
+        self._spy(monkeypatch, [parse_error])
+        assert validate_command("trap '[ a' USR2; ls").risk_level == RiskLevel.BLOCKED
+
+    def test_a_handler_of_a_handler_gets_its_own_shellcheck(self, monkeypatch):
+        # The outer handler re-enters without ShellCheck, so the inner one has no run to join.
+        inputs = self._spy(monkeypatch, [])
+        validate_command("trap \"trap 'rm -f x' EXIT\" INT")
+        assert "rm -f x" in inputs
+
     @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
     @pytest.mark.parametrize(
         ("trap", "inline"),
@@ -740,6 +753,8 @@ class TestTrapHandlerShellCheck:
             ("old=$(pwd); trap 'cd \"$old\"' EXIT; cd /tmp", 'old=$(pwd); cd /tmp; cd "$old"'),
             ("trap 'rm -r$\"\"f /' EXIT", 'rm -r$""f /'),
             ("d=/x; trap 'rm -rf \"$d\"/*' EXIT", 'd=/x; rm -rf "$d"/*'),
+            # A handler ShellCheck cannot parse must not silence the command around it.
+            ('trap \'[ a\' USR2; r$""m -r$""f /', 'r$""m -r$""f /'),
         ],
     )
     def test_handler_scores_like_the_same_text_run_inline(self, monkeypatch, trap, inline):
