@@ -646,12 +646,8 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
 
 
-class _Hung(BaseException):
-    pass
-
-
-def _raise_hung(signum, frame):
-    raise _Hung
+def _parse_hung(signum, frame):
+    pytest.fail("parse did not return within 5 s")
 
 
 # A heredoc body the tokenizer never brace-matches, so an unclosed `${` reaches the expander.
@@ -673,15 +669,11 @@ class TestUnterminatedBraceExpansion:
     @pytest.fixture(autouse=True)
     def _bounded(self):
         # A regression hangs rather than fails; the alarm turns that into a failure.
-        previous = signal.signal(signal.SIGALRM, _raise_hung)
+        previous = signal.signal(signal.SIGALRM, _parse_hung)
         signal.setitimer(signal.ITIMER_REAL, 5)
-        try:
-            yield
-        except _Hung:
-            pytest.fail("parse did not return within 5 s")
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous)
+        yield
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
     @pytest.mark.parametrize("command", UNTERMINATED_BRACE)
     def test_unclosed_brace_raises(self, command):
@@ -692,10 +684,22 @@ class TestUnterminatedBraceExpansion:
         "command",
         [
             'git commit -m "$(cat <<EOF\nuse ${HOME} here\nEOF\n)"',
-            'echo "$(cat << EOF\nfine\nEOF\n)"',
+            'git commit -m "$(cat <<EOF\n${\nx}\nEOF\n)"',
             'echo "${x:-default}"',
             "echo ${HOME} $1",
         ],
     )
     def test_closed_brace_still_parses(self, command):
         assert parser_mod.BashCommandParser().parse(command)
+
+    def test_closed_brace_keeps_its_parameter(self):
+        ast = parser_mod.BashCommandParser().parse('git commit -m "$(cat <<EOF\nuse ${HOME} here\nEOF\n)"')
+        params = []
+
+        class Visitor(bashlex.ast.nodevisitor):
+            def visitparameter(self, node, value):
+                params.append(value)
+
+        for node in ast:
+            Visitor().visit(node)
+        assert "HOME" in params

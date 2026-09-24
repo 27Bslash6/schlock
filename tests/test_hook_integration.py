@@ -633,3 +633,12 @@ class TestValidationDeadline:
         handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
         assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
         assert signal.getsignal(signal.SIGALRM) is previous
+
+    def test_platform_without_sigalrm_still_validates(self, monkeypatch):
+        """Windows has no SIGALRM; the soft deadline steps aside and faulthandler alone bounds the hook."""
+        monkeypatch.setattr(pre_tool_use, "_HAS_ITIMER", False)
+        monkeypatch.delattr(signal, "setitimer")
+
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+
+        assert response["hookSpecificOutput"]["permissionDecision"] == "allow"

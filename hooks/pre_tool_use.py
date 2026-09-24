@@ -55,8 +55,9 @@ logger = logging.getLogger(__name__)
 VALIDATION_DEADLINE_S = 30
 # Backstop for a stall the soft deadline cannot interrupt (C code holding the GIL, a swallowed
 # timeout): faulthandler's watchdog thread exits 1 without the GIL, and the manifest's
-# `|| exit 2` turns that exit into a block.
+# `|| exit 2` turns that exit into a block. It is also the only bound on Windows, which has no SIGALRM.
 HARD_DEADLINE_S = 45
+_HAS_ITIMER = hasattr(signal, "setitimer")
 
 
 class ValidationDeadlineExceeded(BaseException):
@@ -420,8 +421,9 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
     unscannable_warning = None
     unscannable_audit_violation = None
 
-    previous_handler = signal.signal(signal.SIGALRM, _on_deadline)
-    signal.setitimer(signal.ITIMER_REAL, VALIDATION_DEADLINE_S)
+    if _HAS_ITIMER:
+        previous_handler = signal.signal(signal.SIGALRM, _on_deadline)
+        signal.setitimer(signal.ITIMER_REAL, VALIDATION_DEADLINE_S)
     try:
         # 1. Extract command from stdin JSON
         tool_name = input_data.get("tool_name", "")
@@ -691,12 +693,14 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         }
 
     except ValidationDeadlineExceeded:
-        signal.setitimer(signal.ITIMER_REAL, 0)  # the audit write below must not be interrupted
         logger.error(f"Validation exceeded {VALIDATION_DEADLINE_S}s; denying")
+        deadline_violations = [f"Validation deadline exceeded ({VALIDATION_DEADLINE_S}s)"]
+        if unscannable_audit_violation:
+            deadline_violations.append(unscannable_audit_violation)
         audit_logger.log_validation(
             command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
             risk_level="BLOCKED",
-            violations=[f"Validation deadline exceeded ({VALIDATION_DEADLINE_S}s)"],
+            violations=deadline_violations,
             decision="block",
             execution_time_ms=(time.perf_counter() - start_time) * 1000,
             context=context,
@@ -713,8 +717,9 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         }
 
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
+        if _HAS_ITIMER:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
 
 
 def main():
@@ -738,8 +743,9 @@ def main():
         }
         print(json.dumps(error_result))
         sys.exit(1)
-    except Exception as e:
-        logger.error(f"Fatal error in main: {e}", exc_info=True)
+    except (Exception, ValidationDeadlineExceeded) as e:
+        # The deadline escapes handle_pre_tool_use when it fires inside a sibling except branch.
+        logger.error(f"Fatal error in main: {e!r}", exc_info=True)
         # Still output valid JSON even on fatal errors
         error_result = {
             "hookSpecificOutput": {

@@ -193,7 +193,7 @@ class TestPreToolUseFailsClosedOnNonTerminatingValidation:
         start = time.monotonic()
         result = _run(_hook_command("Bash"), REPO_ROOT, payload, home=tmp_path)
 
-        # Well inside the 30 s soft deadline, so this pins the parse itself returning.
+        # Well inside the soft deadline, so this pins the parse itself returning.
         assert time.monotonic() - start < 10
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
