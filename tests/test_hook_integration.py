@@ -614,7 +614,8 @@ class TestValidationDeadline:
     @needs_itimer
     def test_stalled_validation_denies_within_the_deadline(self, monkeypatch):
         def spin(command):
-            while True:
+            give_up = time.perf_counter() + 5  # a regression fails the asserts below instead of hanging
+            while time.perf_counter() < give_up:
                 pass
 
         monkeypatch.setattr(pre_tool_use, "validate_command", spin)
@@ -643,7 +644,8 @@ class TestValidationDeadline:
 
         def stall_first_audit(self, **kw):
             audit.append(kw)
-            while len(audit) == 1:
+            give_up = time.perf_counter() + 5  # a regression fails the asserts below instead of hanging
+            while len(audit) == 1 and time.perf_counter() < give_up:
                 pass
 
         monkeypatch.setattr(pre_tool_use, "validate_command", fail)
@@ -657,6 +659,7 @@ class TestValidationDeadline:
 
         assert json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert len(audit) == 2
+        assert audit[0]["violations"][0].startswith("RuntimeError")  # the alarm fired in the sibling branch
         assert audit[-1]["command"] == "ls"
         assert audit[-1]["decision"] == "block"
         assert "deadline" in audit[-1]["violations"][0]

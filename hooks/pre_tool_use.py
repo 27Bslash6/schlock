@@ -726,6 +726,7 @@ def main():
     """Entry point for Claude Code hook execution."""
     faulthandler.dump_traceback_later(HARD_DEADLINE_S, exit=True)
     start_time = time.perf_counter()
+    input_data = {}  # Initialized before the try so the except handlers can read it safely.
     try:
         # Read hook input from stdin
         input_data = json.load(sys.stdin)
@@ -745,10 +746,10 @@ def main():
         print(json.dumps(error_result))
         sys.exit(1)
     except (Exception, ValidationDeadlineExceeded) as e:
-        # The deadline escapes handle_pre_tool_use when it fires inside a sibling except branch.
+        # The deadline escapes handle_pre_tool_use when it fires inside a sibling except branch or its finally.
         logger.error(f"Fatal error in main: {e!r}", exc_info=True)
         if isinstance(e, ValidationDeadlineExceeded):
-            # That branch may not have written its audit entry, so record the deny here.
+            # That code may have audited nothing, or a verdict this deny replaces, so record the deny.
             get_audit_logger().log_validation(
                 command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
                 risk_level="BLOCKED",
