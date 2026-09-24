@@ -301,7 +301,17 @@ class TestCircuitBreaker:
 class TestShellCheckErrorHandling:
     """Test error handling paths."""
 
-    def test_exit_code_greater_than_one(self):
+    @pytest.mark.parametrize(
+        ("returncode", "stderr"),
+        [
+            (2, "shellcheck: unrecognized option"),
+            # ShellCheck < 0.7.0, which predates --norc. Measured on the 0.6.0 release
+            # binary; 0.7.0 is the minimum supported version (LAB-5084).
+            (3, "unrecognized option `--norc'\n\nUsage: shellcheck [OPTIONS...] FILES...\n"),
+        ],
+        ids=["exit2", "pre-0.7.0-norc"],
+    )
+    def test_exit_code_greater_than_one(self, returncode, stderr):
         """Test handling of exit code > 1 (actual errors)."""
         from unittest.mock import MagicMock, patch  # noqa: PLC0415
 
@@ -312,9 +322,9 @@ class TestShellCheckErrorHandling:
         sc._circuit_breaker_open_until = 0.0
 
         mock_result = MagicMock()
-        mock_result.returncode = 2  # Error exit code
+        mock_result.returncode = returncode  # Error exit code
         mock_result.stdout = ""
-        mock_result.stderr = "shellcheck: unrecognized option"
+        mock_result.stderr = stderr
 
         with (
             patch.object(sc, "get_shellcheck_path", return_value="/usr/bin/shellcheck"),
@@ -517,16 +527,11 @@ def _codes(findings):
 
 
 class TestShellCheckIgnoresCheckoutConfig:
-    """The checkout and the environment cannot change what ShellCheck reports (LAB-5084).
-
-    ShellCheck reads .shellcheckrc from the cwd, each parent dir and ~, and prepends
-    SHELLCHECK_OPTS to its argv. A repo's `disable=SC2086` then switched a security code
-    off, and a .shellcheckrc symlinked to /dev/zero ran every call into the timeout.
-    """
+    """rc files and ShellCheck's env vars cannot change what it reports (LAB-5084; see run_shellcheck)."""
 
     @pytest.fixture
     def dirs(self, tmp_path, monkeypatch):
-        """A cwd two levels under a fake root, a fake HOME, no rc files, no SHELLCHECK_OPTS."""
+        """A cwd two levels under a fake root, a fake HOME, no rc files, no ShellCheck env vars."""
         import schlock.integrations.shellcheck as sc  # noqa: PLC0415
         from schlock.core.validator import clear_caches  # noqa: PLC0415
 
@@ -538,19 +543,21 @@ class TestShellCheckIgnoresCheckoutConfig:
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         monkeypatch.delenv("SHELLCHECK_OPTS", raising=False)
+        monkeypatch.delenv("GHCRTS", raising=False)
         monkeypatch.setattr(sc, "_circuit_breaker_failures", [])
         monkeypatch.setattr(sc, "_circuit_breaker_open_until", 0.0)
         clear_caches()
         yield {"cwd": cwd, "parent": cwd.parent, "home": home}
         clear_caches()
 
-    def test_spawn_passes_norc_and_drops_shellcheck_opts(self, dirs, monkeypatch):
-        """Binary-independent pin of the invocation: argv carries --norc, env lacks SHELLCHECK_OPTS."""
+    def test_spawn_passes_norc_and_drops_shellcheck_env(self, dirs, monkeypatch):
+        """Binary-independent pin of the invocation: argv carries --norc, env lacks SHELLCHECK_OPTS and GHCRTS."""
         from unittest.mock import MagicMock, patch  # noqa: PLC0415
 
         import schlock.integrations.shellcheck as sc  # noqa: PLC0415
 
         monkeypatch.setenv("SHELLCHECK_OPTS", "--exclude=SC2086")
+        monkeypatch.setenv("GHCRTS", "-N")
         monkeypatch.setenv("SCHLOCK_LAB5084_PROBE", "kept")
         mock_result = MagicMock(returncode=0, stdout="[]", stderr="")
 
@@ -563,36 +570,12 @@ class TestShellCheckIgnoresCheckoutConfig:
         argv, env = run.call_args.args[0], run.call_args.kwargs["env"]
         assert "--norc" in argv
         assert "SHELLCHECK_OPTS" not in env
-        assert env["SCHLOCK_LAB5084_PROBE"] == "kept"  # only SHELLCHECK_OPTS is dropped
-
-    def test_binary_without_norc_gives_no_verdict(self, dirs):
-        """Minimum supported ShellCheck is 0.7.0; an older one rejects --norc and gets no verdict.
-
-        0.7.0 added --norc along with .shellcheckrc itself. Measured on the 0.6.0 release
-        binary: exit 3 and this stderr. That is "no verdict", never "clean" (LAB-4586), so
-        a quoted heredoc is BLOCKED rather than waved through with half its checks missing.
-        """
-        from unittest.mock import MagicMock, patch  # noqa: PLC0415
-
-        import schlock.integrations.shellcheck as sc  # noqa: PLC0415
-        from schlock.core.validator import validate_command  # noqa: PLC0415
-
-        stderr = "unrecognized option `--norc'\n\nUsage: shellcheck [OPTIONS...] FILES...\n"
-        pre_070 = MagicMock(returncode=3, stdout="", stderr=stderr)
-
-        with (
-            patch.object(sc, "get_shellcheck_path", return_value="/usr/bin/shellcheck"),
-            patch("subprocess.run", return_value=pre_070),
-        ):
-            assert sc.run_shellcheck("echo hi") is None
-            result = validate_command("cat <<'EOF'\nhi\nEOF")
-
-        assert result.risk_level.name == "BLOCKED"
-        assert "shellcheck:incomplete" in result.matched_rules
+        assert "GHCRTS" not in env
+        assert env["SCHLOCK_LAB5084_PROBE"] == "kept"  # only those two are dropped
 
     @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
     @pytest.mark.parametrize("where", ["cwd", "parent", "home"])
-    @pytest.mark.parametrize("rc", ["disable=all", "disable=SC2086,SC2016,SC2046"])
+    @pytest.mark.parametrize("rc", ["disable=all", "disable=SC2086"])
     def test_rc_file_does_not_change_findings(self, dirs, where, rc):
         command = "rm -r $DIR/build"
         baseline = _codes(run_shellcheck(command))
@@ -612,12 +595,14 @@ class TestShellCheckIgnoresCheckoutConfig:
         assert 2086 in _codes(run_shellcheck("rm -r $DIR/build"))
 
     @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize(("var", "value"), [("SHELLCHECK_OPTS", "--exclude=SC2086,SC2114"), ("GHCRTS", "-M1m")])
     @pytest.mark.parametrize(("command", "code"), [("rm -r $DIR/build", 2086), ("rm -r$''f /usr", 2114)])
-    def test_shellcheck_opts_does_not_change_findings(self, dirs, monkeypatch, command, code):
+    def test_env_does_not_change_findings(self, dirs, monkeypatch, var, value, command, code):
+        """SHELLCHECK_OPTS used to exclude the codes; GHCRTS used to stop every run answering."""
         baseline = _codes(run_shellcheck(command))
         assert code in baseline
 
-        monkeypatch.setenv("SHELLCHECK_OPTS", "--exclude=SC2086,SC2114")
+        monkeypatch.setenv(var, value)
 
         assert _codes(run_shellcheck(command)) == baseline
 
