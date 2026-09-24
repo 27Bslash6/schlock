@@ -78,7 +78,8 @@ FRESHNESS_WINDOW_SECONDS = 30
 GIT_TIMEOUT_SECONDS = 5
 
 # Cap on repositories tracked in the last-seen-HEAD state file (insertion-ordered,
-# oldest evicted) so the file cannot grow unboundedly across a machine's lifetime.
+# oldest evicted) so the file cannot grow unboundedly across a machine's lifetime. It is read
+# back through read_bounded (MAX_READ_BYTES, 64 KiB): 100 entries fit with room to spare, 1000 might not.
 MAX_TRACKED_REPOS = 100
 
 # The file-content extension intentionally recognizes only the canonical phrase —
@@ -122,11 +123,14 @@ def is_schlock_checkout(cwd: Optional[str]) -> bool:
     default is to scan.
     """
     try:
+        from schlock.core.bounded_read import read_bounded  # noqa: PLC0415 - lazy, post-gate
+
         start = Path(cwd or ".").resolve()
         for directory in (start, *start.parents):
             manifest = directory / ".claude-plugin" / "plugin.json"
             if manifest.is_file():
-                return json.loads(manifest.read_text()).get("name") == "schlock"
+                data = json.loads(read_bounded(manifest))
+                return isinstance(data, dict) and data.get("name") == "schlock"
         return False
     except (OSError, ValueError):
         return False
@@ -309,7 +313,9 @@ def read_last_seen(repo_key: Optional[str]) -> Optional[tuple[str, int]]:
     if repo_key is None:
         return None
     try:
-        state = json.loads(state_file_path().read_text())
+        from schlock.core.bounded_read import read_bounded  # noqa: PLC0415 - lazy, post-gate
+
+        state = json.loads(read_bounded(state_file_path()))
         entry = state.get(repo_key) if isinstance(state, dict) else None
         if not isinstance(entry, dict):
             return None
@@ -338,9 +344,11 @@ def record_seen_head(repo_key: Optional[str], full_hash: str) -> None:
         return
     tmp = None
     try:
+        from schlock.core.bounded_read import read_bounded  # noqa: PLC0415 - lazy, post-gate
+
         path = state_file_path()
         try:
-            state = json.loads(path.read_text())
+            state = json.loads(read_bounded(path))
             if not isinstance(state, dict):
                 state = {}
         except (OSError, ValueError):

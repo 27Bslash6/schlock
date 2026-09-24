@@ -30,9 +30,8 @@ if vendor_path.exists():
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import yaml  # noqa: E402 - vendored dependency
-
 from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
+from schlock.core.bounded_read import load_config  # noqa: E402
 from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
 from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
 from schlock.integrations.shellcheck import (  # noqa: E402
@@ -86,7 +85,7 @@ def get_risk_tolerance() -> dict:
     for config_path in config_paths:
         if config_path.exists():
             try:
-                config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                config_data = load_config(config_path)
                 if config_data and "risk_tolerance" in config_data:
                     risk_tol = config_data["risk_tolerance"]
                     if "levels" in risk_tol:
@@ -131,7 +130,7 @@ def get_shellcheck_config() -> dict:
     for config_path in config_paths:
         if config_path.exists():
             try:
-                config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                config_data = load_config(config_path)
                 if config_data and "shellcheck" in config_data:
                     sc_config = config_data["shellcheck"]
                     _shellcheck_config = {
