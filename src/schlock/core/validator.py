@@ -5,6 +5,7 @@ rule engine, and cache. It provides the main validate_command() API and
 handles configuration layering (plugin defaults → user → project).
 """
 
+import fnmatch
 import logging
 import re
 import subprocess
@@ -448,46 +449,74 @@ def _check_dangerous_command_flags(
     return None
 
 
-# Builtins that write a variable named by an operand (`read IFS`, `printf -v IFS`). The name
-# must be read off the AST: the words in between can hold a quoted `;` or `|` (`read -d ';'`,
-# `${y:+;}`), which ends any regex scan of the operand list early. printf's only one is `-v`.
-_NAME_OPERAND_BUILTINS: frozenset[str] = frozenset({"read", "readarray", "mapfile", "getopts"})
+# Builtins that write a variable named by an operand (`read IFS`, `printf -v IFS`), mapped to
+# (option letters that take a value, option letter whose value is a name). The names are read
+# off the AST: an operand before them can hold a quoted `;` or `|` (`read -d ';'`, `${y:+;}`),
+# which ends any regex scan of the operand list early.
+_NAME_WRITERS: dict[str, tuple[str, str]] = {
+    "read": ("dinNptu", "a"),
+    "readarray": ("dnOsuCc", ""),
+    "mapfile": ("dnOsuCc", ""),
+    "getopts": ("", ""),
+    "printf": ("", "v"),
+}
+
+
+def _may_name_ifs(word: str) -> bool:
+    """Whether ``word`` can reach bash as the name IFS, or as an element of it (`IFS[0]`).
+
+    Brace and pathname expansion run before the builtin sees the word and bashlex performs
+    neither, so a brace group is read as `*` and the word as a glob: `I{F,}S`, `{IFS,x}` and
+    `I?S` all match. `$` is dropped because bashlex reads `$'IFS'` as `$IFS`.
+    """
+    word = word.replace("$", "")
+    if word.startswith("IFS["):
+        return True
+    lo, hi = word.find("{"), word.rfind("}")
+    if 0 <= lo < hi:
+        word = word[:lo] + "*" + word[hi + 1 :]
+    return fnmatch.fnmatchcase("IFS", word)
+
+
+def _names_written(builtin: str, operands: list[str]) -> list[str]:
+    """The operands `builtin` treats as the names of variables it writes."""
+    value_letters, name_letter = _NAME_WRITERS[builtin]
+    names: list[str] = []
+    i = 0
+    while i < len(operands) and (operands[i].startswith("-") or any(char in operands[i] for char in "${}*?[`")):
+        option = operands[i]
+        i += 1
+        if option == "--":
+            break
+        if option == "-" or not option.startswith("-") or any(char in option for char in "${}*?[`"):
+            # An expansion can vanish or become any option cluster; every word from here may be a name.
+            return names + operands[i - 1 :]
+        for j, letter in enumerate(option[1:], start=2):
+            if letter in value_letters or letter == name_letter:
+                value = option[j:]
+                if not value and i < len(operands):
+                    value, i = operands[i], i + 1
+                if letter == name_letter:
+                    names.append(value)
+                break
+    rest = operands[i:]
+    if builtin == "printf":
+        return names
+    if builtin == "getopts":
+        return rest[1:2]
+    return names + rest
 
 
 def _writes_ifs(words: list[str]) -> bool:
     """Whether ``words`` (one command, name first) writes IFS through an operand."""
-    # bashlex reads `$'read'` as `$read`; dropping `$` restores the name (and flags a computed one).
-    words = [word.replace("$", "") for word in words]
+    # bashlex reads `$'read'` as `$read`; dropping `$` restores the name.
+    names = [word.replace("$", "") for word in words]
     i = 0
-    while i < len(words) and (words[i] in ("builtin", "command") or (i and words[i].startswith("-"))):
+    while i < len(names) and (names[i] in ("builtin", "command") or (i and names[i].startswith("-"))):
         i += 1
-    name, operands = (words[i], words[i + 1 :]) if i < len(words) else ("", [])
-    if name == "printf":
-        return "-vIFS" in operands or any(a == "-v" and b == "IFS" for a, b in zip(operands, operands[1:]))
-    # An option cluster ending in the name (`-aIFS`, `-raIFS`) is the same write.
-    return name in _NAME_OPERAND_BUILTINS and any(
-        arg == "IFS" or (arg.startswith("-") and arg.endswith("IFS")) for arg in operands
-    )
-
-
-def _check_ifs_operand(commands_with_args: list[tuple[str, list[str]]]) -> Optional[ValidationResult]:
-    """Block a builtin that writes IFS through an operand; the `ifs_obfuscation` rule on the AST.
-
-    No value check, unlike the `IFS=` pattern: the value arrives through another word or stdin,
-    and none of these is an idiom.
-    """
-    for cmd_name, args in commands_with_args:
-        if _writes_ifs([cmd_name, *args]):
-            return ValidationResult(
-                allowed=False,
-                risk_level=RiskLevel.BLOCKED,
-                message="BLOCKED: IFS variable manipulation to bypass space filtering",
-                alternatives=["Use explicit spaces - IFS obfuscation indicates malicious intent"],
-                exit_code=1,
-                error=None,
-                matched_rules=["ifs_obfuscation"],
-            )
-    return None
+    if i >= len(words) or names[i] not in _NAME_WRITERS:
+        return False
+    return any(_may_name_ifs(name) for name in _names_written(names[i], words[i + 1 :]))
 
 
 # LAB-2754: commands whose *argument* is a program, not data.
@@ -2745,7 +2774,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # This catches quoted command names that bypass regex patterns (e.g., "nc" -e)
             # Must run AFTER parsing but BEFORE regex matching for defense in depth
             commands_with_args = parser.extract_commands_with_args(ast)
-            dangerous_check = _check_dangerous_command_flags(commands_with_args) or _check_ifs_operand(commands_with_args)
+            dangerous_check = _check_dangerous_command_flags(commands_with_args)
             if dangerous_check is not None:
                 return dangerous_check
 
@@ -2912,6 +2941,24 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 error=str(e),
             )
             # Don't cache config errors
+
+        # Step 5a: the AST half of `ifs_obfuscation` (_writes_ifs), scored as the rule itself so an
+        # override or a custom rule set applies to both halves alike.
+        ifs_rule = next((rule for rule in engine.rules if rule.name == "ifs_obfuscation"), None)
+        if (
+            ifs_rule is not None
+            and ifs_rule.risk_level > match.risk_level
+            and any(_writes_ifs([name, *args]) for name, args in commands_with_args)
+        ):
+            match = RuleMatch(
+                matched=True,
+                rule=ifs_rule,
+                risk_level=ifs_rule.risk_level,
+                message=ifs_rule.description,
+                alternatives=ifs_rule.alternatives,
+            )
+            if all_matched_rules:
+                all_matched_rules.append(ifs_rule.name)
 
         # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing).
         # Top-level parity with SubstitutionValidator (which BLOCKs these in $()); at the top level

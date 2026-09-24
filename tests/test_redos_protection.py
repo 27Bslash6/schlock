@@ -144,7 +144,14 @@ class TestReDoSProtection:
 
     @pytest.mark.parametrize(
         "text",
-        ["IFS=" + " " * 50_000 + "read", "IFS=" + "x" * 50_000, "I" + "\\\n" * 25_000, "IFS[" * 16_000, "IFS[x]" * 10_000],
+        [
+            "IFS=" + " " * 50_000 + "read",
+            "IFS=" + "x" * 50_000,
+            "I" + "\\\n" * 25_000,
+            "IFS[" * 16_000,
+            "IFS[x]" * 10_000,
+            "for" + "\\\n" * 25_000,
+        ],
     )
     def test_ifs_override_pattern_is_linear(self, safety_rules_path, text):
         """The IFS-override pattern scans a blank run or a `\\<newline>` run once, not once per backtrack."""
