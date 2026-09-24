@@ -769,30 +769,24 @@ class TestAnsiCWordDecoding:
             parser_mod.BashCommandParser().parse(f"bash -c {word} x")
 
     @pytest.mark.parametrize(
-        "span",
+        ("token", "message"),
         [
-            "$'a\\'",  # the backslash escapes the closing quote, so it never closes
-            "$'a' \"b",  # likewise an open double quote
-            "$'a'\\",  # a bare trailing backslash
-            "$'a' b",  # an unquoted blank: bash would split this word
-            "$'a'`b`",  # an expansion bashlex did not model as a child node
-            "$'a'$b",
-            "$'a'\"$(b)\"",
+            ("$'a\\'", "inside a \\$' quote"),  # the backslash escapes the closing quote
+            ("$'a' \"b", "token disagrees"),  # an unquoted blank: bash would split this word
+            ("$'a\"b", "inside a \\$' quote"),
+            ("$'a'\\", "bare backslash"),
+            ('"a\\\nb"', "line continuation"),  # bashlex's tokenizer removes these first
+            ("$'a'`b`", "token disagrees"),  # an expansion bashlex did not model as a child node
+            ("$'a'$b", "did not model"),
+            ("$'a'\"$(b)\"", "did not model"),
         ],
     )
-    def test_dequote_fails_closed_on_what_it_cannot_account_for(self, span):
-        # bashlex's tokenizer honours `$'...'` boundaries, so none of these reach `_dequote`
-        # through `parse` today. They are the backstop if its word spans ever drift: kept and
-        # pinned directly, because an unreachable guard nobody can test is the one that rots.
-        with pytest.raises(ParseError, match="ANSI-C|Quoted word"):
-            parser_mod._dequote(span, 0, len(span), {})
-
-    @pytest.mark.parametrize("tail", ["\\x", "\\\nx"])
-    def test_dequote_never_reads_past_its_span(self, tail):
-        # A span that drifted short must fail closed, not borrow the next character.
-        src = "$'a'" + tail
-        with pytest.raises(ParseError, match="ANSI-C|Quoted word"):
-            parser_mod._dequote(src, 0, 5, {})
+    def test_dequote_fails_closed_on_what_it_cannot_account_for(self, token, message):
+        # bashlex's tokenizer and its expansion parts rule all of these out before `_dequote`
+        # sees a token. They are the backstop if that contract ever breaks: kept and pinned
+        # directly, because an unreachable guard nobody can test is the one that rots.
+        with pytest.raises(ParseError, match=message):
+            parser_mod._dequote(token, {})
 
     @pytest.mark.parametrize(
         ("word", "expected"),

@@ -523,7 +523,7 @@ _HEX_WIDTHS = {"x": 2, "u": 4, "U": 8}  # most hex digits each escape reads; bas
 # `$` followed by one of these starts an expansion (`$x`, `$1`, `$@`, `${`, `$(`, `$[`), which
 # bashlex models as a child node or refuses to parse; any other `$` is literal to bash.
 _EXPANSION_STARTS = frozenset(string.ascii_letters + string.digits + "_{([@*#?$!-")
-# Characters that end a word when unquoted - one inside a word's span means bashlex and bash
+# Characters that end a word when unquoted - one inside a word token means bashlex and bash
 # disagree about where the word is, and the word's text cannot be trusted either way.
 _WORD_BREAKS = frozenset(" \t\n;&|<>()")
 
@@ -533,10 +533,11 @@ def _holds_quote(text: str) -> bool:
     return "'" in text or '"' in text
 
 
-def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # noqa: PLR0912 - one branch per quoting rule
-    """Return the text bash makes of the word at ``src[i:end]`` (see `_expand_word`)."""
+def _dequote(src: str, children: "dict[int, int]") -> str:  # noqa: PLR0912 - one branch per quoting rule
+    """Return the text bash makes of the word token ``src`` (see `_expand_word_internal`)."""
     out: list[str] = []
     quote = ""  # "", "'" or '"'
+    i, end = 0, len(src)
     while i < end:
         if quote != "'" and i in children:
             out.append(src[i : children[i]])
@@ -547,11 +548,11 @@ def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # 
             quote = "" if char == "'" else quote
             out.append("" if char == "'" else char)
             i += 1
-        elif char == "\\" and nxt == "\n":
-            i += 2  # a line continuation is removed, quoted by "..." or not
         elif char == "\\":
-            if not nxt:
-                raise ParseError(f"Quoted word ends in a bare backslash: {src[:end]!r}")
+            # bashlex's tokenizer removes every line continuation outside '...' before a token is
+            # built, so one here means that contract broke - refuse rather than guess.
+            if not nxt or nxt == "\n":
+                raise ParseError(f"Quoted word ends in a bare backslash or line continuation: {src!r}")
             keeps_backslash = quote == '"' and nxt not in '$`"\\'
             out.append(("\\" if keeps_backslash else "") + nxt)
             i += 2
@@ -562,27 +563,24 @@ def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # 
             quote = "'"
             i += 1
         elif char == "$":
-            after = i + 1
-            while after + 1 < end and src.startswith("\\\n", after):
-                after += 2
-            follower = src[after : after + 1] if after < end else ""
+            follower = nxt
             if not quote and follower == "'":
-                text, i = _ansi_c_quote(src, after + 1, end)
+                text, i = _ansi_c_quote(src, i + 2, end)
                 out.append(text)
             elif not quote and follower == '"':
-                quote, i = '"', after + 1  # $"..." without a message catalog is "..."
+                quote, i = '"', i + 2  # $"..." without a message catalog is "..."
             elif follower and follower in _EXPANSION_STARTS:
-                raise ParseError(f"Quoted word holds an expansion bashlex did not model: {src[:end]!r}")
+                raise ParseError(f"Quoted word holds an expansion bashlex did not model: {src!r}")
             else:
                 out.append("$")
                 i += 1
         elif char == "`" or (not quote and char in _WORD_BREAKS):
-            raise ParseError(f"Quoted word span disagrees with bash at {char!r}: {src[:end]!r}")
+            raise ParseError(f"Quoted word token disagrees with bash at {char!r}: {src!r}")
         else:
             out.append(char)
             i += 1
     if quote:
-        raise ParseError(f"Quoted word ends inside a {quote} quote: {src[:end]!r}")
+        raise ParseError(f"Quoted word ends inside a {quote} quote: {src!r}")
     return "".join(out)
 
 
@@ -639,9 +637,45 @@ def _take(src: str, i: int, end: int, alphabet: "frozenset[str]", limit: int) ->
 
 
 _bashlex_expand_word = bashlex.subst._expandwordinternal
+# A single-quoted segment's text is inert to bash, so bashlex is shown this instead: not a quote,
+# not a name character (`$x'y'` must still end the name at the quote), not special anywhere.
+_BLANK = "."
+# Where a word's own quoting stops being readable left to right without matching brackets: an
+# expansion, whose quotes belong to the command inside it.
+_EXPANSION_OPENERS = ("$(", "${", "$[", "`", "<(", ">(")
 
 
-def _expand_word(parserobj: Any, wordtoken: Any, *args: Any) -> "tuple[list[Any], str]":
+def _blank_single_quotes(value: str) -> str:
+    """``value`` with each `'...'` / `$'...'` before its first expansion blanked, offsets kept.
+
+    Stops at the first expansion: past it, telling a quote of the word from one inside the
+    expansion needs bracket matching, so the rest goes to bashlex as written, exactly as before.
+    Only bashlex sees the result, so a misjudged segment can only hide an expansion from it - and
+    `_dequote`, reading the real text, then meets that `$(` with no part and refuses the word.
+    """
+    out, i, dquote = list(value), 0, False
+    while i < len(value):
+        char = value[i]
+        if value.startswith(_EXPANSION_OPENERS, i):
+            break
+        if char == "\\":
+            i += 2
+            continue
+        if char == '"':
+            dquote = not dquote
+        elif not dquote and (char == "'" or value.startswith("$'", i)):
+            close = i + 1 if char == "'" else i + 2
+            while close < len(value) and value[close] != "'":
+                close += 2 if char == "$" and value[close] == "\\" else 1
+            if close >= len(value):
+                break  # unterminated: `_dequote` refuses the word
+            out[i : close + 1] = _BLANK * (close + 1 - i)
+            i = close
+        i += 1
+    return "".join(out)
+
+
+def _expand_word_internal(parserobj: Any, wordtoken: Any, *args: Any) -> "tuple[list[Any], str]":
     """bashlex's word expansion, with the word's text re-read by bash's quoting rules.
 
     bashlex finds a word's boundaries and expansions correctly but removes its quotes wrongly, so
@@ -657,29 +691,31 @@ def _expand_word(parserobj: Any, wordtoken: Any, *args: Any) -> "tuple[list[Any]
     Re-reading here, where every word of every parse is expanded (nested ones included), keeps
     those surfaces from disagreeing about one payload. The token is already free of line
     continuations and bashlex's part offsets index it, so `_dequote` copies each expansion through
-    raw, as bashlex spells it. Anything it cannot account for raises ParseError, which the
-    validator blocks: an unmodelled escape, an unterminated quote, or an unquoted break or
-    unmodelled expansion inside the word.
+    raw, as bashlex spells it. bashlex only finds those parts: it is handed the token with its
+    single-quoted text blanked (`_blank_single_quotes`), because it reads that text as code -
+    `'it'"'"'s `foo`'` grew a phantom substitution, and `'a'"'"'b ${c'` hung its `${` scan.
+    Anything `_dequote` cannot account for raises ParseError, which the validator blocks: an
+    unmodelled escape, an unterminated quote, or an unquoted break or unmodelled expansion.
     """
     value = wordtoken.value
     if not _holds_quote(value):
         return _bashlex_expand_word(parserobj, wordtoken, *args)
-    if value[0] == "'" == value[-1] and value.find("'", 1) < len(value) - 1:
-        # Past the one-string shortcut, via a filler character the shifted lexpos cancels out of
-        # every part's offset. Only its parts are kept, so the filler never reaches the text.
-        steered = copy.copy(wordtoken)
-        steered.value, steered.lexpos = "_" + value, wordtoken.lexpos - 1
-        parts, _ = _bashlex_expand_word(parserobj, steered, *args)
-    else:
-        parts, _ = _bashlex_expand_word(parserobj, wordtoken, *args)
-    # bashlex also hangs an empty `parameter` node on the `$` of each `$'` / `$"`: not an
-    # expansion, so it is left for `_dequote` to read as the quote it opens.
+    blanked = copy.copy(wordtoken)
+    blanked.value = _blank_single_quotes(value)
+    if blanked.value.rfind("${") > blanked.value.rfind("}"):
+        # bashlex's `${` scan never terminates without a `}` after it; bash refuses such a word too.
+        raise ParseError(f"Quoted word opens ${{ with no closing brace: {value!r}")
+    parts, _ = _bashlex_expand_word(parserobj, blanked, *args)
+    # bashlex also hangs an empty `parameter` node on the `$` of each `$"` (and each `$'` past the
+    # blanking): not an expansion, so it is left for `_dequote` to read as the quote it opens.
     base = wordtoken.lexpos
     children = {part.pos[0] - base: part.pos[1] - base for part in parts if getattr(part, "value", None) != ""}
-    return parts, _dequote(value, 0, len(value), children)
+    return parts, _dequote(value, children)
 
 
-bashlex.subst._expandwordinternal = _expand_word
+# Process-global, like the AND-OR correction above: every bashlex.parse in this process - the
+# commit filter's included - reads quoted words this way once this module is imported.
+bashlex.subst._expandwordinternal = _expand_word_internal
 
 
 class BashCommandParser:
@@ -752,7 +788,7 @@ class BashCommandParser:
         Raises:
             ValueError: If command is empty or whitespace-only
             ParseError: If bashlex fails to parse the command syntax, or a quoted word uses
-                quoting `_expand_word` does not model
+                quoting `_expand_word_internal` does not model
 
         Example:
             >>> parser = BashCommandParser()

