@@ -175,7 +175,16 @@ rules:
       # The value class is bash's blanks, NOT `\s`: bash keeps CR, FF and VT
       # inside a word, so `IFS=<CR>,` sets a live separator. `\<newline>` may
       # split the name, because bash joins the lines before it parses them.
-      - '\bI(?:\\\n)*F(?:\\\n)*S(?:\\\n)*\s*=[^; \t\n]+'
+      # `+=` appends; the same value rule holds.
+      - '\bI(?:\\\n)*F(?:\\\n)*S(?:\\\n)*\s*\+?=[^; \t\n]+'
+      # A subscripted IFS outside `${…}` is an element write (`IFS[0]=,`). Matched
+      # on the `[` alone: scanning to a closing `]` is quadratic in repeated `IFS[`,
+      # and a subscript nests (`IFS[a[0]]=,`).
+      - '\bI(?:\\\n)*F(?:\\\n)*S(?:\\\n)*\['
+      # A loop variable named IFS. `read IFS`, `printf -v IFS` and kin are
+      # checked on the AST instead (_check_ifs_operand): their operands can
+      # carry a quoted `;` that no single-line pattern can step over.
+      - '\bfor\s+IFS\b'
       # IFS parameter expansion variants
       - '\$\{IFS[^}]*\}'
     alternatives:

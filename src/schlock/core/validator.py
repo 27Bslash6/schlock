@@ -448,6 +448,48 @@ def _check_dangerous_command_flags(
     return None
 
 
+# Builtins that write a variable named by an operand (`read IFS`, `printf -v IFS`). The name
+# must be read off the AST: the words in between can hold a quoted `;` or `|` (`read -d ';'`,
+# `${y:+;}`), which ends any regex scan of the operand list early. printf's only one is `-v`.
+_NAME_OPERAND_BUILTINS: frozenset[str] = frozenset({"read", "readarray", "mapfile", "getopts"})
+
+
+def _writes_ifs(words: list[str]) -> bool:
+    """Whether ``words`` (one command, name first) writes IFS through an operand."""
+    # bashlex reads `$'read'` as `$read`; dropping `$` restores the name (and flags a computed one).
+    words = [word.replace("$", "") for word in words]
+    i = 0
+    while i < len(words) and (words[i] in ("builtin", "command") or (i and words[i].startswith("-"))):
+        i += 1
+    name, operands = (words[i], words[i + 1 :]) if i < len(words) else ("", [])
+    if name == "printf":
+        return "-vIFS" in operands or any(a == "-v" and b == "IFS" for a, b in zip(operands, operands[1:]))
+    # An option cluster ending in the name (`-aIFS`, `-raIFS`) is the same write.
+    return name in _NAME_OPERAND_BUILTINS and any(
+        arg == "IFS" or (arg.startswith("-") and arg.endswith("IFS")) for arg in operands
+    )
+
+
+def _check_ifs_operand(commands_with_args: list[tuple[str, list[str]]]) -> Optional[ValidationResult]:
+    """Block a builtin that writes IFS through an operand; the `ifs_obfuscation` rule on the AST.
+
+    No value check, unlike the `IFS=` pattern: the value arrives through another word or stdin,
+    and none of these is an idiom.
+    """
+    for cmd_name, args in commands_with_args:
+        if _writes_ifs([cmd_name, *args]):
+            return ValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message="BLOCKED: IFS variable manipulation to bypass space filtering",
+                alternatives=["Use explicit spaces - IFS obfuscation indicates malicious intent"],
+                exit_code=1,
+                error=None,
+                matched_rules=["ifs_obfuscation"],
+            )
+    return None
+
+
 # LAB-2754: commands whose *argument* is a program, not data.
 #
 # `bash -c "rm -rf /"` hands the quoted word to bash as source code. The AST is right to
@@ -2703,7 +2745,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # This catches quoted command names that bypass regex patterns (e.g., "nc" -e)
             # Must run AFTER parsing but BEFORE regex matching for defense in depth
             commands_with_args = parser.extract_commands_with_args(ast)
-            dangerous_check = _check_dangerous_command_flags(commands_with_args)
+            dangerous_check = _check_dangerous_command_flags(commands_with_args) or _check_ifs_operand(commands_with_args)
             if dangerous_check is not None:
                 return dangerous_check
 
