@@ -137,7 +137,7 @@ class TestMessageFormatting:
     @pytest.mark.parametrize(("decision", "status"), [("ask", "CAUTION"), ("deny", "BLOCKED")])
     @pytest.mark.parametrize("matched_rules", [["a", "b"], ["a", "b", "a"]])
     def test_every_matched_rule_is_named(self, decision, status, matched_rules):
-        """A tie must not hide the second rule behind the first rule's message (LAB-5002)."""
+        """Every distinct matched rule is named, not only the one whose message is shown (LAB-5002)."""
         result = ValidationResult(
             allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
         )
@@ -167,6 +167,22 @@ class TestMessageFormatting:
         )
         (line,) = log_file.read_text().splitlines()
         assert json.loads(line)["violations"] == ["git_force_push", "recursive_delete"]
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_shellcheck_audit_entries_stay_out_of_the_prompt_and_the_cache(self, tmp_path, monkeypatch):
+        """The hook appends ShellCheck findings to the audit list; that must not reach `matched_rules`."""
+        log_file = tmp_path / "audit.jsonl"
+        finding = SimpleNamespace(sc_code="SC2086", message="Double quote")
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS["balanced"]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([finding], "ShellCheck says"))
+
+        for _ in range(2):
+            output = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}})
+            assert "Rules matched" not in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        violations = [json.loads(line)["violations"] for line in log_file.read_text().splitlines()]
+        assert violations == [["git_commit", "ShellCheck SC2086: Double quote"]] * 2
 
 
 class TestHookHandler:
