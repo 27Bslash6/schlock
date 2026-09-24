@@ -1,5 +1,7 @@
 """Tests for ShellCheck integration module."""
 
+from pathlib import Path
+
 import pytest
 
 from schlock.integrations.shellcheck import (
@@ -507,6 +509,133 @@ class TestShellCheckErrorHandling:
 
         # Cleanup
         sc._circuit_breaker_failures.clear()
+
+
+def _codes(findings):
+    assert findings is not None, "ShellCheck gave no verdict (timeout or error exit)"
+    return sorted(f.code for f in findings)
+
+
+class TestShellCheckIgnoresCheckoutConfig:
+    """The checkout and the environment cannot change what ShellCheck reports (LAB-5084).
+
+    ShellCheck reads .shellcheckrc from the cwd, each parent dir and ~, and prepends
+    SHELLCHECK_OPTS to its argv. A repo's `disable=SC2086` then switched a security code
+    off, and a .shellcheckrc symlinked to /dev/zero ran every call into the timeout.
+    """
+
+    @pytest.fixture
+    def dirs(self, tmp_path, monkeypatch):
+        """A cwd two levels under a fake root, a fake HOME, no rc files, no SHELLCHECK_OPTS."""
+        import schlock.integrations.shellcheck as sc  # noqa: PLC0415
+        from schlock.core.validator import clear_caches  # noqa: PLC0415
+
+        cwd = tmp_path / "repo" / "sub"
+        cwd.mkdir(parents=True)
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        monkeypatch.delenv("SHELLCHECK_OPTS", raising=False)
+        monkeypatch.setattr(sc, "_circuit_breaker_failures", [])
+        monkeypatch.setattr(sc, "_circuit_breaker_open_until", 0.0)
+        clear_caches()
+        yield {"cwd": cwd, "parent": cwd.parent, "home": home}
+        clear_caches()
+
+    def test_spawn_passes_norc_and_drops_shellcheck_opts(self, dirs, monkeypatch):
+        """Binary-independent pin of the invocation: argv carries --norc, env lacks SHELLCHECK_OPTS."""
+        from unittest.mock import MagicMock, patch  # noqa: PLC0415
+
+        import schlock.integrations.shellcheck as sc  # noqa: PLC0415
+
+        monkeypatch.setenv("SHELLCHECK_OPTS", "--exclude=SC2086")
+        monkeypatch.setenv("SCHLOCK_LAB5084_PROBE", "kept")
+        mock_result = MagicMock(returncode=0, stdout="[]", stderr="")
+
+        with (
+            patch.object(sc, "get_shellcheck_path", return_value="/usr/bin/shellcheck"),
+            patch("subprocess.run", return_value=mock_result) as run,
+        ):
+            assert sc.run_shellcheck("echo hi") == []
+
+        argv, env = run.call_args.args[0], run.call_args.kwargs["env"]
+        assert "--norc" in argv
+        assert "SHELLCHECK_OPTS" not in env
+        assert env["SCHLOCK_LAB5084_PROBE"] == "kept"  # only SHELLCHECK_OPTS is dropped
+
+    def test_binary_without_norc_gives_no_verdict(self, dirs):
+        """Minimum supported ShellCheck is 0.7.0; an older one rejects --norc and gets no verdict.
+
+        0.7.0 added --norc along with .shellcheckrc itself. Measured on the 0.6.0 release
+        binary: exit 3 and this stderr. That is "no verdict", never "clean" (LAB-4586), so
+        a quoted heredoc is BLOCKED rather than waved through with half its checks missing.
+        """
+        from unittest.mock import MagicMock, patch  # noqa: PLC0415
+
+        import schlock.integrations.shellcheck as sc  # noqa: PLC0415
+        from schlock.core.validator import validate_command  # noqa: PLC0415
+
+        stderr = "unrecognized option `--norc'\n\nUsage: shellcheck [OPTIONS...] FILES...\n"
+        pre_070 = MagicMock(returncode=3, stdout="", stderr=stderr)
+
+        with (
+            patch.object(sc, "get_shellcheck_path", return_value="/usr/bin/shellcheck"),
+            patch("subprocess.run", return_value=pre_070),
+        ):
+            assert sc.run_shellcheck("echo hi") is None
+            result = validate_command("cat <<'EOF'\nhi\nEOF")
+
+        assert result.risk_level.name == "BLOCKED"
+        assert "shellcheck:incomplete" in result.matched_rules
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize("where", ["cwd", "parent", "home"])
+    @pytest.mark.parametrize("rc", ["disable=all", "disable=SC2086,SC2016,SC2046"])
+    def test_rc_file_does_not_change_findings(self, dirs, where, rc):
+        command = "rm -r $DIR/build"
+        baseline = _codes(run_shellcheck(command))
+        assert 2086 in baseline
+
+        (dirs[where] / ".shellcheckrc").write_text(rc + "\n")
+
+        assert _codes(run_shellcheck(command)) == baseline
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.skipif(not Path("/dev/zero").exists(), reason="no /dev/zero")
+    def test_rc_symlinked_to_a_device_does_not_stall(self, dirs):
+        """Before the fix ShellCheck read /dev/zero until the 2s timeout killed it (1+ GiB RSS)."""
+        (dirs["cwd"] / ".shellcheckrc").symlink_to("/dev/zero")
+
+        # Not None means it answered inside the timeout, so no wall-clock assert is needed.
+        assert 2086 in _codes(run_shellcheck("rm -r $DIR/build"))
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize(("command", "code"), [("rm -r $DIR/build", 2086), ("rm -r$''f /usr", 2114)])
+    def test_shellcheck_opts_does_not_change_findings(self, dirs, monkeypatch, command, code):
+        baseline = _codes(run_shellcheck(command))
+        assert code in baseline
+
+        monkeypatch.setenv("SHELLCHECK_OPTS", "--exclude=SC2086,SC2114")
+
+        assert _codes(run_shellcheck(command)) == baseline
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [("rm -r $DIR/build", "shellcheck:SC2086"), ("rm -r$''f /usr", "shellcheck:SC2114")],
+    )
+    def test_rc_file_does_not_downgrade_the_verdict(self, dirs, command, rule):
+        """Through validate_command: `disable=all` used to take both from BLOCKED to HIGH."""
+        from schlock.core.validator import validate_command  # noqa: PLC0415
+
+        (dirs["cwd"] / ".shellcheckrc").write_text("disable=all\n")
+
+        result = validate_command(command)
+
+        assert result.risk_level.name == "BLOCKED"
+        assert rule in result.matched_rules
 
 
 class TestMessageSanitization:

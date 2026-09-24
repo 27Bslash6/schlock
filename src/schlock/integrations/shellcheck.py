@@ -20,6 +20,7 @@ Usage:
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -269,11 +270,25 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
     if not path:
         return []
 
+    # The checkout and the environment must not choose which codes ShellCheck reports,
+    # or how long it takes (LAB-5084). Without --norc it reads .shellcheckrc from the cwd,
+    # every parent dir and ~, so `disable=SC2086` in an ordinary repo switches a security
+    # code off, and a .shellcheckrc symlinked to /dev/zero runs every call into the
+    # timeout. SHELLCHECK_OPTS is prepended to argv, so it could --exclude the same codes.
+    #
+    # Minimum supported ShellCheck is 0.7.0: it added --norc along with .shellcheckrc
+    # itself. An older binary rejects the flag (exit 3), which is "no verdict" below, so a
+    # quoted heredoc or a `bash -c` payload is BLOCKED and nothing gets findings. We do
+    # not gate the flag on get_shellcheck_version(), which would cost a second spawn per
+    # hook call, just to support releases from before 2019.
+    child_env = {k: v for k, v in os.environ.items() if k != "SHELLCHECK_OPTS"}
+
     try:
         # Run shellcheck with JSON output, reading from stdin
         result = subprocess.run(
             [
                 path,
+                "--norc",
                 f"--shell={shell}",
                 "--format=json",
                 f"--severity={severity}",
@@ -284,6 +299,7 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=child_env,
         )
 
         # Exit 0 or 1 is a verdict (1 = findings). Anything else - exit 2+, or a negative
