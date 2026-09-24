@@ -9,9 +9,11 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import bisect
 import logging
+import string
 from typing import Any, NamedTuple, Optional
 
 import bashlex
+import bashlex.ast
 import bashlex.errors
 
 from schlock.exceptions import ParseError
@@ -496,6 +498,182 @@ class CommandSegment(NamedTuple):
     node: Any
 
 
+# bash's single-character ANSI-C escapes (`ansicstr`). An escape absent from here and from the
+# octal/hex branches keeps its backslash, as bash does - except \c, whose control-character edge
+# cases (`\c?`, `\c\\`) nothing benign needs, so it fails closed instead.
+_ANSI_C_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+_OCTAL_DIGITS = frozenset("01234567")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_HEX_WIDTHS = {"x": 2, "u": 4, "U": 8}  # most hex digits each escape reads; bash reads greedily
+# `$` followed by one of these starts an expansion (`$x`, `$1`, `$@`, `${`, `$(`, `$[`), which
+# bashlex models as a child node or refuses to parse; any other `$` is literal to bash.
+_EXPANSION_STARTS = frozenset(string.ascii_letters + string.digits + "_{([@*#?$!-")
+# Characters that end a word when unquoted - one inside a word's span means bashlex and bash
+# disagree about where the word is, and the word's text cannot be trusted either way.
+_WORD_BREAKS = frozenset(" \t\n;&|<>()")
+
+
+def _holds_dollar_quote(text: str) -> bool:
+    """Whether ``text`` opens a `$'...'` or `$"..."` quote (a line continuation may sit after the `$`)."""
+    joined = text.replace("\\\n", "")
+    return "$'" in joined or '$"' in joined
+
+
+class _DollarQuoteDecoder(bashlex.ast.nodevisitor):
+    """Rewrite the text of every word holding a `$'...'` or `$"..."` quote to what bash makes of it.
+
+    bashlex finds these words' boundaries correctly but dequotes them wrongly - `$'rm\\t-rf\\t/'`
+    reads as `$rmt-rft/`, `$"bash"` as `$bash` - so every check keyed on word text judged a string
+    bash never runs: the `-c` / `watch` / `<<<` payloads re-validated as code and the pipe-to-shell
+    interpreter name alike (LAB-3005). Fixing the text here, where every parse passes, keeps those
+    surfaces from disagreeing about one payload. (`$"..."` is locale translation; with no message
+    catalog, which is every shell an agent drives, bash reads it as plain `"..."`.)
+
+    Each such word is re-read from its source span with bash's own quoting rules. Expansions stay
+    raw, exactly as bashlex spells them, by copying the spans of the child nodes it built for them.
+    Anything the reading cannot account for raises ParseError, which the validator blocks: an
+    unmodelled escape, an unterminated quote, or an unquoted break or unmodelled expansion inside
+    the span (bashlex and bash would then disagree about the word itself).
+    """
+
+    def __init__(self, command: str):
+        self.command = command
+
+    def visitword(self, n: Any, word: str) -> None:
+        self._decode(n)
+
+    def visitassignment(self, n: Any, word: str) -> None:
+        self._decode(n)
+
+    def _decode(self, n: Any) -> None:
+        start, end = n.pos
+        if not _holds_dollar_quote(self.command[start:end]):
+            return
+        # bashlex also hangs an empty `parameter` node on the `$` of each `$'` / `$"`: not an
+        # expansion, so it is left for `_dequote` to read as the quote it opens.
+        children = {part.pos[0]: part.pos[1] for part in getattr(n, "parts", []) if getattr(part, "value", None) != ""}
+        n.word = _dequote(self.command, start, end, children)
+
+
+def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # noqa: PLR0912 - one branch per quoting rule
+    """Return the text bash makes of the word at ``src[i:end]`` (see `_DollarQuoteDecoder`)."""
+    out: list[str] = []
+    quote = ""  # "", "'" or '"'
+    while i < end:
+        if quote != "'" and i in children:
+            out.append(src[i : children[i]])
+            i = children[i]
+            continue
+        char, nxt = src[i], src[i + 1 : i + 2] if i + 1 < end else ""
+        if quote == "'":
+            quote = "" if char == "'" else quote
+            out.append("" if char == "'" else char)
+            i += 1
+        elif char == "\\" and nxt == "\n":
+            i += 2  # a line continuation is removed, quoted by "..." or not
+        elif char == "\\":
+            if not nxt:
+                raise ParseError(f"ANSI-C word ends in a bare backslash: {src[:end]!r}")
+            keeps_backslash = quote == '"' and nxt not in '$`"\\'
+            out.append(("\\" if keeps_backslash else "") + nxt)
+            i += 2
+        elif char == '"':
+            quote = "" if quote else '"'
+            i += 1
+        elif char == "'" and not quote:
+            quote = "'"
+            i += 1
+        elif char == "$":
+            after = i + 1
+            while after + 1 < end and src.startswith("\\\n", after):
+                after += 2
+            follower = src[after : after + 1] if after < end else ""
+            if not quote and follower == "'":
+                text, i = _ansi_c_quote(src, after + 1, end)
+                out.append(text)
+            elif not quote and follower == '"':
+                quote, i = '"', after + 1  # $"..." without a message catalog is "..."
+            elif follower and follower in _EXPANSION_STARTS:
+                raise ParseError(f"ANSI-C word holds an expansion bashlex did not model: {src[:end]!r}")
+            else:
+                out.append("$")
+                i += 1
+        elif char == "`" or (not quote and char in _WORD_BREAKS):
+            raise ParseError(f"ANSI-C word span disagrees with bash at {char!r}: {src[:end]!r}")
+        else:
+            out.append(char)
+            i += 1
+    if quote:
+        raise ParseError(f"ANSI-C word ends inside a {quote} quote: {src[:end]!r}")
+    return "".join(out)
+
+
+def _ansi_c_quote(src: str, i: int, end: int) -> "tuple[str, int]":
+    """Decode the `$'...'` body starting at ``i``; return (text, index past the closing quote)."""
+    out: list[str] = []
+    truncated = False
+    while i < end and src[i] != "'":
+        if src[i] == "\\":
+            text, i = _ansi_c_escape(src, i, end)
+        else:
+            text, i = src[i], i + 1
+        # bash builds $'...' as a C string: a NUL ends it, and the rest of the quote is lost.
+        truncated = truncated or text == "\0"
+        out.append("" if truncated else text)
+    if i >= end:
+        raise ParseError(f"ANSI-C word ends inside a $' quote: {src[:end]!r}")
+    return "".join(out), i + 1
+
+
+def _ansi_c_escape(src: str, i: int, end: int) -> "tuple[str, int]":
+    """Decode the escape at ``src[i] == '\\\\'`` inside `$'...'`; return (text, index after it)."""
+    letter = src[i + 1 : i + 2] if i + 1 < end else ""
+    # Octal and hex can decode past ASCII (`\777`, `\xff`, `\u2713`). Such a result is the
+    # locale's to render, but whatever it becomes is a word character: bash's blanks and
+    # metacharacters are all ASCII, and ASCII decodes the same in every locale, so it can neither
+    # split a word nor spell a command name. chr() keeps it a non-ASCII word character here too.
+    if letter in _OCTAL_DIGITS:
+        digits = _take(src, i + 1, end, _OCTAL_DIGITS, 3)
+        return chr(int(digits, 8) & 0xFF), i + 1 + len(digits)
+    if letter == "x" and src[i + 2 : i + 3] == "{":
+        # bash 5.3 reads `\x{72}` as `r`; older bash leaves it literal. Either reading is a guess.
+        raise ParseError(f"ANSI-C braced escape \\x{{...}} is not modelled: {src[:end]!r}")
+    if letter in _HEX_WIDTHS:
+        digits = _take(src, i + 2, end, _HEX_DIGITS, _HEX_WIDTHS[letter])
+        if not digits:
+            return "\\" + letter, i + 2
+        code = int(digits, 16)
+        if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+            raise ParseError(f"ANSI-C escape names no character: {src[:end]!r}")
+        return chr(code), i + 2 + len(digits)
+    if not letter:
+        raise ParseError(f"ANSI-C word ends inside a $' quote: {src[:end]!r}")
+    if letter == "c":
+        raise ParseError(f"ANSI-C escape \\c is not modelled: {src[:end]!r}")
+    return _ANSI_C_ESCAPES.get(letter, "\\" + letter), i + 2
+
+
+def _take(src: str, i: int, end: int, alphabet: "frozenset[str]", limit: int) -> str:
+    j = i
+    while j < min(end, i + limit) and src[j] in alphabet:
+        j += 1
+    return src[i:j]
+
+
 class BashCommandParser:
     """Parse bash commands using bashlex AST analysis.
 
@@ -565,7 +743,8 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax
+            ParseError: If bashlex fails to parse the command syntax, or a `$'...'` /
+                `$"..."` word uses quoting `_DollarQuoteDecoder` does not model
 
         Example:
             >>> parser = BashCommandParser()
@@ -579,7 +758,14 @@ class BashCommandParser:
             raise ValueError("Command cannot be whitespace-only")
 
         try:
-            return bashlex.parse(command)
+            nodes = bashlex.parse(command)
+            if _holds_dollar_quote(command):
+                decoder = _DollarQuoteDecoder(command)
+                for node in nodes:
+                    decoder.visit(node)
+            return nodes
+        except ParseError:
+            raise
         except bashlex.errors.ParsingError as e:
             # Preserve original bashlex error for debugging
             raise ParseError(
