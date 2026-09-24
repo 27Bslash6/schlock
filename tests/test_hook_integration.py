@@ -12,6 +12,7 @@ Tests cover:
 
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -599,3 +600,36 @@ class TestUnscannableMessageHookHandling:
         assert block_calls, "expected a block audit entry on validation error"
         joined = " ".join(block_calls[-1].kwargs["violations"]).lower()
         assert "unscannable" in joined  # warn detection survives the error-deny path
+
+
+class TestValidationDeadline:
+    """A validation that never returns must deny, not outlive Claude Code's timeout (LAB-4959).
+
+    Claude Code lets a timed-out PreToolUse command hook through to the permission flow.
+    """
+
+    def test_stalled_validation_denies_within_the_deadline(self, monkeypatch):
+        def spin(command):
+            while True:
+                pass
+
+        monkeypatch.setattr(pre_tool_use, "validate_command", spin)
+        monkeypatch.setattr(pre_tool_use, "VALIDATION_DEADLINE_S", 0.2)
+        audit = []
+        monkeypatch.setattr(AuditLogger, "log_validation", lambda self, **kw: audit.append(kw))
+
+        start = time.perf_counter()
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+
+        assert time.perf_counter() - start < 5
+        output = response["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert "did not finish within" in output["permissionDecisionReason"]
+        assert audit[-1]["decision"] == "block"
+        assert "deadline" in audit[-1]["violations"][0]
+
+    def test_deadline_is_disarmed_after_a_normal_verdict(self):
+        previous = signal.getsignal(signal.SIGALRM)
+        handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+        assert signal.getsignal(signal.SIGALRM) is previous

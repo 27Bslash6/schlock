@@ -13,6 +13,7 @@ from typing import Any, NamedTuple, Optional
 
 import bashlex
 import bashlex.errors
+import bashlex.subst
 
 from schlock.exceptions import ParseError
 
@@ -119,6 +120,32 @@ def _apply_andor_substitution_correction() -> None:
 
 
 _apply_andor_substitution_correction()
+
+
+def _refuse_unterminated_brace_expansion() -> None:
+    """Make bashlex raise on an unterminated ``${`` instead of looping forever (LAB-4959).
+
+    bashlex 0.18's ``subst._paramexpand`` locates the closing brace with ``str.find``, never
+    checks for -1, and hands back scan index 0, so ``_expandwordinternal`` restarts the word and
+    never returns. The tokenizer brace-matches an ordinary word first; the way in is text it does
+    not match, a heredoc body inside a double-quoted ``$( … )`` - Claude Code's own commit form
+    ``git commit -m "$(cat <<EOF … EOF)"`` with a ``${`` in the message. A hook that outlives its
+    timeout fails open, so the loop was an allow.
+
+    Every input that reaches the -1 loops, so raising there changes no parse that ever finished.
+    Unreported upstream.
+    """
+    original = bashlex.subst._paramexpand
+
+    def paramexpand(parserobj: Any, string: str, sindex: int) -> Any:
+        if string[sindex + 1 : sindex + 2] == "{" and string.find("}", sindex + 2) == -1:
+            raise bashlex.errors.ParsingError("bad substitution: no closing '}'", string, sindex)
+        return original(parserobj, string, sindex)
+
+    bashlex.subst._paramexpand = paramexpand
+
+
+_refuse_unterminated_brace_expansion()
 
 # Interpreters that EXECUTE their standard input as a program when given no program source.
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:

@@ -15,9 +15,11 @@ Hook Interface:
 - Output: JSON with hookSpecificOutput structure to stdout
 """
 
+import faulthandler
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -46,6 +48,23 @@ from schlock.setup.config_writer import DEFAULT_RISK_PRESET, RISK_PRESETS  # noq
 # Configure logging to stderr
 logging.basicConfig(level=logging.INFO, format="[schlock-hook] %(levelname)s: %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
+
+# Claude Code lets a PreToolUse command hook that outlives its timeout (600 s by default) through
+# to the normal permission flow, so a validation that never returns is an allow (LAB-4959). The
+# deadline turns that into a denial, with headroom over the slowest legitimate input at the 64 KiB cap.
+VALIDATION_DEADLINE_S = 30
+# Backstop for a stall the soft deadline cannot interrupt (C code holding the GIL, a swallowed
+# timeout): faulthandler's watchdog thread exits 1 without the GIL, and the manifest's
+# `|| exit 2` turns that exit into a block.
+HARD_DEADLINE_S = 45
+
+
+class ValidationDeadlineExceeded(BaseException):
+    """A BaseException, so no `except Exception` on the validation path can swallow it."""
+
+
+def _on_deadline(signum, frame):
+    raise ValidationDeadlineExceeded
 
 
 # Global validator instance (lazy-loaded)
@@ -401,6 +420,8 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
     unscannable_warning = None
     unscannable_audit_violation = None
 
+    previous_handler = signal.signal(signal.SIGALRM, _on_deadline)
+    signal.setitimer(signal.ITIMER_REAL, VALIDATION_DEADLINE_S)
     try:
         # 1. Extract command from stdin JSON
         tool_name = input_data.get("tool_name", "")
@@ -669,9 +690,36 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
             }
         }
 
+    except ValidationDeadlineExceeded:
+        signal.setitimer(signal.ITIMER_REAL, 0)  # the audit write below must not be interrupted
+        logger.error(f"Validation exceeded {VALIDATION_DEADLINE_S}s; denying")
+        audit_logger.log_validation(
+            command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
+            risk_level="BLOCKED",
+            violations=[f"Validation deadline exceeded ({VALIDATION_DEADLINE_S}s)"],
+            decision="block",
+            execution_time_ms=(time.perf_counter() - start_time) * 1000,
+            context=context,
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"BLOCKED: Validation did not finish within {VALIDATION_DEADLINE_S}s, "
+                    "so schlock cannot vouch for this command. Split it into smaller commands."
+                ),
+            }
+        }
+
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
 
 def main():
     """Entry point for Claude Code hook execution."""
+    faulthandler.dump_traceback_later(HARD_DEADLINE_S, exit=True)
     try:
         # Read hook input from stdin
         input_data = json.load(sys.stdin)
