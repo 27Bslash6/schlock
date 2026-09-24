@@ -155,7 +155,8 @@ class TestReDoSProtection:
         assert elapsed < 0.5, f"ifs_obfuscation took {elapsed:.3f}s on {text[:12]!r}..."
 
     @pytest.mark.parametrize(
-        "unit", ['echo "', "echo '", "echo \\", "echo `", "echo 2>&1 ", "cat '", "export ", "chroot ", "source /tmp/"]
+        "unit",
+        ['echo "', "echo '", "echo \\", "echo `", "echo 2>&1 ", "echo $((1)) ", "cat '", "export ", "chroot ", "source /tmp/"],
     )
     def test_one_command_gap_is_linear_in_anchor_density(self, safety_rules_path, unit):
         """The shell-word gap restarts at every anchor, so vary ANCHOR DENSITY, not length.

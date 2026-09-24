@@ -48,6 +48,7 @@ class TestTheNextCommandDoesNotCompleteTheRule:
             'echo start && git commit -m "fix: hash password with bcrypt"',
             'cat README.md && git commit -m "docs: document .env loading"',
             "echo building; make; ls password_utils.py",
+            'echo $(basename $(pwd)) && git commit -m "fix: hash password"',
             # remote_execution: `| shasum` is not `| sh`, `rsync` is not `nc`.
             "npm install && curl -s localhost:3000 | shasum",
             "git commit -am x && git fetch && git log | sha512sum",
@@ -143,6 +144,23 @@ PAYLOADS = [
     ("recursive_permission_system_dirs", 'chown -R "u&g" /etc'),
     ("source_remote_script", "source /tmp/a/b/c.sh"),
     ("source_remote_script", 'source "/tmp/R&D/x.sh"'),
+    # A `$(` the bounded piece cannot close (arithmetic, nesting): one per gap.
+    ("credential_exposure", "cat $(dirname $(pwd))/.env"),
+    ("credential_exposure", "cat $((1+1)) ~/.ssh/id_rsa"),
+    ("credential_exposure", "echo $(basename $(pwd)) password"),
+    ("extended_credential_exposure", "echo $(basename $(pwd)) $GITHUB_TOKEN"),
+    ("extended_credential_exposure", "printf $((1)) $API_KEY"),
+    ("hardcoded_secrets", "export A=$((1)) MY_KEY=x"),
+    ("hardcoded_secrets", "export A=$(a $(b)) MY_TOKEN=x"),
+    ("hardcoded_secrets", "echo $((1)) 'api_key=x' > f"),
+    ("hardcoded_secrets", "echo 'secret_key=' $(a $(b)) \"x\" > .env"),
+    ("privilege_escalation_variants", "chroot $(dirname $(pwd)) /bin/bash"),
+    ("partition_manipulation", "parted -s $((0)) /dev/sda mklabel gpt"),
+    ("filesystem_wipe", "shred -n $((1+2)) -z /dev/sda"),
+    ("source_remote_script", "source /tmp/$(basename $(pwd))/x.sh"),
+    ("source_remote_script", ". /tmp/$((1))/x.sh"),
+    ("recursive_permission_system_dirs", "chown -R $(stat -c %u $(pwd)) /etc"),
+    ("recursive_permission_system_dirs", "chown $(id -u $(whoami)) -R /etc"),
 ]
 
 
