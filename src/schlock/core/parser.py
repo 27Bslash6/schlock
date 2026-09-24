@@ -9,6 +9,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import bisect
 import logging
+import posixpath
 from typing import Any, NamedTuple, Optional
 
 import bashlex
@@ -126,8 +127,8 @@ _apply_andor_substitution_correction()
 # and wrapper-command checks.
 # A heredoc body is inert text to `cat` and source code to `bash`, which decides
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
-# segment has to carry it (extract_command_segments). One set, so the two answers
-# cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
+# segment has to carry it (extract_command_segments), and whether the validator
+# re-validates a here-string as bash. One set, so the answers cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
 #
 # `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
 # bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
@@ -139,7 +140,11 @@ _apply_andor_substitution_correction()
 # its stdin as a command script - a heredoc or here-string included. LAB-2754 already
 # put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
 # the rbash drift with a different interpreter.
-_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
+#
+# `source`/`.` are here because `source /dev/stdin <<EOF` runs the body as bash in the
+# current shell (LAB-3522). Public for that validator filter: a here-string is stdin exactly
+# as a heredoc is.
+HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh", "source", "."})
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -153,6 +158,8 @@ STDIN_EXEC_INTERPRETERS = frozenset(
         "rbash",  # restricted bash still execs its stdin; `rbash -c` is already in _SHELL_COMMANDS
         "csh",  # execs stdin as a script like every other shell here; `csh -c` is in _SHELL_COMMANDS
         "tcsh",  # same as csh - tcsh is its interactive superset, not a different stdin model
+        "source",  # `source /dev/stdin` runs stdin as bash; `source file.sh` is a positional (LAB-3522)
+        ".",
         "python",
         "python2",
         "python3",
@@ -217,13 +224,47 @@ _INLINE_CODE_FLAGS = {
 }
 
 
-# Tokens that explicitly designate STDIN as the program source.
-_STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+# First characters that let an operand expand to no word at all or to an option (LAB-3522):
+# `"$@"` is empty in a Claude Code Bash call, `X=-s; bash $X` splits into `-s`, `{-s,}` brace-
+# expands to `-s`, a glob can match nothing (nullglob) or a file named `-s`, and `<(cat)` reads
+# the same pipe the shell was meant to run.
+_UNFIXED_OPERAND_STARTS = frozenset("$`{*?[<")
+
+
+def may_expand(word: str) -> bool:
+    """True if operand `word` might not reach the command as the single literal word it reads as.
+
+    Only the first character matters: once a word starts with a literal, its first field starts
+    with that literal too, so `./run-$ENV.sh` stays one script however `$ENV` splits. Textual
+    and quote-stripped (bashlex already removed the quotes), so `"$HOME/x.py"` and a literal
+    `'$x'` count as well - over-inclusive on purpose, the fail-closed direction.
+    """
+    return word[:1] in _UNFIXED_OPERAND_STARTS
+
+
+def _names_stdin(arg: str) -> bool:
+    """True if operand `arg` designates STDIN as the program source.
+
+    A suffix test on the lexically normalised path, not a list of spellings: every one of
+    `//dev/stdin`, `/dev/./stdin`, `/dev/../dev/stdin`, `/proc/thread-self/fd/0`,
+    `/proc/$$/fd/0` and `./stdin` (cwd `/dev`) ran its stdin in real bash, and an exact-match
+    set missed each in turn (LAB-3522). Over-inclusive on purpose: a real script named `stdin`
+    only loses its exemption, the fail-closed direction.
+    """
+    if arg == "-":
+        return True
+    path = posixpath.normpath(arg)
+    # ponytail: lexical only - a user symlink to /dev/stdin, or `cd /proc/self/fd && source 0`,
+    # names stdin through filesystem/cwd state no parser sees.
+    return path in ("stdin", "fd/0") or path.endswith(("/stdin", "/fd/0"))
+
 
 # Multicall binaries dispatch to an applet named by their first positional arg
 # (`busybox sh`, `toybox cat`). Classify the pipeline stage by the resolved applet, not the
 # wrapper, so `cat x | busybox sh` is seen as a shell sink while bare `busybox` (no applet) is not.
-_MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
+# `builtin` is not a binary but dispatches the same way (`builtin source /dev/stdin`), and it
+# reaches both stdin surfaces through this resolver (LAB-3522).
+_MULTICALL_BINARIES = frozenset({"busybox", "toybox", "builtin"})
 
 
 # Wrapper commands that pass through execution to subsequent args. Best-effort, NOT an
@@ -340,11 +381,12 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     Fail-CLOSED model (a security check must not guess flag arity): the interpreter is exempt
     (returns False) only when a program source is UNAMBIGUOUS —
       - an inline-code flag valid for this interpreter (-c / -e / -m / ...), separate or attached; or
-      - a positional (non-dash) script token appearing BEFORE any option flag.
+      - a positional (non-dash) script token appearing BEFORE any option flag, and not one that
+        `may_expand`: `bash "$@"` is a bare bash when `$@` is empty (LAB-3522).
     Once an option flag is seen, a following non-dash token is treated as that flag's VALUE
     (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
     (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
-    Explicit stdin paths ('-', '/dev/stdin', ...) -> True. No unambiguous program -> True.
+    Explicit stdin paths ('-', '/dev/stdin', ... - see `_names_stdin`) -> True. No unambiguous program -> True.
     """
     inline = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
     saw_option = False
@@ -353,13 +395,15 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
         if arg in inline or (len(arg) > 2 and arg[0] == "-" and f"-{arg[1]}" in inline):
             return False
         # Explicit stdin designator -> reads stdin.
-        if arg in _STDIN_PATHS:
+        if _names_stdin(arg):
             return True
         if not arg.startswith("-"):
-            # A leading positional (before any option) is a script file -> runs it.
+            # A leading literal positional (before any option) is a script file -> runs it.
+            # A leading expansion is unknown - nothing, options, a script - so assume stdin and
+            # stop: scanning on would let `X=-s; bash $X script.sh` exempt on `script.sh`.
             # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
             if not saw_option:
-                return False
+                return may_expand(arg)
             continue
         saw_option = True
     return True
@@ -400,6 +444,32 @@ def _command_words(node: Any) -> "list[str]":
         if hasattr(part, "word"):
             words.append(part.word)
     return words
+
+
+def _effective_command_name(node: Any) -> Optional[str]:
+    """Basename of the command a command node runs, multicall applets resolved.
+
+    `busybox sh` and `builtin source` run `sh` and `source`, so a heredoc on either is shell
+    code; keying on the literal first word read both bodies as inert text (LAB-3522).
+    """
+    words = _command_words(node)
+    if not words:
+        return None
+    return _resolve_multicall(words[0].split("/")[-1], words[1:])[0]
+
+
+def runs_stdin_as_shell(ast_nodes: "list[Any]") -> bool:
+    """True if some command in `ast_nodes` executes its stdin as shell code.
+
+    The question a heredoc head asks whose body no parser could read: `bash <<'EOF'` and
+    `command . /dev/stdin <<'EOF'` run the body, `bash script.sh <<'EOF'` and `cat <<'EOF'`
+    do not. Same classification as the here-string sink, wrappers included.
+    """
+    return any(
+        (found := _classify_sink(node, "")) is not None and found[0] in HEREDOC_SHELL_COMMANDS
+        for root in ast_nodes
+        for node in _command_nodes(root)
+    )
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -753,8 +823,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
-        executes_body = cmd_name in _HEREDOC_SHELL_COMMANDS
+        executes_body = _effective_command_name(node) in HEREDOC_SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1101,19 +1170,14 @@ class BashCommandParser:
             """Recursively visit AST nodes to find heredocs."""
             if hasattr(node, "kind"):
                 # Track command name for determining if heredoc goes to shell
-                cmd_name = None
-                if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            cmd_name = part.word.split("/")[-1]  # Handle /bin/bash
-                            break
+                cmd_name = _effective_command_name(node) if node.kind == "command" else None
 
                 # Check for redirect nodes with heredocs
                 if node.kind == "redirect" and hasattr(node, "heredoc"):
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
+                        is_shell = parent_cmd in HEREDOC_SHELL_COMMANDS if parent_cmd else False
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
