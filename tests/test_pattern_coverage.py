@@ -1214,6 +1214,11 @@ class TestObfuscationDetection:
             "for IFS in ,; do x=rm,-rf,/; $x; done",
             "set -- ,; for IFS do :; done",
             "IFS[a[0]]=,",
+            # bashlex reads an element assignment as plain words, a spaced subscript as three.
+            "IFS[ 0 ]=,",
+            "x[0]=1 IFS[0]=,",
+            "f(){ local IFS[0]=,; }; f",
+            "command declare 'IFS[0]=,'",
             "mapfile -t IFS <<< ,",
             "readarray -t IFS <<< ,",
             "read -a IFS <<< ,",
@@ -1276,6 +1281,12 @@ class TestObfuscationDetection:
             "printf '%s\\n' IFS",
             "read -r x <<< IFS",
             "grep -n 'for IFS' notes.txt",
+            # An element or loop spelling that no assignment or loop reads is data.
+            "echo IFS[0]",
+            "echo IFS[0]=,",
+            "grep -rn IFS\\[ src/",
+            "echo for IFS in values",
+            "declare -p IFS",
             # An option's value is not a name, whatever it holds.
             'read -rp "${PROMPT}" answer',
             "read -p 'IFS? ' answer",

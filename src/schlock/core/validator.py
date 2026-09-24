@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+import bashlex.ast
 import yaml
 
 from schlock.exceptions import ConfigurationError, ParseError
@@ -461,6 +462,9 @@ _NAME_WRITERS: dict[str, tuple[str, str]] = {
     "printf": ("", "v"),
 }
 
+# Builtins whose operands are assignments (`declare IFS[0]=,`).
+_DECLARATIONS = frozenset({"declare", "typeset", "local", "export", "readonly"})
+
 # Characters that start a parameter, command, brace or pathname expansion, any of which can turn
 # a word into something else before bash reads it.
 _EXPANDS = frozenset("${}*?[`")
@@ -515,8 +519,26 @@ def _names_written(builtin: str, operands: list[str]) -> list[str]:
     return names + rest
 
 
+def _loop_names(nodes: list[Any]) -> list[str]:
+    """The variable of every `for` loop in ``nodes``, nested ones included."""
+    names: list[str] = []
+
+    class _Loops(bashlex.ast.nodevisitor):
+        def visitfor(self, node: Any, parts: list[Any]) -> None:
+            names.append(getattr(parts[1], "word", ""))
+
+    for node in nodes:
+        _Loops().visit(node)
+    return names
+
+
 def _writes_ifs(words: list[str]) -> bool:
-    """Whether ``words`` (one command, name first) writes IFS through an operand."""
+    """Whether ``words`` (one command, name first) writes IFS through an operand or an element."""
+    # bashlex reads an element assignment (`IFS[0]=,`, `IFS[ 0 ]=,`) as plain words, so a prefix
+    # run of them arrives as the command name. As an operand, `IFS[0]` is data (`echo IFS[0]`)
+    # unless a declaration builtin takes it as an assignment (`local IFS[0]=,`).
+    if re.match(r"[A-Za-z_]\w*\[", words[0]):
+        return any(word.startswith("IFS[") for word in words)
     i = 0
     while i < len(words) and (words[i] in ("builtin", "command") or (i and words[i].startswith("-"))):
         i += 1
@@ -529,6 +551,8 @@ def _writes_ifs(words: list[str]) -> bool:
     # naming of a writer (variable/glob dispatch, a function forwarding to `read`) is the LAB-5031
     # class, not caught here; only a name that resolves to a literal writer is.
     name = words[i].replace("$", "")
+    if name in _DECLARATIONS:
+        return any(word.startswith("IFS[") for word in words[i + 1 :])
     if name not in _NAME_WRITERS:
         return False
     return any(_may_name_ifs(word) for word in _names_written(name, words[i + 1 :]))
@@ -2963,7 +2987,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         if (
             ifs_rule is not None
             and ifs_rule.risk_level > match.risk_level
-            and any(_writes_ifs([name, *args]) for name, args in commands_with_args)
+            and (any(_writes_ifs([name, *args]) for name, args in commands_with_args) or "IFS" in _loop_names(ast))
         ):
             match = RuleMatch(
                 matched=True,

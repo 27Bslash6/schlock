@@ -177,14 +177,10 @@ rules:
       # split the name, because bash joins the lines before it parses them.
       # `+=` appends; the same value rule holds.
       - '\bI(?:\\\n)*F(?:\\\n)*S(?:\\\n)*\s*\+?=[^; \t\n]+'
-      # An element write (`IFS[0]=,`), matched on the `[` alone: scanning to a
-      # closing `]` is quadratic in repeated `IFS[`, and a subscript nests
-      # (`IFS[a[0]]=,`). Also hits `${IFS[…]}`, which is blocked below anyway.
-      - '\bI(?:\\\n)*F(?:\\\n)*S(?:\\\n)*\['
-      # A loop variable named IFS, with the same `\<newline>` allowance. Names
+      # Element writes (`IFS[0]=,`), loop variables (`for IFS in`) and names
       # that builtins write (`read IFS`, `printf -v IFS`) are checked on the AST
-      # (validator._writes_ifs): an operand before the name can hold a quoted `;`.
-      - '\bf(?:\\\n)*o(?:\\\n)*r(?:\s|\\\n)+I(?:\\\n)*F(?:\\\n)*S\b'
+      # (validator._writes_ifs, _loop_names): as text they are also plain data
+      # (`echo IFS[0]`), and an operand before a name can hold a quoted `;`.
       # IFS parameter expansion variants
       - '\$\{IFS[^}]*\}'
     alternatives:
