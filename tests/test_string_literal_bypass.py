@@ -6,6 +6,7 @@ ENTIRE match (both start AND end) falls within a string literal.
 Also tests FIX 2: Empty quoted string range bug fix.
 """
 
+import time
 from unittest.mock import patch
 
 import pytest
@@ -363,6 +364,7 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             ("'a'\"b\"", (0, 6), False),
             # Opens and closes with the same quote, yet two runs around code (LAB-4950)
             ("'a'$(x)'b'", (0, 10), False),
+            ("'a''b'", (0, 6), False),
             ('"a"<(x)"b"', (0, 10), False),
             # A single quote char is not a quoted span - `end - start < 2`
             ('"', (0, 1), False),
@@ -450,6 +452,9 @@ class TestSubstitutionBetweenQuotedRuns:
             "echo 'a'$(date)'b'",
             'diff "a"<(sort x)"b"',
             "echo 'a'$(echo \")\")'b'",
+            # empty backquotes run nothing
+            'echo "``"',
+            "echo 'a'``'b'",
         ],
     )
     def test_literal_or_benign(self, command):
@@ -462,9 +467,38 @@ class TestSubstitutionBetweenQuotedRuns:
         assert [(part.kind, part.pos) for part in node.parts[1].parts] == [("commandsubstitution", (8, 12))]
         assert node.parts[1].parts[0].command.parts[0].word == "x"
 
+    def test_a_recovered_node_is_ordered_among_the_parts_bashlex_kept(self):
+        (node,) = BashCommandParser().parse('echo "x"<(b)$(a)')
+        assert [part.kind for part in node.parts[1].parts] == ["processsubstitution", "commandsubstitution"]
+
+    def test_a_recovered_backquote_body_keeps_its_source_offsets(self):
+        (node,) = BashCommandParser().parse("echo 'a'`x`'b'")
+        (sub,) = node.parts[1].parts
+        assert (sub.pos, sub.command.parts[0].pos) == ((8, 11), (9, 10))
+
     def test_a_body_that_cannot_be_placed_fails_closed(self):
         with pytest.raises(ParseError):
             BashCommandParser().parse("echo 'a'$((1+2))'b'")
+
+    def test_a_body_bashlex_cannot_parse_fails_closed(self, monkeypatch):
+        def broken(*_args):
+            raise RuntimeError("bashlex internals changed")
+
+        monkeypatch.setattr("bashlex.subst._parsedolparen", broken)
+        clear_caches()
+        result = validate_command("echo 'a'$(date)'b'")
+        assert (result.allowed, result.risk_level) == (False, RiskLevel.BLOCKED)
+
+    def test_backquote_recovery_is_linear(self):
+        """A recovered body is parsed on its own text, not re-padded to its offset.
+
+        Padding made each recovery cost the offset, so 32KB of these words took
+        seconds, and a hook that outlives its timeout fails open.
+        """
+        command = "echo " + "'a'`x`'b' " * 3200
+        started = time.perf_counter()
+        BashCommandParser().parse(command)
+        assert time.perf_counter() - started < 2.0
 
     @pytest.mark.parametrize(
         ("command", "expected"),
@@ -475,6 +509,8 @@ class TestSubstitutionBetweenQuotedRuns:
             ("git log -S'sudo' --oneline", [(11, 15)]),
             # after an `=` the program splits the word and may run the value: no range
             ("git difftool --extcmd='rm -rf /' HEAD", []),
+            # ANSI-C text is not what the program receives, so it is never a literal
+            ("echo $'x'<(y)$'z'", []),
         ],
     )
     def test_literal_ranges_are_per_quoted_run(self, command, expected):

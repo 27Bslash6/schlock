@@ -154,7 +154,7 @@ _CODE_PART_KINDS = ("commandsubstitution", "processsubstitution")
 def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
     command: str, span: tuple, parts: "list[Any]", recover: "Optional[Any]" = None
 ) -> "Optional[list[tuple[int, int]]]":
-    """Offsets of each opening and closing quote in the word at ``span``, read the way bash reads it.
+    """Offsets of each opening and closing quote in the word at ``span``; with ``recover``, MUTATES ``parts``.
 
     SECURITY (LAB-4950): bashlex drops the substitution node from two word shapes
     bash runs. A word holding any `"` loses every `<(`/`>(` (it reads the word's
@@ -167,7 +167,8 @@ def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
     ``recover(command, offset, word_end)`` builds the missing node, which is appended to
     ``parts`` (the word's own list). Without it a missing node returns None: the caller cannot tell
     quoted text from code, so it must treat the word as having no quotes at all.
-    `$'…'` pairs are skipped, never returned: they earned no range before this.
+    `$'…'` pairs are skipped, never returned: ANSI-C escapes mean the source text
+    is not what the program receives.
     """
     start, end = span
     if end > len(command):
@@ -225,9 +226,10 @@ def _recover_substitution(command: str, offset: int, word_end: int) -> Any:
             raise ParseError("Arithmetic expansion inside a quoted word")  # bashlex rejects it bare, too
         if command[offset] == "`":
             close = bashlex.subst._stringextract(command, offset + 1, "`")
-            body = bashlex.parse(" " * (offset + 1) + command[offset + 1 : close]) if offset < close < word_end else []
+            body = bashlex.parse(command[offset + 1 : close]) if offset < close < word_end else []
             if len(body) != 1:
                 raise ParseError(f"Cannot locate the backquote body at offset {offset}")
+            bashlex.subst._adjustpositions(body[0], offset + 1, len(command))  # what bashlex does for a bare one
             return bashlex.ast.node(kind="commandsubstitution", command=body[0], pos=(offset, close + 1))
         body, close = bashlex.subst._parsedolparen(bashlex.parser._parser(command), command, offset + 2)
         if not close < word_end or command[close] != ")":
@@ -1194,7 +1196,7 @@ class BashCommandParser:
         test because its range covers the whole reconstructed word.
         """
         start, end = span
-        if end > len(command) or end - start < 2:
+        if end - start < 2:
             return False
         return _quote_pairs(command, span, parts) == [(start, end - 1)]
 
@@ -1208,9 +1210,9 @@ class BashCommandParser:
         suppressed - the same test _STRUCTURED_WORD applies inside substitutions.
         A word _quote_pairs cannot read earns none either (fail closed).
         """
-        start = word.pos[0]
         pairs = _quote_pairs(command, word.pos, getattr(word, "parts", None) or []) or []
-        return [(open_ + 1, close) for open_, close in pairs if close > open_ + 1 and "=" not in command[start:open_]]
+        equals = command.find("=", *word.pos)  # once per word: a slice per pair is quadratic in the runs
+        return [(open_ + 1, close) for open_, close in pairs if close > open_ + 1 and not 0 <= equals < open_]
 
     def extract_heredoc_ranges(self, command: str, ast_nodes: list[Any]) -> list[tuple]:
         """Extract heredoc content ranges that should NOT be pattern matched.
@@ -1342,8 +1344,8 @@ class BashCommandParser:
     def extract_quoted_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> list[CommandSegment]:
         """The body of each substitution inside a quoted word, as a segment of its own.
 
-        SECURITY: extract_string_literals gives a quoted word ONE range, so the raw
-        pass suppresses a `"$(…)"` body along with the rest of the word. The only
+        SECURITY: extract_string_literals gives each quoted run ONE range, so the raw
+        pass suppresses a `"$(…)"` body along with the rest of its run. The only
         other view of that body is SubstitutionValidator's word view, where the
         quotes are already gone, so a rule that reads quote characters has no text
         that shows them: `"$(IFS=' ,'; …)"` reads as `IFS= ,`, an empty IFS.
@@ -1361,7 +1363,7 @@ class BashCommandParser:
         each `\\<newline>` moves every later inner offset two places early. The
         word's own span is exact, so a word holding a newline, or a substitution
         whose closer is not where _body_end looks, gets ONE body, from its first
-        substitution to its closing quote. That body keeps its heredoc
+        suppressed substitution to the closing quote of the last one's run. That body keeps its heredoc
         ranges only while no `\\<newline>` has moved them, and never its literal
         ranges, which is a false positive on a quoted argument in a multi-line
         body and never a missed payload.
@@ -1375,12 +1377,16 @@ class BashCommandParser:
         whole_until = -1  # end of the last multi-line word, already one body
         budget = _MAX_BODY_TEXT_FACTOR * len(command)
         words, _ = self._quoted_words(command, ast_nodes)
-        for word, _ in words:
+        for word, ranges in words:
             word_start, word_end = word.pos
+            # Only a body inside a literal range was suppressed; one between runs
+            # is matched bare by the raw pass already.
             code = [
                 part
                 for part in getattr(word, "parts", None) or ()
-                if getattr(part, "kind", None) in ("commandsubstitution", "processsubstitution") and getattr(part, "pos", None)
+                if getattr(part, "kind", None) in _CODE_PART_KINDS
+                and getattr(part, "pos", None)
+                and any(low <= part.pos[0] < high for low, high in ranges)
             ]
             if not code or word_start < whole_until:
                 continue
@@ -1392,7 +1398,8 @@ class BashCommandParser:
                 first = code[0].pos[0]
                 start = word_start + 1 if "\\\n" in command[word_start:first] else self._body_start(command, first)
                 heredocs = [] if "\\\n" in text else self.extract_heredoc_ranges(command, [word])
-                spans = [(start, word_end - 1, [], heredocs)]
+                close = next(high for low, high in ranges if low <= code[-1].pos[0] < high)
+                spans = [(start, close, [], heredocs)]
             else:
                 spans = [
                     (

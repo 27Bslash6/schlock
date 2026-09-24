@@ -767,8 +767,8 @@ def _is_opaque_argument(part: Any) -> bool:
     * ``--extcmd='rm -rf /'`` survives word-splitting as one argv entry, yet only the VALUE was
       quoted — git splits at the ``=`` and runs the right-hand side. Treating it as data made
       the substitution path WEAKER than bare text for eight such flags. The top-level
-      :meth:`BashCommandParser.extract_string_literals` refuses a partially-quoted word for the
-      same reason; this keeps the two models agreeing.
+      :meth:`BashCommandParser.extract_string_literals` gives no range to a quoted run that
+      follows an ``=`` for the same reason; this keeps the two models agreeing.
     * ``$(echo rm -rf /)`` inside a word holds whitespace with no quote anywhere — bashlex keeps
       a nested substitution's source verbatim in ``.word``. It is code, and suppressing it would
       silently disable this whole-text pass over every nested substitution.
