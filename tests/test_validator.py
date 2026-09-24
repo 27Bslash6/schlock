@@ -1357,7 +1357,9 @@ class TestHeredocSurroundings:
         [
             ("ls << 'X'\nrm -rf /", "Heredoc 'X' has no terminator; its body has no end"),
             ("cat << 'EOF'\nx", "Heredoc 'EOF' has no terminator; its body has no end"),
-            ("cat << ''\nx\nEOF", "Heredoc opener with an empty delimiter"),
+            # A quoted EMPTY delimiter is legal and ends at the first empty line; with none,
+            # bash runs the body to the end of input, so the reading is "no terminator".
+            ("cat << ''\nx\nEOF", "Heredoc '' has no terminator; its body has no end"),
             # An opener on a line that does not end there: bash starts the body
             # after the line that finishes the command, so consuming from the
             # next one would delete the commands in between. Denied either way,
@@ -1390,6 +1392,13 @@ class TestHeredocSurroundings:
             ('"a\\\\b"', "a\\b"),
             ("'a\\b'", "a\\b"),
             ("a\\b", "ab"),
+            ("$'EOF'", "EOF"),
+            ('$"EOF"', "EOF"),
+            ("E$'O'F", "EOF"),
+            ("$EOF", "$EOF"),
+            ('""', ""),
+            ("''", ""),
+            ('""EOF', "EOF"),
         ],
     )
     def test_a_delimiter_is_quote_removed_the_way_bash_does(self, word, terminator):
@@ -1407,6 +1416,11 @@ class TestHeredocSurroundings:
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert "system_destruction" in result.matched_rules
+
+    def test_an_unquoted_empty_delimiter_is_rejected(self):
+        """Only a QUOTED delimiter may be empty; `<<` with no word is a syntax error to bash."""
+        with pytest.raises(ParseError, match="empty delimiter"):
+            val_module._read_delimiter(";", 0)
 
     def test_unterminated_quote_in_a_delimiter_is_rejected(self):
         """A delimiter whose quote never closes has no readable end.
@@ -3151,7 +3165,7 @@ class TestHeredocBoundariesOnTheNativePath:
         command = "for i in 1; do bash <<'EOF'\necho a\n\nrm -rf /\nEOF\ndone"
         normalised = val_module._normalise_heredoc_delimiters(command)
 
-        assert [command[start:end] for start, end, _ in normalised.blanked] == ["echo a\n\nrm -rf /"]
+        assert [command[start:end] for _, start, end in normalised.blanked] == ["echo a\n\nrm -rf /"]
 
     @pytest.mark.parametrize(
         "command",
@@ -3188,6 +3202,8 @@ class TestHeredocBoundariesOnTheNativePath:
             "if true; then cat << 'EOF' > f\nx\nEOF\nfi",
             "f() {\n  cat <<'E'\nx\nE\n}",
             "cat <<'EOF'\nx\\\nEOF\necho after\nEOF",
+            "cat <<$'EOF'\nx\nEOF",
+            "cat <<E$'O'F\nx\nEOF",
         ],
     )
     @pytest.mark.skipif(not _native_parser_available(), reason="no vendored schlock-parse binary for this platform")
@@ -3197,17 +3213,19 @@ class TestHeredocBoundariesOnTheNativePath:
         Equality, not a subset: an extra span blanks a body bash expands (a `<< EOF` counted
         as quoted), a missing one leaves a literal body to be re-read as shell. mvdan/sh
         marks a heredoc quoted exactly as bash does - by any quote or backslash in the
-        delimiter word. ASCII inputs only, since mvdan reports byte offsets.
+        delimiter word. The opener is compared too, since a body's consumer is looked up by
+        where its `<<` sits. ASCII inputs only, since mvdan reports byte offsets.
         """
         ast = json.loads(NativeBridge().parse_json(command))
-        quoted: set[tuple[int, int]] = set()
+        quoted: set[tuple[int, int, int]] = set()
 
         def walk(node: object) -> None:
             if isinstance(node, dict):
                 if isinstance(node.get("Hdoc"), dict):
                     word = command[node["Word"]["Pos"]["Offset"] : node["Word"]["End"]["Offset"]]
                     if any(ch in word for ch in "'\"\\"):
-                        quoted.add((node["Hdoc"]["Pos"]["Offset"], node["Hdoc"]["End"]["Offset"]))
+                        terminator_start = command.rfind("\n", 0, node["Hdoc"]["End"]["Offset"]) + 1
+                        quoted.add((node["OpPos"]["Offset"], node["Hdoc"]["Pos"]["Offset"], terminator_start - 1))
                 for value in node.values():
                     walk(value)
             elif isinstance(node, list):
@@ -3215,11 +3233,7 @@ class TestHeredocBoundariesOnTheNativePath:
                     walk(value)
 
         walk(ast)
-        blanked = {
-            (start, terminator_end) for start, _, terminator_end in val_module._normalise_heredoc_delimiters(command).blanked
-        }
-
-        assert blanked == quoted
+        assert set(val_module._normalise_heredoc_delimiters(command).blanked) == quoted
 
     def test_an_unquoted_opener_is_left_byte_for_byte(self):
         command = "cat << EOF\n$(date)\nEOF"
@@ -3296,3 +3310,181 @@ class TestHeredocBoundariesOnTheNativePath:
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert "does not open" in (result.error or "")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestADelimiterBashlexWouldMisread:
+    """bashlex keeps a delimiter's quotes, so it ends a body at a line reading the delimiter AS WRITTEN.
+
+    The normaliser rewrites each quoted delimiter it can to its bare spelling, so bashlex
+    ends the body where bash does. What it cannot rewrite reached bashlex unchanged, and a
+    literal as-written line then let bashlex parse with the wrong boundary: the commands
+    between bash's terminator and that line were filed as inert body. Each spelling below
+    scored SAFE on `main` with a destructive command there, and bash runs that command
+    (checked against real bash with a filesystem witness). Such a command now takes the
+    heredoc fallback, which bounds the body with the scan. The rule is asserted, not just
+    the verdict, so a denial for some other reason cannot stand in for this one.
+    """
+
+    @pytest.mark.parametrize(
+        "opener,terminator,literal",
+        [
+            ("<<'A;B'", "A;B", "'A;B'"),
+            ("<<'E F'", "E F", "'E F'"),
+            ("<<'-q'", "-q", "'-q'"),
+            ('<< ""', "", '""'),
+            ("<<$'EOF'", "EOF", "$'EOF'"),
+            ('<<$"EOF"', "EOF", '$"EOF"'),
+        ],
+        ids=["no-bare-spelling", "blank-in-word", "leading-dash", "empty", "ansi-c", "locale"],
+    )
+    def test_the_command_after_bashs_terminator_is_validated(self, safety_rules_path, opener, terminator, literal):
+        command = f"cat {opener}\nhello\n{terminator}\nrm -rf /\n{literal}"
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "system_destruction" in result.matched_rules
+
+    def test_the_same_under_crlf(self, safety_rules_path):
+        """A CRLF line's delimiter carries its `\\r`, so it has no bare spelling either."""
+        command = "cat <<'EOF'\r\nhello\r\nEOF\r\nrm -rf /\r\n'EOF'\r"
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "system_destruction" in result.matched_rules
+
+    def test_a_benign_command_after_the_terminator_stays_allowed(self, safety_rules_path):
+        result = validate_command("cat <<'A;B'\nhello\nA;B\necho ok\n'A;B'", config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+
+    def test_an_ansi_c_or_locale_delimiter_is_normalised_like_any_quoted_one(self):
+        for command in ("cat <<$'EOF'\nhello $X\nEOF", 'cat <<$"EOF"\nhello $X\nEOF'):
+            normalised = val_module._normalise_heredoc_delimiters(command)
+
+            assert normalised.text.startswith("cat <<EOF "), command
+            assert "$X" not in normalised.text, "a quoted body is literal, so it is blanked"
+
+    def test_an_escape_in_an_ansi_c_delimiter_fails_closed(self, safety_rules_path):
+        """bash 5.3 ends `<<$'E\\x4fF'` at `EOF`; an older bash may not. Not modelled, refused."""
+        result = validate_command("cat <<$'E\\x4fF'\nhello\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "ANSI-C escape" in (result.error or "")
+
+    def test_a_quoted_empty_delimiter_ends_at_the_first_empty_line(self, safety_rules_path):
+        denied = validate_command('cat << ""\nhello\n\nrm -rf /', config_path=safety_rules_path)
+        allowed = validate_command('cat << ""\nhello\n\necho ok', config_path=safety_rules_path)
+
+        assert denied.allowed is False
+        assert "system_destruction" in denied.matched_rules
+        assert allowed.allowed is True, allowed.message
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestBashlexHeredocsAreLocatedByTheirOpener:
+    """One walk of bashlex's heredocs, located by where each `<<` sits."""
+
+    def test_a_shell_body_is_found_even_when_an_inert_heredoc_shares_its_terminator(self, safety_rules_path, monkeypatch):
+        """A phantom `(( 1<<EOF ))` takes the first terminator while a real `bash` heredoc runs to the second.
+
+        Matched by where heredocs END, the two collide and the shell's body was filed as inert.
+        The phantom guard is switched off here so that the lookup itself is what is tested:
+        with it on, the command is refused before bodies are ever read.
+        """
+        monkeypatch.setattr(val_module, "_phantom_heredoc", lambda *args, **kwargs: None)
+        result = validate_command(
+            "cat <<'EOF'; (( 1<<EOF ))\nhello\nEOF\nbash <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path
+        )
+
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules
+
+    def test_the_walk_reaches_a_compounds_own_redirect_and_substitutions(self):
+        command = "while read l; do :; done <<EOF\na\nEOF\nx=$(cat <<EOF\nb\nEOF\n)"
+        heredocs = val_module._bashlex_heredocs(command, val_module._get_parser().parse(command))
+
+        assert [(h.opener, h.owner, h.in_substitution) for h in heredocs] == [
+            (command.index("<<"), None, False),
+            (command.rindex("<<"), "cat", True),
+        ]
+
+    def test_a_phantom_inside_a_substitution_is_refused_by_the_substitution_validator(self, safety_rules_path):
+        """The phantom guard does not compare inside substitutions (see `_phantom_heredoc`).
+
+        The one construct bashlex misreads as an opener is arithmetic `(( … ))`, and inside a
+        substitution the substitution validator refuses it. That refusal is what covers this,
+        so it is the refusal that is asserted.
+        """
+        result = validate_command("git push --force <<'A'\nz\nA\nx=`(( 1<<b ))\nrm -rf /\nb`", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "substitution" in result.message.lower()
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestTheFallbackRefusesEveryProgramItCouldNotRead:
+    """The heredoc fallback discards every body, so a body that runs as a program is refused.
+
+    It used to check only the first opener's head as written, so a shell anywhere else read
+    as an ordinary command whose body was inert - LOW or SAFE, while bash ran the body. Each
+    case here was allowed on `main`. Every heredoc is now checked, by the command bashlex
+    attaches it to. `<<'A;B'` is used because it has no bare spelling, which is what sends
+    a command down this path.
+    """
+
+    @pytest.mark.parametrize(
+        "command,shell",
+        [
+            ("for i in 1; do bash <<'A;B'\nrm -rf /\nA;B\ndone", "bash"),
+            ("if true; then sh <<'A;B'\nrm -rf /\nA;B\nfi", "sh"),
+            ("{ bash <<'A;B'\nrm -rf /\nA;B\n}", "bash"),
+            ("ls <<'X'\nt\nX\nbash <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("/bin/bash <<'A;B'\nrm -rf /\nA;B", "bash"),
+        ],
+        ids=["for-loop", "if", "group", "behind-another-heredoc", "full-path"],
+    )
+    def test_a_shell_anywhere_is_refused(self, safety_rules_path, command, shell):
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert f"Unreadable heredoc delimiter in front of shell interpreter '{shell}'" in (result.error or "")
+
+    def test_a_compounds_own_redirect_is_refused(self, safety_rules_path):
+        """The body feeds the loop's stdin, and this loop runs each line: `$l` executes `rm -rf /`."""
+        result = validate_command("while read l; do $l; done <<'A;B'\nrm -rf /\nA;B", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "compound command" in (result.error or "")
+
+    def test_an_inert_consumer_in_a_loop_stays_allowed(self, safety_rules_path):
+        result = validate_command("for i in 1; do cat <<'A;B' > f\nhello\nA;B\ndone", config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAnEmptyDelimiterInsideASubstitution:
+    """bash 5.3 does not end a `<< ""` heredoc at an empty line inside `$( … )` or `<( … )`.
+
+    There it also expands the quoted body - `$(cat << ""` runs a `$(…)` written in it -
+    so neither the body's end nor whether it is literal is known. At the top level, in a
+    loop, a group or backticks it ends at the first empty line with a literal body, as
+    everywhere else. Both measured against real bash with a filesystem witness.
+    """
+
+    def test_inside_a_command_substitution_it_is_refused(self, safety_rules_path):
+        result = validate_command('x=$(cat << ""\n$(rm -rf /)\n\n)', config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "Empty heredoc delimiter inside a substitution" in (result.error or "")
+
+    @pytest.mark.parametrize(
+        "command",
+        ['cat << ""\nhello\n\necho ok', 'for i in 1; do cat << ""\nx\n\ndone', 'x=`cat << ""\nhi\n\n`'],
+        ids=["top-level", "for-loop", "backticks"],
+    )
+    def test_elsewhere_it_ends_at_the_first_empty_line(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
