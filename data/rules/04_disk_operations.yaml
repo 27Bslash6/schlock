@@ -25,12 +25,12 @@ rules:
     description: Prevent partition table changes
     risk_level: BLOCKED
     # The gap is credential_exposure's one-command gap, so a later `> /dev/null` does not complete it.
-    patterns: ['\bfdisk\s+/dev/', '\bparted\s+(?:\\.|[^;|&\n''"\\$`]|\$(?!\()|\$\([^()\n]{0,100}\)|\$\((?![^()\n]{0,100}\))|`[^`\n]{0,100}`|[<>]&[0-9-]+|&>>?|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\([^()\n]{0,100}|`[^`\n]{0,100})?\s+/dev/', '\bparted\s+/dev/', '\bgparted\b', '\bsfdisk\b', '\bgdisk\b', '\bcfdisk\b']
+    patterns: ['\bfdisk\s+/dev/', '\bparted\s+(?:\\.|[^;|&\n''"\\$`]|\$(?!\()|\$\((?:[^()\n]|\([^()\n]{0,100}\)){0,100}\)|\$\((?!(?:[^()\n]|\([^()\n]{0,100}\)){0,100}\))|`[^`\n]{0,100}`|[<>]&[0-9-]+|&>>?|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\((?:[^()\n]|\([^()\n]{0,100}\)){0,100}(?:\([^()\n]{0,100})?|`[^`\n]{0,100})?\s+/dev/', '\bparted\s+/dev/', '\bgparted\b', '\bsfdisk\b', '\bgdisk\b', '\bcfdisk\b']
     alternatives: ["Use disk management tools with extreme caution", "Create full disk backup first", "Verify device paths"]
 
   - name: filesystem_wipe
     description: Prevent filesystem signature wiping
     risk_level: BLOCKED
     # The gap is credential_exposure's one-command gap, so a later `> /dev/null` does not complete it.
-    patterns: ['\bwipefs\b', '\bblkdiscard\b', '\bshred\s+(?:\\.|[^;|&\n''"\\$`]|\$(?!\()|\$\([^()\n]{0,100}\)|\$\((?![^()\n]{0,100}\))|`[^`\n]{0,100}`|[<>]&[0-9-]+|&>>?|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\([^()\n]{0,100}|`[^`\n]{0,100})?\s+/dev/', '\bshred\s+/dev/']
+    patterns: ['\bwipefs\b', '\bblkdiscard\b', '\bshred\s+(?:\\.|[^;|&\n''"\\$`]|\$(?!\()|\$\((?:[^()\n]|\([^()\n]{0,100}\)){0,100}\)|\$\((?!(?:[^()\n]|\([^()\n]{0,100}\)){0,100}\))|`[^`\n]{0,100}`|[<>]&[0-9-]+|&>>?|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\((?:[^()\n]|\([^()\n]{0,100}\)){0,100}(?:\([^()\n]{0,100})?|`[^`\n]{0,100})?\s+/dev/', '\bshred\s+/dev/']
     alternatives: ["Never wipe filesystem signatures", "Use secure erase only on specific files", "Verify target carefully"]

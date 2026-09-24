@@ -49,6 +49,8 @@ class TestTheNextCommandDoesNotCompleteTheRule:
             'cat README.md && git commit -m "docs: document .env loading"',
             "echo building; make; ls password_utils.py",
             'echo $(basename $(pwd)) && git commit -m "fix: hash password"',
+            'echo $(ls $(pwd) | wc -l) && git commit -m "fix: hash password"',
+            'cat $(dirname $(pwd); true)/README && git commit -m "docs: .env"',
             # remote_execution: `| shasum` is not `| sh`, `rsync` is not `nc`.
             "npm install && curl -s localhost:3000 | shasum",
             "git commit -am x && git fetch && git log | sha512sum",
@@ -161,6 +163,19 @@ PAYLOADS = [
     ("source_remote_script", ". /tmp/$((1))/x.sh"),
     ("recursive_permission_system_dirs", "chown -R $(stat -c %u $(pwd)) /etc"),
     ("recursive_permission_system_dirs", "chown $(id -u $(whoami)) -R /etc"),
+    # A separator inside a nested substitution is data, not the next command.
+    ("credential_exposure", "cat $(ls $(pwd) | head -1)/.env"),
+    ("credential_exposure", "cat $(dirname $(pwd); true)/.env"),
+    ("credential_exposure", "echo $(cat $(ls) | grep password)"),
+    ("credential_exposure", "echo $(printf x $(cat password.txt | wc))"),
+    ("extended_credential_exposure", "printf $(ls $(pwd) | wc -l) $API_KEY"),
+    ("hardcoded_secrets", "export A=$(ls $(pwd) | wc -l) FOO_KEY=x"),
+    ("hardcoded_secrets", "echo $(ls $(pwd) | wc -l) 'api_key=x' > config"),
+    ("privilege_escalation_variants", "chroot $(ls $(pwd) | head -1) /bin/bash"),
+    ("partition_manipulation", "parted $(ls $(pwd) | head -1) /dev/sda"),
+    ("filesystem_wipe", "shred $(ls $(pwd) | head -1) /dev/sda"),
+    ("source_remote_script", "source /tmp/$(ls $(pwd) | head -1)/x.sh"),
+    ("recursive_permission_system_dirs", "chown -R $(id -un $(whoami) | tr a a) /etc"),
 ]
 
 
