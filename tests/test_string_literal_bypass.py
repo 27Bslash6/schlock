@@ -243,6 +243,12 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             # A shell's heredoc body is code. Was HIGH (body never reached the
             # segment); now matches the single-segment `bash <<EOF` verdict.
             ("bash <<EOF | tee log\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
+            # A heredoc NESTED in a substitution is not a direct redirect, so
+            # _close_heredocs never sees it and it rides inside the outer
+            # segment's slice as inert `cat` output that `diff` only reads.
+            # Its range has to be derived off the parent AST or this legitimate
+            # text comparison is hard-denied on system_destruction (LAB-912).
+            ("diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x", True, RiskLevel.MEDIUM),
         ],
     )
     def test_heredoc_segment_verdicts(self, safety_rules_path, command, expected_allowed, expected_risk):
@@ -255,25 +261,37 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             f"{command!r} scored {result.risk_level} (allowed={result.allowed}), expected {expected_risk}"
         )
 
-    def test_segment_that_will_not_reparse_is_blocked(self, safety_rules_path, monkeypatch):
-        """A segment with no AST gets neither literal suppression nor the
-        reconstructed pass, so it fails closed like a whole-command parse error.
-        No known input reaches this branch any more; force it.
+    def test_no_segment_is_re_parsed_so_none_can_lose_its_reconstructed_pass(self, safety_rules_path, monkeypatch):
+        """The gap this class exists to close is now shut structurally (LAB-912).
+
+        The under-block was a segment reaching the rules with no AST: no literal
+        suppression, no quote-stripped pass, so `"chmod" 777 /etc/shadow` scored
+        SAFE. The first fix re-parsed each segment and failed closed when that
+        threw. Segments now derive both their literals and their reconstruction
+        from the parent AST (spec §3.2 parse-once), so there is no second parse
+        left to fail - which is why the fail-closed branch that guarded one is
+        gone rather than dropped.
+
+        Forcing every parse but the whole command's to raise must therefore
+        change nothing, and the quoted command name must still be caught.
         """
         real_parse = BashCommandParser.parse
+        command = 'echo one && "chmod" 777 /etc/shadow'
+        parsed = []
 
-        def parse_all_but_one(self, command):
-            if command == "echo two":
-                raise ParseError("forced segment parse failure")
-            return real_parse(self, command)
+        def parse_recording(self, target):
+            parsed.append(target)
+            if target != command:
+                raise ParseError(f"no segment may be re-parsed, got {target!r}")
+            return real_parse(self, target)
 
-        monkeypatch.setattr(BashCommandParser, "parse", parse_all_but_one)
+        monkeypatch.setattr(BashCommandParser, "parse", parse_recording)
         with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
             clear_caches()
-            result = validate_command("echo one && echo two", config_path=safety_rules_path)
+            result = validate_command(command, config_path=safety_rules_path)
 
-        assert (result.allowed, result.risk_level) == (False, RiskLevel.BLOCKED)
-        assert "Parse error in segment" in result.message
+        assert parsed == [command], f"re-parsed {parsed[1:]}"
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.HIGH, ["chmod_777"])
 
     @pytest.mark.parametrize(
         "command,expected_allowed,expected_risk",
