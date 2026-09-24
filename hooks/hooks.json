@@ -1,5 +1,5 @@
 {
-  "description": "Schlock safety validation and session setup hooks. The PreToolUse/Bash command blocks (exit 2) unless the hook both exits 0 and prints a decision, so a hook that cannot start, or starts something other than the hook, blocks the tool call; see tests/test_hook_manifest.py",
+  "description": "Schlock safety validation and session setup hooks. The PreToolUse/Bash command blocks (exit 2) unless the hook both exits 0 and prints the PreToolUse decision envelope as its whole stdout, so a hook that cannot start, or a python3 that exits without writing that envelope, blocks the tool call. stdout is passed through on every exit, so a block keeps its reason; see tests/test_hook_manifest.py",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "out=$(python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\") || exit 2; case $out in *'\"permissionDecision\"'*) printf '%s\\n' \"$out\" ;; *) echo 'schlock: pre_tool_use.py returned no decision' >&2; exit 2 ;; esac"
+            "command": "out=$(python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\"); rc=$?; case $out in '{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"'*'}}') printf '%s\\n' \"$out\"; [ \"$rc\" -eq 0 ] || exit 2 ;; *) echo 'schlock: pre_tool_use.py returned no decision' >&2; exit 2 ;; esac"
           }
         ]
       },
