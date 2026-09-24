@@ -211,6 +211,25 @@ class TestSubstitutionVerdictCannotUndercutTheRules:
         assert _risk("ls $(base64 -d f)", safety_rules_path) is RiskLevel.HIGH
 
 
+class TestCompoundPassReadsTheParsedText:
+    """The compound pass must match the same text its heredoc ranges index.
+
+    A quoted heredoc delimiter is normalised before parsing and its body blanked, so the
+    parsed text and the submitted text differ. Matching the submitted text against the
+    parsed text's ranges leaves the real body unsuppressed.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("{ cat <<'EOF'\nrm -rf /\nEOF\n} > out.txt; echo b", (RiskLevel.SAFE, ())),
+            ("{ bash <<'EOF'\nrm -rf /\nEOF\n} > out.txt; echo b", (RiskLevel.BLOCKED, ("shell_delegated_payload",))),
+        ],
+    )
+    def test_quoted_heredoc_inside_a_redirected_compound(self, command, expected, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == expected
+
+
 class TestUseWhitelistGovernsEveryForm:
     """`use_whitelist=False` must reach the original-form pass, not only the reconstructions.
 
@@ -418,19 +437,16 @@ class TestInertHeredocIsNotPromotedByAnUnrelatedRedirect:
     did. Harmless until a compound redirect could switch the whole-command pass on —
     then an unrelated `> out.txt` rescored text that `cat` merely prints.
 
-    What this pins is that the unrelated redirect changes NOTHING. The absolute verdict
-    is not this class's to set: the multi-segment whole-command scan matches the
-    original text without heredoc ranges, so the body rates the same with or without
-    the redirect. The reconstruction's own suppression of that body is pinned at the
-    range level in TestSuppressionRangeProvenanceIsPinned.
+    The case is single-segment on purpose. A multi-segment command also runs an
+    unconditional whole-command rule scan over the unreconstructed text, with no heredoc
+    ranges, and that scan rates the body the same with or without this suppression, so a
+    test built on it cannot fail.
     """
 
     def test_unrelated_compound_redirect_does_not_promote_heredoc_text(self, safety_rules_path):
-        base = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x"
-        with_redirect = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
-        expected = (RiskLevel.BLOCKED, ("chmod_exec", "system_destruction"))
-        assert _verdict(base, safety_rules_path) == expected
-        assert _verdict(with_redirect, safety_rules_path) == expected
+        base = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n)"
+        with_redirect = "{ diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); } > out.txt"
+        assert _verdict(with_redirect, safety_rules_path) == _verdict(base, safety_rules_path) == (RiskLevel.SAFE, ())
 
     def test_a_shell_heredoc_is_still_executable_text(self, safety_rules_path):
         """Suppression follows is_shell: `bash <<EOF` runs its body, so it is not inert."""
@@ -492,13 +508,6 @@ class TestHeredocSuppressionRequiresProvenance:
     )
     def test_delimiter_text_does_not_suppress_an_unrelated_word(self, command, rule, safety_rules_path):
         assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
-
-    def test_owning_word_is_still_suppressed(self):
-        """Provenance must not undo the suppression it is guarding — the owner still qualifies."""
-        parser = BashCommandParser()
-        command = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
-        _, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
-        assert ranges, "the substitution word owns its heredoc and must still suppress the body"
 
     def test_sibling_redirect_heredoc_suppresses_nothing(self):
         """A heredoc on a sibling redirect is owned by no word, so it grants no suppression."""

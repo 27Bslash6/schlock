@@ -1022,13 +1022,14 @@ def _match_original_and_reconstructed(
                       not a silent wrong answer. Only quote detection uses it; the
                       ranges returned are offsets into the reconstruction, which
                       is built from `ast_nodes` alone either way.
-        heredoc_ranges: Heredoc ranges for the original-form pass only. Heredoc
-                        bodies still never reach either reconstruction, but since
-                        LAB-2760 the reason is narrower than "_collect_words walks
-                        `.word` parts alone": it now reads redirections too, and
-                        what saves the body is that bashlex parks it on
-                        `redirect.heredoc` while `_redirect_words` reads only
-                        `redirect.output`, which holds the delimiter.
+        heredoc_ranges: Heredoc ranges for the original-form pass only. A body parked
+                        on `redirect.heredoc` never reaches a reconstruction, because
+                        `_redirect_words` reads only `redirect.output`, the delimiter.
+                        Two bodies still do: one carried verbatim inside a
+                        process-substitution word, which `_reconstruct` suppresses
+                        itself, and one inside a compound, where bashlex parses the
+                        body as commands (`{ cat <<EOF … } > f; echo b` reconstructs
+                        with the body's words). The second can only over-block.
         use_whitelist: Whether the whitelist may short-circuit ANY of the three forms.
                        One switch for all three, deliberately: the whitelist is
                        prefix-based, so a caller that needs it off (the compound
@@ -2839,7 +2840,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # so they belong to no segment and no per-segment reconstruction
                 # can carry them - `while true; do echo a; done > "/dev/sda"` was
                 # SAFE while the unquoted form was BLOCKED. Only a whole-command pass
-                # sees them. The unconditional scan below matches the ORIGINAL
+                # sees them. The unconditional scan below matches the unreconstructed
                 # text only, where two quote characters hide the target, so this
                 # pass matches the reconstructions and feeds its result into it.
                 # Whitelist OFF: it is prefix-based, so a leading `ls` would vouch

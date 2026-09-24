@@ -526,7 +526,7 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     # rule 04's `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before `/dev/`, so a
     # phantom gap reclassified `shred old.txt 02>/dev/null` from log tampering to
     # filesystem wiping. Reconstruction resolves quoting and escapes; it must never
-    # re-space. Found by adversarial review (Helly R) - the fd matrix that cleared the
+    # re-space. Found by adversarial review - the fd matrix that cleared the
     # arithmetic used 0/1/2/3/10, none of them zero-padded.
     glued = bool(
         target_pos and command is not None and 0 < target_pos[0] <= len(command) and not command[target_pos[0] - 1].isspace()
@@ -1254,14 +1254,13 @@ class BashCommandParser:
         # A process-substitution word carries its heredoc body VERBATIM (`<(cat <<EOF
         # … EOF)` is one word spanning the body), so the body reaches the
         # reconstruction where no heredoc range suppresses it - the original-form pass
-        # gets `heredoc_ranges`, this one never did. Harmless while the whole-command
-        # pass only ran as a last resort; once a compound redirect could switch it on,
-        # an unrelated `> out.txt` started rescoring inert `cat` input as an executed
-        # command.
+        # gets `heredoc_ranges`, this one never did. Suppress it here, or a compound
+        # redirect such as `{ diff /dev/null <(cat <<EOF … EOF); } > out.txt` scores
+        # text that `cat` merely prints as an executed command.
         #
         # SECURITY: suppress the BODY, never the word that carries it, and only in the
         # word that actually OWNS it. Two separate mistakes were made here, each found
-        # by adversarial review (Helly R), each turning a BLOCKED command SAFE:
+        # by adversarial review, each turning a BLOCKED command SAFE:
         #
         # 1. Containing an inert heredoc does not make a whole shell word inert. Bash
         #    concatenates whatever follows the closing paren into the SAME word, so
@@ -1284,7 +1283,7 @@ class BashCommandParser:
         # negative `end` as relative to the string's end rather than as an empty
         # interval - `"MARKER_suffix_long".rfind("MARKER", 0, -1)` is 0, not -1. That
         # is a real suppression on a word that owns nothing, and only the span test
-        # stops it (adversarial review, Helly R, after I argued the opposite).
+        # stops it, however much the bound looks sufficient.
         #
         # The window says an occurrence COULD be the body, never that it IS. Where it
         # admits more than one, the mapping is unestablished and suppression is
