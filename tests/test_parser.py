@@ -668,7 +668,10 @@ class TestUnterminatedBraceExpansion:
 
     @pytest.fixture(autouse=True)
     def _bounded(self):
-        # A regression hangs rather than fails; the alarm turns that into a failure.
+        # A regression hangs rather than fails; the alarm turns that into a failure where it exists.
+        if not hasattr(signal, "setitimer"):
+            yield
+            return
         previous = signal.signal(signal.SIGALRM, _parse_hung)
         signal.setitimer(signal.ITIMER_REAL, 5)
         yield

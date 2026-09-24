@@ -10,6 +10,7 @@ Tests cover:
 - Performance requirements (skipped in CI - timing tests are flaky)
 """
 
+import io
 import json
 import os
 import signal
@@ -35,6 +36,8 @@ from schlock import RiskLevel, ValidationResult
 from schlock.integrations.audit import AuditLogger
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
 from schlock.setup.config_writer import RISK_PRESETS
+
+needs_itimer = pytest.mark.skipif(not pre_tool_use._HAS_ITIMER, reason="no interval timers (Windows)")
 
 
 @pytest.fixture(autouse=True)
@@ -608,6 +611,7 @@ class TestValidationDeadline:
     Claude Code lets a timed-out PreToolUse command hook through to the permission flow.
     """
 
+    @needs_itimer
     def test_stalled_validation_denies_within_the_deadline(self, monkeypatch):
         def spin(command):
             while True:
@@ -628,6 +632,36 @@ class TestValidationDeadline:
         assert audit[-1]["decision"] == "block"
         assert "deadline" in audit[-1]["violations"][0]
 
+    @needs_itimer
+    def test_deadline_escaping_a_sibling_handler_is_audited_by_main(self, monkeypatch, capsys):
+        """The alarm fires inside the RuntimeError branch's own audit call; main must still audit the deny."""
+
+        def fail(command):
+            raise RuntimeError("validator unavailable")
+
+        audit = []
+
+        def stall_first_audit(self, **kw):
+            audit.append(kw)
+            while len(audit) == 1:
+                pass
+
+        monkeypatch.setattr(pre_tool_use, "validate_command", fail)
+        monkeypatch.setattr(pre_tool_use, "VALIDATION_DEADLINE_S", 0.2)
+        monkeypatch.setattr(AuditLogger, "log_validation", stall_first_audit)
+        monkeypatch.setattr(pre_tool_use.faulthandler, "dump_traceback_later", lambda *a, **kw: None)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})))
+
+        with pytest.raises(SystemExit):
+            pre_tool_use.main()
+
+        assert json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert len(audit) == 2
+        assert audit[-1]["command"] == "ls"
+        assert audit[-1]["decision"] == "block"
+        assert "deadline" in audit[-1]["violations"][0]
+
+    @needs_itimer
     def test_deadline_is_disarmed_after_a_normal_verdict(self):
         previous = signal.getsignal(signal.SIGALRM)
         handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
@@ -637,7 +671,7 @@ class TestValidationDeadline:
     def test_platform_without_sigalrm_still_validates(self, monkeypatch):
         """Windows has no SIGALRM; the soft deadline steps aside and faulthandler alone bounds the hook."""
         monkeypatch.setattr(pre_tool_use, "_HAS_ITIMER", False)
-        monkeypatch.delattr(signal, "setitimer")
+        monkeypatch.delattr(signal, "setitimer", raising=False)
 
         response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
 

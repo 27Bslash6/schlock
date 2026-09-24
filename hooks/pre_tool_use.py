@@ -725,6 +725,7 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
 def main():
     """Entry point for Claude Code hook execution."""
     faulthandler.dump_traceback_later(HARD_DEADLINE_S, exit=True)
+    start_time = time.perf_counter()
     try:
         # Read hook input from stdin
         input_data = json.load(sys.stdin)
@@ -746,6 +747,16 @@ def main():
     except (Exception, ValidationDeadlineExceeded) as e:
         # The deadline escapes handle_pre_tool_use when it fires inside a sibling except branch.
         logger.error(f"Fatal error in main: {e!r}", exc_info=True)
+        if isinstance(e, ValidationDeadlineExceeded):
+            # That branch may not have written its audit entry, so record the deny here.
+            get_audit_logger().log_validation(
+                command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
+                risk_level="BLOCKED",
+                violations=[f"Validation deadline exceeded ({VALIDATION_DEADLINE_S}s)"],
+                decision="block",
+                execution_time_ms=(time.perf_counter() - start_time) * 1000,
+                context=get_context(),
+            )
         # Still output valid JSON even on fatal errors
         error_result = {
             "hookSpecificOutput": {
