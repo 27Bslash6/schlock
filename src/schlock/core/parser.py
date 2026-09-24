@@ -8,8 +8,9 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import bisect
+import functools
 import logging
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 import bashlex
 import bashlex.errors
@@ -293,24 +294,22 @@ def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     return cmd_name, args
 
 
-def _command_nodes(node: Any) -> "list[Any]":
-    """Every `command`-kind node reachable from `node`, in source order.
+def _nodes_of_kind(node: Any, kind: str) -> "list[Any]":
+    """Every `kind` node reachable from `node`, in source order, never entering a command's own parts
+    (word-level substitutions are validated separately and are not group stdin consumers).
 
-    Returns ALL commands in a group so a stdin consumer that is not the first command
-    (`{ true; bash; }`, a while/for/if body) is still seen. Stops at each command without
-    descending into its own parts (word-level substitutions are not group stdin consumers).
-
-    The ONE walk skeleton for both stdin-sink surfaces - `_here_string_programs` and the pipe-to-shell
-    `check_pipeline` - so a future bashlex child-attr change cannot leave one silently under-scanning
-    (LAB-2768, LAB-3006).
+    The ONE walk skeleton behind both stdin-sink surfaces - `_here_string_programs` and the pipe-to-shell
+    `check_pipeline` - and the function table that feeds them (`_function_sinks`), so a future bashlex
+    child-attr change cannot leave one silently under-scanning (LAB-2768, LAB-3006, LAB-3465).
     """
     found: list[Any] = []
 
     def walk(n: Any) -> None:
         if not hasattr(n, "kind"):
             return
-        if n.kind == "command":
+        if n.kind == kind:
             found.append(n)
+        if n.kind == "command":
             return
         for attr in ("list", "parts", "command"):
             child = getattr(n, attr, None)
@@ -322,6 +321,59 @@ def _command_nodes(node: Any) -> "list[Any]":
 
     walk(node)
     return found
+
+
+def _command_nodes(node: Any) -> "list[Any]":
+    """Every command in a group, so a stdin consumer that is not the first (`{ true; bash; }`, a
+    while/for/if body) is still seen. A nested function definition's body is counted too: bash can
+    call it without naming it (`trap g EXIT`, `command_not_found_handle`, a computed command word), so
+    counting it wherever it is defined is the fail-closed reading."""
+    return _nodes_of_kind(node, "command")
+
+
+def _function_sinks(ast_nodes: "list[Any]", classify: "Callable[[Any], list[str]]") -> "dict[str, list[str]]":
+    """Map each shell-function name to every interpreter `classify` finds in a command a call to it reaches.
+
+    A function body inherits its caller's stdin, so `f() { bash; }; f <<< X` and `echo X | f` both run
+    X in bash (verified in real bash) although `f` itself is no interpreter (LAB-3465). Calls chain:
+    `f() { g; }; g() { bash; }` reaches bash from `f`.
+
+    Bodies are a union, not a scope model: `f() { true; }; f <<< X; f() { bash; }` binds both although
+    only the first is live at the call, and a definition inside a branch or subshell is bound as if it
+    always ran. Modelling definition order and scope would be a second bash interpreter; the union
+    over-approximates, which is the fail-closed direction for a sink check.
+
+    Each (name, interpreter) pair is propagated from callee to caller exactly once, so the cost is
+    linear in the bodies. Re-walking a body at every call site is quadratic (one large body piped into
+    from many stages), and a per-path walk exponential in a call DAG (`f1() { f2; f2; }; f2() { f3;
+    f3; }; ...`) - past the hook timeout, which fails OPEN.
+    """
+    bodies: dict[str, list[Any]] = {}
+    for node in ast_nodes or []:
+        for fn in _nodes_of_kind(node, "function"):
+            bodies.setdefault(fn.name.word, []).extend(_command_nodes(fn.body))
+
+    callers: dict[str, set[str]] = {}
+    todo: list[tuple[str, str]] = []
+    for name, body in bodies.items():
+        for cmd in body:
+            callee = _call_name(cmd)
+            if callee in bodies:
+                callers.setdefault(callee, set()).add(name)
+            todo.extend((name, interpreter) for interpreter in classify(cmd))
+
+    sinks: dict[str, set[str]] = {}
+    while todo:
+        name, interpreter = todo.pop()
+        if interpreter not in sinks.setdefault(name, set()):
+            sinks[name].add(interpreter)
+            todo.extend((caller, interpreter) for caller in callers.get(name, ()))
+    return {name: sorted(found) for name, found in sinks.items()}  # sorted: set order varies per process
+
+
+def _call_name(node: Any) -> str:
+    """The word a command node is invoked by - what bash looks a shell function up by - else ''."""
+    return next(iter(_command_words(node)), "")
 
 
 def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
@@ -429,7 +481,7 @@ def _classify_sink(sink: Any) -> "list[str]":
     ]
 
 
-def _here_string_programs(node: Any) -> "list[tuple[str, str]]":
+def _here_string_programs(node: Any, functions: "Callable[[], dict[str, list[str]]]") -> "list[tuple[str, str]]":
     """Every (interpreter, here-string) pair for a stdin sink that runs `node`'s `<<<` here-string.
 
     A `<<<` redirect feeds its word to a command's stdin; a bare interpreter runs that stdin as a
@@ -448,20 +500,23 @@ def _here_string_programs(node: Any) -> "list[tuple[str, str]]":
       Every sink is returned, not the first: `python3 --version` fails closed as a stdin reader, so a
       first-match return let it shadow the later `bash` that runs X (`{ python3 --version; bash; }
       <<< X`), and the caller drops non-shell payloads (LAB-3006).
+
+    Either sink may be a shell-function call, whose body inherits the here-string: `functions()` maps
+    a name to the interpreters its body reaches (`_function_sinks`), built only once a here-string is
+    found - classifying every body costs a wrapper scan per command that no `<<<`-free command should pay.
     """
     kind = getattr(node, "kind", None)
     if kind == "command":
-        here_string = _stdin_here_string(getattr(node, "parts", []))
-        if here_string is None:
-            return []
-        return [(name, here_string) for name in _classify_sink(node)]
-
-    if kind == "compound":
-        here_string = _stdin_here_string(getattr(node, "redirects", []))
-        if here_string is None:
-            return []
-        return [(name, here_string) for sink in _command_nodes(node) for name in _classify_sink(sink)]
-    return []
+        here_string, sinks = _stdin_here_string(getattr(node, "parts", [])), [node]
+    elif kind == "compound":
+        here_string, sinks = _stdin_here_string(getattr(node, "redirects", [])), _command_nodes(node)
+    else:
+        return []
+    if here_string is None:
+        return []
+    direct = [name for sink in sinks for name in _classify_sink(sink)]
+    called = [name for sink in sinks for name in functions().get(_call_name(sink), ())]
+    return [(name, here_string) for name in direct + called]
 
 
 class CommandSegment(NamedTuple):
@@ -692,15 +747,17 @@ class BashCommandParser:
         no payload, no recursion, and the delegated `rm -rf /` degrades to HIGH (allowed by the
         permissive preset).
 
-        Returns (command_basename, here_string_text) for each command whose stdin - supplied by
-        a `<<<` redirect - it executes as a program. Gated by `_reads_stdin_as_program` (the same
-        predicate that makes pipe-to-shell dangerous), so a here-string that is NOT the program is
-        never surfaced: `bash -c X <<< Y` (bash runs X; Y is inert stdin data), `bash script.sh
-        <<< Y` (the script is the program), and `cat <<< text` (cat is not an interpreter). The
+        Returns (interpreter, here_string_text) for each stdin sink - a command, or the body of a
+        shell function it calls - that executes a `<<<` here-string as a program. Gated by
+        `_reads_stdin_as_program` (the same predicate that makes pipe-to-shell dangerous), so a
+        here-string that is NOT the program is never surfaced: `bash -c X <<< Y` (bash runs X; Y is
+        inert stdin data), `bash script.sh <<< Y` (the script is the program), and `cat <<< text`
+        (cat is not an interpreter). The
         caller decides which interpreters' payloads are re-validated as bash - a Python here-string
         (`python3 <<< "import os"`) is real stdin-as-program but nonsense to re-check as bash.
         """
         results: list[tuple[str, str]] = []
+        functions = functools.cache(lambda: _function_sinks(ast_nodes, _classify_sink))
 
         def visit(node):
             if not hasattr(node, "kind"):
@@ -708,7 +765,7 @@ class BashCommandParser:
             # `<<<` rides a command node's `.parts` (`bash <<< X`) or a compound node's `.redirects`
             # (`( bash ) <<< X`); _here_string_programs handles both and finds every stdin sink.
             if node.kind in ("command", "compound"):
-                results.extend(_here_string_programs(node))
+                results.extend(_here_string_programs(node, functions))
             for attr in ["parts", "command", "list", "pipe", "compound"]:
                 child = getattr(node, attr, None)
                 if isinstance(child, list):
@@ -1401,12 +1458,23 @@ class BashCommandParser:
                     words.append(sub.word)
             return words
 
+        def stdin_program(c) -> list[str]:
+            """Rule (2) on one command node: [interpreter] if it runs its stdin as a program, else [].
+
+            The ONE rule-(2) predicate, for stage commands and function bodies alike, so a change to what
+            rule (2) recognises reaches both and the two cannot drift.
+            """
+            name, args = _resolve_multicall(self._get_command_name(c) or "", _stage_args(c))
+            return [name] if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args) else []
+
+        functions = _function_sinks(ast_nodes, stdin_program)
+
         def check_pipeline(node):
             """Check a pipeline node for dangerous patterns."""
             if not hasattr(node, "parts"):
                 return
 
-            # Per stage, the (command name, args) of every command in it, in order.
+            # Per stage, the (command name, args) of every named command in it and the command nodes.
             stages = []
             for part in node.parts:
                 # A subshell/group/loop stage shares the pipe with EVERY inner command: one that does
@@ -1421,8 +1489,10 @@ class BashCommandParser:
                 resolved = [
                     _resolve_multicall(cmd_name, _stage_args(c)) for c in commands if (cmd_name := self._get_command_name(c))
                 ]
-                if resolved:
-                    stages.append(resolved)
+                # A function call counts even when `_get_command_name` cannot name it (`f/`, which bash
+                # still resolves to the function) - dropping the stage would skip rule (2) entirely.
+                if resolved or any(_call_name(c) in functions for c in commands):
+                    stages.append((resolved, commands))
 
             if len(stages) < 2:
                 return
@@ -1431,7 +1501,7 @@ class BashCommandParser:
             # stdin check - so widening it to every command would spread its existing over-block
             # (`git ls-files | python3 check.py`) into every `git ls-files | while read f; do
             # python3 check.py "$f"; done` loop. Rule (2) is the precise check and reads them all.
-            names = [stage[0][0] for stage in stages]
+            names = [resolved[0][0] if resolved else "" for resolved, _ in stages]
 
             # (1) Existing remote-code-execution pattern: download tool -> shell interpreter.
             first_cmd = names[0]
@@ -1442,10 +1512,13 @@ class BashCommandParser:
                         break
 
             # (2) Generalized pipe-to-shell: ANY downstream stage that executes its stdin as a
-            # program (no program-source arg) is RCE on the piped data, regardless of producer.
-            for name, stage_args in (sink for stage in stages[1:] for sink in stage):
-                if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, stage_args):
-                    dangers.append(f"data piped into shell interpreter: {name}")
+            # program (no program-source arg) is RCE on the piped data, regardless of producer. A
+            # shell-function call shares the pipe too - its body inherits the stage's stdin (`echo X
+            # | f` with `f() { bash; }`, LAB-3465) - so the interpreters its body reaches count.
+            for c in (c for _, commands in stages[1:] for c in commands):
+                interpreters = stdin_program(c) + functions.get(_call_name(c), [])
+                if interpreters:
+                    dangers.append(f"data piped into shell interpreter: {interpreters[0]}")
                     break
 
         def visit(node):
