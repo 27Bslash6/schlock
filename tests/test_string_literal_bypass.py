@@ -237,9 +237,10 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
         [
             # Everyday heredoc pipe: must not trip the fail-closed segment branch.
             ("cat <<EOF | grep x\nhello\nEOF", True, RiskLevel.SAFE),
-            # The segment suppresses its body; the whole-command scan does not, and
-            # it now runs whatever the segments matched. Same verdict as the command
-            # without `&& chmod`.
+            # The body is text, so BLOCKED is not the intended verdict: the segment
+            # suppresses its body, but the whole-command scan does not, and it runs
+            # whenever no segment is BLOCKED. A known fail-closed side effect, tracked
+            # on LAB-4979. Same verdict as the command without `&& chmod`.
             ("cat <<EOF | grep x && chmod 777 f\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
             # A shell's heredoc body is code. Was HIGH (body never reached the
             # segment); now matches the single-segment `bash <<EOF` verdict.
@@ -248,8 +249,9 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             # _close_heredocs never sees it and it rides inside the outer
             # segment's slice as inert `cat` output that `diff` only reads.
             # Its range is derived off the parent AST, so the segment reads the body
-            # as text (LAB-912); the whole-command scan still denies it, exactly as
-            # it does `echo lead && diff …` with the same body.
+            # as text (LAB-912). The whole-command scan still denies it, exactly as
+            # it does `echo lead && diff …` with the same body: a known fail-closed
+            # side effect tracked on LAB-4979, not the intended verdict.
             ("diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x", False, RiskLevel.BLOCKED),
         ],
     )
