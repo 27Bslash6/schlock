@@ -1523,7 +1523,10 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
         elif char in "'\"":
             pos += 1
             while pos < len(text) and text[pos] != char:
-                if char == '"' and text[pos] == "\\" and pos + 1 < len(text):
+                # Inside double quotes a backslash escapes only `$ ` " \` and a newline;
+                # before anything else bash keeps it, so `<<"a\b"` ends at a line
+                # reading `a\b`, not `ab`.
+                if char == '"' and text[pos] == "\\" and pos + 1 < len(text) and text[pos + 1] in '$`"\\\n':
                     pos += 1
                 delimiter.append(text[pos])
                 pos += 1

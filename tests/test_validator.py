@@ -1381,6 +1381,33 @@ class TestHeredocSurroundings:
         assert expected_error in (result.error or "")
         assert result.message.startswith("BLOCKED: Cannot determine what this heredoc runs")
 
+    @pytest.mark.parametrize(
+        "word,terminator",
+        [
+            ('"a\\b"', "a\\b"),
+            ('"a\\$b"', "a$b"),
+            ('"a\\"b"', 'a"b'),
+            ('"a\\\\b"', "a\\b"),
+            ("'a\\b'", "a\\b"),
+            ("a\\b", "ab"),
+        ],
+    )
+    def test_a_delimiter_is_quote_removed_the_way_bash_does(self, word, terminator):
+        """Each terminator here is the line bash itself stopped at (checked against real bash).
+
+        Inside double quotes a backslash escapes only `$`, a backtick, `"`, `\\` and a
+        newline; before anything else it stays. Dropping it read `<<"a\\b"` as ending at a
+        line `ab`, and everything between bash's terminator and that line was lost as body.
+        """
+        assert val_module._read_delimiter(word, 0)[0] == terminator
+
+    def test_the_line_after_a_kept_backslash_terminator_is_shell(self, safety_rules_path):
+        """End to end: bash ends this body at `a\\b` and runs the `rm`. LOW on main."""
+        result = validate_command('cat <<"a\\b"\na\\b\nrm -rf /\nab', config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "system_destruction" in result.matched_rules
+
     def test_unterminated_quote_in_a_delimiter_is_rejected(self):
         """A delimiter whose quote never closes has no readable end.
 
