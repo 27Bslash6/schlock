@@ -12,5 +12,6 @@ rules:
   - name: privilege_escalation_variants
     description: Alternative privilege escalation commands beyond sudo
     risk_level: BLOCKED
-    patterns: ['\bsu\b', '\bpkexec\b', '\bdoas\b', '\bgksudo\b', '\bkdesu\b', '\bkdesudo\b', '\bchroot\b.{0,100}(bash|sh|/bin)']
+    # Gap is `[^;|&\n]`, not `.`: it stays inside one command, so a later `sh` in `git push` does not complete it.
+    patterns: ['\bsu\b', '\bpkexec\b', '\bdoas\b', '\bgksudo\b', '\bkdesu\b', '\bkdesudo\b', '\bchroot\b[^;|&\n]{0,100}(bash|sh|/bin)']
     alternatives: ["Use sudo with proper authentication", "Request admin approval"]

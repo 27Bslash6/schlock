@@ -15,7 +15,8 @@ rules:
   - name: recursive_permission_system_dirs
     description: Recursive permission changes on system directories destroy systems
     risk_level: BLOCKED
-    patterns: ['chmod\s+(-R|--recursive)\s+[0-7]{3}\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'chmod\s+[0-7]{3}\s+(-R|--recursive)\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'chown\s+(-R|--recursive)\s+.{0,100}\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'chown\s+.{0,100}\s+(-R|--recursive)\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'find\s+/(|etc|home|usr|var)\s+.{0,200}-exec\s+(chmod|chown)']
+    # Gap is `[^;|&\n]`, not `.`: it stays inside one command, so a later `ls /` or `cd /etc` does not complete it.
+    patterns: ['chmod\s+(-R|--recursive)\s+[0-7]{3}\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'chmod\s+[0-7]{3}\s+(-R|--recursive)\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'chown\s+(-R|--recursive)\s+[^;|&\n]{0,100}\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'chown\s+[^;|&\n]{0,100}\s+(-R|--recursive)\s+(\/|\/etc|\/home|\/usr|\/var|\/opt|\/srv)(\s|$)', 'find\s+/(|etc|home|usr|var)\s+.{0,200}-exec\s+(chmod|chown)']
     alternatives: ["NEVER change permissions recursively on system directories", "Target specific files only", "Use configuration management"]
 
   # HIGH
