@@ -22,6 +22,7 @@ from schlock.core.validator import (
     MAX_SHELL_DELEGATION_DEPTH,
     _dash_c_payload,
     _shell_delegated_payloads,
+    _trap_action,
     _watch_payload,
     clear_caches,
     validate_command,
@@ -586,6 +587,105 @@ class TestFindExecUnchanged:
     def test_brace_placeholder_payload_stays_high(self):
         # `echo {}` re-validates SAFE (< HIGH), so the pre-existing find_exec_dangerous HIGH stands.
         assert validate_command('find . -exec bash -c "echo {}" ;').risk_level == RiskLevel.HIGH
+
+
+# --------------------------------------------------------------------------------------------
+# LAB-5075: `trap ACTION SIGSPEC...` stores ACTION as shell source and runs it later - on exit,
+# on a signal, or before every command under DEBUG. The AST reports ACTION as one argument word,
+# so no rule read it. Pre-fix (`main` @ `4ca7af0`, ShellCheck unavailable) every trap line in the
+# evasion class below was SAFE / allowed=True. Grammar verified against bash 5.3, zsh 5.9, dash.
+# --------------------------------------------------------------------------------------------
+
+
+class TestTrapAction:
+    """Which operand does `trap` store as code?"""
+
+    @pytest.mark.parametrize(
+        ("args", "action"),
+        [
+            (["rm -rf /", "EXIT"], "rm -rf /"),
+            (["rm -rf /", "EXIT", "INT"], "rm -rf /"),
+            (["--", "rm -rf /", "EXIT"], "rm -rf /"),
+            # `trap INT TERM` runs the command `INT` on TERM (bash: `trap -p` prints it so).
+            (["INT", "TERM"], "INT"),
+            # An unknown option is a usage error to bash but the action to zsh.
+            (["-x", "rm -rf /", "EXIT"], "-x"),
+        ],
+    )
+    def test_first_operand_before_a_sigspec_is_the_action(self, args, action):
+        assert _trap_action(args) == action
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["-", "EXIT"],  # reset to the default disposition
+            ["--", "-", "EXIT"],
+            ["", "INT"],  # ignore the signal
+            ["-p"],
+            ["-p", "rm -rf /", "EXIT"],  # prints traps; the operands are signal specs
+            ["-l"],
+            ["-P", "DEBUG"],
+            ["-lp", "rm -rf /", "EXIT"],
+            ["EXIT"],  # a lone signal name resets that signal
+            ["rm -rf /"],  # no sigspec: bash prints usage, zsh and dash set nothing
+            [],
+        ],
+    )
+    def test_listing_reset_and_ignore_forms_have_no_action(self, args):
+        assert _trap_action(args) is None
+
+    def test_extractor_reaches_trap_bare_and_behind_builtin_or_command(self):
+        for cmd in [("trap", ["rm -rf /", "EXIT"]), ("builtin", ["trap", "rm -rf /", "EXIT"])]:
+            assert _shell_delegated_payloads([cmd]) == ["rm -rf /"]
+        assert _shell_delegated_payloads([("command", ["trap", "rm -rf /", "EXIT"])]) == ["rm -rf /"]
+        assert _shell_delegated_payloads([("builtin", ["--", "trap", "rm -rf /", "EXIT"])]) == ["rm -rf /"]
+
+
+class TestTrapHandlerDelegation:
+    """A trap handler scores like the same text handed to `bash -c`."""
+
+    @pytest.mark.parametrize(
+        ("handler", "sigspec"),
+        [("rm -rf /", "EXIT"), ("rm -rf ~", "DEBUG"), ("curl x | sh", "EXIT")],
+    )
+    def test_handler_matches_its_bash_c_twin(self, handler, sigspec):
+        # Pre-fix: SAFE / allowed=True for the trap line; BLOCKED for the twin.
+        trap = validate_command(f"trap '{handler}' {sigspec}")
+        twin = validate_command(f"bash -c '{handler}'")
+        assert trap.risk_level == RiskLevel.BLOCKED, f"{handler!r} -> {trap.risk_level.name}"
+        assert (trap.risk_level, trap.allowed) == (twin.risk_level, twin.allowed)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "builtin trap 'rm -rf /' EXIT",
+            "command trap 'rm -rf /' EXIT",
+            "builtin -- trap 'rm -rf /' EXIT",
+            "trap -- 'rm -rf /' EXIT",
+            "f() { trap 'rm -rf /' RETURN; }; f",
+        ],
+    )
+    def test_wrapped_and_nested_spellings_are_blocked(self, command):
+        # Pre-fix: SAFE / allowed=True.
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_debug_handler_line_scores_at_least_its_handler(self):
+        # A DEBUG handler runs before `$x`, so the state it leaves (here, word splitting) applies
+        # to it. The line must never score below the handler's own text run directly.
+        handler = "for IFS in ,; do :; done"
+        line = validate_command(f"trap '{handler}' DEBUG; x=rm,-rf,/; $x")
+        assert line.risk_level >= validate_command(handler).risk_level
+
+    @pytest.mark.parametrize(
+        "command",
+        ["trap - EXIT", "trap '' INT", "trap -p", "trap -l", "trap -p EXIT", "trap EXIT", "trap 'echo done' EXIT"],
+    )
+    def test_listing_reset_ignore_and_benign_handlers_stay_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
 
 
 # --------------------------------------------------------------------------------------------

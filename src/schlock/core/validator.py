@@ -541,7 +541,10 @@ _FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
 # deliberate: WRAPPER_COMMANDS lets a nested wrapper be skipped past, the program/watch/find
 # members let the wrapped target be found; a member matched sooner only recurses earlier, it
 # can never make the scan miss. su/sg/runuser happen to sit in both unioned sets.
-_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find"})
+_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find", "trap"})
+
+# `trap`'s listing options: any of them prints traps or signal names instead of setting one.
+_TRAP_LISTING_FLAGS: frozenset[str] = frozenset("lpP")
 
 
 def _find_exec_clauses(args: list[str]) -> list[list[str]]:
@@ -627,6 +630,25 @@ def _watch_payload(args: list[str]) -> Optional[str]:
     return " ".join(args[i:]) or None
 
 
+def _trap_action(args: list[str]) -> Optional[str]:
+    """Return the handler `trap` stores to run later as shell source, or None.
+
+    `trap [-lpP] [[ACTION] SIGSPEC ...]` (bash 5.3, zsh 5.9, dash): ACTION is the first operand,
+    and only when a SIGSPEC follows it. A lone operand is a signal to reset (or a usage error),
+    `-` resets, the empty string ignores, and a listing option prints instead of setting. An
+    unknown option is a usage error to bash but the action to zsh, so it is read as the action:
+    the reading that runs code. Only the first word is checked for options, because bash rejects
+    anything past an unknown one and a listing cluster makes the rest signal specs.
+    """
+    if args[:1] == ["--"]:
+        args = args[1:]
+    elif args and len(args[0]) > 1 and args[0][0] == "-" and set(args[0][1:]) <= _TRAP_LISTING_FLAGS:
+        return None
+    if len(args) < 2 or args[0] in ("", "-"):
+        return None
+    return args[0]
+
+
 def _shell_delegated_payloads(
     commands_with_args: list[tuple[str, list[str]]],
     *,
@@ -635,10 +657,11 @@ def _shell_delegated_payloads(
     """Extract every argument the command will hand to a shell as source code.
 
     Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
-    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, `find -exec/-execdir/-ok/-okdir
-    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction, and
-    `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
-    shell on every later git command in that repo or for that user, not at this command.
+    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, the handler of `trap PROG SIGSPEC`
+    (LAB-5075), `find -exec/-execdir/-ok/-okdir <shell> -c PROG ;` (LAB-2767), whose clause
+    re-enters this same extraction, and `git config <exec-key> PROG` (LAB-4264), whose hand-off
+    is DEFERRED — git runs PROG through a shell on every later git command in that repo or for
+    that user, not at this command.
 
     Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
     are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
@@ -684,6 +707,8 @@ def _shell_delegated_payloads(
 
         if base == "watch":
             found.append(_watch_payload(args))
+        elif base == "trap":
+            found.append(_trap_action(args))
         elif base == "find":
             # Each exec clause is a command in its own right; re-run the FULL extractor on it,
             # so a wrapped or nested delegator inside `-exec` is caught for free.
@@ -692,7 +717,9 @@ def _shell_delegated_payloads(
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
-            if base in WRAPPER_COMMANDS:
+            # `builtin NAME ...` runs the builtin NAME, so it passes through like `command`. Kept
+            # out of WRAPPER_COMMANDS, which other walks share, because only this one needs it.
+            if base in WRAPPER_COMMANDS or base == "builtin":
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
                 # operand semantics, `watch`, `find`, and nested wrappers all thread for free
