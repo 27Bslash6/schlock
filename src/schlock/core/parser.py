@@ -8,13 +8,14 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import bisect
+import copy
 import logging
 import string
 from typing import Any, NamedTuple, Optional
 
 import bashlex
-import bashlex.ast
 import bashlex.errors
+import bashlex.subst
 
 from schlock.exceptions import ParseError
 
@@ -527,50 +528,13 @@ _EXPANSION_STARTS = frozenset(string.ascii_letters + string.digits + "_{([@*#?$!
 _WORD_BREAKS = frozenset(" \t\n;&|<>()")
 
 
-def _holds_dollar_quote(text: str) -> bool:
-    """Whether ``text`` opens a `$'...'` or `$"..."` quote (a line continuation may sit after the `$`)."""
-    joined = text.replace("\\\n", "")
-    return "$'" in joined or '$"' in joined
-
-
-class _DollarQuoteDecoder(bashlex.ast.nodevisitor):
-    """Rewrite the text of every word holding a `$'...'` or `$"..."` quote to what bash makes of it.
-
-    bashlex finds these words' boundaries correctly but dequotes them wrongly - `$'rm\\t-rf\\t/'`
-    reads as `$rmt-rft/`, `$"bash"` as `$bash` - so every check keyed on word text judged a string
-    bash never runs: the `-c` / `watch` / `<<<` payloads re-validated as code and the pipe-to-shell
-    interpreter name alike (LAB-3005). Fixing the text here, where every parse passes, keeps those
-    surfaces from disagreeing about one payload. (`$"..."` is locale translation; with no message
-    catalog, which is every shell an agent drives, bash reads it as plain `"..."`.)
-
-    Each such word is re-read from its source span with bash's own quoting rules. Expansions stay
-    raw, exactly as bashlex spells them, by copying the spans of the child nodes it built for them.
-    Anything the reading cannot account for raises ParseError, which the validator blocks: an
-    unmodelled escape, an unterminated quote, or an unquoted break or unmodelled expansion inside
-    the span (bashlex and bash would then disagree about the word itself).
-    """
-
-    def __init__(self, command: str):
-        self.command = command
-
-    def visitword(self, n: Any, word: str) -> None:
-        self._decode(n)
-
-    def visitassignment(self, n: Any, word: str) -> None:
-        self._decode(n)
-
-    def _decode(self, n: Any) -> None:
-        start, end = n.pos
-        if not _holds_dollar_quote(self.command[start:end]):
-            return
-        # bashlex also hangs an empty `parameter` node on the `$` of each `$'` / `$"`: not an
-        # expansion, so it is left for `_dequote` to read as the quote it opens.
-        children = {part.pos[0]: part.pos[1] for part in getattr(n, "parts", []) if getattr(part, "value", None) != ""}
-        n.word = _dequote(self.command, start, end, children)
+def _holds_quote(text: str) -> bool:
+    """Whether ``text`` holds a quote character, so bashlex's reading of it cannot be trusted."""
+    return "'" in text or '"' in text
 
 
 def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # noqa: PLR0912 - one branch per quoting rule
-    """Return the text bash makes of the word at ``src[i:end]`` (see `_DollarQuoteDecoder`)."""
+    """Return the text bash makes of the word at ``src[i:end]`` (see `_expand_word`)."""
     out: list[str] = []
     quote = ""  # "", "'" or '"'
     while i < end:
@@ -587,7 +551,7 @@ def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # 
             i += 2  # a line continuation is removed, quoted by "..." or not
         elif char == "\\":
             if not nxt:
-                raise ParseError(f"ANSI-C word ends in a bare backslash: {src[:end]!r}")
+                raise ParseError(f"Quoted word ends in a bare backslash: {src[:end]!r}")
             keeps_backslash = quote == '"' and nxt not in '$`"\\'
             out.append(("\\" if keeps_backslash else "") + nxt)
             i += 2
@@ -608,17 +572,17 @@ def _dequote(src: str, i: int, end: int, children: "dict[int, int]") -> str:  # 
             elif not quote and follower == '"':
                 quote, i = '"', after + 1  # $"..." without a message catalog is "..."
             elif follower and follower in _EXPANSION_STARTS:
-                raise ParseError(f"ANSI-C word holds an expansion bashlex did not model: {src[:end]!r}")
+                raise ParseError(f"Quoted word holds an expansion bashlex did not model: {src[:end]!r}")
             else:
                 out.append("$")
                 i += 1
         elif char == "`" or (not quote and char in _WORD_BREAKS):
-            raise ParseError(f"ANSI-C word span disagrees with bash at {char!r}: {src[:end]!r}")
+            raise ParseError(f"Quoted word span disagrees with bash at {char!r}: {src[:end]!r}")
         else:
             out.append(char)
             i += 1
     if quote:
-        raise ParseError(f"ANSI-C word ends inside a {quote} quote: {src[:end]!r}")
+        raise ParseError(f"Quoted word ends inside a {quote} quote: {src[:end]!r}")
     return "".join(out)
 
 
@@ -672,6 +636,50 @@ def _take(src: str, i: int, end: int, alphabet: "frozenset[str]", limit: int) ->
     while j < min(end, i + limit) and src[j] in alphabet:
         j += 1
     return src[i:j]
+
+
+_bashlex_expand_word = bashlex.subst._expandwordinternal
+
+
+def _expand_word(parserobj: Any, wordtoken: Any, *args: Any) -> "tuple[list[Any], str]":
+    """bashlex's word expansion, with the word's text re-read by bash's quoting rules.
+
+    bashlex finds a word's boundaries and expansions correctly but removes its quotes wrongly, so
+    every check keyed on word text judged a string bash never runs - the `-c` / `watch` / `<<<`
+    payloads re-validated as code and the pipe-to-shell interpreter name alike. It reads
+    `$'rm\\t-rf\\t/'` as `$rmt-rft/` and `$"bash"` as `$bash` (LAB-3005); it ignores `"..."`,
+    so `a"'"b` reads as `ab` and `"a\\qb"` as `aqb`; and it takes any word that opens and closes
+    with `'` for ONE single-quoted string, so `'a'"'"'b'` - the idiom `shlex.quote` emits for an
+    embedded single quote - reads as `a'"'"'b`, and `'a'$(rm -rf /)'b'` loses its substitution
+    node altogether (LAB-4960). (`$"..."` is locale translation; with no message catalog, which is
+    every shell an agent drives, bash reads it as plain `"..."`.)
+
+    Re-reading here, where every word of every parse is expanded (nested ones included), keeps
+    those surfaces from disagreeing about one payload. The token is already free of line
+    continuations and bashlex's part offsets index it, so `_dequote` copies each expansion through
+    raw, as bashlex spells it. Anything it cannot account for raises ParseError, which the
+    validator blocks: an unmodelled escape, an unterminated quote, or an unquoted break or
+    unmodelled expansion inside the word.
+    """
+    value = wordtoken.value
+    if not _holds_quote(value):
+        return _bashlex_expand_word(parserobj, wordtoken, *args)
+    if value[0] == "'" == value[-1] and value.find("'", 1) < len(value) - 1:
+        # Past the one-string shortcut, via a filler character the shifted lexpos cancels out of
+        # every part's offset. Only its parts are kept, so the filler never reaches the text.
+        steered = copy.copy(wordtoken)
+        steered.value, steered.lexpos = "_" + value, wordtoken.lexpos - 1
+        parts, _ = _bashlex_expand_word(parserobj, steered, *args)
+    else:
+        parts, _ = _bashlex_expand_word(parserobj, wordtoken, *args)
+    # bashlex also hangs an empty `parameter` node on the `$` of each `$'` / `$"`: not an
+    # expansion, so it is left for `_dequote` to read as the quote it opens.
+    base = wordtoken.lexpos
+    children = {part.pos[0] - base: part.pos[1] - base for part in parts if getattr(part, "value", None) != ""}
+    return parts, _dequote(value, 0, len(value), children)
+
+
+bashlex.subst._expandwordinternal = _expand_word
 
 
 class BashCommandParser:
@@ -743,8 +751,8 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax, or a `$'...'` /
-                `$"..."` word uses quoting `_DollarQuoteDecoder` does not model
+            ParseError: If bashlex fails to parse the command syntax, or a quoted word uses
+                quoting `_expand_word` does not model
 
         Example:
             >>> parser = BashCommandParser()
@@ -758,12 +766,7 @@ class BashCommandParser:
             raise ValueError("Command cannot be whitespace-only")
 
         try:
-            nodes = bashlex.parse(command)
-            if _holds_dollar_quote(command):
-                decoder = _DollarQuoteDecoder(command)
-                for node in nodes:
-                    decoder.visit(node)
-            return nodes
+            return bashlex.parse(command)
         except ParseError:
             raise
         except bashlex.errors.ParsingError as e:

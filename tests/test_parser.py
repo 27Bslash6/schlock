@@ -784,14 +784,14 @@ class TestAnsiCWordDecoding:
         # bashlex's tokenizer honours `$'...'` boundaries, so none of these reach `_dequote`
         # through `parse` today. They are the backstop if its word spans ever drift: kept and
         # pinned directly, because an unreachable guard nobody can test is the one that rots.
-        with pytest.raises(ParseError, match="ANSI-C"):
+        with pytest.raises(ParseError, match="ANSI-C|Quoted word"):
             parser_mod._dequote(span, 0, len(span), {})
 
     @pytest.mark.parametrize("tail", ["\\x", "\\\nx"])
     def test_dequote_never_reads_past_its_span(self, tail):
         # A span that drifted short must fail closed, not borrow the next character.
         src = "$'a'" + tail
-        with pytest.raises(ParseError, match="ANSI-C"):
+        with pytest.raises(ParseError, match="ANSI-C|Quoted word"):
             parser_mod._dequote(src, 0, 5, {})
 
     @pytest.mark.parametrize(
@@ -806,10 +806,46 @@ class TestAnsiCWordDecoding:
     def test_locale_quotes_read_as_double_quotes(self, word, expected):
         assert _echo_arg(f"echo {word}") == expected
 
-    def test_commands_without_ansi_c_quotes_are_untouched(self):
-        # Without a `$'` or `$"` opener (`_holds_dollar_quote`) bashlex's own dequoting stands,
-        # quirks included (bash prints a\qb here; changing that is not this decoder's business).
-        command = """echo "a\\qb" 'c' d\\e"""
-        [raw] = bashlex.parse(command)
-        assert parser_mod.BashCommandParser().extract_commands_with_args([raw]) == [("echo", ["aqb", "c", "de"])]
-        assert _echo_arg(command) == "aqb"
+
+# Words joining differently-quoted segments, which bashlex's own dequoting mangles (LAB-4960):
+# it reads `'a'"'"'b'` as `a'"'"'b`, `a"'"b` as `ab` and `"a\qb"` as `aqb`.
+_MIXED_QUOTE_DECODES = [
+    ("""'a'"'"'b'""", "a'b"),  # the idiom `shlex.quote` emits for an embedded single quote
+    ("""'rm -rf '"'"'/'"'"''""", "rm -rf '/'"),
+    ("""'a'"b"'c'""", "abc"),
+    ("""a"'"b""", "a'b"),
+    (""""x"'y'z""", "xyz"),
+    ("""'x'"'\"""", "x'"),
+    (r'''"a\qb"''', r"a\qb"),  # inside "..." a backslash escapes only $ ` " \ and newline
+    (r'''"a\"b"''', 'a"b'),
+    ("""'a"b'""", 'a"b'),
+]
+
+
+class TestMixedQuoteWordDecoding:
+    @pytest.mark.parametrize(("word", "expected"), _MIXED_QUOTE_DECODES)
+    def test_word_text_is_what_bash_runs(self, word, expected):
+        assert _echo_arg(f"echo {word}") == expected
+
+    @pytest.mark.parametrize(("word", "expected"), _MIXED_QUOTE_DECODES)
+    def test_expected_values_match_real_bash(self, real_bash, word, expected):
+        ran = subprocess.run([real_bash, "-c", f"printf %s {word}"], capture_output=True, check=True)  # noqa: S603
+        assert ran.stdout == expected.encode()
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            # bashlex's offsets omit line continuations, so re-reading the source would
+            # misplace every expansion and nested word after one; the token has none.
+            ('echo "`ls \\\n -la`"', "`ls  -la`"),
+            ("echo x$(ls \\\n 'a b')", "x$(ls  'a b')"),
+            ("echo \"a\\\nb$(ls)\"'c'", "ab$(ls)c"),
+        ],
+    )
+    def test_line_continuations_do_not_shift_expansions(self, command, expected):
+        assert _echo_arg(command) == expected
+
+    def test_nested_words_after_a_line_continuation_are_decoded(self):
+        p = parser_mod.BashCommandParser()
+        commands = p.extract_commands_with_args(p.parse("echo $(git log \\\n --format='%h' 'a'\"'\"'b')"))
+        assert ("git", ["log", "--format=%h", "a'b"]) in commands

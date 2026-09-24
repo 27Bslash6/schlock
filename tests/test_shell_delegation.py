@@ -887,3 +887,45 @@ class TestAnsiCBenignUnchanged:
         result = validate_command(command)
         assert result.risk_level == risk, f"{command!r} -> {result.risk_level.name}"
         assert result.allowed is True
+
+
+class TestMixedQuotePayloads:
+    """LAB-4960: a `-c` payload spliced from differently-quoted segments is judged as bash runs it.
+
+    bashlex read `'rm -rf '"'"'/'"'"''` - the `shlex.quote` idiom for an embedded single quote -
+    as `rm -rf '"'"'/'"'"'`, so the payload re-validated was quote soup: HIGH and allowed on
+    `main` @ `e26a840` (ShellCheck off), while the benign `echo it'"'"'s fine` scored BLOCKED.
+    """
+
+    DANGEROUS = """bash -c 'rm -rf '"'"'/'"'"''"""
+
+    def test_payload_is_the_program_bash_runs(self):
+        parser = BashCommandParser()
+        commands = parser.extract_commands_with_args(parser.parse(self.DANGEROUS))
+        assert _shell_delegated_payloads(commands) == ["rm -rf '/'"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            DANGEROUS,
+            # The same splice on the other delegation surfaces, which all read the parsed word.
+            """watch 'rm -rf '"'"'/'"'"''""",
+            """sudo bash -c 'rm -rf '"'"'/'"'"''""",
+            """bash <<< 'rm -rf '"'"'/'"'"''""",
+            # The row's three siblings that were already BLOCKED (AC3).
+            "bash -c 'rm -rf /'",
+            """bash -c 'rm -rf '"/\"""",
+            "bash -c rm\\ -rf\\ /",
+        ],
+    )
+    def test_spliced_payload_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    def test_benign_payload_using_the_idiom_is_allowed(self):
+        # `shlex.quote("echo 'it is fine'")`. (The ticket's `'echo it'"'"'s fine'` makes bash run
+        # `echo it's fine`, which bash itself rejects as an unterminated quote - blocking it is right.)
+        result = validate_command("""bash -c 'echo '"'"'it is fine'"'"''""")
+        assert result.risk_level == RiskLevel.SAFE
+        assert result.allowed is True
