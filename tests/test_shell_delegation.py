@@ -963,3 +963,36 @@ class TestStdinProgramBenignUnchanged:
         result = validate_command(command)
         assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
         assert result.allowed is True
+
+
+class TestShellHeredocBodies:
+    """A shell's heredoc body is code; the head decides that, multicall and quoting included."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # `busybox sh` / `builtin source` run `sh` / `source`: the body is shell code.
+            "busybox sh <<EOF\nrm -rf /\nEOF",
+            "builtin source /dev/stdin <<EOF\nrm -rf /\nEOF",
+            # A quoted delimiter sends the body past bashlex, and the fallback never reads it:
+            # a head that runs its stdin as shell is denied rather than vouched for unread.
+            "bash <<'EOF'\nrm -rf /\nEOF",
+            "source /dev/stdin <<'EOF'\nrm -rf /\nEOF",
+            "command . /dev/stdin <<'EOF'\nrm -rf /\nEOF",
+            "bash <<'EOF'\necho hi\nEOF",
+        ],
+    )
+    def test_denied(self, command):
+        assert validate_command(command).allowed is False, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The body is data to these heads, so the unread body stays out of the verdict.
+            "bash script.sh <<'EOF'\nsome input\nEOF",
+            "cat <<'EOF'\nrm -rf /\nEOF",
+            "python3 <<'EOF'\nprint(1)\nEOF",
+        ],
+    )
+    def test_data_heredoc_still_allowed(self, command):
+        assert validate_command(command).allowed is True, command

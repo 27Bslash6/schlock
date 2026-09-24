@@ -446,6 +446,32 @@ def _command_words(node: Any) -> "list[str]":
     return words
 
 
+def _effective_command_name(node: Any) -> Optional[str]:
+    """Basename of the command a command node runs, multicall applets resolved.
+
+    `busybox sh` and `builtin source` run `sh` and `source`, so a heredoc on either is shell
+    code; keying on the literal first word read both bodies as inert text (LAB-3522).
+    """
+    words = _command_words(node)
+    if not words:
+        return None
+    return _resolve_multicall(words[0].split("/")[-1], words[1:])[0]
+
+
+def runs_stdin_as_shell(ast_nodes: "list[Any]") -> bool:
+    """True if some command in `ast_nodes` executes its stdin as shell code.
+
+    The question a heredoc head asks whose body no parser could read: `bash <<'EOF'` and
+    `command . /dev/stdin <<'EOF'` run the body, `bash script.sh <<'EOF'` and `cat <<'EOF'`
+    do not. Same classification as the here-string sink, wrappers included.
+    """
+    return any(
+        (found := _classify_sink(node, "")) is not None and found[0] in HEREDOC_SHELL_COMMANDS
+        for root in ast_nodes
+        for node in _command_nodes(root)
+    )
+
+
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
 
@@ -797,8 +823,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
-        executes_body = cmd_name in HEREDOC_SHELL_COMMANDS
+        executes_body = _effective_command_name(node) in HEREDOC_SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1145,12 +1170,7 @@ class BashCommandParser:
             """Recursively visit AST nodes to find heredocs."""
             if hasattr(node, "kind"):
                 # Track command name for determining if heredoc goes to shell
-                cmd_name = None
-                if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            cmd_name = part.word.split("/")[-1]  # Handle /bin/bash
-                            break
+                cmd_name = _effective_command_name(node) if node.kind == "command" else None
 
                 # Check for redirect nodes with heredocs
                 if node.kind == "redirect" and hasattr(node, "heredoc"):

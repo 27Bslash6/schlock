@@ -2533,11 +2533,15 @@ class TestParseFailureFailsClosed:
 
         Asserted at its current value rather than skipped, so a LAB-3094 fix has
         to come back through here and re-state the residual.
+
+        LAB-3522 closed the first consumer: a head that runs its stdin as shell is
+        denied, since the fallback cannot read the body it would be vouching for.
+        The second remains the residual.
         """
         shell_consumer = validate_command("bash <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
         write_then_run = validate_command("cat <<'EOF' > s.sh\nrm -rf /\nEOF\nbash s.sh", config_path=safety_rules_path)
 
-        assert shell_consumer.allowed is True
+        assert shell_consumer.allowed is False
         assert write_then_run.allowed is True
 
         # The unquoted twins parse, so their bodies are reachable by the rules

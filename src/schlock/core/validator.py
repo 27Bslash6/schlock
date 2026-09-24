@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import HEREDOC_SHELL_COMMANDS, WRAPPER_COMMANDS, BashCommandParser, may_expand
+from .parser import HEREDOC_SHELL_COMMANDS, WRAPPER_COMMANDS, BashCommandParser, may_expand, runs_stdin_as_shell
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -1968,9 +1968,25 @@ def _heredoc_base_result(engine: "RuleEngine", base_command: str) -> ValidationR
     # `rm -rf /` is a hard BLOCK on a command that is LOW without the heredoc.
     parser = _get_parser()
     try:
-        literals = parser.extract_string_literals(base_command, parser.parse(base_command))
+        head = parser.parse(base_command)
+        literals = parser.extract_string_literals(base_command, head)
     except (ParseError, ValueError):
-        literals = None  # a compound head like `for f in a b; do cat` need not parse alone
+        head, literals = [], None  # a compound head like `for f in a b; do cat` need not parse alone
+
+    # This fallback never reads the body, so for a head that runs its stdin as shell code
+    # (`bash <<'EOF'`, `source /dev/stdin <<'EOF'`) "content not validated" would vouch for
+    # code nobody checked. Shell we cannot read is shell we cannot vouch for (LAB-3522).
+    if runs_stdin_as_shell(head):
+        return ValidationResult(
+            allowed=False,
+            risk_level=RiskLevel.BLOCKED,
+            message="BLOCKED: Cannot validate a shell heredoc body behind a quoted delimiter",
+            alternatives=["Use an unquoted delimiter (<<EOF) so the body can be validated"],
+            exit_code=1,
+            error=None,
+            matched_rules=[],
+        )
+
     match = engine.match_command(base_command, string_literals=literals)
     if match.matched and match.rule:  # rule is guaranteed by __post_init__ but helps type checker
         return ValidationResult(
