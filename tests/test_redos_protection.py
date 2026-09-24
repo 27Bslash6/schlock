@@ -15,6 +15,23 @@ from schlock.core.rules import RuleEngine
 from schlock.core.validator import validate_command
 
 
+def _one_command_gap_patterns(rules_path):
+    """Every pattern that uses credential_exposure's one-command gap."""
+    engine = RuleEngine(rules_path)
+    rules = [
+        "credential_exposure",
+        "hardcoded_secrets",
+        "privilege_escalation_variants",
+        "partition_manipulation",
+        "filesystem_wipe",
+        "source_remote_script",
+        "recursive_permission_system_dirs",
+    ]
+    patterns = [p for r in rules for p in engine.compiled_patterns[r]]
+    extended = engine.compiled_patterns["extended_credential_exposure"]
+    return patterns + [p for p in extended if p.pattern.startswith(("echo", "printf"))]
+
+
 class TestReDoSProtection:
     """Test that validation completes quickly even with pathological inputs."""
 
@@ -179,19 +196,7 @@ class TestReDoSProtection:
         the input), not quadratic. The `.{0,200}` it replaced took ~0.1s here.
         Measured at the regex layer because the whole validator hides it.
         """
-        engine = RuleEngine(safety_rules_path)
-        rules = [
-            "credential_exposure",
-            "hardcoded_secrets",
-            "privilege_escalation_variants",
-            "partition_manipulation",
-            "filesystem_wipe",
-            "source_remote_script",
-            "recursive_permission_system_dirs",
-        ]
-        patterns = [p for r in rules for p in engine.compiled_patterns[r]]
-        extended = engine.compiled_patterns["extended_credential_exposure"]
-        patterns += [p for p in extended if p.pattern.startswith(("echo", "printf"))]
+        patterns = _one_command_gap_patterns(safety_rules_path)
         text = (unit * (64 * 1024 // len(unit) + 1))[: 64 * 1024]
 
         start = time.perf_counter()
@@ -200,6 +205,28 @@ class TestReDoSProtection:
         elapsed = time.perf_counter() - start
 
         assert elapsed < 3.0, f"{unit!r} x density took {elapsed:.3f}s"
+
+    @pytest.mark.parametrize(("piece", "count"), [(" >&11111111", 7), (" &>>f", 20), (" $(x)", 20)])
+    def test_one_command_gap_has_one_parse(self, safety_rules_path, piece, count):
+        """A piece that can end in two places multiplies the parses of a failed match.
+
+        `[<>]&[0-9-]+` gave `>&11111111` eight parses, `&>>?` gave `&>>` two, and a
+        walk-on `$(` without its lookahead gives `$(x)` two. Each input below took
+        1.5s to 2.6s that way, and one more repetition multiplies it. With one
+        parse each, it takes well under a millisecond. Each rule's gap has its own
+        copy of the pieces, so every anchor gets a command.
+        """
+        anchors = ["cat", "echo", "echo 'key'", "printf", "export", "chroot", "parted", "shred", "chown", "chown -R"]
+        anchors += ["source /tmp/", ". /tmp/"]
+        text = "; ".join(anchor + piece * count + " x" for anchor in anchors)
+        patterns = _one_command_gap_patterns(safety_rules_path)
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.25, f"{piece!r} x {count} took {elapsed:.3f}s"
 
 
 class TestBoundedQuantifierEdgeCases:
