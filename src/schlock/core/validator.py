@@ -2820,6 +2820,23 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     quote_source=parse_target,
                     heredoc_ranges=heredoc_ranges,
                 )
+
+            # A `"$(…)"` body is code, which the passes above suppressed with its quoted
+            # word. Matched once, over the whole AST, after the segments are rated: a `for`
+            # word list is in no segment, and a body only ever raises the verdict those
+            # checks reached, never takes part in reaching it. No whitelist: a body can be
+            # a whole list, and whitelist patterns are prefix matches.
+            for body in parser.extract_quoted_substitution_bodies(command, ast):
+                body_match = engine.match_command(
+                    body.text,
+                    string_literals=body.string_literals,
+                    heredoc_ranges=body.heredoc_ranges,
+                    use_whitelist=False,
+                )
+                if body_match.risk_level > match.risk_level:
+                    match = body_match
+                    if all_matched_rules and body_match.rule:
+                        all_matched_rules.append(body_match.rule.name)
         except ConfigurationError as e:
             return ValidationResult(
                 allowed=False,
