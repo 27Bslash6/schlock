@@ -1219,6 +1219,12 @@ class TestObfuscationDetection:
             "x[0]=1 IFS[0]=,",
             "f(){ local IFS[0]=,; }; f",
             "command declare 'IFS[0]=,'",
+            "let IFS[0]=1",
+            # An element assignment ahead of a writer does not hide it from the writer check.
+            "x[0]=1 printf -v IFS ,",
+            "a=1 x[0]=1 b=2 read IFS <<< ,",
+            "x[ 0 ]=1 read -r IFS <<< ,",
+            "sleep 0 & wait -n -p IFS",
             "mapfile -t IFS <<< ,",
             "readarray -t IFS <<< ,",
             "read -a IFS <<< ,",

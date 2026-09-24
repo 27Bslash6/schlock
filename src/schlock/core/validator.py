@@ -460,10 +460,16 @@ _NAME_WRITERS: dict[str, tuple[str, str]] = {
     "mapfile": ("dnOsuCc", ""),
     "getopts": ("", ""),
     "printf": ("", "v"),
+    "wait": ("", "p"),
 }
 
-# Builtins whose operands are assignments (`declare IFS[0]=,`).
-_DECLARATIONS = frozenset({"declare", "typeset", "local", "export", "readonly"})
+# Builtins whose operands can be assignments (`declare IFS[0]=,`, `let IFS[0]=1`).
+_DECLARATIONS = frozenset({"declare", "typeset", "local", "export", "readonly", "let"})
+
+# A word bashlex leaves unclassified in a prefix run once an element assignment has started it:
+# `x[0]=1`, a plain `b=2` after it, or `x[` when a blank inside the subscript split the word.
+_ASSIGNMENT = re.compile(r"[A-Za-z_]\w*(?:\[|\+?=)")
+_SUBSCRIPT_END = re.compile(r"\]\+?=")
 
 # Characters that start a parameter, command, brace or pathname expansion, any of which can turn
 # a word into something else before bash reads it.
@@ -533,12 +539,19 @@ def _loop_names(nodes: list[Any]) -> list[str]:
 
 
 def _writes_ifs(words: list[str]) -> bool:
-    """Whether ``words`` (one command, name first) writes IFS through an operand or an element."""
-    # bashlex reads an element assignment (`IFS[0]=,`, `IFS[ 0 ]=,`) as plain words, so a prefix
-    # run of them arrives as the command name. As an operand, `IFS[0]` is data (`echo IFS[0]`)
-    # unless a declaration builtin takes it as an assignment (`local IFS[0]=,`).
-    if re.match(r"[A-Za-z_]\w*\[", words[0]):
-        return any(word.startswith("IFS[") for word in words)
+    """Whether ``words`` (one command, as bashlex splits it) writes IFS through an operand or an element."""
+    # bashlex reads an element assignment (`IFS[0]=,`) as a plain word, so it and the assignments
+    # after it arrive ahead of the command name: skip them, then check the command they prefix
+    # (`x[0]=1 read IFS`). As an operand, `IFS[0]` is data (`echo IFS[0]`) unless a declaration
+    # builtin takes it as an assignment (`local IFS[0]=,`).
+    i = 0
+    while i < len(words) and (assignment := _ASSIGNMENT.match(words[i])):
+        if words[i].startswith("IFS["):
+            return True
+        while assignment.group().endswith("[") and i < len(words) and not _SUBSCRIPT_END.search(words[i]):
+            i += 1
+        i += 1
+    words = words[i:]
     i = 0
     while i < len(words) and (words[i] in ("builtin", "command") or (i and words[i].startswith("-"))):
         i += 1
@@ -2981,7 +2994,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             )
             # Don't cache config errors
 
-        # Step 5a: the AST half of `ifs_obfuscation` (_writes_ifs), scored as the rule itself so an
+        # Step 5a: the AST half of `ifs_obfuscation` (_writes_ifs, _loop_names), scored as the rule itself so an
         # override or a custom rule set applies to both halves alike.
         ifs_rule = next((rule for rule in engine.rules if rule.name == "ifs_obfuscation"), None)
         if (
