@@ -96,7 +96,5 @@ jobs:
       uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # The action exits 1 without a license on organization-owned repositories
-        # and skips the check on personal-account ones, so this is inert until the
-        # repository moves to an organization.
+        # Required on organization-owned repositories; the action exits 1 without it.
         GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
