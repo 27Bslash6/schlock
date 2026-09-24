@@ -507,7 +507,11 @@ def _names_written(builtin: str, operands: list[str]) -> list[str]:
     if builtin == "printf":
         return names
     if builtin == "getopts":
+        # getopts OPTSTRING NAME [ARG...]: only the second operand is a variable it writes.
         return rest[1:2]
+    if builtin in ("mapfile", "readarray"):
+        # One array operand; `mapfile lines IFS` writes `lines`, and bash rejects the extra word.
+        return names + rest[:1]
     return names + rest
 
 
@@ -518,16 +522,16 @@ def _writes_ifs(words: list[str]) -> bool:
         i += 1
     if i >= len(words):
         return False
-    name, operands = words[i], words[i + 1 :]
-    # A command word that expands (`$c`, `{read,}`, bashlex's `$'read'` -> `$read`) can name any
-    # of the writers, so its operands are read the way each of them would read them.
-    if not _EXPANDS.isdisjoint(name):
-        builtins = list(_NAME_WRITERS)
-    elif name in _NAME_WRITERS:
-        builtins = [name]
-    else:
+    # bashlex reads `$'read'` as `$read`; dropping `$` restores that literal name. A command word
+    # that truly expands at runtime (`$c`, a glob, a brace group) can name any command, so from the
+    # text alone it is undecidable which builtin — if any — runs. Treating it as every writer
+    # over-blocks `$cmd IFS`, where `IFS` is a plain data argument to whatever `$cmd` is. Indirect
+    # naming of a writer (variable/glob dispatch, a function forwarding to `read`) is the LAB-5031
+    # class, not caught here; only a name that resolves to a literal writer is.
+    name = words[i].replace("$", "")
+    if name not in _NAME_WRITERS:
         return False
-    return any(_may_name_ifs(word) for builtin in builtins for word in _names_written(builtin, operands))
+    return any(_may_name_ifs(word) for word in _names_written(name, words[i + 1 :]))
 
 
 # LAB-2754: commands whose *argument* is a program, not data.

@@ -1247,11 +1247,6 @@ class TestObfuscationDetection:
             "read -r 'IFS[0]' <<< ,",
             "printf -v 'IFS[0]' ,",
             "read -${x}d IFS <<< ,",
-            # A command word that expands can name the builtin.
-            "c=read; $c -r IFS <<< ,; x=ls,-la; $x",
-            "c=printf; $c -v IFS ,; x=ls,-la; $x",
-            "c=command; $c read -r IFS <<< ,; x=ls,-la; $x",
-            "{read,} IFS <<< ,",
         ],
     )
     def test_ifs_written_as_operand_blocked(self, safety_rules_path, cmd):
@@ -1285,6 +1280,14 @@ class TestObfuscationDetection:
             'read -rp "${PROMPT}" answer',
             "read -p 'IFS? ' answer",
             "read -d ';' -r field",
+            # An expanding command word is not assumed to be a writer: IFS here is a data argument.
+            "cmd=echo; $cmd IFS",
+            "cmd=grep; $cmd IFS notes.txt",
+            "cmd=ls; $cmd IFS",
+            "${PAGER:-cat} IFS",
+            # mapfile/readarray write only their first array operand; a trailing IFS is not a name.
+            "mapfile lines IFS <<< x",
+            "readarray lines IFS <<< x",
         ],
     )
     def test_ifs_as_data_not_flagged(self, safety_rules_path, cmd):
