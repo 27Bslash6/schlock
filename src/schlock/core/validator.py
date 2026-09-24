@@ -1876,6 +1876,15 @@ def _phantom_heredoc(command: str, heredoc_ranges: list[tuple], heredoc_ends: Op
     independent bash parser on (see `_shell_heredoc_bodies`). ``heredoc_ends`` is None
     when the scan could not read the command, and then there is nothing to compare
     against: that input keeps the route it had.
+
+    SCOPE: the caller runs this only on a command the normaliser rewrote - exactly the
+    inputs that reached the fallback's guard before - and deliberately not on every
+    command. The disagreement is evidence of a phantom only where the scan is right,
+    and the scan has a known blind spot: an opener inside a double-quoted `$( … )` is
+    invisible to it while bashlex reads it correctly (LAB-4615). Run on everything,
+    this refuses `git commit -m "$(cat <<EOF … EOF )"`, an everyday form that main
+    allows. The same broad version would close LAB-4317's bare `(( 1<<b ))` cases, so
+    the two want deciding together, with the blind spot fixed first.
     """
     if heredoc_ends is None:
         return None
@@ -2620,7 +2629,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # Extract heredoc ranges - matches inside non-shell heredocs should be ignored
             # 'cat << EOF' just outputs text, 'bash << EOF' executes it
             heredoc_ranges = parser.extract_heredoc_ranges(parse_target, ast)
-            phantom = _phantom_heredoc(command, heredoc_ranges, normalised.heredoc_ends)
+            # Only for a command the normaliser rewrote - one that took the fallback before
+            # LAB-3094, where this same guard already ran (see `_phantom_heredoc`).
+            phantom = _phantom_heredoc(command, heredoc_ranges, normalised.heredoc_ends) if parse_target != command else None
             if phantom is not None:
                 error = (
                     f"bashlex reads a heredoc {phantom!r} that this command does not open; "

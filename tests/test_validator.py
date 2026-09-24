@@ -3117,6 +3117,20 @@ class TestHeredocBoundariesOnTheNativePath:
 
         assert [command[start:end] for start, end, _ in normalised.blanked] == ["echo a\n\nrm -rf /"]
 
+    def test_the_phantom_guard_does_not_refuse_the_standard_commit_form(self, safety_rules_path):
+        """The guard runs only where the fallback's ran; the scan it relies on has a blind spot.
+
+        An opener inside a double-quoted `$( … )` is invisible to the scan and read correctly
+        by bashlex, so there the disagreement is the scan's error, not a phantom. Run on every
+        command, the guard refused this - the form Claude Code writes its commits in, allowed
+        on main. (The QUOTED-delimiter spelling is denied on main as well, for that same blind
+        spot; that is LAB-4615, and deliberately not pinned here as if it were intended.)
+        """
+        result = validate_command('git commit -m "$(cat <<EOF\nfix: a thing\nEOF\n)"', config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+        assert "git_commit" in result.matched_rules
+
     def test_a_heredoc_only_bashlex_sees_is_refused_behind_a_lesser_rule(self, safety_rules_path):
         """The fallback's phantom-heredoc guard, carried onto the native path.
 
