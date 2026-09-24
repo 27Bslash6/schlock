@@ -407,6 +407,17 @@ def _command_words(node: Any) -> "list[str]":
     return words
 
 
+def command_name(node: Any) -> Optional[str]:
+    """The name a command node runs: its first word, basename only; None when it has none.
+
+    Built on `_command_words`, so an assignment prefix is skipped: `FOO=1 bash` runs `bash`.
+    Taking the first part that merely HAS a `.word` read it as a command named `FOO=1`, and
+    a shell behind any assignment was then treated as an inert heredoc consumer.
+    """
+    words = _command_words(node)
+    return words[0].split("/")[-1] if words else None
+
+
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
 
@@ -758,8 +769,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
-        executes_body = cmd_name in _HEREDOC_SHELL_COMMANDS
+        executes_body = command_name(node) in _HEREDOC_SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1108,10 +1118,7 @@ class BashCommandParser:
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            cmd_name = part.word.split("/")[-1]  # Handle /bin/bash
-                            break
+                    cmd_name = command_name(node)
 
                 # Check for redirect nodes with heredocs
                 if node.kind == "redirect" and hasattr(node, "heredoc"):
