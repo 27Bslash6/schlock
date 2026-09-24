@@ -12,8 +12,6 @@ zsh): `bash -c -- PROG` runs PROG; `bash -ce PROG` runs PROG; `bash -cPROG` is r
 with "option requires an argument", so an attached payload is not a thing.
 """
 
-import shutil
-
 import pytest
 
 from schlock.core import validator
@@ -29,6 +27,7 @@ from schlock.core.validator import (
     clear_caches,
     validate_command,
 )
+from schlock.integrations.shellcheck import is_shellcheck_available
 
 
 @pytest.fixture(autouse=True)
@@ -732,7 +731,7 @@ class TestTrapHandlerShellCheck:
         self._spy(monkeypatch, None)
         assert validate_command("trap 'echo done' EXIT").risk_level == RiskLevel.BLOCKED
 
-    @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="ShellCheck not installed")
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
     @pytest.mark.parametrize(
         ("trap", "inline"),
         [
