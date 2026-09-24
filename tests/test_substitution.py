@@ -1796,6 +1796,11 @@ class TestQuotedSubstitutionBodies:
         """Nested bodies are scanned once per enclosing body, so deep nesting is a stall."""
         deep = "echo " + '"$(echo ' * 100 + "x" + ')"' * 100
         assert validate_command(deep).risk_level == RiskLevel.BLOCKED
+        # Nine levels stay under the substitution depth limit, so only the budget can raise.
+        parser = BashCommandParser()
+        shallow = "echo " + '"$(echo ' * 9 + "x" + ')"' * 9
+        with pytest.raises(ValueError, match="exceed"):
+            parser.extract_quoted_substitution_bodies(shallow, parser.parse(shallow))
         honest = 'echo "$(basename "$(dirname "$(readlink -f "$(which python)")")")"'
         assert validate_command(honest).risk_level == RiskLevel.SAFE
 
