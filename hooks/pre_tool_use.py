@@ -334,7 +334,7 @@ def format_message(result: ValidationResult, decision: str = "deny") -> str:
     Format for "ask" (prompt):
         CAUTION: <reason>
         Risk Level: <risk_level>
-        Rules matched: <rule>, <rule>   (only when two or more rules matched)
+        Rules matched: <rule>, <rule>   (only when two or more distinct rules matched)
         Alternatives:
           - <alternative 1>
 
@@ -356,8 +356,10 @@ def format_message(result: ValidationResult, decision: str = "deny") -> str:
     lines.append(f"Risk Level: {result.risk_level.name}")
 
     # `message` comes from one rule; name every rule so a tie cannot hide the second (LAB-5002)
-    if len(result.matched_rules) > 1:
-        lines.append("Rules matched: " + ", ".join(result.matched_rules))
+    # Segments repeat rules (`rm -r a && rm -r b`), so dedupe in order before counting
+    rules = list(dict.fromkeys(result.matched_rules))
+    if len(rules) > 1:
+        lines.append("Rules matched: " + ", ".join(rules))
 
     # Alternatives (if any)
     if result.alternatives:

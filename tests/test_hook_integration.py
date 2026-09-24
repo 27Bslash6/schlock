@@ -126,19 +126,20 @@ class TestMessageFormatting:
             message = format_message(result)
             assert f"Risk Level: {risk_level.name}" in message
 
-    @pytest.mark.parametrize("matched_rules", [["x"], []])
+    @pytest.mark.parametrize("matched_rules", [["x"], [], ["x", "x"]])
     def test_single_or_no_rule_output_unchanged(self, matched_rules):
-        """One rule or none: no `Rules matched` line, output as before LAB-5002."""
+        """One distinct rule or none: no `Rules matched` line, output as before LAB-5002."""
         result = ValidationResult(
             allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
         )
         assert format_message(result, decision="ask") == "CAUTION: Reason\nRisk Level: HIGH\n\nAlternatives:\n  - Alt"
 
     @pytest.mark.parametrize(("decision", "status"), [("ask", "CAUTION"), ("deny", "BLOCKED")])
-    def test_every_matched_rule_is_named(self, decision, status):
+    @pytest.mark.parametrize("matched_rules", [["a", "b"], ["a", "b", "a"]])
+    def test_every_matched_rule_is_named(self, decision, status, matched_rules):
         """A tie must not hide the second rule behind the first rule's message (LAB-5002)."""
         result = ValidationResult(
-            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=["a", "b"]
+            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
         )
         assert format_message(result, decision=decision) == (
             f"{status}: Reason\nRisk Level: HIGH\nRules matched: a, b\n\nAlternatives:\n  - Alt"
