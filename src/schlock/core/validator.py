@@ -2143,24 +2143,27 @@ def _escalate_past_heredoc(
     return result
 
 
-def _substitution_denial(sub_result: SubstitutionValidationResult) -> ValidationResult:
+def _substitution_verdict(sub_result: SubstitutionValidationResult) -> ValidationResult:
     """Render a substitution verdict as a ValidationResult.
 
     The hook maps risk to the action, so only a genuine BLOCKED verdict may claim the word: an
     amplified-HIGH one is shown as an "ask" prompt, and a prompt whose text reads "BLOCKED" tells
-    the user the opposite of the truth.
+    the user the opposite of the truth. An allowed verdict stays allowed: it carries a rule match
+    that decides the level without denying (LAB-4223).
     """
     denied = sub_result.risk_level == RiskLevel.BLOCKED
     return ValidationResult(
-        allowed=False,
+        allowed=sub_result.allowed,
         risk_level=sub_result.risk_level,
         message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
-        alternatives=[
+        alternatives=[]
+        if sub_result.allowed
+        else [
             "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
             "Run the command directly instead of using substitution",
             "If this command is safe, request it be added to the whitelist",
         ],
-        exit_code=1,
+        exit_code=0 if sub_result.allowed else 1,
         error=None,
         matched_rules=list(sub_result.matched_rules),
     )
@@ -2177,10 +2180,11 @@ def validate_command(
     """Validate a command for safety — the main validation API.
 
     Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
-    denial too weak to have short-circuited it. The join lives HERE, outside the passes, because
-    a join made at any one pass is a join the passes added after it will miss: that is precisely
-    how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked back down to HIGH
-    merely by having a substitution appended. Whatever returns first, the worse verdict wins.
+    verdict above SAFE too weak to have short-circuited it. The join lives HERE, outside the
+    passes, because a join made at any one pass is a join the passes added after it will miss:
+    that is precisely how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked
+    back down to HIGH merely by having a substitution appended. Whatever returns first, the
+    worse verdict wins.
 
     ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
     :func:`_validate_command`.
@@ -2191,23 +2195,25 @@ def validate_command(
     )
     if not deferred:
         return result
-    denial = _substitution_denial(deferred[0])
+    sub = _substitution_verdict(deferred[0])
     # The higher level wins, on level alone: a HIGH rule match arrives with allowed=True, so
     # deciding on `allowed` sent every HIGH tie to the substitution and `rm -r d $(base64 -d f)`
-    # lost `recursive_delete`. A tie is denied and reports both halves, so a cheap HIGH rule
-    # up front cannot hide the refused substitution from the prompt. Only `deferred[0]`, the
-    # first worst substitution, is named.
-    if denial.risk_level > result.risk_level:
-        return denial
-    if denial.risk_level < result.risk_level:
+    # lost `recursive_delete`. A tie is denied if either half is, and reports both halves, so a
+    # cheap HIGH rule up front cannot hide the refused substitution from the prompt. Only
+    # `deferred[0]`, the first worst substitution, is named. An allowed substitution verdict (a
+    # rule match below HIGH, LAB-4223) joins the same way and denies nothing.
+    if sub.risk_level > result.risk_level:
+        return sub
+    if sub.risk_level < result.risk_level:
         return result
+    allowed = result.allowed and sub.allowed
     return replace(
         result,
-        allowed=False,
-        exit_code=1,
-        message=f"{result.message}; {denial.message}",
-        alternatives=[*result.alternatives, *denial.alternatives],
-        matched_rules=[*result.matched_rules, *denial.matched_rules],
+        allowed=allowed,
+        exit_code=0 if allowed else 1,
+        message=f"{result.message}; {sub.message}",
+        alternatives=[*result.alternatives, *sub.alternatives],
+        matched_rules=[*result.matched_rules, *sub.matched_rules],
     )
 
 
@@ -2222,7 +2228,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution denial too weak to short-circuit is placed
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE and below BLOCKED is placed
     there for the caller to join. It is a list rather than a return value so that every one of
     this function's returns carries it without having to remember to.
 
@@ -2350,10 +2356,12 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
             # weaker is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
-                if sub_result.allowed:
-                    continue  # Don't cache (substitution content may vary)
+                # An allowed verdict above SAFE is a rule match that decides the level (LAB-4223):
+                # it is owed the join too, and deferring it also keeps the pre-join verdict uncached.
+                if sub_result.allowed and sub_result.risk_level == RiskLevel.SAFE:
+                    continue
                 if sub_result.risk_level == RiskLevel.BLOCKED:
-                    return _substitution_denial(sub_result)
+                    return _substitution_verdict(sub_result)
                 if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
                     _deferred[:] = [sub_result]
 
@@ -2664,7 +2672,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # reason: that verdict is weaker than the one a fresh call would produce for the key. The
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
-        # Nor when a substitution denial is still owed a join: the cached entry would be the
+        # Nor when a substitution verdict is still owed a join: the cached entry would be the
         # pre-join verdict, and the next identical command would hit it and skip the join.
         if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)
