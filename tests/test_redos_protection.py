@@ -182,6 +182,13 @@ class TestReDoSProtection:
             "echo $((1)) ",
             "echo $(a $(b) | c) ",
             "cat $(a (b ",
+            "echo$($(",
+            "echo $(",
+            "echo $(x",
+            "echo ${",
+            "echo $(${",
+            'echo $("',
+            "echo $(a ('",
             "cat '",
             "export ",
             "chroot ",
@@ -206,12 +213,15 @@ class TestReDoSProtection:
 
         assert elapsed < 3.0, f"{unit!r} x density took {elapsed:.3f}s"
 
-    @pytest.mark.parametrize(("piece", "count"), [(" >&11111111", 7), (" &>>f", 20), (" $(x)", 20)])
+    @pytest.mark.parametrize(
+        ("piece", "count"), [(" >&11111111", 7), (" &>>f", 20), (" $(x)", 20), (" ${x}", 20), (" $(" + "${x}" * 7, 1)]
+    )
     def test_one_command_gap_has_one_parse(self, safety_rules_path, piece, count):
         """A piece that can end in two places multiplies the parses of a failed match.
 
         `[<>]&[0-9-]+` gave `>&11111111` eight parses, `&>>?` gave `&>>` two, and a
-        walk-on `$(` without its lookahead gives `$(x)` two. Each input below took
+        walk-on `$(` without its lookahead gives `$(x)` two, as does a bare `$` that
+        can also start `${x}`, at the gap and inside a `$(` that never closes. Each took
         1.5s to 2.6s that way, and one more repetition multiplies it. With one
         parse each, it takes well under a millisecond. Each rule's gap has its own
         copy of the pieces, so every anchor gets a command.

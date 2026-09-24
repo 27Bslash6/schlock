@@ -52,6 +52,11 @@ class TestTheNextCommandDoesNotCompleteTheRule:
             'echo $(basename $(pwd)) && git commit -m "fix: hash password"',
             'echo $(ls $(pwd) | wc -l) && git commit -m "fix: hash password"',
             'cat $(dirname $(pwd); true)/README && git commit -m "docs: .env"',
+            # A quoted paren inside a substitution is data, not an inner group.
+            "echo $(grep -c '(' x) && git commit -m \"fix(auth): hash password\"",
+            'echo $(printf "(") && git commit -m "fix: hash password"',
+            "chroot /srv $(printf '(') && sh build.sh",
+            "cat $(echo ')') && git commit -m 'docs: .env'",
             # remote_execution: `| shasum` is not `| sh`, `rsync` is not `nc`.
             "npm install && curl -s localhost:3000 | shasum",
             "git commit -am x && git fetch && git log | sha512sum",
@@ -171,7 +176,8 @@ PAYLOADS = [
     ("credential_exposure", "cat $(ls $(pwd) | head -1)/.env"),
     ("credential_exposure", "cat $(dirname $(pwd); true)/.env"),
     ("credential_exposure", "echo $(cat $(ls) | grep password)"),
-    ("credential_exposure", "echo $(printf x $(cat password.txt | wc))"),
+    # The target inside an inner substitution still open at the target: the tail's open-inner arm.
+    ("credential_exposure", "echo $(printf x $(cat password.txt))"),
     ("extended_credential_exposure", "printf $(ls $(pwd) | wc -l) $API_KEY"),
     ("hardcoded_secrets", "export A=$(ls $(pwd) | wc -l) FOO_KEY=x"),
     ("hardcoded_secrets", "echo $(ls $(pwd) | wc -l) 'api_key=x' > config"),
@@ -180,6 +186,29 @@ PAYLOADS = [
     ("filesystem_wipe", "shred $(ls $(pwd) | head -1) /dev/sda"),
     ("source_remote_script", "source /tmp/$(ls $(pwd) | head -1)/x.sh"),
     ("recursive_permission_system_dirs", "chown -R $(id -un $(whoami) | tr a a) /etc"),
+    # An escaped `)`, a quoted paren and a `${...}` do not close or open a substitution,
+    # so the separator after them is still data: one per gap.
+    ("credential_exposure", "cat $(echo a\\) ; echo ~)/.env"),
+    ("credential_exposure", "cat $(echo ')' ; echo ~)/id_rsa"),
+    ("credential_exposure", "echo $(printf '%s' \"(\" ; true) password"),
+    ("credential_exposure", "cat ${x//|/y} .env"),
+    ("credential_exposure", "cat $(echo ${x:-)} ; echo ~)/.env"),
+    ("extended_credential_exposure", "echo $(a \\) ; b) $GITHUB_TOKEN"),
+    ("extended_credential_exposure", "printf ${x//|/y} $API_KEY"),
+    ("hardcoded_secrets", "export A=$(echo a\\) ; b) B_KEY=x"),
+    ("hardcoded_secrets", "export A=${x//|/y} MY_TOKEN=x"),
+    ("hardcoded_secrets", "echo $(a ')' ; b) 'api_key=x' > f"),
+    ("hardcoded_secrets", "echo 'secret_key=' $(a ${x:-)} ; b) \"x\" > .env"),
+    ("privilege_escalation_variants", "chroot $(echo a\\) ; echo x) /bin/bash"),
+    ("partition_manipulation", "parted -s ${x//|/y} /dev/sda mklabel gpt"),
+    ("filesystem_wipe", "shred $(echo \\) ; echo /dev/sda) /dev/sda"),
+    ("source_remote_script", "source /tmp/$(echo a\\) ; b)/x.sh"),
+    ("source_remote_script", '. /tmp/$(a "(" | b)/x.sh'),
+    ("recursive_permission_system_dirs", "chown -R $(a '(' ; b) /etc"),
+    ("recursive_permission_system_dirs", "chown $(a ${x:-)} ; b) -R /etc"),
+    # A gap walks through up to three `$(` the piece cannot balance.
+    ("credential_exposure", "cat $(a $(b $(c $(d $(e)))))/.env"),
+    ("credential_exposure", "cat $(a $(b $(c)))/$(d $(e $(f)))/$(g $(h $(i)))/.env"),
 ]
 
 
