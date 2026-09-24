@@ -2932,7 +2932,7 @@ class TestHeredocDelimiterNormalisation:
         The rewrite has to survive RE-LEXING, not just quote removal. `-q` is a legal
         delimiter ending the body at a line reading `-q`; read as the `<<-` operator the
         body instead ends at `q`, and every command between the two is filed as inert
-        heredoc text. Caught by the panel on this PR - it is this ticket's own defect
+        heredoc text. Caught in review of this PR - it is this ticket's own defect
         class reintroduced by its own fix.
         """
         for command in ["cat <<'-q'\nx\n-q", "cat <<'-'\nx\n-", "cat <<'--force'\nx\n--force"]:
