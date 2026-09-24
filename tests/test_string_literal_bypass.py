@@ -237,18 +237,20 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
         [
             # Everyday heredoc pipe: must not trip the fail-closed segment branch.
             ("cat <<EOF | grep x\nhello\nEOF", True, RiskLevel.SAFE),
-            # Body now travels with the segment, so it needs the same non-shell
-            # heredoc suppression a standalone command gets: pre-fix verdict kept.
-            ("cat <<EOF | grep x && chmod 777 f\nrm -rf /\nEOF", True, RiskLevel.HIGH),
+            # The segment suppresses its body; the whole-command scan does not, and
+            # it now runs whatever the segments matched. Same verdict as the command
+            # without `&& chmod`.
+            ("cat <<EOF | grep x && chmod 777 f\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
             # A shell's heredoc body is code. Was HIGH (body never reached the
             # segment); now matches the single-segment `bash <<EOF` verdict.
             ("bash <<EOF | tee log\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
             # A heredoc NESTED in a substitution is not a direct redirect, so
             # _close_heredocs never sees it and it rides inside the outer
             # segment's slice as inert `cat` output that `diff` only reads.
-            # Its range has to be derived off the parent AST or this legitimate
-            # text comparison is hard-denied on system_destruction (LAB-912).
-            ("diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x", True, RiskLevel.MEDIUM),
+            # Its range is derived off the parent AST, so the segment reads the body
+            # as text (LAB-912); the whole-command scan still denies it, exactly as
+            # it does `echo lead && diff …` with the same body.
+            ("diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x", False, RiskLevel.BLOCKED),
         ],
     )
     def test_heredoc_segment_verdicts(self, safety_rules_path, command, expected_allowed, expected_risk):

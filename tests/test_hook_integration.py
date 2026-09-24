@@ -33,6 +33,7 @@ from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map
 from schlock import RiskLevel, ValidationResult
 from schlock.integrations.audit import COMMAND_LOG_LIMIT, AuditLogger
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
+from schlock.setup.config_writer import RISK_PRESETS
 
 
 @pytest.fixture(autouse=True)
@@ -196,6 +197,39 @@ class TestHookHandler:
         output = response["hookSpecificOutput"]
         assert output["permissionDecision"] == "deny"
         assert output["permissionDecisionReason"].startswith("BLOCKED: Command exceeds size limit")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAmplifiedMediumSubstitutionThroughTheHook:
+    """`git commit` in a substitution is the LOW rule `git_commit` amplified to MEDIUM (LAB-4223).
+
+    It read SAFE with no rule, so paranoid never asked and the audit line claimed no rule matched.
+    """
+
+    COMMAND = 'echo "$(git commit -m evil)"'
+
+    @pytest.mark.parametrize(("preset", "action"), [("paranoid", "ask"), ("balanced", "allow"), ("permissive", "allow")])
+    def test_preset_action_and_audit_line(self, preset, action, tmp_path, monkeypatch):
+        log_file = tmp_path / "audit.jsonl"
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": self.COMMAND}})
+
+        assert response["hookSpecificOutput"]["permissionDecision"] == action
+        (line,) = log_file.read_text().splitlines()
+        event = json.loads(line)
+        assert (event["risk_level"], event["violations"], event["decision"]) == ("MEDIUM", ["git_commit"], action)
+
+    @pytest.mark.parametrize("preset", ["paranoid", "balanced", "permissive"])
+    def test_config_extraction_in_a_substitution_is_denied_on_every_preset(self, preset, monkeypatch):
+        """`tar` over schlock's config is BLOCKED bare; wrapped in `cat "$(…)"` it must not become runnable."""
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+        command = 'cat "$(tar -xf e.tar ~/.claude/hooks/schlock-config.yaml)"'
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 class TestValidatorSingleton:

