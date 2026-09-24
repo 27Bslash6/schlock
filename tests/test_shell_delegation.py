@@ -12,6 +12,8 @@ zsh): `bash -c -- PROG` runs PROG; `bash -ce PROG` runs PROG; `bash -cPROG` is r
 with "option requires an argument", so an attached payload is not a thing.
 """
 
+import shutil
+
 import pytest
 
 from schlock.core import validator
@@ -606,7 +608,7 @@ class TestTrapAction:
             (["rm -rf /", "EXIT"], "rm -rf /"),
             (["rm -rf /", "EXIT", "INT"], "rm -rf /"),
             (["--", "rm -rf /", "EXIT"], "rm -rf /"),
-            # `trap INT TERM` runs the command `INT` on TERM (bash: `trap -p` prints it so).
+            # bash and dash run the command `INT` on TERM; zsh resets both, so INT over-approximates.
             (["INT", "TERM"], "INT"),
             # An unknown option is a usage error to bash but the action to zsh.
             (["-x", "rm -rf /", "EXIT"], "-x"),
@@ -634,11 +636,21 @@ class TestTrapAction:
     def test_listing_reset_and_ignore_forms_have_no_action(self, args):
         assert _trap_action(args) is None
 
-    def test_extractor_reaches_trap_bare_and_behind_builtin_or_command(self):
-        for cmd in [("trap", ["rm -rf /", "EXIT"]), ("builtin", ["trap", "rm -rf /", "EXIT"])]:
-            assert _shell_delegated_payloads([cmd]) == ["rm -rf /"]
-        assert _shell_delegated_payloads([("command", ["trap", "rm -rf /", "EXIT"])]) == ["rm -rf /"]
-        assert _shell_delegated_payloads([("builtin", ["--", "trap", "rm -rf /", "EXIT"])]) == ["rm -rf /"]
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            ("trap", ["rm -rf /", "EXIT"]),
+            ("builtin", ["trap", "rm -rf /", "EXIT"]),
+            ("builtin", ["--", "trap", "rm -rf /", "EXIT"]),
+            ("command", ["trap", "rm -rf /", "EXIT"]),
+        ],
+    )
+    def test_extractor_reaches_trap_bare_and_behind_builtin_or_command(self, cmd):
+        assert _shell_delegated_payloads([cmd]) == ["rm -rf /"]
+        # Given the out-list, the handler is diverted there, never returned as a child payload.
+        handlers: list[str] = []
+        assert _shell_delegated_payloads([cmd], trap_handlers=handlers) == []
+        assert handlers == ["rm -rf /"]
 
 
 class TestTrapHandlerDelegation:
@@ -671,13 +683,6 @@ class TestTrapHandlerDelegation:
         assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
         assert result.allowed is False
 
-    def test_debug_handler_line_scores_at_least_its_handler(self):
-        # A DEBUG handler runs before `$x`, so the state it leaves (here, word splitting) applies
-        # to it. The line must never score below the handler's own text run directly.
-        handler = "for IFS in ,; do :; done"
-        line = validate_command(f"trap '{handler}' DEBUG; x=rm,-rf,/; $x")
-        assert line.risk_level >= validate_command(handler).risk_level
-
     @pytest.mark.parametrize(
         "command",
         ["trap - EXIT", "trap '' INT", "trap -p", "trap -l", "trap -p EXIT", "trap EXIT", "trap 'echo done' EXIT"],
@@ -686,6 +691,61 @@ class TestTrapHandlerDelegation:
         result = validate_command(command)
         assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
         assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        ("command", "twin"), [("builtin eval 'rm -rf /'", "command eval 'rm -rf /'"), ("builtin exec bash", "command exec bash")]
+    )
+    def test_builtin_passes_through_like_command(self, command, twin):
+        # `builtin` runs the named builtin, exactly as `command` does. Pre-fix: SAFE / allowed=True.
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED == validate_command(twin).risk_level
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("command", ["builtin cd /tmp", "builtin echo hi", "builtin read -r line"])
+    def test_benign_builtins_stay_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+
+class TestTrapHandlerShellCheck:
+    """A trap handler is ShellChecked in the command it runs in, never on its own.
+
+    It runs later in the same shell, so its variables are that command's. Checked alone,
+    `tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT` read `$tmp` as unassigned (SC2154) and was BLOCKED,
+    while `tmp=$(mktemp); rm -f "$tmp"` is not.
+    """
+
+    def _spy(self, monkeypatch, result):
+        inputs: list[str] = []
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(validator, "run_shellcheck", lambda text: inputs.append(text) or result)
+        return inputs
+
+    def test_handler_is_checked_appended_to_its_command_not_alone(self, monkeypatch):
+        inputs = self._spy(monkeypatch, [])
+        command = "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT"
+        validate_command(command)
+        assert f'{command}\nrm -f "$tmp"' in inputs
+        assert 'rm -f "$tmp"' not in inputs
+
+    def test_no_verdict_on_a_command_with_a_handler_fails_closed(self, monkeypatch):
+        # This run is the handler's only ShellCheck, so an unfinished one is not a clean one.
+        self._spy(monkeypatch, None)
+        assert validate_command("trap 'echo done' EXIT").risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="ShellCheck not installed")
+    @pytest.mark.parametrize(
+        ("trap", "inline"),
+        [
+            ("tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; echo hi", 'tmp=$(mktemp); echo hi; rm -f "$tmp"'),
+            ("npm run dev & pid=$!; trap 'kill $pid' EXIT; sleep 5", "npm run dev & pid=$!; sleep 5; kill $pid"),
+            ("old=$(pwd); trap 'cd \"$old\"' EXIT; cd /tmp", 'old=$(pwd); cd /tmp; cd "$old"'),
+            ("trap 'rm -r$\"\"f /' EXIT", 'rm -r$""f /'),
+            ("d=/x; trap 'rm -rf \"$d\"/*' EXIT", 'd=/x; rm -rf "$d"/*'),
+        ],
+    )
+    def test_handler_scores_like_the_same_text_run_inline(self, monkeypatch, trap, inline):
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
+        assert validate_command(trap).risk_level == validate_command(inline).risk_level
 
 
 # --------------------------------------------------------------------------------------------
