@@ -461,6 +461,10 @@ _NAME_WRITERS: dict[str, tuple[str, str]] = {
     "printf": ("", "v"),
 }
 
+# Characters that start a parameter, command, brace or pathname expansion, any of which can turn
+# a word into something else before bash reads it.
+_EXPANDS = frozenset("${}*?[`")
+
 
 def _may_name_ifs(word: str) -> bool:
     """Whether ``word`` can reach bash as the name IFS, or as an element of it (`IFS[0]`).
@@ -483,12 +487,12 @@ def _names_written(builtin: str, operands: list[str]) -> list[str]:
     value_letters, name_letter = _NAME_WRITERS[builtin]
     names: list[str] = []
     i = 0
-    while i < len(operands) and (operands[i].startswith("-") or any(char in operands[i] for char in "${}*?[`")):
+    while i < len(operands) and (operands[i].startswith("-") or not _EXPANDS.isdisjoint(operands[i])):
         option = operands[i]
         i += 1
         if option == "--":
             break
-        if option == "-" or not option.startswith("-") or any(char in option for char in "${}*?[`"):
+        if option == "-" or not option.startswith("-") or not _EXPANDS.isdisjoint(option):
             # An expansion can vanish or become any option cluster; every word from here may be a name.
             return names + operands[i - 1 :]
         for j, letter in enumerate(option[1:], start=2):
@@ -509,14 +513,21 @@ def _names_written(builtin: str, operands: list[str]) -> list[str]:
 
 def _writes_ifs(words: list[str]) -> bool:
     """Whether ``words`` (one command, name first) writes IFS through an operand."""
-    # bashlex reads `$'read'` as `$read`; dropping `$` restores the name.
-    names = [word.replace("$", "") for word in words]
     i = 0
-    while i < len(names) and (names[i] in ("builtin", "command") or (i and names[i].startswith("-"))):
+    while i < len(words) and (words[i] in ("builtin", "command") or (i and words[i].startswith("-"))):
         i += 1
-    if i >= len(words) or names[i] not in _NAME_WRITERS:
+    if i >= len(words):
         return False
-    return any(_may_name_ifs(name) for name in _names_written(names[i], words[i + 1 :]))
+    name, operands = words[i], words[i + 1 :]
+    # A command word that expands (`$c`, `{read,}`, bashlex's `$'read'` -> `$read`) can name any
+    # of the writers, so its operands are read the way each of them would read them.
+    if not _EXPANDS.isdisjoint(name):
+        builtins = list(_NAME_WRITERS)
+    elif name in _NAME_WRITERS:
+        builtins = [name]
+    else:
+        return False
+    return any(_may_name_ifs(word) for builtin in builtins for word in _names_written(builtin, operands))
 
 
 # LAB-2754: commands whose *argument* is a program, not data.

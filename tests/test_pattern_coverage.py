@@ -1247,6 +1247,11 @@ class TestObfuscationDetection:
             "read -r 'IFS[0]' <<< ,",
             "printf -v 'IFS[0]' ,",
             "read -${x}d IFS <<< ,",
+            # A command word that expands can name the builtin.
+            "c=read; $c -r IFS <<< ,; x=ls,-la; $x",
+            "c=printf; $c -v IFS ,; x=ls,-la; $x",
+            "c=command; $c read -r IFS <<< ,; x=ls,-la; $x",
+            "{read,} IFS <<< ,",
         ],
     )
     def test_ifs_written_as_operand_blocked(self, safety_rules_path, cmd):
