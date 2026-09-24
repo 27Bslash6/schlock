@@ -154,6 +154,39 @@ class TestReDoSProtection:
 
         assert elapsed < 0.5, f"ifs_obfuscation took {elapsed:.3f}s on {text[:12]!r}..."
 
+    @pytest.mark.parametrize(
+        "unit", ['echo "', "echo '", "echo \\", "echo `", "echo 2>&1 ", "cat '", "export ", "chroot ", "source /tmp/"]
+    )
+    def test_one_command_gap_is_linear_in_anchor_density(self, safety_rules_path, unit):
+        """The shell-word gap restarts at every anchor, so vary ANCHOR DENSITY, not length.
+
+        Every anchor re-runs a bounded gap plus its open-quote tail. That is linear
+        in input size with a large constant (~0.8s at 64 KB, 4x the time for 4x
+        the input), not quadratic. The `.{0,200}` it replaced took ~0.1s here.
+        Measured at the regex layer because the whole validator hides it.
+        """
+        engine = RuleEngine(safety_rules_path)
+        rules = [
+            "credential_exposure",
+            "hardcoded_secrets",
+            "privilege_escalation_variants",
+            "partition_manipulation",
+            "filesystem_wipe",
+            "source_remote_script",
+            "recursive_permission_system_dirs",
+        ]
+        patterns = [p for r in rules for p in engine.compiled_patterns[r]]
+        extended = engine.compiled_patterns["extended_credential_exposure"]
+        patterns += [p for p in extended if p.pattern.startswith(("echo", "printf"))]
+        text = (unit * (64 * 1024 // len(unit) + 1))[: 64 * 1024]
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 3.0, f"{unit!r} x density took {elapsed:.3f}s"
+
 
 class TestBoundedQuantifierEdgeCases:
     """Test edge cases around the boundaries of quantifiers."""
