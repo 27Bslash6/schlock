@@ -548,6 +548,9 @@ _EXPANSION_STARTS = frozenset(string.ascii_letters + string.digits + "_{([@*#?$!
 # disagree about where the word is, and the word's text cannot be trusted either way.
 _WORD_BREAKS = frozenset(" \t\n;&|<>()")
 
+# The escapes bash removes from a backtick substitution's text before parsing it.
+_BACKTICK_UNESCAPES = ("\\$", "\\`", "\\\\", '\\"')
+
 
 def _holds_dollar_quote(text: str) -> bool:
     """Whether ``text`` opens a `$'...'` or `$"..."` quote (a line continuation may sit after the `$`)."""
@@ -569,11 +572,18 @@ class _DollarQuoteDecoder(bashlex.ast.nodevisitor):
     raw, exactly as bashlex spells them, by copying the spans of the child nodes it built for them.
     Anything the reading cannot account for raises ParseError, which the validator blocks: an
     unmodelled escape, an unterminated quote, or an unquoted break or unmodelled expansion inside
-    the span (bashlex and bash would then disagree about the word itself).
+    the span (bashlex and bash would then disagree about the word itself). So is a word whose
+    child spans cannot be trusted - one holding an expansion and a line continuation - and a
+    word inside backticks holding an escape bash removes before it reads the quote.
     """
 
     def __init__(self, command: str):
         self.command = command
+        self.backticks: list[tuple[int, int]] = []
+
+    def visitcommandsubstitution(self, n: Any, command: Any) -> None:
+        if self.command[n.pos[0]] == "`":
+            self.backticks.append(n.pos)
 
     def visitword(self, n: Any, word: str) -> None:
         self._decode(n)
@@ -583,19 +593,21 @@ class _DollarQuoteDecoder(bashlex.ast.nodevisitor):
 
     def _decode(self, n: Any) -> None:
         start, end = n.pos
-        if not _holds_dollar_quote(self.command[start:end]):
+        span = self.command[start:end]
+        if not _holds_dollar_quote(span):
             return
-        # bashlex parses a substitution from its word's text with every `\<newline>` already cut,
-        # so each one moves the offsets of everything after it inside the word two places early.
-        # No span inside such a word can be trusted - reading one either blocks a benign word or
-        # leaves the payload undecoded - so the word is refused before its parts are visited.
-        if "\\\n" in self.command[start:end] and any(
-            getattr(part, "kind", None) in ("commandsubstitution", "processsubstitution") for part in getattr(n, "parts", ())
-        ):
-            raise ParseError(f"ANSI-C word follows a line continuation inside a substitution: {self.command[start:end]!r}")
+        # Inside backticks bash strips the backslash from `\$`, `\``, `\\` (and `\"` within "...")
+        # before parsing, so `\$'\x2d...'` there is an ANSI-C quote this reading takes for a `$`.
+        if any(pair in span for pair in _BACKTICK_UNESCAPES) and any(o < start < c for o, c in self.backticks):
+            raise ParseError("ANSI-C word holds a backslash escape inside backticks")
         # bashlex also hangs an empty `parameter` node on the `$` of each `$'` / `$"`: not an
         # expansion, so it is left for `_dequote` to read as the quote it opens.
         children = {part.pos[0]: part.pos[1] for part in getattr(n, "parts", []) if getattr(part, "value", None) != ""}
+        # bashlex builds a word's child nodes from its text with every `\<newline>` already cut, so
+        # each one places everything after it two characters early. Copying or visiting a child at
+        # that span either blocks a benign word or leaves a payload undecoded (`$x\<newline>$'rm'`).
+        if children and "\\\n" in span:
+            raise ParseError("ANSI-C word holds an expansion and a line continuation")
         n.word = _dequote(self.command, start, end, children)
 
 

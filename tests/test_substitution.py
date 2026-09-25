@@ -1778,13 +1778,13 @@ class TestQuotedSubstitutionBodies:
         assert rule in result.matched_rules, f"{command!r} -> {result.matched_rules}"
 
     def test_a_line_continuation_before_an_ansi_c_quote_in_a_body_fails_closed(self):
-        """Each `\\<newline>` shifts every later inner offset by two, which the body pass
-        survives but `$'...'` decoding cannot: the parse is refused (LAB-3005), so this
-        body never reaches the rule the entries above pin.
+        """Each `\\<newline>` shifts every later inner offset by two, which `$'...'` decoding
+        cannot survive: the parse is refused (LAB-3005) before the body pass runs, and the
+        validator must report it BLOCKED rather than route it to a weaker path.
         """
         result = validate_command("echo \"$(echo \\\n hi; echo $'\\x72\\x6d')\"")
         assert result.risk_level == RiskLevel.BLOCKED, result.risk_level
-        assert "line continuation inside a substitution" in result.message, result.message
+        assert "an expansion and a line continuation" in result.message, result.message
 
     def test_a_body_match_never_lowers_the_verdict(self):
         """The body pass only raises what the segment checks reached without it."""

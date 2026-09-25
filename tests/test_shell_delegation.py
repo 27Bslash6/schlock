@@ -856,6 +856,12 @@ class TestAnsiCDelegationEvasion:
             # An escape the decoder does not model fails closed rather than guess.
             "bash <<< $'\\cA'",
             "bash -c $'\\x{72}\\x{6d} -rf ~'",
+            # A line continuation moves the spans of a word's children (panel, merge with main):
+            # `$xy` was glued onto `rm` and the whole command scored SAFE.
+            "$xy\\\n$'rm' -rf /",
+            # Inside backticks bash reads `\\$'` as `$'`: `find / -delete`, a core.pager RCE.
+            "echo \"`find / \\$'\\x2d\\x64\\x65\\x6c\\x65\\x74\\x65'`\"",
+            "echo \"`git -c \\$'\\x63ore.pager=\\x72m -rf /' log`\"",
         ],
     )
     def test_ansi_c_payload_is_blocked(self, command):

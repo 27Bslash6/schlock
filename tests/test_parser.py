@@ -807,18 +807,46 @@ class TestAnsiCWordDecoding:
             # enough continuations move the payload's span wholly off its `$'`, which used to
             # leave it undecoded rather than refused
             'echo "$(echo ' + "\\\n" * 12 + " x; $'\\x72\\x6d' -rf /)\"",
-            # conservative: a continuation after the substitution moves nothing, but is refused too
-            "echo \"$(echo hi)\"\\\n$'\\x72\\x6d'",
+            # a continuation after a child moves the children after it: the second `$(` here
+            'echo "$(:)"\\\n"$(echo $\'\\x72\\x6d\' -rf /)"',
+            # parameters shift too: `$xy` was copied two places early, gluing `$xy` onto `rm`
+            "$xy\\\n$'rm' -rf /",
+            "echo a\\\n${x}b$'\\x72'",
         ],
     )
-    def test_a_line_continuation_inside_a_substitution_fails_closed(self, command):
-        # bashlex parses the substitution from its word's text with each `\<newline>` cut out,
-        # so every later span inside the word lands two places early per continuation.
-        with pytest.raises(ParseError, match="line continuation inside a substitution"):
+    def test_a_word_with_an_expansion_and_a_line_continuation_fails_closed(self, command):
+        # bashlex builds a word's child nodes from its text with each `\<newline>` cut out, so
+        # every child after one lands two places early per continuation.
+        with pytest.raises(ParseError, match="an expansion and a line continuation"):
             parser_mod.BashCommandParser().parse(command)
 
-    def test_a_line_continuation_outside_a_substitution_still_decodes(self):
-        assert _echo_arg("echo \\\n $'\\x72\\x6d'") == "rm"
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # bash reads `\$'` inside backticks as `$'`: this runs `find / -delete`
+            "echo \"`find / \\$'\\x2d\\x64\\x65\\x6c\\x65\\x74\\x65'`\"",
+            "echo `find / \\$'\\x2ddelete'`",
+            "echo `printf $'a\\\\b'`",  # `\\` becomes `\`, so bash decodes `\b`
+        ],
+    )
+    def test_a_backtick_unescape_in_an_ansi_c_word_fails_closed(self, command):
+        with pytest.raises(ParseError, match="inside backticks"):
+            parser_mod.BashCommandParser().parse(command)
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("echo \\\n $'\\x72\\x6d'", "rm"),  # a continuation between words moves no span
+            ("echo x\\\n$'\\x72\\x6d'", "xrm"),  # nor one in a word with no child node
+        ],
+    )
+    def test_a_line_continuation_without_a_child_still_decodes(self, command, expected):
+        assert _echo_arg(command) == expected
+
+    def test_an_ansi_c_escape_inside_backticks_still_decodes(self):
+        p = parser_mod.BashCommandParser()
+        [(_, args)] = p.extract_commands_with_args(p.parse("echo `printf %s $'\\x72\\x6d'`"))[1:]
+        assert args == ["%s", "rm"]
 
     @pytest.mark.parametrize(
         ("word", "expected"),
