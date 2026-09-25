@@ -10,7 +10,9 @@ so each touched rule keeps a baseline payload plus the spellings a naive `[^;|&]
 gap would lose (a separator inside quotes, an escape, a substitution or an fd
 redirect), plus nested substitutions, including ones deeper than the `$(...)`
 piece balances. Each is pinned at BLOCKED and again at the rule's own patterns,
-so another layer cannot hide a lost pattern.
+so another layer cannot hide a lost pattern. Past the depth a gap balances, a
+payload is pinned at BLOCKED and at the rule matched against the command with
+its substitution bodies blanked, which is the text the validator's extra pass sees.
 """
 
 import pytest
@@ -159,7 +161,8 @@ PAYLOADS = [
     ("recursive_permission_system_dirs", 'chown -R "u&g" /etc'),
     ("source_remote_script", "source /tmp/a/b/c.sh"),
     ("source_remote_script", 'source "/tmp/R&D/x.sh"'),
-    # Arithmetic closes as one piece at the gap. bashlex fails the parse, so pin the rule too.
+    # Arithmetic closes as one piece at the gap. BLOCKED here is bashlex failing the parse,
+    # so only the rule row pins this.
     ("credential_exposure", "cat $((0)) .env"),
     # Deeper than the `$(...)` piece balances, a `$(` walks on: one per gap.
     ("credential_exposure", "cat $(dirname $(dirname $(pwd)))/.env"),
@@ -237,6 +240,9 @@ DEEP_PAYLOADS = [
     ("credential_exposure", "cat $(a $(b $(c)) | d)/id_rsa"),
     ("credential_exposure", "echo $(a $(b $(c)) | d) password"),
     ("credential_exposure", "true; cat $(a $(b $(c $(d)) | e) | f)/.env"),
+    # A redirect target, and a `${...}`, whose bashlex node has no children.
+    ("credential_exposure", "cat < $(printf %s $(dirname $(pwd)) | head -1)/.env"),
+    ("credential_exposure", "cat ${x:-$(printf %s $(dirname $(pwd)) | head -1)}/.env"),
     ("extended_credential_exposure", "echo $(a $(b $(c)) | d) $GITHUB_TOKEN"),
     ("hardcoded_secrets", "export A=$(a $(b $(c)) | d) MY_KEY=x"),
     ("privilege_escalation_variants", "chroot $(a $(b $(c)) | d) /bin/bash"),
@@ -256,3 +262,17 @@ class TestADeepSubstitutionIsOneWord:
     def test_the_rule_matches_the_blanked_command(self, engine, rule, command):
         parser = BashCommandParser()
         assert rule_matches(engine, rule, parser.mask_substitution_bodies(command, parser.parse(command))), (rule, command)
+
+    @pytest.mark.parametrize(
+        ("command", "level"),
+        [
+            # A whitelisted first word vouches for no later segment (`ls` is whitelisted).
+            ("ls; cat $(printf %s $(dirname $(pwd)) | head -1)/.env", RiskLevel.BLOCKED),
+            # A single segment keeps its whitelist (`chmod 777 /tmp/...`), as the pass it shadows does.
+            ("chmod 777 /tmp/$(echo x)", RiskLevel.SAFE),
+            # A non-shell heredoc body stays text in the blanked pass too.
+            ("cat $(echo x) <<EOF\nrm -rf /\nEOF", RiskLevel.SAFE),
+        ],
+    )
+    def test_keeps_the_whitelist_and_heredoc_suppression(self, command, level, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == level, command

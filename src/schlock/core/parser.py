@@ -14,6 +14,7 @@ from typing import Any, NamedTuple, Optional
 import bashlex
 import bashlex.errors
 
+from schlock.core.substitution import _SUBSTITUTION_INTRODUCERS
 from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
@@ -1301,28 +1302,46 @@ class BashCommandParser:
         word. A separator inside a substitution is data, but a regex can only
         balance so many paren levels, so a separator in a body nested deeper than
         the gap balances ends it: `cat $(printf %s $(dirname $(pwd)) | head -1)/.env`
-        reads a `.env` and rated SAFE. bashlex already knows where every body ends,
+        reads a `.env` and rated SAFE. bashlex already knows where each body ends,
         at any depth. Blanking the bodies turns each substitution into one opaque
         word and leaves every top-level separator in place, so a rule matched
         against this text reaches past a substitution and still cannot cross into
         another command.
 
+        Redirect targets are walked too (`cat < $(…)/.env`). A `parameter` node
+        has no children, so a `${…}` holding a substitution has its whole
+        interior blanked from the node's own span.
+
+        This reaches a target OUTSIDE every body. A target inside one
+        (`echo $(cat $(…)/.env)`) is blanked with it; the rule's own gap is
+        still what reaches that.
+
         Length-preserving, so the caller's literal and heredoc ranges still index
-        it. A substitution whose closer is not where _body_end looks is left as
-        written: the pass is additive, so a missed blank costs a match, never a
-        wrong one.
+        it. A span is blanked only when its opener is at the node's start and its
+        closer where _body_end looks: a `\\<newline>` earlier in the word moves
+        bashlex's offsets, and a span left as written only costs this pass a match.
         """
         spans: list[tuple[int, int]] = []
 
         def visit(node: Any) -> None:
             if not hasattr(node, "kind"):
                 return
-            if node.kind in ("commandsubstitution", "processsubstitution") and getattr(node, "pos", None):
-                end = self._body_end(command, node.pos)
-                if end is not None:
-                    spans.append((self._body_start(command, node.pos[0]), end))
+            pos = getattr(node, "pos", None)
+            if node.kind in ("commandsubstitution", "processsubstitution") and pos:
+                end = self._body_end(command, pos)
+                if end is not None and command.startswith(_SUBSTITUTION_INTRODUCERS, pos[0]):
+                    spans.append((self._body_start(command, pos[0]), end))
                 return  # An inner body is inside this one, blanked with it.
-            for attr in ("parts", "command", "list", "pipe", "compound"):
+            if node.kind == "parameter" and pos:
+                interior = command[pos[0] + 2 : pos[1] - 1]
+                if (
+                    command.startswith("${", pos[0])
+                    and command[pos[1] - 1 : pos[1]] == "}"
+                    and any(opener in interior for opener in _SUBSTITUTION_INTRODUCERS)
+                ):
+                    spans.append((pos[0] + 2, pos[1] - 1))
+                return
+            for attr in ("parts", "command", "list", "pipe", "compound", "redirects", "output"):
                 child = getattr(node, attr, None)
                 if isinstance(child, list):
                     for item in child:

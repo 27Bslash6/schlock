@@ -654,6 +654,11 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
         # A quoted substitution is still code; a single-quoted one is text.
         ('cat "$(a | b)/.env"', 'cat "$(     )/.env"'),
         ("echo '$(a | b)' && ls", "echo '$(a | b)' && ls"),
+        # A redirect target is a word too; a `${...}` has no child nodes, so its interior goes.
+        ("cat < $(a | b)/.env", "cat < $(     )/.env"),
+        ("cat ${x:-$(a | b)}/.env ${y}", "cat ${           }/.env ${y}"),
+        # A `\<newline>` earlier in the word moves bashlex's offsets: no opener there, no blank.
+        ('echo "x\\\ny $(echo $(a)x)"', 'echo "x\\\ny $(echo $(a)x)"'),
         # Top-level separators survive, so the masked text is still two commands.
         ("echo $(a; b) && git commit -m x", "echo $(    ) && git commit -m x"),
     ],
