@@ -513,13 +513,30 @@ def _over_size_ceiling(command: str, *, derived: bool) -> Optional[ValidationRes
 
 # Ceiling on distinct (command, tail) suffixes one top-level extraction may visit. Legitimate
 # commands need a few dozen at most. Past it the command is adversarial and extraction fails
-# CLOSED: the extractor raises, validate_command's catch-all returns BLOCKED, the hook denies.
+# CLOSED: the extractor raises, validate_command converts that to an ordinary BLOCKED verdict
+# at the single call site, and the hook denies on it.
 # Needed because the per-call memo bounds ONE wrapper chain, not k independent chains with
 # distinct tails, so total work still grew with command size - and a PreToolUse hook that
 # outlives its timeout fails OPEN. Pinned by test_sibling_chains_past_the_ceiling_fail_closed.
 # ponytail: each suffix costs O(len) for the `args[i+1:]` slice + tuple key, so the worst case
 # under this ceiling is ~0.2 s (measured); index-based re-entry would make it O(1) if needed.
+# Step 5c caps the distinct stdin programs (here-strings, heredoc bodies) at the same number.
 MAX_DELEGATOR_TOKENS = 256
+
+
+class _DelegatorCeilingError(ValueError):
+    """Raised past MAX_DELEGATOR_TOKENS, by the extractor and by Step 5c's stdin-program count.
+
+    Converted to a BLOCKED verdict only by the `try` around Step 5c's payload collection in
+    `_validate_command`; raised anywhere else it reaches the catch-all.
+
+    An exception rather than a threaded return value because the extractor is recursive and
+    already unwinds. A subclass rather than a bare `except ValueError` at the call site: today
+    the extractor raises nothing else, but a bare clause would silently convert a FUTURE
+    unrelated ValueError into this ceiling's verdict - error=None, traceback dropped, a
+    confident wrong message on a deny path. That is LAB-4582's own defect, mirrored.
+    """
+
 
 # `watch`'s own options. Only these consume a following word; everything after the option run
 # belongs to the command. Getting this wrong over-approximates (an option value is prepended to
@@ -650,7 +667,8 @@ def _shell_delegated_payloads(
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
 
-    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there).
+    Raises _DelegatorCeilingError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed,
+    see there).
     """
     # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
     # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
@@ -667,7 +685,7 @@ def _shell_delegated_payloads(
             continue
         seen.add(key)
         if len(seen) > MAX_DELEGATOR_TOKENS:
-            raise ValueError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} delegator tokens")
+            raise _DelegatorCeilingError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} delegator tokens")
         base = cmd_name.rsplit("/", 1)[-1]
         found = []
 
@@ -2994,14 +3012,33 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # exactly as a here-string does, so it counts against the same ceiling.
         payloads: list[str] = []
         if match.risk_level < RiskLevel.BLOCKED:
-            # Distinct payloads, as the here-string count already is: 257 copies of one body
-            # are one program to validate, not 257.
-            stdin_payloads = list(
-                dict.fromkeys(herestring_payloads + _shell_heredoc_bodies(command, normalised.blanked, bashlex_heredocs))
-            )
-            if len(stdin_payloads) > MAX_DELEGATOR_TOKENS:
-                raise ValueError(f"Stdin program re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
-            payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
+            try:
+                # Distinct payloads, as the here-string count already is: 257 copies of one body
+                # are one program to validate, not 257.
+                stdin_payloads = list(
+                    dict.fromkeys(herestring_payloads + _shell_heredoc_bodies(command, normalised.blanked, bashlex_heredocs))
+                )
+                if len(stdin_payloads) > MAX_DELEGATOR_TOKENS:
+                    raise _DelegatorCeilingError(
+                        f"Stdin program re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads"
+                    )
+                payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
+            except _DelegatorCeilingError as e:
+                # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH below and _over_size_ceiling
+                # (LAB-4363). Letting this reach the catch-all denied with `error` set, an empty
+                # `alternatives`, a message naming no limit, and `logger.exception(f"... {command!r}")`
+                # writing the whole adversarial command to the log (LAB-4582). `str(e)` so the limit is
+                # stated once, at the raise. The deny itself is unchanged.
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=str(e),
+                    alternatives=[
+                        "Run the command directly instead of delegating it through wrappers, here-strings or heredocs"
+                    ],
+                    exit_code=1,
+                    error=None,
+                )
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:

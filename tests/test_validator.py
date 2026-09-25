@@ -3342,7 +3342,10 @@ class TestHeredocBoundariesOnTheNativePath:
         assert validate_command(same, config_path=safety_rules_path).allowed is True
         refused = validate_command(distinct, config_path=safety_rules_path)
         assert refused.allowed is False
-        assert "exceeded" in (refused.error or "")
+        assert refused.risk_level == RiskLevel.BLOCKED
+        assert refused.error is None
+        assert "distinct payloads" in refused.message
+        assert refused.alternatives
 
     def test_the_phantom_guard_does_not_refuse_the_standard_commit_form(self, safety_rules_path):
         """The guard runs only where the fallback's ran; the scan it relies on has a blind spot.

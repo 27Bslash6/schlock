@@ -12,6 +12,8 @@ zsh): `bash -c -- PROG` runs PROG; `bash -ce PROG` runs PROG; `bash -cPROG` is r
 with "option requires an argument", so an attached payload is not a thing.
 """
 
+import logging
+
 import pytest
 
 from schlock.core import validator
@@ -219,8 +221,8 @@ class TestShellDelegatedPayloadExtraction:
         # Panel on #153: the per-call memo bounds ONE chain, not k independent chains with
         # distinct tails, so total extraction work still grew with command size - and a
         # PreToolUse hook that outlives its timeout fails OPEN. Past MAX_DELEGATOR_TOKENS
-        # distinct suffixes the extractor raises; validate_command's catch-all turns that into
-        # BLOCKED with the reason in `error`, which the hook denies on.
+        # distinct suffixes the extractor raises; validate_command converts that at the call
+        # site into an ordinary BLOCKED verdict naming the ceiling, which the hook denies on.
         half = MAX_DELEGATOR_TOKENS // 2 + 1  # two chains of `half` nice tokens + bash > ceiling
         progs = ("echo a", "echo b")
         with pytest.raises(ValueError, match="delegator tokens"):
@@ -229,7 +231,36 @@ class TestShellDelegatedPayloadExtraction:
         result = validate_command(command)
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.allowed is False
-        assert "delegator tokens" in (result.error or "")
+        assert "delegator tokens" in result.message
+
+    def test_ceiling_denies_without_routing_through_the_catch_all(self, caplog):
+        """LAB-4582: the deny is purpose-built, not an internal error.
+
+        The ceiling used to raise into validate_command's catch-all, which set `error`, emptied
+        `alternatives`, reported only `Unexpected validation error: ValueError`, and ran
+        `logger.exception(f"... {command!r}")` - writing an attacker-chosen command of any length
+        up to the input ceiling into the log on demand. The payload must be BENIGN: a chain ending
+        in something dangerous matches an ordinary rule first and never reaches the ceiling.
+        """
+        command = " ".join(["timeout", "5"] * 300 + ["ls"])
+        # DEBUG, not ERROR: the property is level-independent. Capturing only ERROR would pass
+        # vacuously if a later edit logged the command at WARNING or below.
+        with caplog.at_level(logging.DEBUG):
+            result = validate_command(command)
+
+        # The fail-closed deny is preserved, not relaxed.
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+        # Also proves the message is not the catch-all's: that handler sets `message` and `error`
+        # in the same return, so error=None rules out "Unexpected validation error: ..." outright.
+        assert result.error is None
+        assert str(MAX_DELEGATOR_TOKENS) in result.message
+        assert "delegator tokens" in result.message
+        assert result.alternatives  # actionable, not the catch-all's empty list
+
+        # Neither the traceback nor the command itself reaches the log.
+        assert not [r for r in caplog.records if "timeout 5 timeout 5" in r.getMessage()]
 
 
 class TestFindExecPayloadExtraction:
@@ -772,13 +803,14 @@ class TestHereStringDelegationEvasion:
         # Every surfaced here-string re-enters validation - and ShellCheck - once, so n distinct
         # `<<<` payloads were n unbounded re-entries while the `-c` spelling of the same command
         # stopped at MAX_DELEGATOR_TOKENS; a PreToolUse hook that outlives its timeout fails
-        # OPEN. Same ceiling, same catch-all denial as the extractor's. Identical payloads
-        # collapse before the count, so repetition alone never trips it.
+        # OPEN. Same ceiling as the extractor's. Identical payloads collapse before the count, so
+        # repetition alone never trips it.
         distinct = "; ".join(f'bash <<< "echo {i}"' for i in range(MAX_DELEGATOR_TOKENS + 1))
         result = validate_command(distinct)
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.allowed is False
-        assert "distinct payloads" in (result.error or "")
+        assert result.error is None
+        assert "distinct payloads" in result.message
         repeated = "; ".join('bash <<< "echo hi"' for _ in range(MAX_DELEGATOR_TOKENS + 1))
         assert validate_command(repeated).allowed is True
 
