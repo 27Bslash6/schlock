@@ -5,6 +5,35 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3](https://github.com/27Bslash6/schlock/compare/schlock-v0.9.2...schlock-v0.9.3) (2026-09-22)
+
+
+### Bug Fixes
+
+* **audit:** redact curl -u/--user credentials and URL userinfo ([#159](https://github.com/27Bslash6/schlock/issues/159)) ([f46efdd](https://github.com/27Bslash6/schlock/commit/f46efdd23f1ebb030d971e8e25baa8f5622c4cb5))
+* **commit-filter:** bind stdin heredoc to its own opener instead of refusing on 2+ heredocs ([#154](https://github.com/27Bslash6/schlock/issues/154)) ([8fd7ec8](https://github.com/27Bslash6/schlock/commit/8fd7ec80534b2bdb640a3e46c401dd37f07696d4))
+* **hooks:** gate post-commit detector by HEAD identity, not wall-clock age (LAB-1439) ([#142](https://github.com/27Bslash6/schlock/issues/142)) ([2cf45bd](https://github.com/27Bslash6/schlock/commit/2cf45bd695cc6e5eff5640421d771d5720e16d77))
+* isolate hook-integration tests from operator's global schlock config ([#157](https://github.com/27Bslash6/schlock/issues/157)) ([d1118b8](https://github.com/27Bslash6/schlock/commit/d1118b83715f0a0a875ab4452339924a0c4801a2))
+* **parser:** agree csh/tcsh membership across the three shell-detection sets ([#200](https://github.com/27Bslash6/schlock/issues/200)) ([e54349e](https://github.com/27Bslash6/schlock/commit/e54349eb7964fc1510277b07695dda0a92764a81))
+* **parser:** drop literal-suppression ranges inside ${...} spans (LAB-1584) ([#139](https://github.com/27Bslash6/schlock/issues/139)) ([828e814](https://github.com/27Bslash6/schlock/commit/828e8148a8e55b4e4a1ed210ca110f8c7b72fce1))
+* **rules:** rate git ops and credential reads on the operation, not adjacency (LAB-4209) ([#167](https://github.com/27Bslash6/schlock/issues/167)) ([e74a4b4](https://github.com/27Bslash6/schlock/commit/e74a4b4c6f2d8f14943a917f657d6a593d7eb4c6))
+* **rules:** require a non-blank operand in the tee, rm and truncation patterns (LAB-4360) ([#175](https://github.com/27Bslash6/schlock/issues/175)) ([d910d37](https://github.com/27Bslash6/schlock/commit/d910d3789b1ed445a3ba53d4b9c12a20303835ab))
+* **substitution:** run YAML rules on whitelisted substitution commands ([#164](https://github.com/27Bslash6/schlock/issues/164)) ([d9fec69](https://github.com/27Bslash6/schlock/commit/d9fec69ad69c9b5331716a0b256b46797ee51501))
+* **validator:** invalidate the validation cache when the ruleset changes (LAB-4602) ([#191](https://github.com/27Bslash6/schlock/issues/191)) ([a6b0757](https://github.com/27Bslash6/schlock/commit/a6b07574d97515c9a0e4343364fb3017ee65bc1a))
+* **validator:** keep an escaped blank on a heredoc opener line parseable (LAB-4126) ([#161](https://github.com/27Bslash6/schlock/issues/161)) ([a285078](https://github.com/27Bslash6/schlock/commit/a285078d0fc2b7ef63eaffda53e8fd9c01b8282c))
+* **validator:** refuse commands over MAX_COMMAND_SIZE before parsing (LAB-4363) ([#174](https://github.com/27Bslash6/schlock/issues/174)) ([7dee2bc](https://github.com/27Bslash6/schlock/commit/7dee2bc9767a6367267b4eed23ae38fe524abfb2))
+* **validator:** require full-span whitelist match for chained commands (LAB-2752) ([#146](https://github.com/27Bslash6/schlock/issues/146)) ([986a63e](https://github.com/27Bslash6/schlock/commit/986a63e4a705d3e0ee386396f2a93f253eedef4e))
+* **validator:** stop a quoted token disabling quote-stripped matching (LAB-1732) ([#145](https://github.com/27Bslash6/schlock/issues/145)) ([9aa9a0b](https://github.com/27Bslash6/schlock/commit/9aa9a0b4fe9bdbc493e838ad1dec9a033cd58412))
+* **validator:** treat find -exec shell -c payloads as shell delegation (LAB-2767) ([#150](https://github.com/27Bslash6/schlock/issues/150)) ([a508274](https://github.com/27Bslash6/schlock/commit/a50827402272324a8b6c381c74ea79e6eb507dad))
+* **validator:** unify wrapped dash-c runner / watch delegation onto the recursive extractor ([#153](https://github.com/27Bslash6/schlock/issues/153)) ([d496df3](https://github.com/27Bslash6/schlock/commit/d496df392e96f915baa2514fe442e3459872aeca))
+* **validator:** validate here-string (&lt;&lt;&lt;) delegated payloads as code (LAB-2768) ([#151](https://github.com/27Bslash6/schlock/issues/151)) ([65afe74](https://github.com/27Bslash6/schlock/commit/65afe747c373af51714d76cd0e566a4bb36e3549))
+* **validator:** validate the commands that outlive a heredoc ([#148](https://github.com/27Bslash6/schlock/issues/148)) ([1f47994](https://github.com/27Bslash6/schlock/commit/1f47994585fbc8d8605cf8680a417cada2803477))
+
+
+### Performance Improvements
+
+* **validator:** ShellCheck the heredoc rewrite once, not once per segment (LAB-2780) ([#156](https://github.com/27Bslash6/schlock/issues/156)) ([582f9b2](https://github.com/27Bslash6/schlock/commit/582f9b2cd3cb798596a0e7cf797e565c393e8c23))
+
 ## [0.9.2](https://github.com/27Bslash6/schlock/compare/schlock-v0.9.1...schlock-v0.9.2) (2026-09-05)
 
 

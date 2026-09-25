@@ -112,33 +112,11 @@ rules:
         engine = RuleEngine(test_rules_file)
         assert engine.is_whitelisted(command) == should_be_whitelisted
 
-    @pytest.mark.parametrize(
-        "command,fully_whitelisted",
-        [
-            ("git status", True),
-            ("git status\n", True),  # trailing whitespace does not defeat the span check
-            ("git status --short", False),  # prefix pattern stops at "status"
-            ("git status; rm -rf /", False),  # LAB-2752: prefix must not cover the chain
-            ("git push", False),
-        ],
-    )
-    def test_is_fully_whitelisted_requires_full_span(self, test_rules_file, command, fully_whitelisted):
-        """LAB-2752: is_fully_whitelisted() needs the match to reach the command's end."""
-        engine = RuleEngine(test_rules_file)
-        assert engine.is_fully_whitelisted(command) == fully_whitelisted
-
     def test_is_whitelisted_keeps_prefix_semantics(self, test_rules_file):
         """AC-5: the prefix contract (issue #66) is untouched for single-segment callers."""
         engine = RuleEngine(test_rules_file)
         assert engine.is_whitelisted("git status --short")
         assert engine.is_whitelisted("git status; rm -rf /")
-
-    def test_is_fully_whitelisted_allows_pattern_to_overshoot_rstrip(self, tmp_path):
-        """The ">=" is load-bearing: a "\\s*" tail spans whitespace rstrip() discounted."""
-        rules = tmp_path / "trailing.yaml"
-        rules.write_text("whitelist:\n  - ^git\\s+status\\s*$\nrules: []\n")
-        engine = RuleEngine(rules)
-        assert engine.is_fully_whitelisted("git status  ")
 
     def test_match_command_can_skip_the_whitelist(self, test_rules_file):
         """use_whitelist=False lets the multi-segment fallback re-check a command whose
@@ -414,6 +392,141 @@ rules: []
         assert engine.is_whitelisted("git status")
         assert engine.is_whitelisted("ls")
         assert not engine.is_whitelisted("git push")
+
+    def test_a_single_command_entry_declares_no_separator_and_clears_no_line(self, rules_directory):
+        """`^ls\\b` describes one command, so it can never speak for a line that holds two."""
+        engine = RuleEngine.from_directory(rules_directory)
+
+        # The prefix test still clears the single command each pattern was written for --
+        # including, and this is the bug it exists to keep out of the fast path, a line that
+        # carries a second command.
+        assert engine.is_whitelisted("ls -la")
+        assert engine.is_whitelisted("ls && rm -rf /")
+
+        # Declaring no separator means speaking for one command, so no line is ever cleared.
+        assert not engine.is_whitelisted_whole("ls && rm -rf /", 2)
+        assert not engine.is_whitelisted_whole("git status && rm -rf /", 2)
+
+    def test_an_entry_is_held_to_the_number_of_commands_it_declares(self, tmp_path):
+        """Anchoring is not sufficient, and neither is merely mentioning a separator."""
+        rules_dir = tmp_path / "declared"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^rm\s+-rf\s+(dist|build)(/.*)?$
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+-u\s+\S+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # Anchored AND open-ended: `.*` consumes the chained payload, so this pattern really
+        # does fullmatch the whole line. It declares no separator, so it speaks for one
+        # command -- note its `|`s are alternation and must not be counted as separators.
+        assert engine.whitelist_patterns[0].fullmatch("rm -rf dist/ && rm -rf /")
+        assert not engine.is_whitelisted_whole("rm -rf dist/ && rm -rf /", 2)
+
+        # The entry that declares one separator clears its own two-command pipeline...
+        pipeline = "gh auth token | docker login ghcr.io -u me --password-stdin"
+        assert engine.is_whitelisted_whole(pipeline, 2)
+        # ...and `$` matches before a trailing newline, so the command is stripped first.
+        assert engine.is_whitelisted_whole(pipeline + "\n", 2)
+        # ...but it declared TWO commands, so it cannot speak for a third. `\S+` matches `;`,
+        # which is how a payload rides an entry that does write a separator.
+        injected = "gh auth token | docker login ghcr.io -u foo;sudo;true --password-stdin"
+        assert engine.whitelist_patterns[1].fullmatch(injected)
+        assert not engine.is_whitelisted_whole(injected, 4)
+        assert not engine.is_whitelisted_whole(pipeline + " && rm -rf /", 3)
+
+    def test_an_entry_declaring_no_separator_clears_nothing_here_even_alone(self, rules_directory):
+        """Holds standing alone, not only because the one caller guards `len(segments) > 1`."""
+        engine = RuleEngine.from_directory(rules_directory)
+
+        assert engine.is_whitelisted("ls")  # the prefix test is how a single command clears
+        assert not engine.is_whitelisted_whole("ls", 1)
+        assert not engine.is_whitelisted_whole("ls -la", 1)
+
+    def test_an_unanchored_entry_covers_only_the_arguments_it_described(self, tmp_path):
+        """Counting commands says nothing about a command's arguments; the anchor does.
+
+        Every separator-writing pattern schlock ships is also `$`-anchored, so `match` and
+        `fullmatch` agree on all of them. A user's own pipeline entry need not be anchored,
+        and there only `fullmatch` stops it vouching for arguments it never mentioned.
+        """
+        rules_dir = tmp_path / "unanchored"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^foo\s*\|\s*bar
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        assert engine.is_whitelisted_whole("foo | bar", 2)
+        # Two commands, so the count is satisfied -- but the entry never described `-rf /etc`.
+        assert not engine.is_whitelisted_whole("foo | bar -rf /etc", 2)
+
+    def test_counting_clears_the_legal_multi_line_spelling_that_a_newline_ban_would_not(self, tmp_path):
+        """A newline after `|` is a bash CONTINUATION, not a separator: still two commands."""
+        rules_dir = tmp_path / "continuation"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # bash reads this as one two-command pipeline, and so does the count.
+        assert engine.is_whitelisted_whole("gh auth token |\n  docker login ghcr.io --password-stdin", 2)
+        # But `\s` also spans a line break the author never wrote, turning one regex "command"
+        # into several for bash. The count sees through that where the pattern cannot.
+        assert not engine.is_whitelisted_whole("gh auth token | docker login\nsudo\n--password-stdin", 4)
+
+    def test_a_bracket_expression_is_a_slot_not_a_declared_separator(self, tmp_path):
+        """`[^;]` and `[\\w;]` mention `;` without writing a boundary, so neither declares one."""
+        rules_dir = tmp_path / "classes"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^mytool\s+[^;]+$
+  - ^cd\s+[\w;]+\s*&&\s*make$
+  - ^foo\s*[;]\s*bar$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # A negated class writes no separator: this entry speaks for one command, however well
+        # it matches a longer line.
+        assert engine.whitelist_patterns[0].fullmatch("mytool x && rm -rf /")
+        assert not engine.is_whitelisted_whole("mytool x && rm -rf /", 2)
+        # A class holding `;` among other characters does not add to the one `&&` declares.
+        assert engine.is_whitelisted_whole("cd src && make", 2)
+        assert not engine.is_whitelisted_whole("cd a;rm && make", 3)
+        # A class holding nothing but the separator is the separator.
+        assert engine.is_whitelisted_whole("foo; bar", 2)
+
+    def test_whitespace_bash_reads_as_a_word_never_clears_a_line(self, tmp_path):
+        """Only space, tab and newline are blank to bash; `\\s` and `strip()` accept far more."""
+        rules_dir = tmp_path / "blanks"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+        pipeline = "gh auth token | docker login ghcr.io -u me --password-stdin"
+
+        assert engine.is_whitelisted_whole(" \t\n" + pipeline + " \t\n", 2)
+        for blank in ("\r", "\x0b", "\x0c", "\x1c", "\x1f", "\x85", "\xa0", "\u2028", "\u3000"):
+            assert not engine.is_whitelisted_whole(pipeline + "\n" + blank, 2)
+            assert not engine.is_whitelisted_whole(blank + "\n" + pipeline, 2)
+            assert not engine.is_whitelisted_whole(pipeline.replace("|", "|\n" + blank + "\n"), 2)
 
     def test_directory_files_loaded_in_order(self, rules_directory):
         """Test that files are loaded in alphabetical order."""
