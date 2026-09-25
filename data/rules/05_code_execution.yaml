@@ -102,6 +102,9 @@ rules:
     description: macOS Keychain contains all stored passwords and certificates
     risk_level: BLOCKED
     patterns:
+      # Runs here and in linux_keyring_theft are `[^;|&]{0,200}` so each reader
+      # word costs a bounded scan; why 200: database_credential_theft in
+      # 03_credential_theft.yaml.
       # Find and extract passwords
       - 'security\s+find-generic-password'
       - 'security\s+find-internet-password'
@@ -109,13 +112,13 @@ rules:
       - 'security\s+dump-keychain'
       - 'security\s+dump-trust-settings'
       # Export keys/certificates
-      - 'security\s+export[^;|&]*-k'
-      - 'security\s+find-certificate[^;|&]*-p'
+      - 'security\s+export[^;|&]{0,200}-k'
+      - 'security\s+find-certificate[^;|&]{0,200}-p'
       # Show keychain info
       - 'security\s+show-keychain-info'
       # Access keychain files directly
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*Library/Keychains/'
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.keychain'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}Library/Keychains/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.keychain'
     alternatives:
       - "Keychain access requires explicit user consent"
       - "Use Keychain Access.app for authorized access"
@@ -128,17 +131,17 @@ rules:
       # GNOME Keyring
       - 'secret-tool\s+lookup'
       - 'secret-tool\s+search'
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.local/share/keyrings/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.local/share/keyrings/'
       # pass password manager (\b anchors 'pass' as its own word so it does not
       # match inside bypass/compass/surpass - see #100)
       - '\bpass\b\s+show'
-      - '\bpass\b\s+[^;|&]*-c'
+      - '\bpass\b\s+[^;|&]{0,200}-c'
       # GPG private keys
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.gnupg/private-keys'
-      - 'gpg\s+[^;|&]*--export-secret-keys'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.gnupg/private-keys'
+      - 'gpg\s+[^;|&]{0,200}--export-secret-keys'
       # KWallet
       - 'kwallet-query\s+'
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.local/share/kwalletd/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.local/share/kwalletd/'
     alternatives:
       - "Credential store access requires explicit consent"
       - "Use system tools for authorized access"
