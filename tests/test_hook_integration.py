@@ -31,7 +31,24 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
-from schlock.integrations.commit_filter import CommitMessageFilter
+from schlock.integrations.audit import AuditLogger
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
+from schlock.setup.config_writer import RISK_PRESETS
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Point config resolution at an empty dir so tests assert the shipped default preset.
+
+    map_risk_to_status() reads pre_tool_use._risk_tolerance, a singleton cached (once per
+    process) from the project config (cwd-relative) or $HOME/.config/schlock/config.yaml.
+    Without isolating cwd, $HOME, and the cache, these tests pass or fail based on whatever
+    preset happens to be installed on the machine running them instead of the code under test.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(pre_tool_use, "_validator_initialized", False)
+    monkeypatch.setattr(pre_tool_use, "_risk_tolerance", None)
 
 
 class TestStatusMapping:
@@ -109,6 +126,64 @@ class TestMessageFormatting:
             message = format_message(result)
             assert f"Risk Level: {risk_level.name}" in message
 
+    @pytest.mark.parametrize("matched_rules", [["x"], [], ["x", "x"]])
+    def test_single_or_no_rule_output_unchanged(self, matched_rules):
+        """One distinct rule or none: no `Rules matched` line, output as before LAB-5002."""
+        result = ValidationResult(
+            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
+        )
+        assert format_message(result, decision="ask") == "CAUTION: Reason\nRisk Level: HIGH\n\nAlternatives:\n  - Alt"
+
+    @pytest.mark.parametrize(("decision", "status"), [("ask", "CAUTION"), ("deny", "BLOCKED")])
+    @pytest.mark.parametrize("matched_rules", [["a", "b"], ["a", "b", "a"]])
+    def test_every_matched_rule_is_named(self, decision, status, matched_rules):
+        """Every distinct matched rule is named, not only the one whose message is shown (LAB-5002)."""
+        result = ValidationResult(
+            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
+        )
+        assert format_message(result, decision=decision) == (
+            f"{status}: Reason\nRisk Level: HIGH\nRules matched: a, b\n\nAlternatives:\n  - Alt"
+        )
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_segment_tie_prompt_names_both_rules(self, tmp_path, monkeypatch):
+        """Two HIGH segments on different rules: the ask text names both; the audit line is unchanged."""
+        log_file = tmp_path / "audit.jsonl"
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS["balanced"]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+
+        command = "git push --force origin main && rm -r ./build"
+        output = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})["hookSpecificOutput"]
+
+        assert output["permissionDecision"] == "ask"
+        assert output["permissionDecisionReason"] == (
+            "CAUTION: Force push overwrites remote history\n"
+            "Risk Level: HIGH\n"
+            "Rules matched: git_force_push, recursive_delete\n"
+            "\n"
+            "Alternatives:\n"
+            "  - Use --force-with-lease"
+        )
+        (line,) = log_file.read_text().splitlines()
+        assert json.loads(line)["violations"] == ["git_force_push", "recursive_delete"]
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_shellcheck_audit_entries_stay_out_of_the_prompt_and_the_cache(self, tmp_path, monkeypatch):
+        """The hook appends ShellCheck findings to the audit list; that must not reach `matched_rules`."""
+        log_file = tmp_path / "audit.jsonl"
+        finding = SimpleNamespace(sc_code="SC2086", message="Double quote")
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS["balanced"]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([finding], "ShellCheck says"))
+
+        for _ in range(2):
+            output = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}})
+            assert "Rules matched" not in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        violations = [json.loads(line)["violations"] for line in log_file.read_text().splitlines()]
+        assert violations == [["git_commit", "ShellCheck SC2086: Double quote"]] * 2
+
 
 class TestHookHandler:
     """Test hook handler integration with validation engine."""
@@ -171,15 +246,55 @@ class TestHookHandler:
         # Should have an error reason
         assert "BLOCKED:" in response["hookSpecificOutput"]["permissionDecisionReason"]
 
+    def test_oversized_command_blocked_as_a_verdict(self):
+        """Over MAX_COMMAND_SIZE is denied through the BLOCKED path, not swallowed as an error (LAB-4363)."""
+        command = " && ".join(["echo hello"] * 6000)
+        assert len(command) > MAX_COMMAND_SIZE
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+
+        output = response["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert output["permissionDecisionReason"].startswith("BLOCKED: Command exceeds size limit")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAmplifiedMediumSubstitutionThroughTheHook:
+    """`git commit` in a substitution is the LOW rule `git_commit` amplified to MEDIUM (LAB-4223).
+
+    It read SAFE with no rule, so paranoid never asked and the audit line claimed no rule matched.
+    """
+
+    COMMAND = 'echo "$(git commit -m evil)"'
+
+    @pytest.mark.parametrize(("preset", "action"), [("paranoid", "ask"), ("balanced", "allow"), ("permissive", "allow")])
+    def test_preset_action_and_audit_line(self, preset, action, tmp_path, monkeypatch):
+        log_file = tmp_path / "audit.jsonl"
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": self.COMMAND}})
+
+        assert response["hookSpecificOutput"]["permissionDecision"] == action
+        (line,) = log_file.read_text().splitlines()
+        event = json.loads(line)
+        assert (event["risk_level"], event["violations"], event["decision"]) == ("MEDIUM", ["git_commit"], action)
+
+    @pytest.mark.parametrize("preset", ["paranoid", "balanced", "permissive"])
+    def test_config_extraction_in_a_substitution_is_denied_on_every_preset(self, preset, monkeypatch):
+        """`tar` over schlock's config is BLOCKED bare; wrapped in `cat "$(…)"` it must not become runnable."""
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+        command = 'cat "$(tar -xf e.tar ~/.claude/hooks/schlock-config.yaml)"'
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
 
 class TestValidatorSingleton:
     """Test validator singleton pattern."""
 
     def test_singleton_reuse(self):
         """Verify validator is initialized once and reused."""
-        # Reset singleton state
-        pre_tool_use._validator_initialized = False
-
         # First call initializes
         result1 = get_validator()
         assert result1 is True
@@ -192,9 +307,6 @@ class TestValidatorSingleton:
 
     def test_initialization_error_handling(self):
         """Verify validator initialization succeeds without errors."""
-        # Reset singleton
-        pre_tool_use._validator_initialized = False
-
         # get_validator should succeed (it just sets a flag, actual validation happens via validate_command)
         result = get_validator()
         assert result is True

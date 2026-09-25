@@ -708,15 +708,20 @@ class RuleEngine:
         command: str,
         string_literals: Optional[list[tuple]] = None,
         heredoc_ranges: Optional[list[tuple]] = None,
+        use_whitelist: bool = True,
     ) -> RuleMatch:
         """Match command against all rules, return highest risk.
 
         Matching algorithm:
         1. Check whitelist first (returns SAFE if matched)
         2. Match against all rules, collect all matches
-        3. Skip matches that fall inside quoted string literals (AST context)
-        4. Skip matches inside non-shell heredocs (text, not executed)
+        3. Skip OCCURRENCES that fall inside quoted string literals (AST context)
+        4. Skip OCCURRENCES inside non-shell heredocs (text, not executed)
         5. Return highest risk level match
+
+        A pattern only fails to match when EVERY one of its occurrences is
+        suppressed - a quoted decoy does not excuse an unquoted occurrence
+        later in the same command (LAB-4321).
 
         Args:
             command: Command string to validate
@@ -724,6 +729,10 @@ class RuleEngine:
                            from AST analysis. Matches inside these ranges are ignored.
             heredoc_ranges: Optional list of (start, end, is_shell) tuples for heredocs.
                           Matches inside non-shell heredocs are ignored (just text).
+            use_whitelist: Consult the whitelist before matching rules. Pass False when
+                          the caller has already settled the whitelist question — the
+                          multi-segment path does, with the whole-line
+                          is_whitelisted_whole() where this check is prefix-based.
 
         Returns:
             RuleMatch with highest risk level from all matching rules
@@ -736,10 +745,10 @@ class RuleEngine:
 
             >>> # With AST context to avoid false positives
             >>> match = engine.match_command('echo "rm -rf /"', string_literals=[(6, 15)])
-            >>> # Pattern match at position 11-18 is inside string literal, ignored
+            >>> # The match at 6-11 is inside the string literal (6, 15), so it is ignored
         """
         # Whitelist override
-        if self.is_whitelisted(command):
+        if use_whitelist and self.is_whitelisted(command):
             return RuleMatch(
                 matched=False,
                 rule=None,
@@ -755,18 +764,8 @@ class RuleEngine:
         for rule in self.rules:
             patterns = self.compiled_patterns.get(rule.name, [])
             for pattern in patterns:
-                match = pattern.search(command)
+                match = self._first_executable_match(pattern, command, string_literals, heredoc_ranges)
                 if match:
-                    # Check if match is inside a quoted string literal
-                    if string_literals and self._is_in_string_literal(match, string_literals):
-                        # Skip this match - it's in a quoted string that won't execute
-                        continue
-
-                    # Check if match is inside a non-shell heredoc (text, not executed)
-                    if heredoc_ranges and self._is_in_non_shell_heredoc(match, heredoc_ranges):
-                        # Skip this match - it's in heredoc content that won't execute
-                        continue
-
                     # Rule matched - check if higher risk than current
                     if rule.risk_level > highest_risk:
                         highest_risk = rule.risk_level
@@ -789,6 +788,45 @@ class RuleEngine:
             message="No security rules matched",
             alternatives=[],
         )
+
+    def _first_executable_match(
+        self,
+        pattern: "re.Pattern",
+        command: str,
+        string_literals: Optional[list[tuple]],
+        heredoc_ranges: Optional[list[tuple]],
+    ) -> Optional["re.Match"]:
+        """First match of `pattern` that is not inert text, or None.
+
+        SECURITY CRITICAL: keep scanning past a suppressed match. Stopping at the
+        first one lets an inert decoy hide a real hit from the SAME pattern --
+        `cat \':(){ :|:& };:\'` followed by a newline and the same fork bomb unquoted
+        rated SAFE, because the quoted decoy consumed the rule\'s only search.
+        Pick the example carefully: `rm -rf /` hides the leak, because
+        `system_destruction`'s `[^;|&]` run crosses the newline, so its first match
+        starts inside the decoy, ends at the payload, and is never suppressed.
+
+        Advances by one character rather than to match.end() so a later match that
+        overlaps the suppressed one is still found.
+
+        The scan is EXACT - it never gives up early. A bound here looks like cheap
+        insurance and is not: reporting anything other than "first executable match,
+        or none" on exhaustion is wrong in one direction or the other. Reporting the
+        last suppressed match denies benign text (a quoted doc listing 32 `sudo`
+        lines). Returning None instead lets padding silence the rule. Measured, the
+        bound bought ~1%; the superlinearity lives elsewhere.
+        Termination is structural: `pos` strictly increases every iteration.
+        """
+        pos = 0
+        while True:
+            match = pattern.search(command, pos)
+            if match is None:
+                return None
+            in_literal = bool(string_literals) and self._is_in_string_literal(match, string_literals)
+            in_heredoc = bool(heredoc_ranges) and self._is_in_non_shell_heredoc(match, heredoc_ranges)
+            if not (in_literal or in_heredoc):
+                return match
+            pos = match.start() + 1
 
     def _is_in_string_literal(self, match: re.Match, string_literals: list[tuple]) -> bool:
         """Check if a regex match falls within a quoted string literal.

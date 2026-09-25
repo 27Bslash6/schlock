@@ -112,6 +112,32 @@ rules:
         engine = RuleEngine(test_rules_file)
         assert engine.is_whitelisted(command) == should_be_whitelisted
 
+    @pytest.mark.parametrize("command", ["git status; rm -rf /", "git status && rm -rf /", "git status | rm -rf /"])
+    def test_prefix_entry_does_not_cover_the_chain(self, test_rules_file, command):
+        """LAB-2752: a prefix entry must not vouch for the commands chained after it."""
+        engine = RuleEngine(test_rules_file)
+        assert not engine.is_whitelisted_whole(command, 2)
+
+    def test_is_whitelisted_keeps_prefix_semantics(self, test_rules_file):
+        """AC-5: the prefix contract (issue #66) is untouched for single-segment callers."""
+        engine = RuleEngine(test_rules_file)
+        assert engine.is_whitelisted("git status --short")
+        assert engine.is_whitelisted("git status; rm -rf /")
+
+    def test_is_whitelisted_whole_ignores_trailing_whitespace(self, tmp_path):
+        """A "\\s*" tail and the strip must agree: trailing blank space never unseats an entry."""
+        rules = tmp_path / "trailing.yaml"
+        rules.write_text("whitelist:\n  - ^foo\\s*\\|\\s*bar\\s*$\nrules: []\n")
+        engine = RuleEngine(rules)
+        assert engine.is_whitelisted_whole("foo | bar  ", 2)
+
+    def test_match_command_can_skip_the_whitelist(self, test_rules_file):
+        """use_whitelist=False lets the multi-segment fallback re-check a command whose
+        prefix is whitelisted (LAB-2752) without the prefix vouching for the rest."""
+        engine = RuleEngine(test_rules_file)
+        assert not engine.match_command("git status; rm -rf /").matched
+        assert engine.match_command("git status; rm -rf /", use_whitelist=False).matched
+
     def test_no_match_returns_safe(self, test_rules_file):
         """Unknown commands are safe."""
         engine = RuleEngine(test_rules_file)

