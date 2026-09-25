@@ -127,7 +127,7 @@ _apply_andor_substitution_correction()
 # A heredoc body is inert text to `cat` and source code to `bash`, which decides
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
 # segment has to carry it (extract_command_segments). One set, so the two answers
-# cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
+# cannot drift apart. Both ask `heredoc_owner`, which sees past a wrapper.
 #
 # `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
 # bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
@@ -140,6 +140,11 @@ _apply_andor_substitution_correction()
 # put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
 # the rbash drift with a different interpreter.
 _HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
+
+# Quoted-substitution body text may total this many times the command's length
+# before extract_quoted_substitution_bodies fails closed. Bodies nest, so text
+# is scanned once per enclosing body; an honest command stays under 3x.
+_MAX_BODY_TEXT_FACTOR = 4
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -400,6 +405,28 @@ def _command_words(node: Any) -> "list[str]":
         if hasattr(part, "word"):
             words.append(part.word)
     return words
+
+
+def heredoc_owner(node: Any) -> Optional[str]:
+    """The name of what runs a command node's heredoc, basename only; None when it has no word.
+
+    Built on `_command_words`, so an assignment prefix is skipped: `FOO=1 bash` runs `bash`.
+    Taking the first part that merely HAS a `.word` read it as a command named `FOO=1`, and
+    a shell behind any assignment was then treated as an inert heredoc consumer.
+
+    A wrapper execs its command with its own stdin, so `env bash <<EOF` hands the body to
+    bash; busybox and toybox are wrappers here too (`busybox sh`). The owner is then the
+    first shell among ALL the wrapper's operands, or the wrapper's own name when none is a
+    shell. Not the first operand: the shell need not be it (`timeout 5 sh`). The cost is an
+    over-read - `flock ./bash cat` names bash, though it locks a file called `bash` and runs
+    cat - which only rescans a body that may not run: the fail-closed direction.
+    """
+    words = [word.split("/")[-1] for word in _command_words(node)]
+    if not words:
+        return None
+    if words[0] in WRAPPER_COMMANDS:
+        return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), words[0])
+    return words[0]
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -753,8 +780,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
-        executes_body = cmd_name in _HEREDOC_SHELL_COMMANDS
+        executes_body = heredoc_owner(node) in _HEREDOC_SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1103,10 +1129,7 @@ class BashCommandParser:
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            cmd_name = part.word.split("/")[-1]  # Handle /bin/bash
-                            break
+                    cmd_name = heredoc_owner(node)
 
                 # Check for redirect nodes with heredocs
                 if node.kind == "redirect" and hasattr(node, "heredoc"):
@@ -1164,7 +1187,24 @@ class BashCommandParser:
             >>> literals = parser.extract_string_literals('echo "rm -rf /"', ast)
             >>> # literals = [(6, 14)]  # Position of content inside quotes
         """
-        string_literals: list[tuple] = []
+        words, parameter_spans = self._quoted_words(command, ast_nodes)
+        # Record the position INSIDE the quotes (exclude quote chars).
+        # _is_quoted_span's own `end - start < 2` check rules out the
+        # empty-quote span that would invert this range.
+        string_literals = [(word.pos[0] + 1, word.pos[1] - 1) for word in words]
+        if not parameter_spans:
+            return string_literals
+        return self._drop_ranges_inside(string_literals, parameter_spans)
+
+    def _quoted_words(self, command: str, ast_nodes: list[Any]) -> tuple[list[Any], list[tuple]]:
+        """Every word node whose span is quoted, and every `parameter` span, in walk order.
+
+        The one definition of which words earn a suppression range. It is shared
+        with extract_quoted_substitution_bodies because that pass exists to cover
+        exactly those words: a walk widened for one and not the other suppresses a
+        body with nothing matching it.
+        """
+        words: list[Any] = []
         parameter_spans: list[tuple] = []
 
         def visit(node):
@@ -1176,13 +1216,8 @@ class BashCommandParser:
                 if node.kind == "parameter" and hasattr(node, "pos"):
                     parameter_spans.append(node.pos)
 
-                # Look for word nodes that are quoted strings
-                if node.kind == "word" and hasattr(node, "pos"):
-                    # Record the position INSIDE the quotes (exclude quote chars).
-                    # _is_quoted_span's own `end - start < 2` check rules out the
-                    # empty-quote span that would invert this range.
-                    if self._is_quoted_span(command, node.pos):
-                        string_literals.append((node.pos[0] + 1, node.pos[1] - 1))
+                if node.kind == "word" and hasattr(node, "pos") and self._is_quoted_span(command, node.pos):
+                    words.append(node)
 
                 # Recursively visit child nodes
                 for attr in ["parts", "command", "list", "pipe", "compound"]:
@@ -1196,10 +1231,103 @@ class BashCommandParser:
 
         for node in ast_nodes or []:
             visit(node)
+        return words, parameter_spans
 
-        if not parameter_spans:
-            return string_literals
-        return self._drop_ranges_inside(string_literals, parameter_spans)
+    def extract_quoted_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> list[CommandSegment]:
+        """The body of each substitution inside a quoted word, as a segment of its own.
+
+        SECURITY: extract_string_literals gives a quoted word ONE range, so the raw
+        pass suppresses a `"$(…)"` body along with the rest of the word. The only
+        other view of that body is SubstitutionValidator's word view, where the
+        quotes are already gone, so a rule that reads quote characters has no text
+        that shows them: `"$(IFS=' ,'; …)"` reads as `IFS= ,`, an empty IFS.
+        Matching each body raw, with its own ranges, gives it the view a bare
+        `$(…)` already gets from the raw pass. Bodies get the raw pass only: the
+        quote-stripped form of a body is SubstitutionValidator's word view.
+
+        The word keeps its range on purpose. Cutting the substitution out of it
+        instead exposes the `$(` itself, and a rule written against bare
+        substitutions (`command_substitution_dangerous`) then reads
+        `"$(grep -rn 'rm -rf' src/)"` as the command it searches for.
+
+        Offsets come from the substitution's own span, never its inner command:
+        bashlex ends the inner command at the first newline, and inside a word
+        each `\\<newline>` moves every later inner offset two places early. The
+        word's own span is exact, so a word holding a newline, or a substitution
+        whose closer is not where _body_end looks, gets ONE body, from its first
+        substitution to its closing quote. That body keeps its heredoc
+        ranges only while no `\\<newline>` has moved them, and never its literal
+        ranges, which is a false positive on a quoted argument in a multi-line
+        body and never a missed payload.
+
+        Raises:
+            ValueError: past _MAX_BODY_TEXT_FACTOR times the command's length in
+                body text. Nested bodies are scanned once per enclosing body, and
+                a hook that outlives its timeout fails open (fail closed).
+        """
+        bodies: list[CommandSegment] = []
+        whole_until = -1  # end of the last multi-line word, already one body
+        budget = _MAX_BODY_TEXT_FACTOR * len(command)
+        words, _ = self._quoted_words(command, ast_nodes)
+        for word in words:
+            word_start, word_end = word.pos
+            code = [
+                part
+                for part in getattr(word, "parts", None) or ()
+                if getattr(part, "kind", None) in ("commandsubstitution", "processsubstitution") and getattr(part, "pos", None)
+            ]
+            if not code or word_start < whole_until:
+                continue
+            text = command[word_start:word_end]
+            found = [] if "\n" in text else [self._body_end(command, part.pos) for part in code]
+            ends = [end for end in found if end is not None]
+            if len(ends) < len(code):
+                whole_until = word_end
+                first = code[0].pos[0]
+                start = word_start + 1 if "\\\n" in command[word_start:first] else self._body_start(command, first)
+                heredocs = [] if "\\\n" in text else self.extract_heredoc_ranges(command, [word])
+                spans = [(start, word_end - 1, [], heredocs)]
+            else:
+                spans = [
+                    (
+                        self._body_start(command, part.pos[0]),
+                        end,
+                        self.extract_string_literals(command, [part]),
+                        self.extract_heredoc_ranges(command, [part]),
+                    )
+                    for part, end in zip(code, ends)
+                ]
+            for start, end, literals, heredocs in spans:
+                budget -= end - start
+                if budget < 0:
+                    raise ValueError(f"Quoted substitution bodies exceed {_MAX_BODY_TEXT_FACTOR}x the command's length")
+                bodies.append(
+                    CommandSegment(
+                        text=command[start:end],
+                        string_literals=self._rebase(literals, start, end),
+                        heredoc_ranges=self._rebase(heredocs, start, end),
+                        node=word,
+                    )
+                )
+        return bodies
+
+    @staticmethod
+    def _body_start(command: str, part_start: int) -> int:
+        """Where a substitution's body begins: past a backtick, or past `$(`, `<(` or `>(`."""
+        return part_start + (1 if command[part_start] == "`" else 2)
+
+    @staticmethod
+    def _body_end(command: str, span: tuple) -> Optional[int]:
+        """Offset of a substitution's closing delimiter, or None if it is not where bashlex says.
+
+        bashlex ends a substitution's span on the first blank of a trailing run
+        (`$(x    )` spans `$(x `), so the closer is found by skipping blanks.
+        """
+        closer = "`" if command[span[0]] == "`" else ")"
+        end = span[1] - 1
+        while command[end : end + 1] in (" ", "\t"):
+            end += 1
+        return end if command[end : end + 1] == closer else None
 
     @staticmethod
     def _drop_ranges_inside(ranges: list[tuple], spans: list[tuple]) -> list[tuple]:

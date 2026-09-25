@@ -758,9 +758,9 @@ class RuleEngine:
         first one lets an inert decoy hide a real hit from the SAME pattern --
         `cat \':(){ :|:& };:\'` followed by a newline and the same fork bomb unquoted
         rated SAFE, because the quoted decoy consumed the rule\'s only search.
-        Pick the example carefully: a rule with two patterns matching at different
-        offsets (`rm -rf /`) hides the leak, because its second pattern catches the
-        payload anyway.
+        Pick the example carefully: `rm -rf /` hides the leak, because
+        `system_destruction`'s `[^;|&]` run crosses the newline, so its first match
+        starts inside the decoy, ends at the payload, and is never suppressed.
 
         Advances by one character rather than to match.end() so a later match that
         overlaps the suppressed one is still found.
@@ -769,12 +769,8 @@ class RuleEngine:
         insurance and is not: reporting anything other than "first executable match,
         or none" on exhaustion is wrong in one direction or the other. Reporting the
         last suppressed match denies benign text (a quoted doc listing 32 `sudo`
-        lines) AND under-blocks, because `validate_command` only runs its
-        cross-segment scan when no segment matched, so a bogus segment match hides
-        a `BLOCKED` the whole command would have earned. Returning None instead just
-        lets padding silence the rule. Measured, the bound bought ~1%: on a 229 KB
-        padded command the loop is 13.1 s bounded vs 13.1 s unbounded, against 12.9 s
-        on a tree without this scan at all - the superlinearity is elsewhere.
+        lines). Returning None instead lets padding silence the rule. Measured, the
+        bound bought ~1%; the superlinearity lives elsewhere.
         Termination is structural: `pos` strictly increases every iteration.
         """
         pos = 0

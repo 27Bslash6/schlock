@@ -1149,11 +1149,47 @@ class TestObfuscationDetection:
             "cat$IFS/etc/passwd",
             "IFS=x; cmd",
             "${IFS:0:1}cmd",
+            "IFS=:; cmd=$PATH; echo $cmd",
+            "IFS=,; x=rm,-rf,/; $x",
+            "f(){ local IFS=,; x=rm,-rf,/; $x; }; f",
+            "IFS=$'\\n\\t'",
+            # Non-empty value glued to a quoted-empty prefix is still non-empty.
+            "IFS=''x; y=a",
+            # A prefix to `read` is not exempt: a function named `read` inherits it.
+            "read(){ x=rm,-rf,/; $x; }; IFS=, read",
+            "IFS=, read -r a b",
+            # bash keeps CR/FF/VT/\x1c inside a word, so each is a live separator.
+            "IFS=\r,; x=rm,-rf,/; $x",
+            "IFS=''\x0b; x=a",
+            'IFS=""\x1c; x=a',
+            # A leading quoted blank is caught on the raw pass only: reconstruction drops the quotes.
+            "IFS=' ,' read -r a b",
+            "IFS=$' \\t' read a",
+            # Reconstruction drops quotes and joins lines: these read as IFS='' / IFS= there.
+            "IFS\\\n=\\'\\'; x=a\\'b; $x",
+            "IFS\\\n=' ,'; x=a,b; $x",
+            "I\\\nFS=\\ ,; x=a,b; $x",
         ]
         for cmd in dangerous:
             result = validate_command(cmd, config_path=safety_rules_path)
-            assert not result.allowed, f"IFS obfuscation not blocked: {cmd}"
-            assert result.risk_level == RiskLevel.BLOCKED
+            assert result.risk_level == RiskLevel.BLOCKED, f"IFS obfuscation not blocked: {cmd}"
+            assert "ifs_obfuscation" in result.matched_rules, f"blocked by another path: {cmd}"
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "IFS= read -r line",
+            'cat f | while IFS= read -r line; do echo "$line"; done',
+            # The heredoc re-validation path ("Alongside heredoc:") the report hit.
+            "python3 - <<'PY'\nprint(1)\nPY\ncat f | while IFS= read -r line; do echo \"$line\"; done",
+        ],
+    )
+    def test_empty_ifs_not_flagged(self, safety_rules_path, cmd):
+        """An empty IFS disables word splitting, so it cannot hide words."""
+        result = validate_command(cmd, config_path=safety_rules_path)
+        assert result.risk_level in (RiskLevel.SAFE, RiskLevel.LOW), f"{cmd!r} -> {result.risk_level}"
+        assert result.matched_rules == [], f"{cmd!r} -> {result.matched_rules}"
 
     def test_base64_shell_execution_blocked(self, safety_rules_path):
         """Base64 decode to shell should be BLOCKED."""
