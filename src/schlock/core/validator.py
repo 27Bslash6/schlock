@@ -1509,10 +1509,12 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     Returns ``(delimiter, offset just past the word)``.
 
     Raises:
-        ParseError: on an unterminated quote, an empty delimiter, or an escape
-            inside `$'…'`. A delimiter this cannot tokenize is a body boundary it
-            cannot locate, so the caller must not vouch for anything around it.
+        ParseError: on an unterminated quote, an empty delimiter, an escape
+            inside `$'…'`, or `${`, `$(` or a backtick anywhere in the word. A
+            delimiter this cannot tokenize is a body boundary it cannot locate, so
+            the caller must not vouch for anything around it.
     """
+    start = pos
     delimiter: list[str] = []
     while pos < len(text) and text[pos] not in _WORD_START_AFTER:
         char = text[pos]
@@ -1548,6 +1550,14 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
         else:
             delimiter.append(char)
             pos += 1
+
+    # bash removes a delimiter's quotes only at the top level of the word, not inside
+    # `${…}`, `$(…)` or backticks: `<<${a'b'}` ends at a line reading `${a'b'}`, and the
+    # body is expanded, while the loop above reads `${ab}`. Refused rather than modelled.
+    # The character that stopped the word counts too, since `<<$(x)` stops at `(`.
+    found = next((s for s in ("${", "$(", "`") if s in text[start : pos + 1]), None)
+    if found is not None:
+        raise ParseError(f"`{found}` in a heredoc delimiter; the line that ends its body is unknown")
 
     if not delimiter:
         # Also a quoted empty one (`<<''`): bash ends that at the first empty line, but
