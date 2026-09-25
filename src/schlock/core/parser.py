@@ -554,11 +554,6 @@ _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
     ),
 }
 _DEFAULT_SPEC = _WrapperSpec()
-# The short single-letter value options of each `-c` runner, so the validator can tell an attached
-# `-c` program (`-c'rm'`) from a `c` that sits inside another option's attached value (`-Tclock.log`).
-DASH_C_VALUE_LETTERS: "dict[str, frozenset[str]]" = {
-    base: frozenset(o[1] for o in _WRAPPER_SPECS[base].values if len(o) == 2 and o.startswith("-")) for base in DASH_C_WRAPPERS
-}
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -584,6 +579,20 @@ def _option_kind(arg: str, spec: _WrapperSpec, dash_c: bool) -> str:  # noqa: PL
         if opt not in spec.flags:
             return "unknown"
     return "flag"
+
+
+def runner_option_kind(runner: str, word: str) -> str:
+    """How `DASH_C_WRAPPERS` member `runner` reads option `word`: `dash_c`, `value`, `flag` or `unknown`.
+
+    Read as getopt does: a value option earlier in a cluster takes the rest as its value, so
+    `runuser -s/bin/csh` sets a shell and `-gcdrom` a group, not `-c`; a `value` takes the next
+    word, so `runuser -w -cfoo` whitelists `-cfoo` (LAB-5180). A letter the spec does not know
+    ends the reading of a short cluster, and then any later `c` counts - the fail-closed direction.
+    """
+    kind = _option_kind(word, _WRAPPER_SPECS.get(runner, _DEFAULT_SPEC), dash_c=True)
+    if kind == "unknown" and not word.startswith("--") and "c" in word[1:]:
+        return "dash_c"
+    return kind
 
 
 def _sets_option(arg: str, spec: _WrapperSpec) -> bool:
@@ -695,7 +704,12 @@ def _is_dynamic_loader(base: str) -> bool:
     return base == "ld.so" or (base.startswith(("ld-linux", "ld-musl", "ld64", "ld-2")) and ".so" in base)
 
 
-def _is_wrapper(word: str) -> bool:
+def is_wrapper(word: str) -> bool:
+    """True if `word`, read as a command, execs its operands: a `WRAPPER_COMMANDS` member or the loader.
+
+    The one predicate for heredoc owners, here-string sinks and `-c` delegation, so the three
+    cannot disagree about which words pass a command through (LAB-5180).
+    """
     base = word.split("/")[-1]
     return base in WRAPPER_COMMANDS or _is_dynamic_loader(base)
 
@@ -709,6 +723,22 @@ def _sources_stdin(args: list[str]) -> bool:
         return True
     path = posixpath.normpath(target)  # `/dev/fd//0`, `/dev/fd/./0`, `/dev/../dev/stdin` are all stdin
     return path in ("-", "stdin") or path.endswith(("/stdin", "/fd/0"))
+
+
+def _builtin_invoked(words: list[str]) -> list[str]:
+    """`words` past any leading `command`/`builtin` and their options: the builtin that runs.
+
+    `command . FILE` and `builtin source FILE` run `.` itself, on the same stdin `. FILE` reads
+    (LAB-5180). Only these two prefixes reach a builtin; an exec wrapper (`timeout 5 . FILE`)
+    finds no program named `.`. Every dashed word is skipped, so `command -v . FILE` (which only
+    prints) over-reads - the fail-closed direction.
+    """
+    at = 0
+    while at < len(words) - 1 and words[at] in ("command", "builtin"):
+        at += 1
+        while at < len(words) - 1 and words[at].startswith("-"):
+            at += 1
+    return words[at:]
 
 
 def expand_env_split_string(base: str, args: list[str]) -> list[str]:
@@ -887,17 +917,19 @@ def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses 
         option its spec does not know;
       - `xargs` whose command is itself a wrapper, so a body line supplies the command
         (`xargs env`), and GNU `parallel` with no template or one that runs its line as code;
-      - `.`/`source` of stdin or of a file this parser cannot name.
+      - `.`/`source` of stdin or of a file this parser cannot name, also behind `command`/`builtin`.
     """
     raw = _command_words(node)
     if not raw:
         return None
-    if names_unresolved_program(raw[0]):
-        return _DEFAULT_SHELL
+    builtin = _builtin_invoked(raw)
+    if names_unresolved_program(builtin[0]):
+        return _DEFAULT_SHELL  # `$'bash'`, or `builtin $X /dev/stdin`
+    name = builtin[0].split("/")[-1]
+    if name in (".", "source"):
+        return _DEFAULT_SHELL if _sources_stdin(builtin[1:]) else name
     head = raw[0].split("/")[-1]
-    if head in (".", "source"):
-        return _DEFAULT_SHELL if _sources_stdin(raw[1:]) else head
-    if not _is_wrapper(head):
+    if not is_wrapper(head):
         return head
     operands = expand_env_split_string(head, raw[1:])
     shell = next((word.split("/")[-1] for word in operands if word.split("/")[-1] in _HEREDOC_SHELL_COMMANDS), None)
@@ -906,7 +938,7 @@ def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses 
     candidates, runs_code = _scan_wrapper_operands(head, operands)
     if runs_code:
         return _DEFAULT_SHELL
-    if head == "xargs" and any(map(_is_wrapper, candidates)):
+    if head == "xargs" and any(map(is_wrapper, candidates)):
         return _DEFAULT_SHELL  # `xargs env`: a body line supplies the wrapped command
     return head
 
@@ -1010,7 +1042,7 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args):
         return (name, here_string)
 
-    if name in WRAPPER_COMMANDS:
+    if is_wrapper(name):
         for at, arg in enumerate(args):
             interpreter = arg.split("/")[-1]
             if interpreter in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(interpreter, args[at + 1 :]):
@@ -1678,8 +1710,12 @@ class BashCommandParser:
             is_shell=True means the heredoc will be executed by a shell.
         """
         heredoc_ranges = []
+        # A function that runs a shell on its stdin (`f() { bash; }; f <<EOF`) runs its heredoc as
+        # code, as `_bashlex_heredocs` reads it (LAB-5180). Only a heredoc can be affected.
+        wrapping_funcs = shell_wrapping_functions(ast_nodes or []) if "<<" in command else set()
+        code_subs: set[int] = set()  # command-position substitutions, filled before they are visited
 
-        def visit(node, parent_cmd=None, in_process=False):
+        def visit(node, parent_cmd=None, body_is_code=False):
             """Recursively visit AST nodes to find heredocs."""
             if hasattr(node, "kind"):
                 # A heredoc under an unquoted process substitution feeds `cat` (inert), but the
@@ -1687,21 +1723,27 @@ class BashCommandParser:
                 # `source <( … )` - so its body is code, exactly as the quoted twin is treated
                 # None in `_bashlex_heredocs`. Mark every heredoc below the procsub is_shell
                 # (LAB-5180). The reader is not known here, so this over-reads rather than
-                # trusting the inner command's name.
-                if node.kind == "processsubstitution":
-                    in_process = True
+                # trusting the inner command's name. A substitution in command position
+                # (`$(cat <<EOF … )`) runs its output, so the same holds below it.
+                if node.kind == "processsubstitution" or id(node) in code_subs:
+                    body_is_code = True
 
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
                     cmd_name = heredoc_owner(node)
+                    if cmd_name in wrapping_funcs:
+                        cmd_name = _DEFAULT_SHELL
+                    sub = command_position_substitution(node)
+                    if sub is not None:
+                        code_subs.add(id(sub))
 
                 # Check for redirect nodes with heredocs
                 if node.kind == "redirect" and hasattr(node, "heredoc"):
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = in_process or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
+                        is_shell = body_is_code or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -1710,9 +1752,9 @@ class BashCommandParser:
                         child = getattr(node, attr)
                         if isinstance(child, list):
                             for item in child:
-                                visit(item, cmd_name or parent_cmd, in_process)
+                                visit(item, cmd_name or parent_cmd, body_is_code)
                         elif child:
-                            visit(child, cmd_name or parent_cmd, in_process)
+                            visit(child, cmd_name or parent_cmd, body_is_code)
 
         for node in ast_nodes or []:
             visit(node)

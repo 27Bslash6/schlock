@@ -105,6 +105,11 @@ class TestHeredocOwnerResolvesUncertainToShell:
             ". /dev/fd//0",  # the path is normalised before the stdin test
             ". /dev/fd/./0",
             "source /dev/fd/0/",
+            "command . /dev/stdin",  # `command`/`builtin` run the `.` builtin itself
+            "builtin source /dev/stdin",
+            "command -p . /dev/stdin",
+            "command -- source /dev/stdin",
+            "builtin $X /dev/stdin",  # the builtin's own name is unresolved
             "${SHELL#)/}",  # the `)` is pattern text: `${` closes only on `}`
             "timeout 5 ${SHELL#)/}",
             "$(: ')'; echo /bin/bash)",  # a quote inside `$(…)`: bracket it no further
@@ -219,6 +224,9 @@ class TestHeredocOwnerInertReadersUnchanged:
             ("parallel echo", "parallel"),
             ("parallel 'echo {}'", "parallel"),  # the template is parsed, so `{}` is echo's argument
             ("source ./env.sh", "source"),
+            ("command . ./env.sh", "."),  # sources a file, not this stdin
+            ("command git status", "command"),
+            ("builtin echo hi", "builtin"),
             ("bash", "bash"),
             ("/bin/bash", "bash"),
         ],
@@ -361,6 +369,12 @@ class TestProcsubHeredocRangesAreShell:
             "source <(cat <<EOF\nrm -rf /\nEOF\n)",
             ". <(cat <<EOF\nrm -rf /\nEOF\n)",
             "bash <(cat <<EOF\nrm -rf /\nEOF\n) | wc -l",
+            # A command-position substitution runs its output; a shell-wrapping function its stdin.
+            "$(cat <<EOF\nrm -rf /\nEOF\n)",
+            "`cat <<EOF\nrm -rf /\nEOF\n`",
+            "f() { bash; }; f <<EOF\nrm -rf /\nEOF",
+            "g() { bash; }; f() { g; }; f <<EOF\nrm -rf /\nEOF",
+            "command . /dev/stdin <<EOF\nrm -rf /\nEOF",
         ],
     )
     def test_procsub_heredoc_is_shell(self, command):
@@ -368,6 +382,20 @@ class TestProcsubHeredocRangesAreShell:
         ranges = parser.extract_heredoc_ranges(command, parser.parse(command))
         assert ranges, f"no heredoc range for {command!r}"
         assert all(is_shell for _s, _e, is_shell in ranges), ranges
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=$(cat <<EOF\nrm -rf /\nEOF\n)",  # assignment: data
+            'echo "$(cat <<EOF\nrm -rf /\nEOF\n)"',  # argument: data
+            "f() { cat; }; f <<EOF\nrm -rf /\nEOF",  # the function reads, it does not run
+        ],
+    )
+    def test_data_heredoc_is_not_shell(self, command):
+        parser = BashCommandParser()
+        ranges = parser.extract_heredoc_ranges(command, parser.parse(command))
+        assert ranges, f"no heredoc range for {command!r}"
+        assert not any(is_shell for _s, _e, is_shell in ranges), ranges
 
 
 class TestBusyboxPathShellHereString:
@@ -474,6 +502,9 @@ AC1_QUOTED_ROWS = [
     ". /dev/fd//0",
     ". /dev/fd/./0",
     "source /dev/fd/0/",
+    "command . /dev/stdin",
+    "builtin source /dev/stdin",
+    "command -p . /dev/stdin",
 ]
 
 
@@ -520,6 +551,8 @@ class TestAc1UnquotedRegressionTwins:
             "xargs env",
             ". /dev/stdin",
             "source /dev/stdin",
+            "command . /dev/stdin",
+            "builtin source /dev/stdin",
         ],
     )
     def test_unquoted_twin_blocked(self, head, no_shellcheck):
@@ -533,6 +566,7 @@ class TestAc2DashCPayloads:
         [
             "env $'bash' -c 'rm -rf /'",
             "env -S 'bash -c \"rm -rf /\"'",
+            f'/lib64/ld-linux-x86-64.so.2 /bin/bash -c "{Q}"',  # the loader is a wrapper here too
         ],
     )
     def test_dash_c_payload_blocked(self, command, no_shellcheck):
@@ -559,6 +593,14 @@ class TestAc3HereStringDrift:
         bash = validate_command(f'bash <<< "{body}"')
         assert busybox.risk_level == bash.risk_level == RiskLevel.BLOCKED, (body, busybox.risk_level, bash.risk_level)
 
+    def test_loader_shell_matches_bash(self, no_shellcheck):
+        result = validate_command(f'/lib64/ld-linux-x86-64.so.2 /bin/bash <<< "{Q}"')
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "shell_delegated_payload" in (result.matched_rules or [])
+
+    def test_loader_reader_stays_inert(self, no_shellcheck):
+        assert validate_command(f'/lib64/ld-linux-x86-64.so.2 /bin/cat <<< "{Q}"').risk_level == RiskLevel.SAFE
+
 
 class TestAc4UnquotedRowsMatchDirectTwin:
     """Parity with the direct unquoted twin `bash <<EOF` (regex over the raw body); structural
@@ -573,6 +615,9 @@ class TestAc4UnquotedRowsMatchDirectTwin:
             "unshare <<EOF\n{body}\nEOF",
             "chroot / <<EOF\n{body}\nEOF",
             "script -q /dev/null <<EOF\n{body}\nEOF",
+            "$(cat <<EOF\n{body}\nEOF\n)",  # command position: its output runs
+            "`cat <<EOF\n{body}\nEOF\n`",
+            "f() {{ bash; }}; f <<EOF\n{body}\nEOF",
         ],
     )
     @pytest.mark.parametrize("body", [RM, CURL])
@@ -696,6 +741,7 @@ class TestOwnerDoesNotOverRead:
             'script -q "-cls -la" /dev/null',
             "script -Tclock.log echo /dev/null",  # -T takes clock.log; echo is the command
             hd('"$(dirname "$0")/run.sh"', "hello world"),  # a clean body run from a $()-quoted path
+            "runuser -s/bin/csh root -c 'ls -la'",
         ],
     )
     def test_inert_reader_keeps_base_verdict(self, command, no_shellcheck):
@@ -708,7 +754,12 @@ class TestOwnerDoesNotOverRead:
             "script -q --command \"'rm' -rf /\" /dev/null",  # SAFE on a72b45c: --command was skipped
             "script -q -c \"'rm' -rf /\" /dev/null",  # the short twin, BLOCKED on a72b45c too
             "script -q \"-c'rm' -rf /\" /dev/null",  # SAFE on a72b45c: the attached program was skipped
-            "script -Tclock.log -c \"'rm' -rf /\" /dev/null",  # the `c` in `clock.log` is -T's value, not -c
+            # The runner's grammar picks the `-c`: a value option's `c` is not it (SAFE on a72b45c).
+            "runuser -s/bin/csh root -c \"'rm' -rf /\"",
+            "runuser -gcdrom root -c \"'rm' -rf /\"",
+            "script -Tclock.log -c \"'rm' -rf /\" /dev/null",
+            "runuser -w -cfoo -c \"'rm' -rf /\" root",  # -w takes `-cfoo` as its value
+            "script -T -cfoo -c \"'rm' -rf /\" /dev/null",
             "runuser -gdocker -c \"'rm' -rf /\" root",  # the `c` in `docker` is -g's value, not -c
         ],
     )

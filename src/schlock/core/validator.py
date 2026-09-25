@@ -25,14 +25,15 @@ from schlock.integrations.shellcheck import (
 
 from .cache import ValidationCache
 from .parser import (
-    DASH_C_VALUE_LETTERS,
     DASH_C_WRAPPERS,
     WRAPPER_COMMANDS,
     BashCommandParser,
     command_position_substitution,
     expand_env_split_string,
     heredoc_owner,
+    is_wrapper,
     names_unresolved_program,
+    runner_option_kind,
     shell_wrapping_functions,
 )
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
@@ -586,24 +587,8 @@ def _find_exec_clauses(args: list[str]) -> list[list[str]]:
     return clauses
 
 
-def _attached_dash_c(word: str, value_letters: "frozenset[str]") -> "tuple[bool, Optional[str]]":
-    """Walk a getopt runner's short cluster for a `-c`. Returns ``(has_c, program)``:
-    ``(False, None)`` no `-c` here; ``(True, prog)`` an attached `-c<prog>`; ``(True, None)`` a
-    bare `-c` at the cluster end (its program is the next word).
-
-    Stops at the first letter that takes a value, whose attached argument is not a `-c`
-    (`-Tclock.log` -> ``(False, None)``, not the `c` inside `clock`).
-    """
-    for idx, ch in enumerate(word[1:], start=1):
-        if ch == "c":
-            return True, (word[idx + 1 :] or None)
-        if ch in value_letters:
-            return False, None
-    return False, None
-
-
 def _dash_c_payload(  # noqa: PLR0912 - one branch per getopt case
-    words: list[str], *, operand_ends_options: bool = True, value_letters: Optional[frozenset[str]] = None
+    words: list[str], *, operand_ends_options: bool = True, runner: Optional[str] = None
 ) -> Optional[str]:
     """Return the program a `-c` hands to a shell, given the words following the command name.
 
@@ -616,12 +601,17 @@ def _dash_c_payload(  # noqa: PLR0912 - one branch per getopt case
     (`bash -c -- 'echo hi'` prints hi). A `--` *before* any `-c` ends option parsing, so
     there is no inline program at all.
 
-    ``value_letters`` is set for the getopt runners (`script`, `su`, `runuser`), which do take an
-    attached `-c` program (the rest of the cluster after `c`). The cluster is walked letter by
-    letter and stops at the first `value_letters` option, so the `c` inside another option's
-    attached value is not read as `-c`: `script -Tclock.log -c PROG` runs PROG, not `lock.log`.
+    ``runner`` names a getopt runner (`DASH_C_WRAPPERS`: `script`, `su`, `runuser`, `sg`), where
+    the rest of the cluster after `c` is the program: `script -q "-c'rm' -rf /" f` runs `'rm' -rf /`.
+    Its own grammar decides which word is `-c`: `runuser -s/bin/csh root -c X` sets the shell
+    `/bin/csh` and runs X, where reading the `c` in `csh` as `-c` took `sh` as the program and
+    dropped X; `runuser -w -cfoo -c X root` whitelists `-cfoo` and runs X (LAB-5180).
     """
+    value_next = False
     for i, word in enumerate(words):
+        if value_next:
+            value_next = False
+            continue  # the runner's value option took this word (`-w -cfoo`)
         if word == "--":
             return None  # end of options: a later -c is an argument, not a flag
         if not word.startswith("-"):
@@ -632,6 +622,10 @@ def _dash_c_payload(  # noqa: PLR0912 - one branch per getopt case
             if i == 0 and operand_ends_options:
                 return None
             continue
+        kind = runner_option_kind(runner, word) if runner is not None else None
+        if kind == "value":
+            value_next = True
+            continue
         if word.startswith("--"):
             # su, runuser, script and fish also spell it `--command PROG` / `--command=PROG`.
             name, has_value, value = word.partition("=")
@@ -639,16 +633,13 @@ def _dash_c_payload(  # noqa: PLR0912 - one branch per getopt case
                 continue
             if has_value:
                 return value or None
-        elif value_letters is None:
-            if "c" not in word[1:]:
-                continue  # a shell's -c always takes the next word (`bash -cX` is an error)
-        else:
-            has_c, program = _attached_dash_c(word, value_letters)
-            if not has_c:
-                continue
-            if program is not None:
-                return program  # `-c'rm'`: the rest of the cluster is the program
-            # a bare `-c` at the cluster end: the program is the next word
+        elif "c" not in word[1:]:
+            continue
+        elif runner is not None:
+            if kind != "dash_c":
+                continue  # a value option took the rest of the cluster (`-s/bin/csh`, `-gcdrom`)
+            if word[word.index("c", 1) + 1 :]:
+                return word[word.index("c", 1) + 1 :]
         rest = words[i + 1 :]
         while rest and rest[0] == "--":
             rest = rest[1:]
@@ -731,10 +722,10 @@ def _shell_delegated_payloads(
                     _dash_c_payload(
                         args,
                         operand_ends_options=base in _SHELL_COMMANDS,
-                        value_letters=DASH_C_VALUE_LETTERS.get(base),
+                        runner=base if base in DASH_C_WRAPPERS else None,
                     )
                 )
-            if base in WRAPPER_COMMANDS:
+            if is_wrapper(base):
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
                 # operand semantics, `watch`, `find`, and nested wrappers all thread for free
