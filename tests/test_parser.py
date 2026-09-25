@@ -133,6 +133,9 @@ class TestBashCommandParser:
             # hides an rm -rf / from every pass.
             ("bash <<EOF | tee log\nrm -rf /\nEOF", ["bash <<EOF\nrm -rf /\nEOF", "tee log"]),
             ("/bin/bash <<EOF | x\nrm -rf /\nEOF", ["/bin/bash <<EOF\nrm -rf /\nEOF", "x"]),
+            # A wrapper runs its shell with the wrapper's stdin; wrapping cat keeps it inert.
+            ("env bash <<EOF | x\nrm -rf /\nEOF", ["env bash <<EOF\nrm -rf /\nEOF", "x"]),
+            ("timeout 5 cat <<EOF | x\nrm -rf /\nEOF", ["timeout 5 cat <<EOF\n\nEOF", "x"]),
             # Each heredoc is closed in opener order.
             ("cat <<A <<B | x\n1\nA\n2\nB", ["cat <<A <<B\n\nA\n\nB", "x"]),
             ("cat <<-EOF | x\n\tq\n\tEOF", ["cat <<-EOF\n\nEOF", "x"]),
