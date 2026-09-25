@@ -1982,6 +1982,20 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     return bodies
 
 
+# A `<` ending a line that a backslash continues, then a `<` opening the next. bash deletes
+# an unquoted backslash-newline before it tokenizes, so the two are ONE operator: `cat <\`
+# then `<EOF` is a heredoc, `cat q <\` then `<<'B' r` is the here-string `<<<'B'`. The
+# opener scan, and the `<<` test in front of it, read the text as written, one physical line
+# at a time: they find no opener in the first spelling, and misread the second as a quoted
+# heredoc, blanking the command after it as that heredoc's body. ShellCheck does not parse
+# the join at all. bashlex alone reads it as bash does, and one reader is not enough to vouch.
+#
+# Matched on raw text on purpose: the join is made before tokenizing, so this is the level
+# bash itself acts at. Where bash would NOT join - single quotes, a comment, a quoted
+# heredoc body - this refuses anyway. That costs a false positive, never a miss.
+_SPLIT_LESS_THAN_RE = re.compile(r"<(?:\\\n)+<")
+
+
 class _Normalised(NamedTuple):
     """What `_normalise_heredoc_delimiters` hands back, beyond the rewritten text."""
 
@@ -2684,6 +2698,19 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             return special_check
 
         # Step 4: Parse command and extract AST context
+        if _SPLIT_LESS_THAN_RE.search(command):
+            # Before the normaliser, whose `<<` test cannot see this join (see the pattern).
+            error = "a `<` continued onto a line that starts with `<` is one `<<` or `<<<` to bash"
+            return ValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"BLOCKED: Cannot determine what this redirection reads: {error}",
+                alternatives=["Write `<<` and `<<<` without a line break inside them"],
+                exit_code=1,
+                error=error,
+            )
+            # Not cached: a parse-level refusal, like the parse errors below.
+
         parser = _get_parser()
         # bashlex ends a heredoc at the delimiter as written, bash at the delimiter with
         # its quotes removed. Reconciling the two before parsing is what keeps a quoted
