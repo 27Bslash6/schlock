@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, command_name
+from .parser import WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -1882,7 +1882,7 @@ class _BashlexHeredoc(NamedTuple):
     """One heredoc as bashlex read it, located by its opener rather than its body."""
 
     opener: int  # offset of its `<<` in the text that was walked
-    owner: Optional[str]  # the owning command's name (`command_name`); None when it has none
+    owner: Optional[str]  # what runs the body (`heredoc_owner`); None when it has none
     word: str  # the delimiter as bashlex took it: AS WRITTEN, quotes and all
     in_substitution: bool
 
@@ -1893,16 +1893,16 @@ def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHered
     One walk for every check that reads bashlex's heredocs - the misread routing, both
     phantom refusals, the body lookup and the fallback's owner check - so they cannot
     disagree about which heredocs exist. It visits every child: list parts, substitutions,
-    and a compound's own `redirects`. The owner is `command_name`, as
-    `extract_heredoc_ranges` and `_close_heredocs` name it, and None for a compound's own
-    redirect or a redirect with no command word.
+    and a compound's own `redirects`. The owner is `heredoc_owner` - the shell a wrapper
+    runs, not the wrapper - and None for a compound's own redirect or a redirect with no
+    command word.
     """
     found: list[_BashlexHeredoc] = []
 
     def visit(node: Any, owner: Optional[str], in_substitution: bool) -> None:
         kind = getattr(node, "kind", None)
         if kind == "command":
-            owner = command_name(node)
+            owner = heredoc_owner(node)
         elif kind == "compound":
             owner = None
         elif kind in ("commandsubstitution", "processsubstitution"):
@@ -2133,7 +2133,7 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
     return _Normalised("\n".join(out) if changed else command, blanked, frozenset(opener_starts))
 
 
-def _neuter_heredocs(command: str) -> tuple[str, str]:
+def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one refusal per uncertain body reading
     """Rewrite a heredoc into something bashlex parses, keeping the rest verbatim.
 
     bashlex reads a quoted heredoc delimiter as written, quotes and all, so it
@@ -2211,6 +2211,10 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:
                         rewritten.extend(["", *body_lines])
                     rewritten.append(_HEREDOC_PLACEHOLDER)
                     break
+                if not quoted and _HEREDOC_PLACEHOLDER in body:
+                    # A kept body line reading as the placeholder is where bashlex ends the
+                    # body and bash does not. (A quoted body is dropped, so it cannot.)
+                    raise ParseError("An unquoted heredoc body contains the rewrite delimiter")
                 body_lines.append(body)
             else:
                 raise ParseError(f"Heredoc {delimiter!r} has no terminator; its body has no end")

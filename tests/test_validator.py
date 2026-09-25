@@ -2914,6 +2914,26 @@ class TestQuotedHeredocDelimiter:
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.allowed is False
 
+    @pytest.mark.parametrize(
+        "head", ["env bash", "timeout 5 sh", "nice -n 5 bash", "env FOO=1 /bin/bash", "nohup env bash", "busybox sh"]
+    )
+    def test_a_wrapped_shell_heredoc_body_is_validated_as_code(self, safety_rules_path, head):
+        """A wrapper execs the shell with its own stdin, so the heredoc is still that shell's program.
+
+        Pre-fix the owner was the wrapper's name, not a shell, so the body was filed inert and
+        `env bash <<'EOF'` running `rm -rf /` scored SAFE.
+        """
+        result = validate_command(f"{head} <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    def test_a_wrapped_non_shell_heredoc_body_stays_inert(self, safety_rules_path):
+        """`timeout 5 cat` prints its heredoc: resolving the wrapper must not rescan it as code."""
+        result = validate_command("timeout 5 cat <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is True
+
     def test_body_ends_where_bash_ends_it(self, safety_rules_path):
         """AC2: bash terminates at the bare delimiter, so what follows is shell.
 
@@ -3491,6 +3511,23 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
 
         assert result.allowed is False
         assert "ends in a backslash" in (result.error or "")
+
+    def test_a_kept_body_that_spells_the_placeholder_fails_closed(self, safety_rules_path):
+        """bashlex would end the kept body at that line, where bash does not."""
+        result = validate_command(
+            "cat <<'A;B'\nx\nA;B\ncat <<EOF\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC\nEOF\n"
+            "rm -rf /\nSCHLOCK_HEREDOC",
+            config_path=safety_rules_path,
+        )
+
+        assert result.allowed is False
+        assert "rewrite delimiter" in (result.error or "")
+
+    def test_a_dropped_body_may_spell_the_placeholder(self, safety_rules_path):
+        """A quoted body is dropped before bashlex sees it, so the placeholder in it is harmless text."""
+        result = validate_command("cat <<'A;B'\nx\nA;B\ncat <<'Q'\nSCHLOCK_HEREDOC\nQ\necho ok", config_path=safety_rules_path)
+
+        assert result.allowed is True
 
     @pytest.mark.parametrize(
         "body",

@@ -418,6 +418,23 @@ def command_name(node: Any) -> Optional[str]:
     return words[0].split("/")[-1] if words else None
 
 
+def heredoc_owner(node: Any) -> Optional[str]:
+    """The name of what runs a command node's heredoc: `command_name`, resolved past a wrapper.
+
+    A wrapper execs its command with its own stdin, so `env bash <<EOF` hands the body to
+    bash. Any shell among a wrapper's operands counts, not the first operand: an operand can
+    be a decoy (`flock ./bash sh`), and over-reading only rescans a body that may not run -
+    the fail-closed direction. A multicall binary resolves to its applet (`busybox sh`).
+    """
+    words = [word.split("/")[-1] for word in _command_words(node)]
+    if not words:
+        return None
+    name = _resolve_multicall(words[0], words[1:])[0]
+    if name in WRAPPER_COMMANDS:
+        return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), name)
+    return name
+
+
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
 
