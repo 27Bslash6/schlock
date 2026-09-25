@@ -2477,6 +2477,15 @@ class TestDerivedTextCeiling:
         assert result.error is None
 
 
+# The three messages the parse-failure path can deny with. Kept together so the
+# per-case pins below can assert exclusivity rather than mere presence.
+PARSE_FAILURE_REASONS = (
+    "No heredoc opener found",
+    "Cannot determine what this heredoc runs: Unexpected parsing error",
+    "Parse error:",
+)
+
+
 class TestParseFailureFailsClosed:
     """LAB-3464: nothing bashlex could not read comes back allowed.
 
@@ -2562,10 +2571,14 @@ class TestParseFailureFailsClosed:
     def test_unparseable_command_is_never_allowed(self, safety_rules_path, command, expected_reason, description):
         """schlock is fail-closed by contract; an unreadable command is not vouched for.
 
-        The verdict alone does not pin the finding: these ten reach BLOCKED by three
-        different exits, and a routing change that moved a case between them would
-        leave every verdict assertion green. `expected_reason` names the exit, and
-        the three strings are mutually exclusive, so a case cannot drift silently.
+        The verdict alone does not pin the finding: these ten reach BLOCKED carrying
+        three distinct messages, and a routing change that moved a case between them
+        would leave every verdict assertion green. Two return statements produce the
+        three -- the heredoc fallback formats whichever ParseError it caught, so
+        `No heredoc opener found` and `Unexpected parsing error` share an exit and
+        differ by payload, while `Parse error:` is the exit that never reached the
+        fallback. The three strings are mutually exclusive across all ten messages,
+        so a case cannot drift silently.
         """
         result = validate_command(command, config_path=safety_rules_path)
 
@@ -2573,6 +2586,11 @@ class TestParseFailureFailsClosed:
         assert result.risk_level == RiskLevel.BLOCKED, description
         assert result.exit_code == 1, description
         assert expected_reason in result.message, f"{description}: {result.message}"
+        # Exactly one, not merely at least one. These messages echo the command back,
+        # so a case whose own text happened to contain another reason would otherwise
+        # satisfy its pin no matter which exit ran.
+        matched = [r for r in PARSE_FAILURE_REASONS if r in result.message]
+        assert matched == [expected_reason], f"{description}: matched {matched}"
 
     def test_here_string_is_not_an_opener_at_either_guard(self):
         """The two guards that close AC-1, each pinned where it lives.

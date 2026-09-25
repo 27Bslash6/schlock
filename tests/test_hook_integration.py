@@ -11,7 +11,6 @@ Tests cover:
 """
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -24,16 +23,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
 
-# Skip timing-sensitive tests in CI - they're inherently flaky
-_IN_CI = os.environ.get("CI", "").lower() == "true" or os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
-skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI environments")
-
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
 from schlock.integrations.audit import AuditLogger
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
 from schlock.setup.config_writer import RISK_PRESETS
+from tests.conftest import skip_in_ci
 
 
 @pytest.fixture(autouse=True)
