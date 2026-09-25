@@ -23,6 +23,9 @@ word means no body regex can carry the verdict, so a BLOCKED verdict there prove
 the validator as code (the `shell_delegated_payload` path the fixed `bash <<'EOF'` twin gets).
 """
 
+import subprocess
+import sys
+
 import pytest
 
 from schlock.core.parser import (
@@ -222,7 +225,7 @@ class TestHeredocOwnerInertReadersUnchanged:
             ('flock --nonblock /tmp/l psql "$DB"', "flock"),
             ('runuser --user=postgres -- psql "$DB"', "runuser"),  # --user= drops the USER positional
             ("parallel echo", "parallel"),
-            ("parallel 'echo {}'", "parallel"),  # the template is parsed, so `{}` is echo's argument
+            ("parallel 'echo {}'", "parallel"),  # inert template: `{}` is echo's argument, not a command
             ("source ./env.sh", "source"),
             ("command . ./env.sh", "."),  # sources a file, not this stdin
             ("command git status", "command"),
@@ -488,6 +491,8 @@ AC1_QUOTED_ROWS = [
     "parallel 'sh -c'",
     "parallel -j4 'sh -c'",
     "parallel --max-lines $SH cat",
+    "parallel --pipe sort -S16k --compress-program=sh",  # sort runs the compress program
+    "parallel printf %s {}",  # printf dropped from the inert set (printf -v runs code)
     "parallel -i echo",
     "parallel -e echo",
     "parallel --replace echo",
@@ -799,19 +804,34 @@ class TestTemplateRunsCode:
             (["echo"], False),
             (["gzip -9"], False),
             (["sha256sum {}"], False),
-            (["printf %s {}"], False),
             (["grep foo {}"], False),
             (["echo", ":::", "a"], False),  # `:::` args are not the template
+            # Members dropped for an option that runs a program (LAB-5180):
+            (["printf %s {}"], True),  # `printf -v arr[$(...)]` evaluates the subscript
+            (["sort -S16k"], True),  # `sort --compress-program=X` runs X
+            # parallel's own Perl replacement strings run code whatever the head:
+            (['echo {= system "id" =}'], True),
+            (["echo {= uq =}"], True),
+            (["--rpl", "{U} uq", "echo {U}"], True),
         ],
     )
     def test_classifier(self, template, runs_code):
         assert _template_runs_code(template) is runs_code
 
-    def test_hang_template_does_not_reparse(self, no_shellcheck):
-        # A template that reopened bashlex's _paramexpand loop (LAB-4959) must finish and BLOCK.
-        command = "rm -rf / ; parallel 'echo \"$(cat <<X\n${\nX\n)\"' ::: a"
-        result = validate_command(command)
-        assert result.risk_level == RiskLevel.BLOCKED
+    def test_hang_template_does_not_reparse(self):
+        # A template that reopened bashlex's _paramexpand loop (LAB-4959) must finish and BLOCK. Run
+        # it in a subprocess with a timeout, so a regression fails the test instead of hanging the
+        # suite (there is no pytest-timeout, LAB-4572).
+        command = "rm -rf / ; parallel 'echo \"$(cat <<X\\n${\\nX\\n)\"' ::: a"
+        script = (
+            "import sys; from schlock.core.validator import validate_command, is_shellcheck_available;\n"
+            "import schlock.core.validator as v; v.is_shellcheck_available = lambda: False;\n"
+            "r = validate_command(sys.argv[1], _shellcheck=False);\n"
+            "print(r.risk_level.name)"
+        )
+        proc = subprocess.run([sys.executable, "-c", script, command], check=False, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "BLOCKED"
 
     def test_nested_template_runners_block(self, no_shellcheck):
         # 200 nested `parallel` words resolve to code without a per-level re-parse (no recursion).
@@ -824,8 +844,25 @@ class TestTemplateRunsCode:
 class TestQuotedSubstitutionInProgramNameOverReads:
     """A quote inside `$(...)` in the program word makes `_last_component` return the whole word, so
     it reads as unresolved and the body is scanned as code. Accepted as a rare fail-closed
-    over-block; pinned as intended (dropped by the pragmatism filter)."""
+    over-block; pinned as intended."""
 
     def test_dangerous_body_blocks(self, no_shellcheck):
         result = validate_command('"$(dirname "$0")/run.sh" <<\'EOF\'\n' + Q + "\nEOF")
         assert result.risk_level == RiskLevel.BLOCKED
+
+
+class TestParallelPerlReplacement:
+    """GNU parallel's `{= perl =}` and `--rpl 'X perl'` run arbitrary Perl in parallel itself,
+    regardless of the template head or whether a heredoc is present (LAB-5180)."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'parallel echo {= system "id" =} ::: a',  # no heredoc: caught as a dangerous construct
+            "parallel 'echo {= uq =}' <<EOF\n;rm -rf /\nEOF",
+            "parallel --rpl '{U} uq' 'echo {U}' <<'EOF'\n" + Q + "\nEOF",
+            "parallel --rpl='{U} uq' 'echo {U}' <<'EOF'\n" + Q + "\nEOF",
+        ],
+    )
+    def test_perl_replacement_blocks(self, command, no_shellcheck):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED, command

@@ -394,7 +394,8 @@ class _WrapperSpec(NamedTuple):
     ``subcommand`` is the word the command follows (`uv run CMD`) - without it nothing runs.
     ``drops_leading`` options, in any spelling, remove the leading positional (`runuser -u USER
     CMD`). ``template`` means the command words are a shell snippet the wrapper runs through
-    `$SHELL` with each input line appended (GNU parallel), so they are parsed, not just named.
+    `$SHELL` with each input line appended (GNU parallel), so they are classified by the
+    allowlist (`_template_runs_code`), not just named.
     """
 
     leading: int = 0
@@ -515,16 +516,16 @@ _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
         shell_exec=True,
         template=True,
         values=_opts(
-            "-a -C -d -I -j -J -N -P -S --arg-file --arg-file-sep --arg-sep --basefile --bf --block"
+            "-a -C -d -E -I -j -J -L -n -N -P -s -S --arg-file --arg-file-sep --arg-sep --basefile --bf --block"
             " --block-size --colsep --compress-program --decompress-program --delay --delimiter --env --filter"
             " --group-by --halt --halt-on-error --header --jobs --joblog --limit --load --max-args --max-chars"
             " --max-procs --max-replace-args --memfree --memsuspend --nice --profile --recend"
-            " --recstart --res --results --retries --return --rpl --ssh --sshdelay --sshlogin --sshloginfile"
+            " --recstart --res --results --retries --return --ssh --sshdelay --sshlogin --sshloginfile"
             " --slf --tag-string --tagstring --template --termseq --tf --timeout --tmpdir --transferfile --trc"
             " --trim --wd --workdir"
         ),
         flags=_opts(
-            "-0 -g -h -k -m -p -r -t -u -v -V -x -X --bar --bg --cat --cleanup --csv --dry-run"
+            "-0 -g -h -k -m -p -q -r -t -u -v -V -x -X --bar --bg --cat --cleanup --csv --dry-run"
             " --dryrun --eta --fg --fifo --files --group --keep-order --lb --line-buffer --linebuffer"
             " --no-notice --no-run-if-empty --nonall --null --onall --pipe --pipepart --plus --progress --quote"
             " --resume --resume-failed --retry-failed --round-robin --semaphore --shuf --spreadstdin"
@@ -612,10 +613,26 @@ def _sets_option(arg: str, spec: _WrapperSpec) -> bool:
 # anything that can execute (eval, awk, sed's `e`, perl, python, node, find, xargs, env, the
 # shells) stays OUT, so it reads as code. A template head outside this set fails closed (LAB-5180).
 _INERT_TEMPLATE_COMMANDS = _opts(
-    "echo printf cat tac gzip gunzip zcat bzip2 bunzip2 xz unxz zstd wc grep egrep fgrep head tail"
-    " sort uniq cut tr nl rev base64 basename dirname true false seq"
+    "echo cat tac gzip gunzip zcat bzip2 bunzip2 xz unxz zstd wc grep egrep fgrep head tail"
+    " uniq cut tr nl rev base64 basename dirname true false seq"
     " md5sum sha1sum sha224sum sha256sum sha384sum sha512sum cksum b2sum"
 )
+
+
+# NEVER add a command with an option that runs a program: `sort --compress-program=X`,
+# `printf -v arr[$(...)]`, and every executor (eval, awk, sed's `e`, find, xargs, env, the
+# shells) run code, so they stay OUT and read as the shell (LAB-5180).
+def _parallel_executes_perl(words: list[str]) -> bool:
+    """True if GNU parallel would run Perl from its own words, whatever the template head.
+
+    `{= perl =}` is an inline Perl replacement string and `--rpl 'X perl'` defines one, so
+    `parallel echo {= system "id" =}` and `parallel --rpl '{U} uq' 'echo {U}'` execute code in
+    parallel itself, not in the template's first word (LAB-5180). Checked on the raw words, so it
+    holds whether the `{= =}` is one quoted template word or split across argv.
+    """
+    return any("{=" in word or word == "--rpl" or word.startswith("--rpl=") for word in words)
+
+
 # A metacharacter in the joined template means it is more than one simple command - a pipe, a
 # redirect, a `;`/`&&`, a substitution, a newline - so it runs the line as code.
 _TEMPLATE_CODE_CHARS = frozenset("|&;<>()$`\n")
@@ -636,6 +653,8 @@ def _template_runs_code(words: list[str]) -> bool:
     template = list(itertools.takewhile(lambda word: not word.startswith(":::"), words))
     if not template:
         return True
+    if _parallel_executes_perl(template):
+        return True  # `{= perl =}` runs code whatever the template head
     joined = " ".join(template)
     if any(ch in _TEMPLATE_CODE_CHARS for ch in joined):
         return True
@@ -686,7 +705,7 @@ def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], 
                 return [], True
             slack += 1
             continue
-        if spec.drops_leading and _sets_option(arg, spec):
+        if _sets_option(arg, spec):
             leading = 0
         if kind == "value":
             i += 1
@@ -1733,6 +1752,9 @@ class BashCommandParser:
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
                     cmd_name = heredoc_owner(node)
                     if cmd_name in wrapping_funcs:
+                        # A second defence, currently shadowed: every shell-wrapping-function row
+                        # already BLOCKs through the whole-command scan, on every tree. Kept so a
+                        # future narrowing of that scan cannot silently reopen the class (LAB-5180).
                         cmd_name = _DEFAULT_SHELL
                     sub = command_position_substitution(node)
                     if sub is not None:
@@ -2032,6 +2054,11 @@ class BashCommandParser:
                 # We must NOT flag those - they're container tools, not shell exec.
                 if node.kind == "command":
                     cmd_name = self._get_command_name(node)
+
+                    # GNU parallel's `{= perl =}` / `--rpl` run Perl in parallel itself, so they
+                    # are code with no heredoc and no template head to classify (LAB-5180).
+                    if cmd_name in ("parallel", "env_parallel") and _parallel_executes_perl(_get_all_words(node)):
+                        dangers.append("parallel replacement string executes Perl code")
 
                     # Direct eval/exec invocation
                     # EXCEPTION: exec used for FD operations is SAFE
