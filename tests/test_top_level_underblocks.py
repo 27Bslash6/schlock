@@ -421,7 +421,11 @@ class TestSubscriptedAssignmentPrefix:
             ("a[0]=1 bash -s", ["bash", "-s"]),
             ("a[0]=1 b=2 c+=3 bash", ["bash"]),
             ("a[ 0 ]=1 bash", ["bash"]),
-            ("a[ i + 1 ]+=x b[ 2 ]=y bash", ["bash"]),
+            ("a[ i + 1 ]+=x bash", ["bash"]),
+            ("a[ 0 ]=1 b[ 1 ]=2 bash", ["bash"]),
+            # bashlex drops the quotes, so the subscript can hold a bare `]` or a newline.
+            ('a["]"]=1 bash', ["bash"]),
+            ('a["x\ny"]=1 bash', ["bash"]),
             ("a[0]=1 >/dev/null bash", ["bash"]),
             ("a[0]=1", []),
             # After the command name nothing is a prefix.
