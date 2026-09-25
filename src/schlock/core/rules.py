@@ -33,8 +33,13 @@ logger = logging.getLogger(__name__)
 #         newline, so a "$"-anchored entry spans a string bash runs as SEVERAL
 #         commands: "chmod\n-R\n777\n/tmp/evil.sh" satisfies the /tmp chmod
 #         entry end to end, and the last line is an executable, not an operand.
-#         Checked against command.rstrip() so one TRAILING newline still
-#         whitelists.
+#         A bare newline like that is split by the parser before is_whitelisted()
+#         sees it, and is_whitelisted_whole() counts the pieces. This half is for
+#         text that still arrives as ONE command with a newline inside: a
+#         backslash continuation, a quoted string, a substitution body, and the
+#         quote-stripped reconstructions match_command() also tries, where a
+#         quoted newline becomes a bare one. Checked against command.rstrip() so
+#         one TRAILING newline still whitelists.
 #
 # Refusing the whitelist is NOT refusing the command. The whitelist is an
 # override that short-circuits to SAFE; declining it only sends the command to
@@ -554,9 +559,10 @@ class RuleEngine:
                 # No re.MULTILINE: whitelist uses match() which anchors at start.
                 # MULTILINE would change $ to match at line boundaries, not string end.
                 compiled = re.compile(pattern_str)
-                # is_whitelisted() refuses any command carrying a disqualifier before
-                # it ever consults a pattern, so an entry that describes one can never
-                # match and would otherwise fail silently - the user writes a whitelist
+                # Both whitelist checks refuse a command carrying ".." or a redirection
+                # before consulting a pattern, and is_whitelisted() a line break too, so
+                # an entry that describes one may never match and would otherwise fail
+                # silently - the user writes a whitelist
                 # rule for "psql db < schema.sql", sees it ignored, and has nothing to
                 # go on. Advisory, not fatal: the source is a regex, so "\.\." here is
                 # a literal ".." but a bare ".." is two wildcards and may be harmless.
@@ -762,10 +768,9 @@ class RuleEngine:
 
         A redirection is not a command, so it leaves the count unchanged, and a `\\S+` slot accepts
         `>/path` as readily as a user name. So this gate also refuses a line carrying `..` or a
-        redirection, as `is_whitelisted` does and for the reasons at _WHITELIST_DISQUALIFIER. It
-        does NOT take that guard's newline half: the count already refuses a newline that adds a
-        command, and must keep clearing the one after a pipe that adds none. Beyond those, how
-        loose a single command's arguments are is the entry's own shape to fix, not this gate's.
+        redirection (_WHOLE_LINE_DISQUALIFIER, for the reasons at _WHITELIST_DISQUALIFIER), but
+        not a line break, which the count already judges. Beyond those, how loose a single
+        command's arguments are is the entry's own shape to fix, not this gate's.
 
         Args:
             command: Full command line being validated

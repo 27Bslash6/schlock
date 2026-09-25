@@ -1127,7 +1127,7 @@ class TestWhitelistClearsOnlyWhatItDescribes:
         """AC-4: the guard must not cost the prefix contract of issue #66."""
         assert prefix_engine.is_whitelisted(command)
 
-    def test_full_span_check_carries_the_same_guard(self, tmp_path):
+    def test_whole_line_check_refuses_dot_dot_and_redirection(self, tmp_path):
         """The invariant belongs to the mechanism, not to whichever entries ship.
 
         No shipped entry can span a line carrying a redirection, so this is measured
@@ -1179,7 +1179,7 @@ class TestWhitelistClearsOnlyWhatItDescribes:
 
 
 class TestWhitelistRefusesCommandSeparators:
-    """LAB-4310 panel finding: every "\\s" in a whitelist pattern matches a NEWLINE.
+    """LAB-4310 review finding: every "\\s" in a whitelist pattern matches a NEWLINE.
 
     So a "$"-anchored entry spans a string bash runs as several commands:
     "chmod\\n-R\\n777\\n/tmp/evil.sh" satisfies the /tmp chmod entry end to end,
@@ -1201,7 +1201,7 @@ class TestWhitelistRefusesCommandSeparators:
             "chmod -R\n777 /tmp/x",
             "rm\n-rf\n.git/hooks",  # pre-existing, same cause, closed by the same guard
             "chmod 755 /tmp/x\rrm -rf /",  # a bare CR is a separator to some readers
-            "ls -la\rrm -rf /",  # the row above never reaches the guard (the /tmp entry refuses a CR); this one does
+            "ls -la\rrm -rf /",  # the row above is refused by the /tmp entry's charset, guard or not; this only by it
             # The one shipped entry that declares a separator, with the extra lines riding its
             # user slot: it fullmatches, so only the count stands between it and SAFE.
             "gh auth token | docker login ghcr.io -u\npoweroff\n--password-stdin",
@@ -1212,7 +1212,8 @@ class TestWhitelistRefusesCommandSeparators:
 
         is_whitelisted_whole is asserted explicitly: it is the multi-segment
         short-circuit, so it is the one that skips the per-segment loop. It carries
-        no newline guard; the count (or _NON_BASH_BLANK, for a CR) refuses these.
+        no newline guard. Only the gh row exercises the count here: the other rows
+        match no entry that declares a separator, so no count can clear them.
         """
         assert not shipped_engine.is_whitelisted(command)
         assert not shipped_engine.is_whitelisted_whole(command, _segment_count(command))
@@ -1222,8 +1223,7 @@ class TestWhitelistRefusesCommandSeparators:
         """The guard reads command.rstrip(); dropping that rstrip fails this test.
 
         A trailing newline is not a separator - there is no second command after
-        it - and tests/test_rules.py already pins "git status\\n" as fully
-        whitelisted. Refusing it would be a regression, not a fix.
+        it. Refusing it would be a regression, not a fix.
         """
         assert shipped_engine.is_whitelisted(command)
 
