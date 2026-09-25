@@ -414,16 +414,44 @@ _SUBSCRIPT_TOKEN = re.compile(
 )
 
 
-def _subscript_closes(word: Any, command: str) -> bool:
+def _subscript_span_is_trustworthy(command: str, word: Any) -> "Optional[dict[int, int]]":
+    """The command-substitution spans inside ``word`` to skip, or None when they cannot be trusted.
+
+    The scan skips a `$(...)` / backtick / `<(...)` using bashlex's own span so a `]` inside one is
+    not read as the subscript's close. Two things make that span wrong, and bash still runs the
+    command, so both must fail closed:
+    - A backslash-newline: bashlex removes it and shifts every later offset, so no child span lines
+      up with ``command`` any more.
+    - A `#` comment or a `<<` heredoc inside the substitution: bashlex ends the span before the real
+      closer, and the scan would resume inside the substitution and read a `]` bash never reaches.
+    """
+    start, end = word.pos
+    if "\\\n" in command[start:end]:
+        return None
+    skip: dict[int, int] = {}
+    for part in word.parts:
+        if part.kind not in ("commandsubstitution", "processsubstitution"):
+            continue
+        src = command[part.pos[0] : part.pos[1]]
+        brackets = (src[:2] in ("$(", "<(", ">(") and src.endswith(")")) or (src[:1] == "`" and src.endswith("`"))
+        if not brackets or "#" in src or "<<" in src:
+            return None
+        skip[part.pos[0]] = part.pos[1]
+    return skip
+
+
+def _subscript_closes(command: str, word: Any) -> bool:
     """Whether the subscript opened by the first `[` of ``word`` also closes inside it.
 
     Bash reads a subscript as one matched `[`...`]` pair, and blanks, `;`, `|`, `#` and newlines
-    inside it are ordinary characters. bashlex ends the word at the first of them. A command
-    substitution is skipped over using bashlex's own span for it. Anything this does not model
-    counts as not closing.
+    inside it are ordinary characters. bashlex ends the word at the first of them. Anything this
+    does not model, and any substitution span it cannot trust, counts as not closing - so a
+    quoted key holding a substitution (`m["$(basename x)"]=1`) is a deliberate over-block.
     """
+    skip = _subscript_span_is_trustworthy(command, word)
+    if skip is None:
+        return False
     start, end = word.pos
-    skip = {n.pos[0]: n.pos[1] for n in word.parts if n.kind in ("commandsubstitution", "processsubstitution")}
     depth, i = 0, command.index("[", start)
     while i < end:
         if i in skip:
@@ -439,25 +467,30 @@ def _subscript_closes(word: Any, command: str) -> bool:
     return False
 
 
-def _refuse_split_subscripts(command: str, nodes: "list[Any]") -> None:
+class _PrefixSubscriptCheck(bashlex.ast.nodevisitor):
     """Raise ParseError when bash reads a subscript before the command name past bashlex's word.
 
     `a[ ; ]=1 bash` is one assignment followed by `bash` to bash, but to bashlex it is two commands.
     Once the word boundaries disagree, no reading of bashlex's tree can be trusted.
     """
 
-    class _Visitor(bashlex.ast.nodevisitor):
-        def visitcommand(self, n: Any, parts: "list[Any]") -> None:
-            for part in parts:
-                if part.kind != "word":
-                    continue
-                if _SUBSCRIPT_START.match(command, part.pos[0], part.pos[1]) and not _subscript_closes(part, command):
-                    raise ParseError("Failed to parse bash command: a subscript before the command name is not closed")
-                if not _ASSIGNMENT_WORD.match(part.word):
-                    return
+    def __init__(self, command: str) -> None:
+        self._command = command
 
+    def visitcommand(self, n: Any, parts: "list[Any]") -> None:
+        for part in parts:
+            if part.kind != "word":
+                continue
+            if _SUBSCRIPT_START.match(self._command, part.pos[0], part.pos[1]) and not _subscript_closes(self._command, part):
+                raise ParseError("Failed to parse bash command: a subscript before the command name is not closed")
+            if not _ASSIGNMENT_WORD.match(part.word):
+                return
+
+
+def _refuse_split_subscripts(command: str, nodes: "list[Any]") -> None:
+    checker = _PrefixSubscriptCheck(command)
     for node in nodes:
-        _Visitor().visit(node)
+        checker.visit(node)
 
 
 def _command_words(node: Any) -> "list[str]":

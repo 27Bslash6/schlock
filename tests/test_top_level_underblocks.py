@@ -465,6 +465,15 @@ class TestSubscriptedAssignmentPrefix:
             "a[$'\\'];x']=1 bash",
             "a[`echo ]`;0]=1 bash",
             "a[']';0]=1 bash",
+            # bashlex's own span for the `$(...)` is wrong here, so it cannot be trusted to skip it:
+            # a comment or a heredoc inside the substitution ends the span before its real `)`, and a
+            # backslash-newline shifts every later offset.
+            "a[$(echo #]\n) ; x]=1 bash",
+            "a[$(cat <<E\n]\nE\n) ; x]=1 bash",
+            "a[\\\n$(echo ]);0]=1 bash",
+            "a[$(echo \\\n ]);0]=1 bash",
+            "a[$(echo \\\n \\)]);0]=1 bash",
+            "a[\\\n`echo ]`;0]=1 bash",
             # Any prefix word, in any command the tree holds.
             "b=1 a[;0]=1 bash",
             "a[0]=1 b[;0]=1 bash",
@@ -477,18 +486,35 @@ class TestSubscriptedAssignmentPrefix:
             BashCommandParser().parse(command)
         assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A quoted key holding a substitution: bashlex drops the quotes, so the raw span cannot
+            # be read, and these standalone assignments fail closed. A deliberate over-block - bash
+            # would just perform the assignment.
+            'm["$(basename x)"]=1',
+            'seen["`id -u`"]=1',
+        ],
+    )
+    def test_quoted_substitution_key_is_a_deliberate_over_block(self, command):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
     @pytest.mark.parametrize("text", ["a[`echo ]`", "a[$(echo ])"])
     def test_a_substitution_the_parser_did_not_mark_does_not_close_the_subscript(self, text):
-        # bashlex marks these as substitutions, and their spans are skipped. Without that span the
-        # `]` inside is still not bash's closing `]`.
-        assert not _subscript_closes(SimpleNamespace(pos=(0, len(text)), parts=[]), text)
+        # A word with no marked substitution parts: the `]` inside is still not bash's closing `]`.
+        assert not _subscript_closes(text, SimpleNamespace(pos=(0, len(text)), parts=[]))
 
-    def test_split_subscript_is_not_routed_to_the_heredoc_fallback(self):
-        # validate_command hands a ParseError that mentions a heredoc to the heredoc fallback.
+    def test_split_subscript_error_message_says_nothing_about_heredocs(self):
+        # validate_command hands a ParseError that mentions a heredoc to the heredoc fallback, so the
+        # split-subscript message must never say "here" even when the word is `heredoc[`.
         with pytest.raises(ParseError) as raised:
             BashCommandParser().parse("heredoc[;0]=1 bash")
         assert "here" not in str(raised.value).lower()
-        assert validate_command("a[ 0 ]=1 cat <<'EOF'\nhello\nEOF").risk_level == RiskLevel.BLOCKED
+
+    def test_split_subscript_in_front_of_a_real_heredoc_is_blocked(self):
+        # A split subscript AND a quoted heredoc: bashlex raises its own heredoc error first, so the
+        # fallback runs. It must still land on BLOCKED, not a SAFE reading of the diverted command.
+        assert validate_command("heredoc[;0]=1 bash <<'EOF'\nrm -rf /\nEOF").risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         ("command", "words"),
