@@ -679,9 +679,9 @@ def _shell_delegated_payloads(
         # command straight through (`timeout 5 git config core.pager PROG`) and this scan keys on
         # the `config` token rather than on the first word.
         if base == "git" or base in WRAPPER_COMMANDS:
-            from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
+            from schlock.core.substitution import git_config_exec_payloads  # noqa: PLC0415
 
-            found.append(git_config_exec_payload(args))
+            found.extend(git_config_exec_payloads(args))
 
         if base == "watch":
             found.append(_watch_payload(args))
@@ -727,13 +727,14 @@ def _check_contextual_high_risk(
     caller elevates to HIGH (ask) and lets the preset decide, rather than hard-blocking. Reuses the
     same `dangerous_kubectl` / `key_rated_git_config_write` helpers as the substitution path.
 
-    The git check runs for wrappers too (`timeout 5 git config man.viewer custom`): a wrapper hands
-    the whole command through, and the helper keys on the `config` token, not the first word.
+    The git check also runs for wrappers (`timeout 5 git config man.viewer custom`) and for a
+    `find -exec` clause, which hand a git command through whole. There it scans only what follows a
+    `git` word, so `nice grep config man.1 README` is not read as a config write.
 
-    NOTE: find is deliberately NOT handled here. The substitution path blocks *any* `find -exec`
-    (conservative), but at the top level read-only `find -exec grep/cat/...` is legitimate, so
-    top-level find stays command-aware via the `find_exec_dangerous` / `recursive_delete` YAML
-    rules (extended to cover -execdir/-ok/-okdir). See #97.
+    NOTE: find's own -exec is deliberately NOT rated here. The substitution path blocks *any*
+    `find -exec` (conservative), but at the top level read-only `find -exec grep/cat/...` is
+    legitimate, so top-level find stays command-aware via the `find_exec_dangerous` /
+    `recursive_delete` YAML rules (extended to cover -execdir/-ok/-okdir). See #97.
     """
     from schlock.core.substitution import dangerous_kubectl, key_rated_git_config_write  # noqa: PLC0415
 
@@ -743,10 +744,13 @@ def _check_contextual_high_risk(
             reason = dangerous_kubectl(args)
             if reason:
                 return base_name, reason
-        if base_name == "git" or base_name in WRAPPER_COMMANDS:
-            reason = key_rated_git_config_write(args)
-            if reason:
-                return "git", reason
+        git_args = args if base_name == "git" else None
+        if base_name in WRAPPER_COMMANDS or base_name == "find":
+            git_at = next((i for i, arg in enumerate(args) if arg.rsplit("/", 1)[-1] == "git"), None)
+            git_args = None if git_at is None else args[git_at + 1 :]
+        reason = key_rated_git_config_write(git_args) if git_args else None
+        if reason:
+            return "git", reason
     return None
 
 
