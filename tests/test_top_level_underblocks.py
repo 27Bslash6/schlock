@@ -1,8 +1,10 @@
 """Top-level under-block fixes: pipe-to-shell + git -c exec (security)."""
 
+from types import SimpleNamespace
+
 import pytest
 
-from schlock.core.parser import BashCommandParser, _command_words, _reads_stdin_as_program
+from schlock.core.parser import BashCommandParser, _command_words, _reads_stdin_as_program, _subscript_closes
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import dangerous_find, dangerous_git_config, dangerous_kubectl
 from schlock.core.validator import validate_command
@@ -474,6 +476,12 @@ class TestSubscriptedAssignmentPrefix:
         with pytest.raises(ParseError):
             BashCommandParser().parse(command)
         assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("text", ["a[`echo ]`", "a[$(echo ])"])
+    def test_a_substitution_the_parser_did_not_mark_does_not_close_the_subscript(self, text):
+        # bashlex marks these as substitutions, and their spans are skipped. Without that span the
+        # `]` inside is still not bash's closing `]`.
+        assert not _subscript_closes(SimpleNamespace(pos=(0, len(text)), parts=[]), text)
 
     def test_split_subscript_is_not_routed_to_the_heredoc_fallback(self):
         # validate_command hands a ParseError that mentions a heredoc to the heredoc fallback.
