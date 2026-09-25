@@ -2711,7 +2711,7 @@ class TestParseFailureFailsClosed:
 
 class TestCshTcshHeredocAgreesWithHereString:
     """LAB-4442: csh/tcsh were in _SHELL_COMMANDS (the `-c` surface) but neither
-    _HEREDOC_SHELL_COMMANDS nor STDIN_EXEC_INTERPRETERS - the same drift rbash had before it
+    the heredoc shell set nor STDIN_EXEC_INTERPRETERS - the same drift rbash had before it
     was added to all three. Pins the heredoc-spelling verdict to match `csh <<< ...` and the
     `bash <<EOF` control above.
     """

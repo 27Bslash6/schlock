@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
+from .parser import SHELL_COMMANDS, WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -458,7 +458,7 @@ def _check_dangerous_command_flags(
 #
 # Shells: `-c PROG` runs PROG, and a LEADING operand is the script to run, which ends option
 # parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
-_SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "rbash"})
+_SHELL_COMMANDS: frozenset[str] = SHELL_COMMANDS
 
 # Not shells, but their `-c` argument is a command string they hand to one. Their leading
 # operand is a user/group/file rather than a script, so it must NOT end option parsing

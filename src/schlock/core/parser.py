@@ -120,44 +120,34 @@ def _apply_andor_substitution_correction() -> None:
 
 _apply_andor_substitution_correction()
 
-# Interpreters that EXECUTE their standard input as a program when given no program source.
-# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
-# those run a *named* command, not stdin-as-program, and are covered by the download->shell
-# and wrapper-command checks.
 # A heredoc body is inert text to `cat` and source code to `bash`, which decides
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
 # segment has to carry it (extract_command_segments). One set, so the two answers
 # cannot drift apart. Both ask `heredoc_owner`, which sees past a wrapper.
 #
-# `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
-# bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
-# one disagree about one interpreter - `rbash <<< X` blocks while `rbash <<EOF` does
-# not - which is exactly the drift the paragraph above says cannot happen.
+# It is also the shell subset of STDIN_EXEC_INTERPRETERS below - that set is built FROM
+# it - and the validator's `-c` and heredoc-owner shell set, so a shell can never sit in
+# one surface and not the others. `python3 <<EOF` does execute its body, but as Python:
+# scanning it with bash rules is nonsense, for the reason the `-c` and `<<<` payload
+# rechecks cover shells only.
 #
-# `csh`/`tcsh` are here for the same reason: like every Bourne-family shell, invoking
-# either with no program source (no `-c`, no script operand) makes it read and execute
-# its stdin as a command script - a heredoc or here-string included. LAB-2754 already
-# put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
-# the rbash drift with a different interpreter.
-_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
+# `rbash`, `csh` and `tcsh` belong for the reason every shell here does: invoked with
+# no program source (no `-c`, no script operand) each reads and executes its stdin, a
+# heredoc or here-string included. Separate copies of this list are how `rbash <<< X`
+# once blocked while `rbash <<EOF` did not, and how csh/tcsh repeated that drift.
+SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
 
 # Quoted-substitution body text may total this many times the command's length
 # before extract_quoted_substitution_bodies fails closed. Bodies nest, so text
 # is scanned once per enclosing body; an honest command stays under 3x.
 _MAX_BODY_TEXT_FACTOR = 4
 
-STDIN_EXEC_INTERPRETERS = frozenset(
+# Interpreters that EXECUTE their standard input as a program when given no program source.
+# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
+# those run a *named* command, not stdin-as-program, and are covered by the download->shell
+# and wrapper-command checks.
+STDIN_EXEC_INTERPRETERS = SHELL_COMMANDS | frozenset(
     {
-        "bash",
-        "sh",
-        "zsh",
-        "dash",
-        "ksh",
-        "ash",
-        "fish",
-        "rbash",  # restricted bash still execs its stdin; `rbash -c` is already in _SHELL_COMMANDS
-        "csh",  # execs stdin as a script like every other shell here; `csh -c` is in _SHELL_COMMANDS
-        "tcsh",  # same as csh - tcsh is its interactive superset, not a different stdin model
         "python",
         "python2",
         "python3",
@@ -425,7 +415,7 @@ def heredoc_owner(node: Any) -> Optional[str]:
     if not words:
         return None
     if words[0] in WRAPPER_COMMANDS:
-        return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), words[0])
+        return next((word for word in words[1:] if word in SHELL_COMMANDS), words[0])
     return words[0]
 
 
@@ -780,7 +770,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        executes_body = heredoc_owner(node) in _HEREDOC_SHELL_COMMANDS
+        executes_body = heredoc_owner(node) in SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1136,7 +1126,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
+                        is_shell = parent_cmd in SHELL_COMMANDS if parent_cmd else False
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
