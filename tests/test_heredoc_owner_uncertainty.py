@@ -64,8 +64,9 @@ def hd(head, body, delim="EOF", quoted=True):
 
 class TestHeredocOwnerResolvesUncertainToShell:
     """An owner this parser cannot resolve to a definite inert reader resolves to the default
-    shell - NOT None, which is inert on the unquoted regex path. This covers expansion-spelled
-    heads and command operands, `xargs`/`parallel`, and `.`/`source`."""
+    shell - NOT None, which is inert on the unquoted regex path. Expansion-spelled heads and
+    wrapper commands (the program's own name, not its directory), `xargs`/`parallel` whose
+    command is a wrapper or absent, and `.`/`source` of stdin or an unresolved file."""
 
     @pytest.mark.parametrize(
         "command",
@@ -74,17 +75,29 @@ class TestHeredocOwnerResolvesUncertainToShell:
             "{bash,}",
             '"$SHELL"',  # bashlex leaves $SHELL
             "${X:-bash}",
-            "${SHELL:-/bin/sh}",  # raw-word check: basename would drop the $ (item 5)
+            "${SHELL:-/bin/sh}",  # one component: a basename would read `sh}` and drop the `$`
+            "$(which bash)",
+            "$DIR/$PROG",  # the program's own name is the unresolved part
             "/bin/b?sh",
-            "env $'bash'",  # the wrapper's COMMAND operand is expansion-spelled
+            "env $'bash'",  # the wrapper's command is expansion-spelled
             "timeout 5 $'sh'",
             "busybox $'sh'",
             "$'env' bash",  # head itself carries the metachar
-            "xargs env",  # runs stdin as commands
+            "chrt 5 $'bash'",  # chrt's PRIORITY is a leading positional, not the command
+            "uv run $SH",  # the command follows the `run` subcommand
+            "uv tool run $SH",
+            "strace -x $'bash'",  # -x is a flag, so $'bash' is the command
+            "strace -u app $SH",
+            "systemd-run --uid 0 $SH",  # unknown option: either following word may be the command
+            "prlimit --pid 1 $SH",
+            "env -P /x $SH",
+            "xargs env",  # the body supplies env's command
             "xargs -L1 timeout 9",
-            "parallel",
-            ". /dev/stdin",  # sources stdin/file
+            "parallel",  # runs each line as a command
+            ". /dev/stdin",
+            ". /dev/fd/0",
             "source /dev/stdin",
+            "source $F",
         ],
     )
     def test_owner_is_default_shell(self, command):
@@ -96,28 +109,35 @@ class TestHeredocOwnerResolvesUncertainToShell:
 
 
 class TestHeredocOwnerDefaultShellWrappers:
-    """A `$SHELL`-exec wrapper run with NO command operand runs the default shell on its stdin -
-    including long-option and short-cluster spellings (item 3)."""
+    """A `$SHELL`-exec wrapper run with no command runs the default shell on its stdin (each row
+    verified against the real binary with a `touch` witness). An option the wrapper's spec does
+    not know reads as that shell too, so a missing table entry fails closed."""
 
     @pytest.mark.parametrize(
         "command",
         [
             "unshare -U",
             "unshare -r",
-            "unshare --root /",  # long value option consumes /
-            "unshare -rS 0",  # short cluster: -r flag, -S consumes 0
+            "unshare --root /",  # long value option: unknown, so the shell
+            "unshare -rS 0",  # short cluster: -r flag, -S takes 0
             "chroot /",
             "chroot --userspec 0:0 /",
             "runuser - root",
+            "runuser -w -cX root",  # -w takes `-cX` as its value: no -c escape
             "script -q /dev/null",
             "nsenter -t 1 -m",
-            "nsenter --target 1 -m",  # long spelling of the short AC1 row
+            "nsenter --target 1 -m",
+            "nsenter --setuid 0",  # optional argument on newer util-linux, required on older
+            "nsenter -t 1 -m -S 0",
             "setarch x86_64",
             "linux32",
             "linux64",
-            "i386",  # setarch personality alias
+            "i386",  # setarch personality aliases
+            "x86_64",
             "uname26",
-            "fakeroot",  # should-fix: no program -> user's shell
+            "sg staff",  # sg GROUP with no command runs a shell
+            "fakeroot",
+            "fakeroot -b 3",  # -b takes a file descriptor
             "firejail",
         ],
     )
@@ -125,7 +145,6 @@ class TestHeredocOwnerDefaultShellWrappers:
         assert heredoc_owner(_first_command(command)) == _DEFAULT_SHELL
 
     def test_unknown_option_fails_closed_to_shell(self):
-        # An option unknown to a $SHELL-exec wrapper resolves to the shell, not a guessed flag.
         assert heredoc_owner(_first_command("unshare --frobnicate cat")) == _DEFAULT_SHELL
 
 
@@ -137,8 +156,8 @@ class TestHeredocOwnerResolvesWrappedShell:
         [
             ("env bash", "bash"),
             ("timeout 5 sh", "sh"),
-            ("env FOO=$X bash", "bash"),  # shell found past an assignment carrying $
-            ("nice -n $N bash", "bash"),  # shell found past an option value carrying $
+            ("env FOO=$X bash", "bash"),  # past an assignment carrying $
+            ("nice -n $N bash", "bash"),  # past an option value carrying $
             ("/lib64/ld-linux-x86-64.so.2 /bin/bash", "bash"),  # ELF loader
         ],
     )
@@ -147,9 +166,10 @@ class TestHeredocOwnerResolvesWrappedShell:
 
 
 class TestHeredocOwnerInertReadersUnchanged:
-    """Controls: a definite inert reader still names itself. A `$SHELL`-exec wrapper WITH a command
-    operand names the wrapper, not the shell - the body is not rescanned as a program (AC7). An
-    assignment prefix or option value carrying `$` does not force the body to code (item 2)."""
+    """Controls: a definite inert reader still names itself, so its body is not rescanned. That
+    covers a `$SHELL`-exec wrapper WITH a command, a `-c` escape, an assignment or option value
+    carrying `$`, a literal command's own expansion arguments, and a program run from a variable
+    directory."""
 
     @pytest.mark.parametrize(
         "command,expected",
@@ -157,17 +177,29 @@ class TestHeredocOwnerInertReadersUnchanged:
             ("cat", "cat"),
             ("grep foo", "grep"),
             ("tee out.txt", "tee"),
+            ("$VENV/bin/python3 -", "python3"),  # the program's name is literal
+            ('"$HOME/.venv/bin/python" -', "python"),
             ("timeout 5 cat", "timeout"),
-            ("timeout $T cat", "timeout"),  # $T is the DURATION, not the command (item 2)
-            ("env FOO=$X cat", "env"),  # assignment carries $, command is cat (item 2)
+            ("timeout $T cat", "timeout"),  # $T is the DURATION
+            ("env FOO=$X cat", "env"),  # the assignment carries the $
             ("env DATABASE_URL=$DB psql", "env"),
+            ('timeout 5 psql "$DB"', "timeout"),  # "$DB" is psql's argument, not a command
             ("unshare cat", "unshare"),
             ("unshare -r cat", "unshare"),
+            ("unshare -f --kill-child cat", "unshare"),  # --kill-child's argument is optional
             ("chroot / cat", "chroot"),
             ("chroot /mnt tee /etc/fstab", "chroot"),
+            ("runuser -u postgres -- psql", "runuser"),  # -u USER: no leading USER positional
+            ("runuser -lc psql postgres", "runuser"),  # -c inside the cluster
+            ("su root -c id", "su"),
+            ("script --command cat f", "script"),
+            ("script --command=cat f", "script"),
+            ("sg staff cat", "sg"),
+            ("xargs -n1 echo", "xargs"),  # echo reads the body lines as arguments
+            ('arch -x86_64 psql "$DB"', "arch"),  # macOS architecture names are flags
+            ("source ./env.sh", "source"),
             ("bash", "bash"),
             ("/bin/bash", "bash"),
-            ("su root -c id", "su"),  # -c escape: stdin is data, su is inert here
         ],
     )
     def test_owner_is_the_reader(self, command, expected):
@@ -175,44 +207,73 @@ class TestHeredocOwnerInertReadersUnchanged:
 
 
 class TestScanWrapperOperands:
-    """The option-arity scanner locates the first COMMAND operand: present -> (op, False),
-    absent -> (None, runs_default_shell). Long options, short clusters and env assignments (item 3)."""
+    """The operand scan returns ``(candidates, runs_code)``: the words that may be the command -
+    the positional after the leading ones, widened by one word per unknown option - and whether
+    stdin runs as code. A literal command's own arguments are never candidates."""
 
     @pytest.mark.parametrize(
-        "base,operands,cmd_op,runs_shell",
+        "base,operands,candidates,runs_code",
         [
-            ("unshare", ["-U"], None, True),
-            ("unshare", ["-r"], None, True),
-            ("unshare", ["cat"], "cat", False),
-            ("unshare", ["-r", "cat"], "cat", False),
-            ("unshare", ["--root", "/"], None, True),  # long value option
-            ("unshare", ["-rS", "0"], None, True),  # short cluster consumes 0
-            ("unshare", ["--frobnicate", "cat"], None, True),  # unknown option -> fail closed
-            ("nsenter", ["-t", "1", "-m"], None, True),
-            ("nsenter", ["--target", "1", "-m"], None, True),
-            ("nsenter", ["-t", "1", "bash"], "bash", False),
-            ("chroot", ["/"], None, True),
-            ("chroot", ["/", "cat"], "cat", False),
-            ("chroot", ["--userspec", "0:0", "/"], None, True),
-            ("chroot", ["/mnt", "tee", "/etc/fstab"], "tee", False),
-            ("setarch", ["x86_64"], None, True),
-            ("setarch", ["x86_64", "cat"], "cat", False),
-            ("linux32", [], None, True),
-            ("runuser", ["-", "root"], None, True),
-            ("runuser", ["-", "root", "cat"], "cat", False),
-            ("runuser", ["root", "-c", "id"], None, False),  # -c escape
-            ("su", ["root"], None, True),
-            ("su", ["root", "cat"], "cat", False),
-            ("script", ["-q", "/dev/null"], None, True),  # file positional, not a command
-            ("script", ["-c", "id", "/dev/null"], None, False),  # -c escape
-            ("timeout", ["$T", "cat"], "cat", False),  # DURATION then command
-            ("timeout", ["5"], None, False),  # not a $SHELL-exec wrapper
-            ("env", ["FOO=1", "cat"], "cat", False),  # assignment skipped
-            ("env", ["FOO=1"], None, False),
+            ("unshare", ["-U"], [], True),
+            ("unshare", ["cat"], ["cat"], False),
+            ("unshare", ["-r", "cat"], ["cat"], False),
+            ("unshare", ["-rS", "0"], [], True),
+            ("unshare", ["--root", "/"], [], True),
+            ("unshare", ["-f", "--kill-child", "cat"], ["cat"], False),
+            ("unshare", ["--frobnicate", "cat"], [], True),
+            ("nsenter", ["-t", "1", "-m"], [], True),
+            ("nsenter", ["--target", "1", "-m"], [], True),
+            ("nsenter", ["--setuid", "0"], [], True),
+            ("nsenter", ["-t", "1", "-m", "-S", "0"], [], True),
+            ("nsenter", ["-t", "1", "cat"], ["cat"], False),
+            ("chroot", ["/"], [], True),
+            ("chroot", ["/", "cat"], ["cat"], False),
+            ("chroot", ["--userspec", "0:0", "/"], [], True),
+            ("chroot", ["/mnt", "tee", "/etc/fstab"], ["tee"], False),
+            ("setarch", ["x86_64"], [], True),
+            ("setarch", ["x86_64", "-R", "cat"], ["cat"], False),  # options after ARCH
+            ("x86_64", [], [], True),
+            ("runuser", ["-", "root"], [], True),
+            ("runuser", ["-", "root", "cat"], ["cat"], False),
+            ("runuser", ["root", "-c", "id"], [], False),  # -c after the user (su-style getopt)
+            ("runuser", ["-u", "postgres", "--", "psql"], ["psql"], False),
+            ("runuser", ["-w", "-cX", "root"], [], True),
+            ("runuser", ["-lc", "psql", "postgres"], [], False),
+            ("su", ["root"], [], True),
+            ("su", ["root", "cat"], ["cat"], False),
+            ("sg", ["staff"], [], True),
+            ("sg", ["staff", "cat"], ["cat"], False),
+            ("sg", ["staff", "-c", "cat"], [], False),
+            ("script", ["-q", "/dev/null"], [], True),  # the positional is the typescript FILE
+            ("script", ["-c", "id", "/dev/null"], [], False),
+            ("script", ["--command", "cat", "f"], [], False),
+            ("script", ["--command=cat", "f"], [], False),
+            ("fakeroot", ["-b", "3"], [], True),
+            ("fakeroot", ["cat"], ["cat"], False),
+            ("timeout", ["$T", "cat"], ["cat"], False),
+            ("timeout", ["5"], [], False),  # not a $SHELL-exec wrapper: runs nothing
+            ("timeout", ["5", "psql", "$DB"], ["psql"], False),
+            ("sudo", ["-u", "postgres", "psql", "$DB"], ["psql"], False),
+            ("env", ["FOO=1", "cat"], ["cat"], False),
+            ("env", ["FOO=1"], [], False),
+            ("env", ["-P", "/x", "$SH"], ["/x", "$SH"], True),  # unknown -P widens the window
+            ("chrt", ["5", "$bash"], ["$bash"], True),
+            ("uv", ["run", "$SH"], ["$SH"], True),
+            ("uv", ["tool", "run", "$SH"], ["$SH"], True),
+            ("uv", ["run", "pytest", "-k", "exec"], ["pytest"], False),
+            ("uv", ["pip", "install", "x"], [], False),  # no `run`: uv runs nothing
+            ("strace", ["-x", "$bash"], ["$bash"], True),
+            ("strace", ["-u", "app", "$SH"], ["$SH"], True),
+            ("strace", ["-f", "cat", "$F"], ["cat"], False),
+            ("systemd-run", ["--uid", "0", "$SH"], ["0", "$SH"], True),
+            ("prlimit", ["--pid", "1", "$SH"], ["1", "$SH"], True),
+            ("xargs", ["-n1", "echo"], ["echo"], False),
+            ("arch", ["-x86_64", "$SH"], ["$SH"], True),
+            ("arch", ["-arm64", "python3", "$F"], ["python3"], False),
         ],
     )
-    def test_scan(self, base, operands, cmd_op, runs_shell):
-        assert _scan_wrapper_operands(base, operands) == (cmd_op, runs_shell)
+    def test_scan(self, base, operands, candidates, runs_code):
+        assert _scan_wrapper_operands(base, operands) == (candidates, runs_code)
 
 
 class TestEnvSplitStringExpansion:
@@ -240,8 +301,9 @@ class TestShellWrappingFunctions:
             ("g() { unshare -U; }; g", {"g"}),  # runs the default shell
             ("h() { cat; }; h", set()),  # inert body
             ("cat file", set()),  # no function
-            ("g() { bash; }; f() { g; }; f", {"g", "f"}),  # transitive (item 4)
-            ("f() { g; }; g() { bash; }; f", {"g", "f"}),  # forward call, declaration order (item 4)
+            ("g() { bash; }; f() { g; }; f", {"g", "f"}),  # transitive
+            ("f() { g; }; g() { bash; }; f", {"g", "f"}),  # a forward call: declaration order is irrelevant
+            ("f() { f; }; f", set()),  # a self-recursive function terminates and wraps nothing
         ],
     )
     def test_detects_shell_wrapping_functions(self, command, expected):
@@ -317,7 +379,7 @@ AC1_QUOTED_ROWS = [
     "timeout 5 $'sh'",
     "busybox $'sh'",
     "$'env' bash",
-    "env FOO=$X bash",  # assignment-prefix operand carrying $ (regression witness, item 1)
+    "env FOO=$X bash",  # an assignment carrying $ must not hide the shell
     "unshare -U",
     "unshare -r",
     "unshare --root /",
@@ -349,6 +411,27 @@ AC1_QUOTED_ROWS = [
     "env -S 'bash -e'",
     "env -Sbash",
     "env --split-string=bash",
+    # Operand-scan spellings: a table gap, a leading positional or a subcommand must not hide the command.
+    "chrt 5 $'bash'",
+    "uv run $SH",
+    "uv tool run $SH",
+    "strace -x $'bash'",
+    "strace -u app $SH",
+    "systemd-run --uid 0 $SH",
+    "prlimit --pid 1 $SH",
+    "env -P /x $SH",
+    "${SHELL:-/bin/sh}",
+    "$(which bash)",
+    "$DIR/$PROG",
+    "nsenter --setuid 0",
+    "nsenter -t 1 -m -S 0",
+    "fakeroot -b 3",
+    "runuser -w -cX root",
+    "sg staff",
+    "x86_64",
+    "i386",
+    ". /dev/fd/0",
+    "source $F",
 ]
 
 
@@ -366,7 +449,7 @@ class TestAc1QuotedHeredocRowsBlocked:
         "command",
         [
             "f() { bash; }; " + hd("f", Q),  # direct wrapping function
-            "g() { bash; }; f() { g; }; " + hd("f", Q),  # transitive (item 4)
+            "g() { bash; }; f() { g; }; " + hd("f", Q),  # transitive
         ],
     )
     def test_shell_wrapping_function_blocked(self, command, no_shellcheck):
@@ -381,8 +464,8 @@ class TestAc1QuotedHeredocRowsBlocked:
 
 
 class TestAc1UnquotedRegressionTwins:
-    """The CRIT regression: a None owner was inert on the unquoted path. Every uncertain owner over
-    an UNQUOTED `rm -rf /` body must reach the direct `bash <<EOF` twin's BLOCKED (item 1)."""
+    """A None owner is inert on the unquoted path, so an uncertain owner must resolve to a shell:
+    over an UNQUOTED `rm -rf /` body each row reaches the direct `bash <<EOF` twin's BLOCKED."""
 
     @pytest.mark.parametrize(
         "head",
@@ -423,7 +506,7 @@ class TestAc2DashCPayloads:
         ],
     )
     def test_dash_c_of_another_program_not_extracted(self, command, no_shellcheck):
-        # SAFE on base; the review's item-2 over-block must not reappear.
+        # SAFE on a72b45c: the -c belongs to the literal program, so nothing is delegated.
         assert validate_command(command).risk_level == RiskLevel.SAFE, command
 
 
@@ -522,9 +605,56 @@ class TestAc7InertControlsUnchanged:
 
 
 class TestLauncherExecEvalNotBypassScanned:
-    """Item 2c: launchers whose own subcommand is `exec`/`eval` are out of the wrapper-bypass scan,
+    """Launchers whose own subcommand is `exec`/`eval` are out of the wrapper-bypass scan,
     so a benign `uv run … exec` / `firejail … eval` is not read as the shell builtin."""
 
     @pytest.mark.parametrize("command", ["uv run pytest -k exec", "firejail --noprofile make eval"])
     def test_launcher_subcommand_not_blocked(self, command, no_shellcheck):
         assert validate_command(command).risk_level != RiskLevel.BLOCKED, command
+
+
+PY = "import os\nprint(os.getcwd())"
+SQL = "INSERT INTO t (a, b) VALUES (1, 'x');"
+
+
+class TestOwnerDoesNotOverRead:
+    """Each row is SAFE on a72b45c and must stay SAFE: a program run from a variable directory, a
+    literal command's own expansion argument, a `-c` inside a cluster or in `--command=` form, an
+    optional-argument option, `runuser -u USER CMD`, `xargs` with a literal command and sourcing a
+    named file are all definite inert readers. Each body fails to parse as bash, so a row that
+    wrongly reads its owner as a shell BLOCKS."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            hd('"$HOME/.venv/bin/python" -', PY),
+            hd("$VENV/bin/python3 -", PY),
+            hd("$HOME/bin/psql", SQL),
+            hd('timeout 5 psql "$DB"', SQL),
+            hd('timeout 5 grep "$PAT"', UNPARSEABLE),
+            hd('env FOO=1 cat "$f"', UNPARSEABLE),
+            hd("runuser -u postgres -- psql", SQL),
+            hd("runuser -lc psql postgres", SQL),
+            hd("script --command cat f", UNPARSEABLE),
+            hd("script --command=cat f", UNPARSEABLE),
+            hd("unshare -f --kill-child cat", UNPARSEABLE),
+            hd("xargs -n1 echo", UNPARSEABLE),
+            hd("source ./env.sh", UNPARSEABLE),
+        ],
+    )
+    def test_inert_reader_keeps_base_verdict(self, command, no_shellcheck):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name} {result.matched_rules}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "script -q --command \"'rm' -rf /\" /dev/null",  # SAFE on a72b45c: --command was skipped
+            "script -q -c \"'rm' -rf /\" /dev/null",  # the short twin, BLOCKED on a72b45c too
+        ],
+    )
+    def test_long_command_payload_is_delegated(self, command, no_shellcheck):
+        # `--command PROG` is the same delegation as `-c PROG`, so its payload is re-validated.
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, command
+        assert "shell_delegated_payload" in (result.matched_rules or [])

@@ -25,12 +25,13 @@ from schlock.integrations.shellcheck import (
 
 from .cache import ValidationCache
 from .parser import (
+    DASH_C_WRAPPERS,
     WRAPPER_COMMANDS,
     BashCommandParser,
     command_position_substitution,
     expand_env_split_string,
-    has_expansion_char,
     heredoc_owner,
+    names_unresolved_program,
     shell_wrapping_functions,
 )
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
@@ -470,8 +471,9 @@ _SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh",
 
 # Not shells, but their `-c` argument is a command string they hand to one. Their leading
 # operand is a user/group/file rather than a script, so it must NOT end option parsing
-# (`sg root -c PROG`, `su postgres -c PROG`).
-_DASH_C_RUNNERS: frozenset[str] = frozenset({"su", "runuser", "sg", "script"})
+# (`sg root -c PROG`, `su postgres -c PROG`). The parser's owner resolution reads the same `-c`
+# as "stdin is data", so both take the one table.
+_DASH_C_RUNNERS: frozenset[str] = DASH_C_WRAPPERS
 
 _DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
 
@@ -608,7 +610,14 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
             if i == 0 and operand_ends_options:
                 return None
             continue
-        if word.startswith("--") or "c" not in word[1:]:
+        if word.startswith("--"):
+            # su, runuser, script and fish also spell it `--command PROG` / `--command=PROG`.
+            name, has_value, value = word.partition("=")
+            if name not in ("--command", "--session-command"):
+                continue
+            if has_value:
+                return value or None
+        elif "c" not in word[1:]:
             continue
         rest = words[i + 1 :]
         while rest and rest[0] == "--":
@@ -710,13 +719,13 @@ def _shell_delegated_payloads(
                 for i, word in enumerate(words):
                     if word in _DELEGATOR_COMMANDS:
                         found.extend(_shell_delegated_payloads([(scan_args[i], scan_args[i + 1 :])], _seen=seen))
-                    elif has_expansion_char(word):
+                    elif names_unresolved_program(scan_args[i]):
                         # An operand we cannot resolve (`env $'bash' -c PROG`) might be a shell.
                         # Fail closed: extract the `-c PROG` that DIRECTLY follows it, as a shell's
                         # own would. operand_ends_options=True stops at an intervening program, so
                         # `timeout $T python3 -c 'print(1)'` and `env DB=$X psql -c '…'` - where the
                         # -c belongs to python3/psql, not to the unresolved word - are not extracted
-                        # (LAB-5180 review: item 2 over-block, item 5).
+                        # (LAB-5180).
                         found.append(_dash_c_payload(scan_args[i + 1 :], operand_ends_options=True))
 
         payloads.extend(p for p in found if p and p.strip())
