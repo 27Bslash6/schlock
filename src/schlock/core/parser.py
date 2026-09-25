@@ -1312,9 +1312,8 @@ class BashCommandParser:
         has no children, so a `${…}` holding a substitution has its whole
         interior blanked from the node's own span.
 
-        This reaches a target OUTSIDE every body. A target inside one
-        (`echo $(cat $(…)/.env)`) is blanked with it; the rule's own gap is
-        still what reaches that.
+        This reaches a target OUTSIDE every body. A target inside one is blanked
+        with it, so reaching that stays the rule's own gap's job.
 
         Length-preserving, so the caller's literal and heredoc ranges still index
         it. A span is blanked only when its opener is at the node's start and its
