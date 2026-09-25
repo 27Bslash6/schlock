@@ -427,6 +427,7 @@ class TestSubscriptedAssignmentPrefix:
             "a[0]=1",
             "arr[i]+=x",
             'm["k"]=v',
+            "m['k']=v",
             "a[${#a[@]}]=x",
             'for f in *; do c[$(basename "$f")]=1; done',
             "(( a[0]++ ))",
@@ -460,7 +461,8 @@ class TestSubscriptedAssignmentPrefix:
             "a[${x:-]};0]=1 bash",
             "a[$(echo ]);0]=1 bash",
             "a[$'\\'];x']=1 bash",
-            "a[`echo`;0]=1 bash",
+            "a[`echo ]`;0]=1 bash",
+            "a[']';0]=1 bash",
             # Any prefix word, in any command the tree holds.
             "b=1 a[;0]=1 bash",
             "a[0]=1 b[;0]=1 bash",
