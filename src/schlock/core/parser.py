@@ -127,7 +127,7 @@ _apply_andor_substitution_correction()
 # A heredoc body is inert text to `cat` and source code to `bash`, which decides
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
 # segment has to carry it (extract_command_segments). One set, so the two answers
-# cannot drift apart. Wrapper-blind by inheritance - see LAB-3095.
+# cannot drift apart. Both ask `heredoc_owner`, which sees past a wrapper.
 #
 # `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
 # bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
@@ -405,6 +405,28 @@ def _command_words(node: Any) -> "list[str]":
         if hasattr(part, "word"):
             words.append(part.word)
     return words
+
+
+def heredoc_owner(node: Any) -> Optional[str]:
+    """The name of what runs a command node's heredoc, basename only; None when it has no word.
+
+    Built on `_command_words`, so an assignment prefix is skipped: `FOO=1 bash` runs `bash`.
+    Taking the first part that merely HAS a `.word` read it as a command named `FOO=1`, and
+    a shell behind any assignment was then treated as an inert heredoc consumer.
+
+    A wrapper execs its command with its own stdin, so `env bash <<EOF` hands the body to
+    bash; busybox and toybox are wrappers here too (`busybox sh`). The owner is then the
+    first shell among ALL the wrapper's operands, or the wrapper's own name when none is a
+    shell. Not the first operand: the shell need not be it (`timeout 5 sh`). The cost is an
+    over-read - `flock ./bash cat` names bash, though it locks a file called `bash` and runs
+    cat - which only rescans a body that may not run: the fail-closed direction.
+    """
+    words = [word.split("/")[-1] for word in _command_words(node)]
+    if not words:
+        return None
+    if words[0] in WRAPPER_COMMANDS:
+        return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), words[0])
+    return words[0]
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -758,8 +780,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        cmd_name = next((part.word.split("/")[-1] for part in node.parts if hasattr(part, "word")), None)
-        executes_body = cmd_name in _HEREDOC_SHELL_COMMANDS
+        executes_body = heredoc_owner(node) in _HEREDOC_SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1108,10 +1129,7 @@ class BashCommandParser:
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            cmd_name = part.word.split("/")[-1]  # Handle /bin/bash
-                            break
+                    cmd_name = heredoc_owner(node)
 
                 # Check for redirect nodes with heredocs
                 if node.kind == "redirect" and hasattr(node, "heredoc"):
