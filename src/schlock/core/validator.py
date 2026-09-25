@@ -1878,26 +1878,30 @@ def _blank_body_line(line: str) -> str:
     return "x" * len(line)
 
 
-def _body_line(lines: list[str], index: int, quoted: bool) -> tuple[str, int]:
-    """The heredoc body line bash reads from ``lines[index]``, and the index after its last physical line.
+def _body_line(lines: list[str], index: int, quoted: bool) -> tuple[str, list[str]]:
+    """The heredoc body line bash reads from ``lines[index]``, and the physical lines it spans.
 
     Bash tests the delimiter against this line, not against a physical one. In an UNQUOTED
     body its `read_secondary_line` deletes each unescaped backslash-newline as it reads, so
     `EO\\` followed by `F` is one line, `EOF`, and it ends an `<<EOF` body (LAB-5272). Compare
     physical lines instead and the body runs on to some later `EOF`, filing every command in
-    between as inert body text. That is a misread body *start* for the shell after the real
-    terminator, which escalation never sees. bashlex joins these lines too, so this reading is
-    also the one the kept body gets when it is parsed.
+    between as inert body text.
 
     A physical line with an odd run of trailing backslashes joins; an even run is escaped
-    backslashes and does not. A QUOTED body is literal: bash never joins it, so neither does this.
+    backslashes and does not. bashlex is not so careful - it deletes EVERY backslash-newline,
+    escaped or not - which `_neuter_heredocs` has to answer for. A QUOTED body is literal:
+    bash's heredoc reader never joins it, so neither does this.
     """
-    line = lines[index]
-    index += 1
-    while not quoted and index < len(lines) and (len(lines[index - 1]) - len(lines[index - 1].rstrip("\\"))) % 2:
-        line = line[:-1] + lines[index]
-        index += 1
-    return line, index
+    end = index + 1
+    while not quoted and end < len(lines) and (len(lines[end - 1]) - len(lines[end - 1].rstrip("\\"))) % 2:
+        end += 1
+    physical = lines[index:end]
+    return "".join(part[:-1] for part in physical[:-1]) + physical[-1], physical
+
+
+def _is_terminator(line: str, delimiter: str, strips_tabs: bool) -> bool:
+    """Whether body line ``line`` ends the heredoc: `<<-` strips its leading tabs first, as bash does."""
+    return (line.lstrip("\t") if strips_tabs else line) == delimiter
 
 
 class _BashlexHeredoc(NamedTuple):
@@ -2129,13 +2133,12 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
             for (delimiter, strips_tabs, start, _), quoted in zip(openers, was_quoted):
                 body_start = at
                 while index < len(lines):
-                    body, after = _body_line(lines, index, quoted)
-                    physical = lines[index:after]
+                    body, physical = _body_line(lines, index, quoted)
                     line_at = at
                     at += sum(len(part) + 1 for part in physical)
-                    index = after
-                    if (body.lstrip("\t") if strips_tabs else body) == delimiter:
-                        out.extend(physical)  # terminator stays verbatim; bashlex ends here
+                    index += len(physical)
+                    if _is_terminator(body, delimiter, strips_tabs):
+                        out.extend(physical)  # terminator stays verbatim
                         if quoted:
                             # The body runs up to the newline before the terminator; an
                             # empty one slices to "" and is never delegated.
@@ -2220,16 +2223,22 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
             quoted = _delimiter_is_quoted(opener_line, delimiter, strips_tabs, start, end)
             body_lines: list[str] = []
             while index < len(lines):
-                body, after = _body_line(lines, index, quoted)
-                physical = lines[index:after]
+                body, physical = _body_line(lines, index, quoted)
                 at += sum(len(part) + 1 for part in physical)
-                index = after
-                if (body.lstrip("\t") if strips_tabs else body) == delimiter:
-                    # Every physical line of a joined terminator is consumed as the
-                    # terminator, so the kept body never ends in a `\` that bashlex
-                    # would join onto the placeholder.
+                index += len(physical)
+                if _is_terminator(body, delimiter, strips_tabs):
                     if quoted or not body_lines:
                         rewritten.append("")
+                    elif body_lines[-1].endswith("\\"):
+                        # The run of backslashes is even - an odd one would have joined this
+                        # line onto the terminator - so bash reads escaped backslashes and ends
+                        # the body here. bashlex deletes every backslash-newline, escaped or
+                        # not, so it would join this line onto the placeholder and read the
+                        # command after it as body.
+                        raise ParseError(
+                            "An unquoted heredoc's last body line ends in a backslash, which bashlex "
+                            "joins onto the rewrite delimiter; where the body ends is unknown"
+                        )
                     else:
                         # The leading blank line absorbs a bashlex quirk: inside a compound
                         # statement it lexes a heredoc's first body line, so a `<<` there
@@ -2239,11 +2248,11 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
                     break
                 if not quoted and _HEREDOC_PLACEHOLDER in body:
                     # bashlex ends the kept body at a line equal to the placeholder (after the
-                    # backslash-newline join and the `<<-` tab strip), and bash does not, so
-                    # the command behind it would be read as body. Tested on the JOINED line,
-                    # since that is the line bashlex compares; containment is a strict superset
-                    # of that line test, and needs no copy of bashlex's strip. (A quoted body
-                    # is dropped, so it cannot.)
+                    # `<<-` tab strip), and bash does not, so the command behind it would be
+                    # read as body. The placeholder holds no backslash, so any line bashlex
+                    # joins into it is one bash joins too: containment in the joined line is a
+                    # strict superset of that line test, and needs no copy of bashlex's strip.
+                    # (A quoted body is dropped, so it cannot.)
                     raise ParseError("An unquoted heredoc body contains the rewrite delimiter")
                 body_lines.extend(physical)
             else:

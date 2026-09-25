@@ -3194,7 +3194,9 @@ class TestHeredocBoundariesOnTheNativePath:
     """What moving quoted heredocs onto the native parse must not lose (LAB-3094).
 
     Boundaries here are checked against an independent bash parser (mvdan/sh, the parser
-    behind the native tier) rather than against bashlex's own view of them.
+    behind the native tier) rather than against bashlex's own view of them. mvdan/sh does
+    not end a body at a backslash-joined terminator (`EO\\` then `F`) where bash does, so
+    rows with one are pinned against bash in TestAnUnquotedBodyIsReadThroughItsBackslashNewlines.
     """
 
     @pytest.mark.parametrize(
@@ -3605,14 +3607,17 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
 
 
 class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
-    """Bash tests an unquoted heredoc's delimiter against the JOINED line (LAB-5272).
+    """An unquoted heredoc ends at the JOINED line bash reads (LAB-5272; see `_body_line`).
 
-    In an unquoted body bash's `read_secondary_line` deletes each unescaped backslash-newline
-    as it reads, so `EO\\` then `F` is the line `EOF`, and it ends an `<<EOF` body. Both of
-    schlock's readers compared physical lines instead, read on to a later `EOF`, and filed
-    every command in between as inert body. Every row here was decided by running bash 5.3
-    first, with `touch PWNED` in the payload's place.
+    Every row here was decided by running bash 5.3 first, with `touch PWNED` in the
+    payload's place.
     """
+
+    @staticmethod
+    def _shell_after_rewrite(neutered: str) -> list[str]:
+        """The commands bashlex reads outside every heredoc body when it re-parses the rewrite."""
+        bash_parser = parser.BashCommandParser()
+        return bash_parser.extract_command_segments(neutered, bash_parser.parse(neutered))
 
     @pytest.mark.parametrize(
         "command,neutered",
@@ -3638,14 +3643,15 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
         ids=["joined-terminator", "tabs-stripped-from-the-joined-line", "three-physical-lines", "a-body-line-joined-into-EOF"],
     )
     def test_the_fallback_ends_the_body_at_the_line_bash_ends_it(self, command, neutered):
-        """Bash ran the payload in every row, so it must sit after the placeholder terminator.
+        """Bash ran the payload in every row, so it must be shell in the rewrite as bashlex reads it.
 
         Pinned on the rewrite, not on a verdict: a payload swallowed as body is gone from the
         text escalation sees, so a verdict can pass for an unrelated reason. The last row is
         the reverse join - `foo\\` onto `EOF` is the body line `fooEOF`, so the body ends at
-        the NEXT `EOF` - which the fallback used to refuse rather than read.
+        the NEXT `EOF`.
         """
         assert val_module._neuter_heredocs(command)[0] == neutered
+        assert "rm -rf /" in self._shell_after_rewrite(neutered)
 
     @pytest.mark.parametrize(
         "command,neutered",
@@ -3662,16 +3668,50 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
                 "cat <<'A;B'\nq\nA;B\ncat <<EOF > s.sh\na \\\n  b\nEOF",
                 "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC > s.sh\n\na \\\n  b\nSCHLOCK_HEREDOC",
             ),
+            (
+                "cat <<'A;B'\nq\nA;B\ncat <<EOF\nx\\\\\ny\nEOF",
+                "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC\n\nx\\\\\ny\nSCHLOCK_HEREDOC",
+            ),
         ],
-        ids=["a-tab-after-the-join-is-kept", "an-escaped-backslash-does-not-join", "benign-continued-body"],
+        ids=[
+            "a-tab-after-the-join-is-kept",
+            "an-escaped-backslash-does-not-join",
+            "benign-continued-body",
+            "an-escaped-backslash-mid-body",
+        ],
     )
     def test_a_line_bash_reads_as_body_stays_body(self, command, neutered):
         """The other direction: bash ran nothing here, and printed every line as body text.
 
         `<<-` strips tabs from the front of the JOINED line only, so `\\tEO\\` then `\\tF`
-        is `EO\\tF`, not `EOF`. An even run of backslashes is escaped backslashes, not a join.
+        is `EO\\tF`, not `EOF`. An even run of backslashes is escaped backslashes, not a join,
+        and one that is not on the last body line leaves bashlex's reading of the end alone.
         """
         assert val_module._neuter_heredocs(command)[0] == neutered
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<EOF\na\\\\\nEO\\\nF\nrm -rf ~\ncat <<'Q'\nQ",
+            "cat <<'A;B'\nq\nA;B\ncat <<EOF\nx\\\\\nEOF\nrm -rf ~\ncat <<'C;D'\ny\nC;D",
+        ],
+        ids=["before-a-joined-terminator", "before-a-plain-terminator"],
+    )
+    def test_a_kept_body_ending_in_an_escaped_backslash_fails_closed(self, safety_rules_path, command):
+        """Bash ends the body at the terminator and runs the `rm`; bashlex would read it as body.
+
+        bashlex deletes every backslash-newline, escaped or not, so the kept last line `x\\\\`
+        joins onto the placeholder and the body runs on past it. The first row scored LOW and
+        allowed, ShellCheck on or off, once the joined terminator was read; the second did on
+        `main`, where only an odd run was refused.
+        """
+        with pytest.raises(ParseError, match="ends in a backslash"):
+            val_module._neuter_heredocs(command)
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "ends in a backslash" in (result.error or "")
 
     @pytest.mark.parametrize(
         "command",
@@ -3693,9 +3733,14 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.allowed is False
 
-    def test_a_benign_continued_body_is_not_over_blocked(self, safety_rules_path):
+    @pytest.mark.parametrize(
+        "command",
+        ["cat <<EOF > s.sh\na \\\n  b\nEOF", "cat <<'A;B'\nq\nA;B\ncat <<EOF > s.sh\na \\\n  b\nEOF"],
+        ids=["native", "fallback"],
+    )
+    def test_a_benign_continued_body_is_not_over_blocked(self, safety_rules_path, command):
         """Bash writes `a   b` to s.sh and runs nothing else."""
-        result = validate_command("cat <<EOF > s.sh\na \\\n  b\nEOF", config_path=safety_rules_path)
+        result = validate_command(command, config_path=safety_rules_path)
 
         assert result.allowed is True, result.message
 

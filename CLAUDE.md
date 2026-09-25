@@ -42,15 +42,17 @@
         *not* cover: the dangerous failure is not the uncertain reading that raises, it is
         the confident wrong one that does not. The pre-parse rewrite shares that exposure on
         the same inputs - it blanks what it reads as a quoted body - which is why its body
-        spans are pinned against an independent bash parser, not against bashlex.
+        spans are pinned against an independent bash parser, not against bashlex (and against
+        bash itself where mvdan/sh differs: it does not end a body at a backslash-joined
+        terminator).
      4. **Escalation is monotonic, which is not the same as safe** —
         `_escalate_past_heredoc` can worsen a verdict and never improve one, so a misread
         body *end* is bounded to a false positive. A misread body *start* is not: the
         swallowed text is deleted from the rewrite before escalation ever sees it, leaving
         the verdict pinned at the heredoc head's own floor. That asymmetry is why every
         uncertain body-*start* reading must raise, and why changes here are pinned by
-        asserting the rewritten text still contains the payload rather than by asserting a
-        verdict.
+        asserting the rewritten text still contains the payload - outside every heredoc body
+        bashlex reads when it re-parses the rewrite - rather than by asserting a verdict.
      Bash's tokenization is what it must match, so every behavioural change here is decided by
      running real bash first and pinned by a test that names what bash did.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
