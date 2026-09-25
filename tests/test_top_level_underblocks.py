@@ -4,7 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from schlock.core.parser import BashCommandParser, _command_words, _reads_stdin_as_program, _subscript_closes
+from schlock.core.parser import (
+    BashCommandParser,
+    _command_words,
+    _reads_stdin_as_program,
+    _subscript_closes,
+    _subscript_span_is_trustworthy,
+)
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import dangerous_find, dangerous_git_config, dangerous_kubectl
 from schlock.core.validator import validate_command
@@ -474,6 +480,10 @@ class TestSubscriptedAssignmentPrefix:
             "a[$(echo \\\n ]);0]=1 bash",
             "a[$(echo \\\n \\)]);0]=1 bash",
             "a[\\\n`echo ]`;0]=1 bash",
+            # A process substitution whose span a `#` cut short: `<`/`>` are not stop chars, so
+            # without the span-trust guard the scan reads the `]` inside it as the close.
+            "a[<(echo #]\n);0]=1 bash",
+            "a[>(cat #]\n);0]=1 bash",
             # Any prefix word, in any command the tree holds.
             "b=1 a[;0]=1 bash",
             "a[0]=1 b[;0]=1 bash",
@@ -503,6 +513,31 @@ class TestSubscriptedAssignmentPrefix:
     def test_a_substitution_the_parser_did_not_mark_does_not_close_the_subscript(self, text):
         # A word with no marked substitution parts: the `]` inside is still not bash's closing `]`.
         assert not _subscript_closes(text, SimpleNamespace(pos=(0, len(text)), parts=[]))
+
+    @staticmethod
+    def _word(command, sub=None):
+        # A synthetic word spanning all of `command`, optionally with one substitution part `sub`
+        # (start, end). Lets the span-trust contract be pinned on spans a real parse never yields
+        # (bashlex ends a span early on a `#`/`<<`, so it never returns one that both closes and
+        # carries them).
+        parts = [SimpleNamespace(kind="commandsubstitution", pos=sub)] if sub else []
+        return SimpleNamespace(pos=(0, len(command)), parts=parts)
+
+    def test_span_trust_accepts_a_clean_substitution(self):
+        cmd = "a[$(echo 0)]"
+        assert _subscript_span_is_trustworthy(cmd, self._word(cmd, (2, 11))) == {2: 11}
+
+    @pytest.mark.parametrize(
+        ("command", "sub"),
+        [
+            ("a[$(echo # x)]", (2, 13)),  # a `#` the parser's span would have ended before
+            ("a[$(cat << E)]", (2, 13)),  # a `<<` heredoc the parser's span would have ended before
+            ("a[$(echo 0 ]", (2, 12)),  # a span bashlex ended before its `)`
+            ("a[\\\n$(echo 0)]", (4, 13)),  # a backslash-newline shifting every later offset
+        ],
+    )
+    def test_span_trust_refuses_an_untrustworthy_substitution(self, command, sub):
+        assert _subscript_span_is_trustworthy(command, self._word(command, sub)) is None
 
     def test_split_subscript_error_message_says_nothing_about_heredocs(self):
         # validate_command hands a ParseError that mentions a heredoc to the heredoc fallback, so the
