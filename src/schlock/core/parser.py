@@ -9,6 +9,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import bisect
 import logging
+import re
 from typing import Any, NamedTuple, Optional
 
 import bashlex
@@ -396,15 +397,41 @@ def _stdin_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
     return by_fd.get(0)
 
 
+# bashlex reads `FOO=1` in front of a command as an assignment node, but it reads `a[0]=1` as a
+# plain word, and so is every assignment after that word or after a redirect. Bash still makes each
+# one an assignment (``a[0]': not a valid identifier``) and then runs the command. The subscript
+# match runs to the LAST `]=` because bashlex has already dropped the quotes that can hide a `]`
+# (`a["]"]=1`).
+_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=", re.DOTALL)
+# A blank inside a subscript splits the word, so `a[ 0 ]=1` arrives as `a[`, `0`, `]=1`.
+_SUBSCRIPT_OPEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\[")
+_SUBSCRIPT_CLOSE = re.compile(r"\]\+?=")
+
+
+def _prefix_length(words: "list[str]") -> int:
+    """Count the leading words that bash treats as assignments before it reaches the command name."""
+    i = 0
+    while i < len(words):
+        if _ASSIGNMENT_WORD.match(words[i]):
+            i += 1
+            continue
+        if not _SUBSCRIPT_OPEN.match(words[i]):
+            break
+        close = next((j for j in range(i + 1, len(words)) if _SUBSCRIPT_CLOSE.search(words[j])), None)
+        if close is None:
+            break
+        i = close + 1
+    return i
+
+
 def _command_words(node: Any) -> "list[str]":
     """Word tokens (command name + args) of a command node, skipping assignment/redirect prefixes."""
-    words: list[str] = []
-    for part in getattr(node, "parts", []):
-        if getattr(part, "kind", None) in ("assignment", "redirect"):
-            continue
-        if hasattr(part, "word"):
-            words.append(part.word)
-    return words
+    words = [
+        part.word
+        for part in getattr(node, "parts", [])
+        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
+    ]
+    return words[_prefix_length(words) :]
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -537,22 +564,8 @@ class BashCommandParser:
         """
         if not hasattr(node, "kind") or node.kind != "command":
             return None
-        if not hasattr(node, "parts"):
-            return None
-
-        for part in node.parts:
-            # Skip assignment nodes (VAR=value prefixes)
-            if hasattr(part, "kind") and part.kind == "assignment":
-                continue
-            # Skip redirects
-            if hasattr(part, "kind") and part.kind == "redirect":
-                continue
-            # Found a word node - this is the command name
-            if hasattr(part, "word"):
-                cmd = part.word.split("/")[-1]
-                return cmd if cmd else None
-
-        return None
+        words = _command_words(node)
+        return (words[0].split("/")[-1] or None) if words else None
 
     def parse(self, command: str) -> list[Any]:
         """Parse command into bashlex AST.
@@ -667,16 +680,7 @@ class BashCommandParser:
             if hasattr(node, "kind"):
                 # Command nodes contain the actual command and arguments
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    words = []
-                    for part in node.parts:
-                        # Skip assignment nodes (VAR=value prefixes)
-                        if hasattr(part, "kind") and part.kind == "assignment":
-                            continue
-                        # Skip redirects (2>&1, >, <, etc.)
-                        if hasattr(part, "kind") and part.kind == "redirect":
-                            continue
-                        if hasattr(part, "word"):
-                            words.append(part.word)
+                    words = _command_words(node)
                     if words:
                         # First word is command, rest are arguments
                         results.append((words[0], words[1:]))
@@ -1374,19 +1378,8 @@ class BashCommandParser:
         dangers.extend(pipeline_dangers)
 
         def _get_all_words(node) -> list[str]:
-            """Get ALL words from a command node, skipping assignments/redirects."""
-            words = []
-            if not hasattr(node, "parts"):
-                return words
-            for part in node.parts:
-                # Skip assignment and redirect prefixes
-                if hasattr(part, "kind") and part.kind in ("assignment", "redirect"):
-                    continue
-                if hasattr(part, "word"):
-                    cmd = part.word.split("/")[-1]
-                    if cmd:  # Skip empty strings
-                        words.append(cmd)
-            return words
+            """Basenames of a command node's words from its name on, skipping empty ones."""
+            return [name for word in _command_words(node) if (name := word.split("/")[-1])]
 
         def visit_children(node, visitor):
             """Recursively visit child nodes of an AST node."""
@@ -1508,20 +1501,6 @@ class BashCommandParser:
         # locally for THAT check only.
         shell_interpreters = STDIN_EXEC_INTERPRETERS | {"env", "xargs"}
 
-        def _stage_args(part) -> list[str]:
-            """Word-args AFTER the command name for a pipeline stage command node."""
-            words = []
-            seen_name = False
-            for sub in getattr(part, "parts", []):
-                if getattr(sub, "kind", None) in ("assignment", "redirect"):
-                    continue
-                if hasattr(sub, "word"):
-                    if not seen_name:
-                        seen_name = True  # first word is the command name
-                        continue
-                    words.append(sub.word)
-            return words
-
         def check_pipeline(node):
             """Check a pipeline node for dangerous patterns."""
             if not hasattr(node, "parts"):
@@ -1540,7 +1519,7 @@ class BashCommandParser:
                     if cmd_name:
                         # Resolve multicall wrappers (busybox/toybox) to their applet so the
                         # stage is classified by what actually runs (`busybox sh` -> `sh`).
-                        stages.append(_resolve_multicall(cmd_name, _stage_args(stage_node)))
+                        stages.append(_resolve_multicall(cmd_name, _command_words(stage_node)[1:]))
 
             if len(stages) < 2:
                 return
