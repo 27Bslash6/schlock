@@ -11,8 +11,10 @@ loader) and the `env -S` spelling - filing each one's destructive body inert.
 An owner this parser cannot resolve to a definite inert reader resolves to `_DEFAULT_SHELL`, not
 None: None is inert on the unquoted regex-suppression path (`extract_heredoc_ranges`), so
 returning it reopened the bypass (`env FOO=$X bash <<EOF` -> SAFE). The expansion check is applied
-ONLY to the command-position operand, so an assignment prefix or an option value carrying `$`
-(`env FOO=$X cat`, `timeout $T cat`) is not over-blocked.
+to the words that may be the wrapper's command - its command position, widened by one word per
+option the wrapper's spec does not know - so an assignment prefix, an option value or a literal
+command's own argument carrying `$` (`env FOO=$X cat`, `timeout $T cat`, `timeout 5 psql "$DB"`)
+is not over-blocked.
 
 Two layers are pinned: the STRUCTURAL owner/segment view (a verdict can be reached by the
 whole-command rule scan even when the segment view is wrong - LAB-4955), and the integration
@@ -20,6 +22,8 @@ verdict with ShellCheck off. The witness for the quoted rows is `'rm' -rf /`: qu
 word means no body regex can carry the verdict, so a BLOCKED verdict there proves the body reached
 the validator as code (the `shell_delegated_payload` path the fixed `bash <<'EOF'` twin gets).
 """
+
+import time
 
 import pytest
 
@@ -31,6 +35,7 @@ from schlock.core.parser import (
     command_position_substitution,
     expand_env_split_string,
     heredoc_owner,
+    names_unresolved_program,
     shell_wrapping_functions,
 )
 from schlock.core.rules import RiskLevel
@@ -98,6 +103,18 @@ class TestHeredocOwnerResolvesUncertainToShell:
             ". /dev/fd/0",
             "source /dev/stdin",
             "source $F",
+            ". /dev/fd//0",  # the path is normalised before the stdin test
+            ". /dev/fd/./0",
+            "source /dev/fd/0/",
+            "${SHELL#)/}",  # the `)` is pattern text: `${` closes only on `}`
+            "timeout 5 ${SHELL#)/}",
+            "$(: ')'; echo /bin/bash)",  # a quote inside `$(…)`: bracket it no further
+            "parallel --jobs 4",  # parallel with no template runs each line; long options too
+            "parallel -P 4",
+            "parallel --halt now,fail=1",
+            "parallel 'sh -c'",  # the template is a shell snippet that runs the line
+            "parallel -j4 'sh -c'",
+            "parallel 'echo {} | sh'",
         ],
     )
     def test_owner_is_default_shell(self, command):
@@ -143,9 +160,6 @@ class TestHeredocOwnerDefaultShellWrappers:
     )
     def test_owner_is_default_shell(self, command):
         assert heredoc_owner(_first_command(command)) == _DEFAULT_SHELL
-
-    def test_unknown_option_fails_closed_to_shell(self):
-        assert heredoc_owner(_first_command("unshare --frobnicate cat")) == _DEFAULT_SHELL
 
 
 class TestHeredocOwnerResolvesWrappedShell:
@@ -197,6 +211,14 @@ class TestHeredocOwnerInertReadersUnchanged:
             ("sg staff cat", "sg"),
             ("xargs -n1 echo", "xargs"),  # echo reads the body lines as arguments
             ('arch -x86_64 psql "$DB"', "arch"),  # macOS architecture names are flags
+            ('"$(git rev-parse --show-toplevel)/.venv/bin/python" -', "python"),
+            ("${VENV:-.venv}/bin/python -", "python"),
+            ('uv run --no-dev psql "$DB"', "uv"),
+            ('env --ignore-environment psql "$DB"', "env"),
+            ('flock --nonblock /tmp/l psql "$DB"', "flock"),
+            ('runuser --user=postgres -- psql "$DB"', "runuser"),  # --user= drops the USER positional
+            ("parallel echo", "parallel"),
+            ("parallel 'echo {}'", "parallel"),  # the template is parsed, so `{}` is echo's argument
             ("source ./env.sh", "source"),
             ("bash", "bash"),
             ("/bin/bash", "bash"),
@@ -207,73 +229,70 @@ class TestHeredocOwnerInertReadersUnchanged:
 
 
 class TestScanWrapperOperands:
-    """The operand scan returns ``(candidates, runs_code)``: the words that may be the command -
-    the positional after the leading ones, widened by one word per unknown option - and whether
-    stdin runs as code. A literal command's own arguments are never candidates."""
+    """The operand scan decides whether stdin runs as code. Only ``runs_code`` is pinned: the
+    candidate window is an over-read by design, and a correct future tightening must not break
+    these. Rows the owner tables above already reach are not repeated here."""
 
     @pytest.mark.parametrize(
-        "base,operands,candidates,runs_code",
+        "base,operands,runs_code",
         [
-            ("unshare", ["-U"], [], True),
-            ("unshare", ["cat"], ["cat"], False),
-            ("unshare", ["-r", "cat"], ["cat"], False),
-            ("unshare", ["-rS", "0"], [], True),
-            ("unshare", ["--root", "/"], [], True),
-            ("unshare", ["-f", "--kill-child", "cat"], ["cat"], False),
-            ("unshare", ["--frobnicate", "cat"], [], True),
-            ("nsenter", ["-t", "1", "-m"], [], True),
-            ("nsenter", ["--target", "1", "-m"], [], True),
-            ("nsenter", ["--setuid", "0"], [], True),
-            ("nsenter", ["-t", "1", "-m", "-S", "0"], [], True),
-            ("nsenter", ["-t", "1", "cat"], ["cat"], False),
-            ("chroot", ["/"], [], True),
-            ("chroot", ["/", "cat"], ["cat"], False),
-            ("chroot", ["--userspec", "0:0", "/"], [], True),
-            ("chroot", ["/mnt", "tee", "/etc/fstab"], ["tee"], False),
-            ("setarch", ["x86_64"], [], True),
-            ("setarch", ["x86_64", "-R", "cat"], ["cat"], False),  # options after ARCH
-            ("x86_64", [], [], True),
-            ("runuser", ["-", "root"], [], True),
-            ("runuser", ["-", "root", "cat"], ["cat"], False),
-            ("runuser", ["root", "-c", "id"], [], False),  # -c after the user (su-style getopt)
-            ("runuser", ["-u", "postgres", "--", "psql"], ["psql"], False),
-            ("runuser", ["-w", "-cX", "root"], [], True),
-            ("runuser", ["-lc", "psql", "postgres"], [], False),
-            ("su", ["root"], [], True),
-            ("su", ["root", "cat"], ["cat"], False),
-            ("sg", ["staff"], [], True),
-            ("sg", ["staff", "cat"], ["cat"], False),
-            ("sg", ["staff", "-c", "cat"], [], False),
-            ("script", ["-q", "/dev/null"], [], True),  # the positional is the typescript FILE
-            ("script", ["-c", "id", "/dev/null"], [], False),
-            ("script", ["--command", "cat", "f"], [], False),
-            ("script", ["--command=cat", "f"], [], False),
-            ("fakeroot", ["-b", "3"], [], True),
-            ("fakeroot", ["cat"], ["cat"], False),
-            ("timeout", ["$T", "cat"], ["cat"], False),
-            ("timeout", ["5"], [], False),  # not a $SHELL-exec wrapper: runs nothing
-            ("timeout", ["5", "psql", "$DB"], ["psql"], False),
-            ("sudo", ["-u", "postgres", "psql", "$DB"], ["psql"], False),
-            ("env", ["FOO=1", "cat"], ["cat"], False),
-            ("env", ["FOO=1"], [], False),
-            ("env", ["-P", "/x", "$SH"], ["/x", "$SH"], True),  # unknown -P widens the window
-            ("chrt", ["5", "$bash"], ["$bash"], True),
-            ("uv", ["run", "$SH"], ["$SH"], True),
-            ("uv", ["tool", "run", "$SH"], ["$SH"], True),
-            ("uv", ["run", "pytest", "-k", "exec"], ["pytest"], False),
-            ("uv", ["pip", "install", "x"], [], False),  # no `run`: uv runs nothing
-            ("strace", ["-x", "$bash"], ["$bash"], True),
-            ("strace", ["-u", "app", "$SH"], ["$SH"], True),
-            ("strace", ["-f", "cat", "$F"], ["cat"], False),
-            ("systemd-run", ["--uid", "0", "$SH"], ["0", "$SH"], True),
-            ("prlimit", ["--pid", "1", "$SH"], ["1", "$SH"], True),
-            ("xargs", ["-n1", "echo"], ["echo"], False),
-            ("arch", ["-x86_64", "$SH"], ["$SH"], True),
-            ("arch", ["-arm64", "python3", "$F"], ["python3"], False),
+            ("unshare", ["--frobnicate", "cat"], True),  # unknown option on a shell-exec wrapper
+            ("nsenter", ["-t", "1", "cat"], False),
+            ("setarch", ["x86_64", "-R", "cat"], False),  # options after ARCH
+            ("runuser", ["-", "root", "cat"], False),
+            ("runuser", ["root", "-c", "id"], False),  # -c after the user (su-style getopt)
+            ("runuser", ["-lu", "postgres", "--", "psql", "$DB"], False),  # -u inside a cluster
+            ("su", ["root"], True),
+            ("su", ["root", "cat"], False),
+            ("sg", ["staff", "-c", "cat"], False),
+            ("script", ["-c", "id", "/dev/null"], False),
+            ("fakeroot", ["cat"], False),
+            ("timeout", ["5"], False),  # not a $SHELL-exec wrapper: runs nothing
+            ("timeout", ["5", "cat", "-"], False),  # `-` after the command is its operand
+            ("sudo", ["-u", "postgres", "psql", "$DB"], False),
+            ("env", ["FOO=1", "cat"], False),
+            ("env", ["FOO=1"], False),
+            ("env", ["--ignore-environment", "$SH"], True),
+            ("flock", ["--nonblock", "lockfile", "$SH"], True),
+            ("uv", ["run", "pytest", "-k", "exec"], False),
+            ("uv", ["run", "--no-dev", "$SH"], True),
+            ("uv", ["pip", "install", "x"], False),  # no `run`: uv runs nothing
+            ("strace", ["-f", "cat", "$F"], False),
+            ("arch", ["-arm64", "python3", "$F"], False),
+            ("parallel", ["--frobnicate"], True),
+            ("parallel", ["--jobs", "4", "gzip", "-9"], False),
+            ("parallel", ["{}"], True),  # the line itself is the command
+            ("parallel", ["env"], True),  # the line becomes env's command
+            ("parallel", ["echo", ":::", "a"], False),  # arguments come from :::, not stdin
+            ("parallel", [":::", "a"], True),  # no template: read as the shell
+            ("parallel", ["parallel", "echo"], True),  # a nested runner is code, not parsed again
         ],
     )
-    def test_scan(self, base, operands, candidates, runs_code):
-        assert _scan_wrapper_operands(base, operands) == (candidates, runs_code)
+    def test_scan(self, base, operands, runs_code):
+        assert _scan_wrapper_operands(base, operands)[1] is runs_code
+
+
+class TestNamesUnresolvedProgram:
+    """The program's own name is the last path component outside `${…}`, `$(…)` and backticks; a
+    word the bracket scan cannot read for certain is unresolved as a whole."""
+
+    @pytest.mark.parametrize(
+        "word,unresolved",
+        [
+            ("$VENV/bin/python3", False),
+            ("$(pwd)/bin/tool", False),
+            ("${VENV:-.venv}/bin/python", False),
+            ("${SHELL:-/bin/sh}", True),
+            ("${SHELL#)/}", True),  # mismatched closer inside `${…}` is pattern text
+            ("$(: ')'; echo /bin/bash)", True),  # quote inside `$(…)`
+            ("`echo /bin/sh`", True),
+            ("${SHELL", True),  # opener never closed
+            ("a)b/$SH", True),  # closer with nothing open
+            ("$DIR/$PROG", True),
+        ],
+    )
+    def test_predicate(self, word, unresolved):
+        assert names_unresolved_program(word) is unresolved
 
 
 class TestEnvSplitStringExpansion:
@@ -420,7 +439,6 @@ AC1_QUOTED_ROWS = [
     "systemd-run --uid 0 $SH",
     "prlimit --pid 1 $SH",
     "env -P /x $SH",
-    "${SHELL:-/bin/sh}",
     "$(which bash)",
     "$DIR/$PROG",
     "nsenter --setuid 0",
@@ -432,6 +450,21 @@ AC1_QUOTED_ROWS = [
     "i386",
     ". /dev/fd/0",
     "source $F",
+    "parallel --jobs 4",
+    "parallel -P 4",
+    "parallel --halt now,fail=1",
+    "parallel --timeout 10",
+    "parallel --retries 3",
+    "parallel 'sh -c'",
+    "parallel -j4 'sh -c'",
+    "${SHELL#)/}",
+    "timeout 5 ${SHELL#)/}",
+    "env ${SHELL#)/}",
+    "nohup ${SHELL#)/}",
+    "$(: ')'; echo /bin/bash)",
+    ". /dev/fd//0",
+    ". /dev/fd/./0",
+    "source /dev/fd/0/",
 ]
 
 
@@ -640,6 +673,18 @@ class TestOwnerDoesNotOverRead:
             hd("unshare -f --kill-child cat", UNPARSEABLE),
             hd("xargs -n1 echo", UNPARSEABLE),
             hd("source ./env.sh", UNPARSEABLE),
+            hd('uv run --no-dev psql "$DB"', SQL),
+            hd('uv run --all-extras psql "$DB"', SQL),
+            hd('uv run --script x.py "$ARG"', PY),
+            hd('env --ignore-environment psql "$DB"', SQL),
+            hd('flock --nonblock /tmp/l psql "$DB"', SQL),
+            hd('runuser --user=postgres -- psql "$DB"', SQL),
+            hd('runuser -lu postgres -- psql "$DB"', SQL),
+            hd("parallel 'echo {}'", UNPARSEABLE),
+            hd("parallel -j4 echo", UNPARSEABLE),
+            hd('"$(git rev-parse --show-toplevel)/.venv/bin/python" -', PY),
+            hd("${VENV:-.venv}/bin/python -", PY),
+            'script -q "-cls -la" /dev/null',
         ],
     )
     def test_inert_reader_keeps_base_verdict(self, command, no_shellcheck):
@@ -651,10 +696,25 @@ class TestOwnerDoesNotOverRead:
         [
             "script -q --command \"'rm' -rf /\" /dev/null",  # SAFE on a72b45c: --command was skipped
             "script -q -c \"'rm' -rf /\" /dev/null",  # the short twin, BLOCKED on a72b45c too
+            "script -q \"-c'rm' -rf /\" /dev/null",  # SAFE on a72b45c: the attached program was skipped
         ],
     )
     def test_long_command_payload_is_delegated(self, command, no_shellcheck):
-        # `--command PROG` is the same delegation as `-c PROG`, so its payload is re-validated.
+        # `--command PROG` and an attached `-cPROG` are the same delegation as `-c PROG`.
         result = validate_command(command)
         assert result.risk_level == RiskLevel.BLOCKED, command
+        assert "shell_delegated_payload" in (result.matched_rules or [])
+
+
+class TestTemplateCostIsLinear:
+    """A template whose command is another template runner is code outright, never parsed again.
+    Recursing cost two operand scans per level - exponential in the nesting - and a hook that
+    outlives its timeout fails open. 200 nested words must still resolve, and to code."""
+
+    def test_nested_template_runners_resolve_fast(self, no_shellcheck):
+        command = "parallel " * 200 + "echo <<'EOF'\n" + Q + "\nEOF"
+        started = time.perf_counter()
+        result = validate_command(command)
+        assert time.perf_counter() - started < 5
+        assert result.risk_level == RiskLevel.BLOCKED
         assert "shell_delegated_payload" in (result.matched_rules or [])

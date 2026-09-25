@@ -8,7 +8,9 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import bisect
+import itertools
 import logging
+import posixpath
 import re
 import shlex
 from typing import Any, NamedTuple, Optional
@@ -293,7 +295,7 @@ _EXEC_BYPASS_SCAN_WRAPPERS: frozenset[str] = frozenset(
         "i386",  # setarch personality alias
         "uname26",  # setarch personality alias (UNAME26)
         "x86_64",  # setarch personality alias
-        "arch",  # Architecture override (setarch alias), `arch -x86_64 CMD`
+        "arch",  # macOS arch(1): `arch -x86_64 CMD` (on Linux it prints the machine and runs nothing)
         "caffeinate",  # macOS keep-awake wrapper, `caffeinate -i CMD`
         "dbus-run-session",  # `dbus-run-session -- CMD`
         "fakeroot",  # `fakeroot CMD`
@@ -332,21 +334,34 @@ def _last_component(word: str) -> str:
     """The text after the last `/` outside `${…}`, `$(…)` and backticks, else the whole word.
 
     `$VENV/bin/python` -> `python`, while `${SHELL:-/bin/sh}` and `$(command -v sh)` stay whole.
+    Each opener closes only on its own bracket (`${` on `}`, `$(` and a `(` nested in it on `)`),
+    so the `)` in `${SHELL#)/}` is pattern text. Whatever this scan cannot bracket for certain - a
+    quote, backslash, backtick or bare `{` inside an expansion, a closer with nothing open, an
+    opener never closed - returns the whole word, which then reads as unresolved.
     """
-    depth, in_backtick, start, i = 0, False, 0, 0
+    closers: list[str] = []
+    start, i = 0, 0
     while i < len(word):
         ch = word[i]
-        if ch == "`":
-            in_backtick = not in_backtick
-        elif not in_backtick and ch == "$" and word[i + 1 : i + 2] in ("{", "("):
-            depth += 1
-            i += 1
-        elif not in_backtick and ch in "})" and depth:
-            depth -= 1
-        elif not in_backtick and ch == "/" and depth == 0:
+        if ch == "$" and word[i + 1 : i + 2] in ("{", "("):
+            closers.append("}" if word[i + 1] == "{" else ")")
+            i += 2
+            continue
+        if closers and ch == closers[-1]:
+            closers.pop()
+        elif ch == "`" and not closers:
+            closers.append("`")
+        elif closers:
+            if ch == "(" and closers[-1] == ")":
+                closers.append(")")
+            elif ch in "'\"\\`{":
+                return word
+        elif ch in ")}":
+            return word
+        elif ch == "/":
             start = i + 1
         i += 1
-    return word[start:] or word
+    return word if closers else word[start:] or word
 
 
 def names_unresolved_program(word: str) -> bool:
@@ -377,6 +392,9 @@ class _WrapperSpec(NamedTuple):
     which the command may sit (`_scan_wrapper_operands`). ``permute`` wrappers (su-style getopt)
     accept options after their positionals; ``assignments`` skips env's `NAME=VALUE`;
     ``subcommand`` is the word the command follows (`uv run CMD`) - without it nothing runs.
+    ``drops_leading`` options, in any spelling, remove the leading positional (`runuser -u USER
+    CMD`). ``template`` means the command words are a shell snippet the wrapper runs through
+    `$SHELL` with each input line appended (GNU parallel), so they are parsed, not just named.
     """
 
     leading: int = 0
@@ -386,10 +404,14 @@ class _WrapperSpec(NamedTuple):
     permute: bool = False
     assignments: bool = False
     subcommand: Optional[str] = None
+    drops_leading: frozenset = frozenset()
+    template: bool = False
 
 
-# `-c`/`--command` hands these a program to run, so their stdin is data, not a script. One table
-# for the parser's owner resolution and the validator's `-c` payload extraction.
+# `-c`/`--command` hands these a program to run instead of a shell reading stdin. One table for
+# the parser's owner resolution and the validator's `-c` payload extraction. The `-c` program is
+# re-validated on its own; one that itself reads stdin (`script -c "$SH"`, `sg G -c 'sh -s'`) is
+# not modelled, so its heredoc reads as data (LAB-5295).
 DASH_C_WRAPPERS: frozenset[str] = frozenset({"su", "runuser", "sg", "script"})
 _DASH_C_OPTS = _opts("-c --command --session-command")
 
@@ -399,13 +421,20 @@ _SU_SPEC = _WrapperSpec(
     permute=True,
     values=_opts("-g -G -s -w -u --group --supp-group --shell --whitelist-environment --user"),
     flags=_opts("-m -p -l -f -P -h -V --login --preserve-environment --fast --pty"),
+    drops_leading=_opts("-u --user"),  # runuser's command form; su has no -u
 )
 _PERSONALITY_SPEC = _WrapperSpec(shell_exec=True, flags=_opts("-B -F -I -L -R -S -T -X -Z -3 -v -h -V"))
 
-# The `shell_exec` short-option sets are complete (util-linux 2.41, coreutils 9 --help): any
-# option outside them, long ones included, reads as the shell. For the rest, a value option
-# listed as a flag (or a flag as a value) is the error that can hide a command - keep entries
-# to what the man page states.
+# How an entry that disagrees with the tool's getopt fails, which is what to check when editing:
+# - an option MISSING from both sets is safe: it reads as the shell for a `shell_exec` wrapper and
+#   widens the command window by one word for the rest;
+# - consuming FEWER words than getopt (a value option listed as a flag, a leading positional
+#   under-counted) makes the option's value the command, which fails OPEN;
+# - consuming MORE (a flag listed as a value, a leading positional over-counted) swallows the
+#   command, which fails open too - unless the wrapper is `shell_exec`, where nothing left means
+#   the shell.
+# So list an option only as the man page states it. The `shell_exec` short-option sets are
+# complete (util-linux 2.41, coreutils 9 --help); their long options are left to "missing".
 _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
     "unshare": _WrapperSpec(
         shell_exec=True,
@@ -440,7 +469,13 @@ _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
     ),
     "fakeroot": _WrapperSpec(shell_exec=True, values=_opts("-l -s -i -b --lib --faked --fd-base"), flags=_opts("-u -h -v")),
     "firejail": _WrapperSpec(shell_exec=True),  # options are `--name[=value]`; a bare one reads as unknown
-    "env": _WrapperSpec(assignments=True, values=_opts("-u -C --unset --chdir"), flags=_opts("-i -0 -v --null --debug")),
+    "env": _WrapperSpec(
+        assignments=True,
+        values=_opts("-u -C --unset --chdir"),
+        flags=_opts(
+            "-i -0 -v --ignore-environment --null --debug --list-signal-handling --block-signal --default-signal --ignore-signal"
+        ),
+    ),
     "timeout": _WrapperSpec(
         leading=1, values=_opts("-s -k --signal --kill-after"), flags=_opts("-v --foreground --preserve-status")
     ),
@@ -450,7 +485,9 @@ _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
     "sudo": _WrapperSpec(values=_opts("-u -g -C -h -p -r -t -T -R -U -D"), flags=_opts("-A -b -E -H -k -K -n -P -S")),
     "doas": _WrapperSpec(values=_opts("-u -C"), flags=_opts("-n -s -L")),
     "flock": _WrapperSpec(
-        leading=1, values=_opts("-w -E -c --timeout --conflict-exit-code --command"), flags=_opts("-s -x -n -u -o -F -e")
+        leading=1,
+        values=_opts("-w -E -c --timeout --conflict-exit-code --command"),
+        flags=_opts("-s -x -n -u -o -F -e --shared --exclusive --nonblock --unlock --close --no-fork --fcntl --verbose"),
     ),
     "strace": _WrapperSpec(
         values=_opts("-a -b -e -E -I -o -O -p -P -s -S -u -U -X"),
@@ -468,11 +505,50 @@ _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
     "pkexec": _WrapperSpec(values=_opts("--user")),
     "arch": _WrapperSpec(values=_opts("-arch -d -e"), flags=_opts("-x86_64 -arm64 -arm64e -i386 -32 -64 -c -h")),  # macOS
     "xargs": _WrapperSpec(values=_opts("-a -d -E -I -L -n -P -s"), flags=_opts("-0 -e -i -l -o -p -r -t -x")),
-    "parallel": _WrapperSpec(values=_opts("-a -I -j -S"), flags=_opts("-k -q -v")),
+    # GNU parallel runs its input lines as commands when it has no template, so it is `shell_exec`:
+    # an option it does not list reads as the shell. From parallel(1); only options whose arity
+    # the man page states are listed. Optional-argument options (`-e`, `-i`, `-l`, `--replace`)
+    # take their argument attached, so as a separate word they are flags.
+    "parallel": _WrapperSpec(
+        shell_exec=True,
+        template=True,
+        values=_opts(
+            "-a -C -d -E -I -j -J -L -n -N -P -S -s --arg-file --arg-file-sep --arg-sep --basefile --bf --block"
+            " --block-size --colsep --compress-program --decompress-program --delay --delimiter --env --filter"
+            " --group-by --halt --halt-on-error --header --jobs --joblog --limit --load --max-args --max-chars"
+            " --max-lines --max-procs --max-replace-args --memfree --memsuspend --nice --profile --recend"
+            " --recstart --res --results --retries --return --rpl --ssh --sshdelay --sshlogin --sshloginfile"
+            " --slf --tag-string --tagstring --template --termseq --tf --timeout --tmpdir --transferfile --trc"
+            " --trim --wd --workdir"
+        ),
+        flags=_opts(
+            "-0 -e -g -h -i -k -l -m -p -q -r -t -u -v -V -x -X --bar --bg --cat --cleanup --csv --dry-run"
+            " --dryrun --eta --fg --fifo --files --group --keep-order --lb --line-buffer --linebuffer"
+            " --no-notice --no-run-if-empty --nonall --null --onall --pipe --pipepart --plus --progress --quote"
+            " --replace --resume --resume-failed --retry-failed --round-robin --semaphore --shuf --spreadstdin"
+            " --tag --tee --transfer --ungroup --verbose --version --will-cite --xargs"
+        ),
+    ),
+    # From `uv run --help` (uv 0.10). Not `shell_exec`: a missing option widens the window.
     "uv": _WrapperSpec(
         subcommand="run",
-        values=_opts("-p -w --with --python --project --directory --env-file --extra --group --package --index"),
-        flags=_opts("-q -v --no-sync --frozen --locked --isolated --no-project"),
+        values=_opts(
+            "-C -P -f -i -p -w --allow-insecure-host --cache-dir --color --config-file --config-setting"
+            " --config-settings-package --default-index --directory --env-file --exclude-newer --exclude-newer-package"
+            " --extra --extra-index-url --find-links --fork-strategy --group --index --index-strategy --index-url"
+            " --keyring-provider --link-mode --no-binary-package --no-build-isolation-package --no-build-package"
+            " --no-extra --no-group --no-sources-package --only-group --package --prerelease --project --python"
+            " --python-platform --refresh-package --reinstall-package --resolution --upgrade-package --with"
+            " --with-editable --with-requirements"
+        ),
+        flags=_opts(
+            "-U -h -m -n -q -s -v --active --all-extras --all-groups --all-packages --compile-bytecode --exact"
+            " --frozen --gui-script --help --isolated --locked --managed-python --module --native-tls --no-binary"
+            " --no-build --no-build-isolation --no-cache --no-config --no-default-groups --no-dev --no-editable"
+            " --no-env-file --no-index --no-managed-python --no-progress --no-project --no-python-downloads"
+            " --no-sources --no-sync --offline --only-dev --quiet --refresh --reinstall --script --upgrade"
+            " --verbose"
+        ),
     ),
 }
 _DEFAULT_SPEC = _WrapperSpec()
@@ -503,31 +579,86 @@ def _option_kind(arg: str, spec: _WrapperSpec, dash_c: bool) -> str:  # noqa: PL
     return "flag"
 
 
-def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], bool]":
+def _sets_option(arg: str, spec: _WrapperSpec, names: frozenset) -> bool:
+    """True if option word ``arg`` sets one of ``names``: `--user`, `--user=x`, `-u`, `-lu`."""
+    if arg.startswith("--"):
+        return arg.partition("=")[0] in names
+    for ch in arg[1:]:
+        if f"-{ch}" in names:
+            return True
+        if f"-{ch}" in spec.values:
+            return False  # the rest of the cluster is that option's value
+    return False
+
+
+def _template_runs_code(words: list[str]) -> bool:  # noqa: PLR0911 - one return per way a line runs
+    """True if a GNU parallel command template may run its input line as code.
+
+    parallel joins the template words, appends each line (quoted) and runs the result through
+    `$SHELL`, so the template is parsed as the shell snippet it is: `'sh -c'`, `'echo {} | sh'`,
+    `'{}'` and `env` all run the line, `echo {}` and `gzip -9` do not. No template (only `:::`
+    arguments) or one this parser cannot read is code - fail closed.
+
+    Never recursive: a template whose own command is another template runner (`parallel parallel
+    …`) is code outright rather than parsed again, so the cost is one parse however the words nest.
+    Recursing there cost two operand scans per level - exponential in the nesting - and a hook
+    that outlives its timeout fails open.
+    """
+    template = list(itertools.takewhile(lambda word: not word.startswith(":::"), words))
+    if not template:
+        return True
+    try:
+        nodes = bashlex.parse(" ".join(template))
+    except Exception:  # noqa: BLE001 - a template bashlex cannot read is one we cannot vouch for
+        return True
+    for node in nodes:
+        for cmd in _command_nodes(node):
+            cmd_words = _command_words(cmd)
+            if not cmd_words or names_unresolved_program(cmd_words[0]):
+                return True  # `X=1` or `$CMD`: the appended line is, or picks, the command
+            head = cmd_words[0].split("/")[-1]
+            if head in _HEREDOC_SHELL_COMMANDS or head in (".", "source"):
+                return True
+            if not _is_wrapper(head):
+                continue
+            if _WRAPPER_SPECS.get(head, _DEFAULT_SPEC).template:
+                return True
+            operands = expand_env_split_string(head, cmd_words[1:])
+            if any(word.split("/")[-1] in _HEREDOC_SHELL_COMMANDS for word in operands):
+                return True
+            candidates, runs_code = _scan_wrapper_operands(head, operands)
+            if runs_code or not candidates:
+                return True  # `env`, `timeout 5`: the appended line becomes the command
+    return False
+
+
+def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], bool]":  # noqa: PLR0912
     """``(candidates, runs_code)`` for wrapper ``base`` given the words after it.
 
     ``candidates`` are the words that may be the command the wrapper runs: the positional after
     ``leading`` ones, widened by one per unknown option (any of which may have taken one word as
     its value). So a missing table entry can only over-read, never hide `$SH`. A literal command's
     own arguments are not candidates (`sudo -u pg psql "$DB"`). ``runs_code`` is True when a
-    candidate names an unresolved program, or a ``shell_exec`` wrapper has no command or meets an
-    unknown option. A `-c`/`--command` on a `DASH_C_WRAPPERS` member supplies the program, so
-    stdin is data and neither holds.
+    candidate names an unresolved program, a ``template`` runs its line as code, or a
+    ``shell_exec`` wrapper has no command or meets an unknown option. A `-c`/`--command` on a
+    `DASH_C_WRAPPERS` member supplies the program instead of a shell reading stdin, so neither
+    holds (see `DASH_C_WRAPPERS` for the case that leaves open).
     """
     spec = _WRAPPER_SPECS.get(base, _DEFAULT_SPEC)
     dash_c = base in DASH_C_WRAPPERS
-    leading, slack, positionals = spec.leading, 0, []
+    leading, slack, positionals, positional_at = spec.leading, 0, [], []
     awaiting_subcommand, options_done, i = spec.subcommand is not None, False, 0
     while i < len(operands) and (spec.permute or len(positionals) <= leading + slack):
         arg = operands[i]
         i += 1
         if options_done or not arg.startswith("-") or arg == "-":
-            if arg == "-" and not options_done:
-                continue  # env's and su's `-`: a flag, not an operand
+            if arg == "-" and not options_done and not positionals:
+                continue  # env's and su's `-`: a flag before any operand; after one it is an operand
             if awaiting_subcommand:
                 awaiting_subcommand = arg != spec.subcommand
             elif not (spec.assignments and not positionals and _ASSIGNMENT_RE.match(arg)):
                 positionals.append(arg)
+                positional_at.append(i - 1)
             continue
         if arg == "--":
             options_done = True
@@ -539,13 +670,16 @@ def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], 
             if spec.shell_exec:
                 return [], True
             slack += 1
-        elif kind == "value":
-            if base == "runuser" and arg in ("-u", "--user"):
-                leading = 0  # `runuser -u USER CMD` has no USER positional
+            continue
+        if spec.drops_leading and _sets_option(arg, spec, spec.drops_leading):
+            leading = 0
+        if kind == "value":
             i += 1
     if awaiting_subcommand:
         return [], False
     candidates = positionals[leading : leading + slack + 1]
+    if spec.template and candidates:
+        return candidates, _template_runs_code(operands[positional_at[leading] :])
     runs_code = any(names_unresolved_program(word) for word in candidates) or (spec.shell_exec and not candidates)
     return candidates, runs_code
 
@@ -565,7 +699,10 @@ def _sources_stdin(args: list[str]) -> bool:
     target = next(iter(args[1:] if args[:1] == ["--"] else args), None)
     if target is None:
         return False  # `.` with no file is an error; nothing runs
-    return names_unresolved_program(target) or target == "-" or target.endswith(("/stdin", "/fd/0")) or target == "stdin"
+    if names_unresolved_program(target):
+        return True
+    path = posixpath.normpath(target)  # `/dev/fd//0`, `/dev/fd/./0`, `/dev/../dev/stdin` are all stdin
+    return path in ("-", "stdin") or path.endswith(("/stdin", "/fd/0"))
 
 
 def expand_env_split_string(base: str, args: list[str]) -> list[str]:
@@ -742,8 +879,8 @@ def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses 
       - a head or wrapper command that `names_unresolved_program` (`$'bash'`, `${SHELL:-/bin/sh}`);
       - a `$SHELL`-exec wrapper with no command (`unshare -U`, `chroot /`, `sg GROUP`), or with an
         option its spec does not know;
-      - `xargs`/`parallel` whose command is itself a wrapper, so a body line supplies the command
-        (`xargs env`), and `parallel` with no command, which runs each line;
+      - `xargs` whose command is itself a wrapper, so a body line supplies the command
+        (`xargs env`), and GNU `parallel` with no template or one that runs its line as code;
       - `.`/`source` of stdin or of a file this parser cannot name.
     """
     raw = _command_words(node)
@@ -763,8 +900,8 @@ def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses 
     candidates, runs_code = _scan_wrapper_operands(head, operands)
     if runs_code:
         return _DEFAULT_SHELL
-    if head in ("xargs", "parallel") and (any(map(_is_wrapper, candidates)) or (head == "parallel" and not candidates)):
-        return _DEFAULT_SHELL
+    if head == "xargs" and any(map(_is_wrapper, candidates)):
+        return _DEFAULT_SHELL  # `xargs env`: a body line supplies the wrapped command
     return head
 
 

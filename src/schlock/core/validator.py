@@ -469,13 +469,11 @@ def _check_dangerous_command_flags(
 # parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
 _SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "rbash"})
 
-# Not shells, but their `-c` argument is a command string they hand to one. Their leading
-# operand is a user/group/file rather than a script, so it must NOT end option parsing
-# (`sg root -c PROG`, `su postgres -c PROG`). The parser's owner resolution reads the same `-c`
-# as "stdin is data", so both take the one table.
-_DASH_C_RUNNERS: frozenset[str] = DASH_C_WRAPPERS
-
-_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
+# Not shells, but their `-c` argument is a command string they hand to one: `DASH_C_WRAPPERS`,
+# the table the parser's owner resolution reads too. Their leading operand is a user/group/file
+# rather than a script, so it must NOT end option parsing (`sg root -c PROG`, `su postgres -c
+# PROG`), and they parse with getopt, so `-cPROG` carries its program attached.
+_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | DASH_C_WRAPPERS
 
 # Depth cap for re-entering validation on a payload. Reachable in practice only by chaining
 # `watch` (shell quoting collapses before `bash -c` can nest this far), so it is a backstop,
@@ -587,7 +585,7 @@ def _find_exec_clauses(args: list[str]) -> list[list[str]]:
     return clauses
 
 
-def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> Optional[str]:
+def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True, attached: bool = False) -> Optional[str]:
     """Return the program a `-c` hands to a shell, given the words following the command name.
 
     The shell's own getopt is the specification, and it says the program is always the NEXT
@@ -598,6 +596,9 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
     A `--` between `-c` and the program is skipped, because the shell skips it too
     (`bash -c -- 'echo hi'` prints hi). A `--` *before* any `-c` ends option parsing, so
     there is no inline program at all.
+
+    ``attached`` is for the getopt runners (`script`, `su`, `runuser`), where the rest of the
+    cluster after `c` is the program: `script -q "-c'rm' -rf /" f` runs `'rm' -rf /`.
     """
     for i, word in enumerate(words):
         if word == "--":
@@ -619,6 +620,8 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
                 return value or None
         elif "c" not in word[1:]:
             continue
+        elif attached and word[word.index("c", 1) + 1 :]:
+            return word[word.index("c", 1) + 1 :]
         rest = words[i + 1 :]
         while rest and rest[0] == "--":
             rest = rest[1:]
@@ -697,7 +700,9 @@ def _shell_delegated_payloads(
                 found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
-                found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
+                found.append(
+                    _dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS, attached=base in DASH_C_WRAPPERS)
+                )
             if base in WRAPPER_COMMANDS:
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
