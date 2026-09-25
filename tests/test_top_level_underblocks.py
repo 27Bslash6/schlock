@@ -10,6 +10,7 @@ from schlock.core.substitution import (
     dangerous_git_config,
     dangerous_kubectl,
     git_config_exec_payload,
+    key_rated_git_config_write,
 )
 from schlock.core.validator import validate_command
 
@@ -75,6 +76,23 @@ class TestDangerousGitConfigHelper:
     def test_bare_exec_key_without_value_is_safe(self):
         # `git -c core.fsmonitor` (no =VALUE) means core.fsmonitor=true to git
         assert dangerous_git_config(["-c", "core.fsmonitor", "status"]) is None
+
+    # --- the man-viewer chain: `git help` runs the program these keys pick ---
+    @pytest.mark.parametrize(
+        "config",
+        ["man.viewer=custom", "man.custom.cmd=/tmp/x.sh", "man.custom.path=/tmp/x", "help.format=web", "Man.Viewer=custom"],
+    )
+    def test_man_viewer_keys_are_dangerous(self, config):
+        assert dangerous_git_config(["-c", config, "help", "add"]) is not None
+
+    def test_man_viewer_boolean_is_still_dangerous(self):
+        # git reads man.viewer=true as a viewer NAMED `true` and runs man.true.cmd for it
+        # (verified against git 2.43), so the boolean refinement above must not clear it.
+        assert dangerous_git_config(["-c", "man.viewer=true", "help", "add"]) is not None
+        assert dangerous_git_config(["-c", "man.viewer", "help", "add"]) is not None
+
+    def test_man_prefix_needs_its_dot(self):
+        assert dangerous_git_config(["-c", "manual.x=y", "status"]) is None
 
 
 class TestTopLevelGitC:
@@ -548,6 +566,125 @@ class TestGitConfigWriteVerdicts:
     def test_injected_form_still_denied(self):
         # The -c path this fix is the persisted twin of must not regress.
         assert validate_command("git -c core.pager='rm -rf /' log").risk_level == RiskLevel.BLOCKED
+
+
+class TestKeyRatedGitConfigWriteHelper:
+    def test_viewer_writes_are_rated(self):
+        assert key_rated_git_config_write(["config", "man.viewer", "custom"]) is not None
+        assert key_rated_git_config_write(["git", "config", "help.format", "web"]) is not None
+
+    def test_reads_are_not_rated(self):
+        assert key_rated_git_config_write(["config", "--get", "man.viewer", "custom"]) is None
+        assert key_rated_git_config_write(["config", "man.viewer"]) is None
+
+    def test_other_keys_are_not_rated(self):
+        # Value-judged keys stay value-judged: the key alone cannot decide an editor or a pager.
+        assert key_rated_git_config_write(["config", "core.pager", "less"]) is None
+        assert key_rated_git_config_write(["config", "manual.x", "y"]) is None
+
+    def test_a_key_rated_word_as_the_value_is_not_rated(self):
+        assert key_rated_git_config_write(["config", "user.name", "man.viewer"]) is None
+
+
+@pytest.mark.usefixtures("no_shellcheck_underblocks")
+class TestGitConfigManViewerVerdicts:
+    """`git help <cmd>` runs the viewer these keys pick, so writing them is the weaponisation step.
+
+    Rated on the key: `custom`, `web` and `/tmp/x.sh` are values no command rule can tell from an
+    ordinary one. `git help` itself stays unrated — it is an everyday command.
+    """
+
+    # Every spelling TestGitConfigWriteVerdicts.ATTACKS uses, applied to the viewer keys.
+    WRITES = [
+        "git config man.viewer custom",
+        "git config --global man.viewer custom",
+        "git config man.custom.cmd /tmp/x.sh",
+        "git config --global man.custom.cmd /tmp/x.sh",
+        "git config man.custom.path /tmp/x",
+        "git config help.format web",
+        "git config --global help.format web",
+        "git config --add man.viewer custom",
+        "git config --replace-all man.viewer custom",
+        "git config --local man.viewer custom",
+        "git config set man.viewer custom",
+        "git config --file /tmp/f man.viewer custom",
+        "git -C /tmp config man.viewer custom",
+        "git config man.viewer custom --get",
+        "git config man.viewer custom --list",
+        "git config --get=x man.viewer custom",
+        "git config --file get man.viewer custom",
+        "git config Man.Viewer custom",
+        # A viewer named `true` is still a viewer: git runs man.true.cmd for it.
+        "git config man.viewer true",
+        "timeout 5 git config man.viewer custom",
+        "env X=1 git config man.viewer custom",
+        "nice git config man.viewer custom",
+        "ls && git config man.viewer custom",
+    ]
+    WORSE_VALUES = [
+        "git config man.custom.cmd 'rm -rf /'",
+        "git config --global man.custom.cmd 'rm -rf /'",
+    ]
+    INJECTIONS = [
+        "git -c man.viewer=custom help add",
+        "git -c man.custom.cmd=/tmp/x.sh help add",
+        "git -c help.format=web help add",
+    ]
+    READS = [
+        "git config --get man.viewer",
+        "git config --get-all man.custom.cmd",
+        "git config --list",
+        "git config --get help.format",
+        "git config --get man.viewer custom",
+        "git config --unset man.viewer",
+    ]
+    UNCHANGED = [
+        "git help add",
+        "git help",
+        "git help config",
+        "git status",
+        "git config user.name x",
+        "git config pull.rebase true",
+        "git config --global core.editor vim",
+        "git config --global help.autocorrect 10",
+        "git config --global manual.x y",
+        "git config user.name man.viewer",
+    ]
+
+    @pytest.mark.parametrize("command", WRITES)
+    def test_viewer_write_asks(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed
+        assert result.matched_rules == ["ast_contextual_high:git"]
+
+    @pytest.mark.parametrize("command", WRITES)
+    def test_viewer_write_is_denied_in_a_substitution(self, command):
+        result = validate_command(f'echo "$({command})"')
+        assert result.risk_level >= RiskLevel.HIGH
+        assert not result.allowed
+
+    @pytest.mark.parametrize("command", WORSE_VALUES)
+    def test_a_worse_value_still_wins(self, command):
+        # The key-level HIGH must not cap the value's own verdict.
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["shell_delegated_payload"]
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", INJECTIONS)
+    def test_injected_viewer_matches_core_pager(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["ast_dangerous_combo:git"]
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", READS + UNCHANGED)
+    def test_reads_and_everyday_git_stay_safe(self, command):
+        for spelling in (command, f'echo "$({command})"'):
+            result = validate_command(spelling)
+            assert result.risk_level == RiskLevel.SAFE
+            assert result.allowed
 
 
 class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:

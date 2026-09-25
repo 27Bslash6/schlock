@@ -438,7 +438,8 @@ def _check_dangerous_command_flags(
                     message=f"BLOCKED: {git_reason}",
                     alternatives=[
                         "Remove the -c config override",
-                        "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, etc.)",
+                        "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, "
+                        "man.*, help.format, etc.)",
                     ],
                     exit_code=1,
                     error=None,
@@ -719,27 +720,33 @@ def _check_contextual_high_risk(
     commands_with_args: list[tuple[str, list[str]]],
 ) -> Optional[tuple[str, str]]:
     """Return (base_name, reason) for the first kubectl command that modifies cluster state or
-    executes code, else None.
+    executes code, or for the first `git config` write to a key-rated key, else None.
 
-    Top-level parity with the SubstitutionValidator kubectl check (which BLOCKs these inside
+    Top-level parity with the SubstitutionValidator kubectl and git checks (which BLOCK these inside
     `$()`/`<()`). At the top level `kubectl delete`/`apply`/`exec` are common legitimate ops, so the
     caller elevates to HIGH (ask) and lets the preset decide, rather than hard-blocking. Reuses the
-    same `dangerous_kubectl` helper as the substitution path.
+    same `dangerous_kubectl` / `key_rated_git_config_write` helpers as the substitution path.
+
+    The git check runs for wrappers too (`timeout 5 git config man.viewer custom`): a wrapper hands
+    the whole command through, and the helper keys on the `config` token, not the first word.
 
     NOTE: find is deliberately NOT handled here. The substitution path blocks *any* `find -exec`
     (conservative), but at the top level read-only `find -exec grep/cat/...` is legitimate, so
     top-level find stays command-aware via the `find_exec_dangerous` / `recursive_delete` YAML
     rules (extended to cover -execdir/-ok/-okdir). See #97.
     """
-    from schlock.core.substitution import dangerous_kubectl  # noqa: PLC0415
+    from schlock.core.substitution import dangerous_kubectl, key_rated_git_config_write  # noqa: PLC0415
 
     for cmd_name, args in commands_with_args:
         base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
-        if base_name != "kubectl":
-            continue
-        reason = dangerous_kubectl(args)
-        if reason:
-            return base_name, reason
+        if base_name == "kubectl":
+            reason = dangerous_kubectl(args)
+            if reason:
+                return base_name, reason
+        if base_name == "git" or base_name in WRAPPER_COMMANDS:
+            reason = key_rated_git_config_write(args)
+            if reason:
+                return "git", reason
     return None
 
 
@@ -2957,7 +2964,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             )
             # Don't cache config errors
 
-        # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing).
+        # Step 5b: Contextual HIGH-risk commands (kubectl state-changing, key-rated git config writes).
         # Top-level parity with SubstitutionValidator (which BLOCKs these in $()); at the top level
         # they are common legitimate ops, so elevate to HIGH (ask) and let the preset decide rather
         # than hard-blocking. Only elevate when nothing already matched at >= HIGH. See #97.
@@ -2967,7 +2974,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 ctx_name, ctx_reason = contextual
                 ctx_alternatives = [
                     "Review exactly what will run or be modified before executing",
-                    "Use a read-only form (e.g. find without -exec/-delete, kubectl get/describe)",
+                    "Use a read-only form (e.g. kubectl get/describe, git config --get)",
                 ]
                 match = RuleMatch(
                     matched=True,

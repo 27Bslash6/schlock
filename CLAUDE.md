@@ -75,7 +75,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 | Command | Safe Usage | Dangerous Flags/Options |
 |---------|------------|------------------------|
 | `find` | `-name`, `-type`, `-maxdepth` | `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete` |
-| `git` | `status`, `log`, `diff` | `-c alias.X=!cmd`, `-c core.sshCommand`, `-c core.pager`, `-c credential.helper`, `-c diff.external`, `-c merge.tool` |
+| `git` | `status`, `log`, `diff` | `-c alias.X=!cmd`, `-c core.sshCommand`, `-c core.pager`, `-c credential.helper`, `-c diff.external`, `-c merge.tool`, `-c man.*`, `-c help.format`; writing `man.*` / `help.format` with `git config` (HIGH, any value: they pick the program `git help` runs) |
 | `grep` | Pattern matching | (generally safe) |
 | `locate` | File search | (generally safe) |
 
