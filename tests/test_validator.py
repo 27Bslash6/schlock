@@ -3419,21 +3419,26 @@ class TestADelimiterBashlexWouldMisread:
 
 
 class TestARedirectionOperatorSplitByAContinuation:
-    """`<`, a backslash-newline, then `<`: one operator to bash, and none to the heredoc readers.
+    """A backslash-newline inside a heredoc or here-string operator, or its delimiter word.
 
     bash deletes an unquoted backslash-newline before it tokenizes, so `cat <\\` followed by
-    `<EOF` is `cat <<EOF`, and `cat q <\\` followed by `<<'B' r` is the here-string
-    `cat q <<<'B' r`. Neither the `<<` presence test nor the opener scan sees that join:
-    they read the text as written, line by line. ShellCheck cannot read it either (SC1073,
-    a parse error, which carries no security verdict).
+    `<EOF` is `cat <<EOF`, `cat q <\\` followed by `<<'B' r` is the here-string
+    `cat q <<<'B' r`, `cat <<\\` followed by `-EOF` is `cat <<-EOF`, and `cat <<E\\` or
+    `cat << \\` followed by `OF` or `X` opens a heredoc ended by `EOF` or `X`. Neither the
+    `<<` presence test nor the opener scan sees that join: they read the text as written,
+    line by line. ShellCheck cannot read it either (SC1073, a parse error, which carries no
+    security verdict).
 
     What bash does with each row was established under bash 5.3 in a temp dir, with
     `touch` standing in for `rm -rf /` and an existence check on the file afterwards:
 
-    - heredoc, two-continuations, tab-stripping: the body is expanded, so the substitution runs;
+    - every heredoc row: the body is expanded, so the substitution runs;
     - command-after-terminator: the line after `EOF` runs;
     - here-string, here-string-from-a-heredoc-operator: the join makes `<<<`, so the line
       after the opener runs as a command.
+
+    command-after-terminator and here-string-from-a-heredoc-operator are regression pins:
+    they are denied with this check removed too, so they guard the verdict, not the check.
 
     Rows pin the verdict, not a message, so a later change that reads the joined operator
     instead of refusing it keeps them.
@@ -3463,6 +3468,12 @@ class TestARedirectionOperatorSplitByAContinuation:
             "cat <\\\n<EOF\nx\nEOF\nrm -rf /",
             HERE_STRING,
             "cat <<\\\n<EOF\n$(rm -rf /)\nEOF",
+            "cat <<\\\n-EOF\n$(rm -rf /)\n\tEOF",
+            "cat <<E\\\nOF\n$(rm -rf /)\nEOF",
+            "cat << \\\nX\n$(rm -rf /)\nX",
+            "cat <<\t\\\nX\n$(rm -rf /)\nX",
+            "cat <<- \\\nX\n$(rm -rf /)\n\tX",
+            "cat <<A <<B\\\nC\nx\nA\n$(rm -rf /)\nBC",
         ],
         ids=[
             "heredoc",
@@ -3471,6 +3482,12 @@ class TestARedirectionOperatorSplitByAContinuation:
             "command-after-terminator",
             "here-string",
             "here-string-from-a-heredoc-operator",
+            "dash-split-from-its-operator",
+            "delimiter-split",
+            "space-before-a-continued-delimiter",
+            "tab-before-a-continued-delimiter",
+            "space-after-dash-before-a-continued-delimiter",
+            "second-heredoc-on-the-line",
         ],
     )
     @pytest.mark.usefixtures("shellcheck")
@@ -3498,12 +3515,22 @@ class TestARedirectionOperatorSplitByAContinuation:
 
     @pytest.mark.parametrize(
         "command",
-        ["cat <\\\nfile", "cat <\\\\\n<file"],
-        ids=["continued-onto-a-word", "escaped-backslash-is-no-continuation"],
+        ["cat <\\\nfile", "cat <\\\\\n<file", "cat <<<\\\n-x", "cat <<< \\\nx"],
+        ids=[
+            "continued-onto-a-word",
+            "escaped-backslash-is-no-continuation",
+            "here-string-continued-before-its-word",
+            "here-string-continued-after-a-space",
+        ],
     )
     @pytest.mark.usefixtures("shellcheck")
-    def test_a_redirect_that_does_not_join_a_second_less_than_keeps_its_verdict(self, safety_rules_path, command):
-        """Real bash reads these as `cat <file`, and as `cat <\\` followed by `<file`. SAFE on main."""
+    def test_a_continuation_that_forms_no_heredoc_operator_keeps_its_verdict(self, safety_rules_path, command):
+        """None of these joins into a heredoc operator, so each keeps main's SAFE verdict.
+
+        Real bash reads them as `cat <file`, as `cat <\\` followed by `<file`, and as the
+        here-strings `cat <<<-x` and `cat <<< x`. No `<` may precede the `<<` the pattern
+        starts at, which is what keeps the here-strings from reading as a heredoc.
+        """
         result = validate_command(command, config_path=safety_rules_path)
 
         assert result.allowed is True, result.message
