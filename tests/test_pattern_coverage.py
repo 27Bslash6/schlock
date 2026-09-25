@@ -1685,3 +1685,73 @@ class TestHomebrewSupplyChain:
         for cmd in safe:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.SAFE, f"Safe brew not SAFE: {cmd}"
+
+
+class TestNewlineEndsRmOperandSpan:
+    r"""A bare newline ends an `rm` exactly as `;` does, so its operand spans stop there.
+
+    `[^;|&]*` crossed the line break: an `rm -f` with no operand on one line paired
+    with `.git`, `known_hosts`, a history file or a `-rf .*` on a LATER line, and two
+    commands that touch nothing rated HIGH or BLOCKED. Pinned at the regex layer
+    because the validator only rescans the whole command when no segment matched,
+    so a verdict alone cannot tell the span apart from another rm rule catching the
+    head first. hidden_glob_destruction's `\s+\.\*` still bridges one newline
+    (`rm -fr` on one line, `.*` on the next stays BLOCKED); that is not a span.
+    """
+
+    @pytest.mark.parametrize(
+        ("rule", "text"),
+        [
+            ("vcs_directory_deletion", "rm -f\n.git"),
+            ("vcs_directory_deletion", "rm -f\n.hg"),
+            ("vcs_directory_deletion", "rm -f x\n-rf .git"),
+            ("vcs_directory_deletion", "rm -f x\n-rf .svn/"),
+            ("hidden_glob_destruction", "rm -f x\n-rf .*"),  # first span: flags on the next line
+            ("hidden_glob_destruction", "rm -fr foo\nx .*"),  # second span: target on the next line
+            ("hidden_glob_destruction", "rm .* x\nfoo -rf"),
+            ("ssh_known_hosts_manipulation", "rm -f\n.ssh/known_hosts"),
+            ("history_evasion_extended", "rm -f\n.bash_history"),
+        ],
+    )
+    def test_span_stops_at_a_newline(self, safety_rules_path, rule, text):
+        engine = RuleEngine(safety_rules_path)
+        crossed = [p.pattern for p in engine.compiled_patterns[rule] if p.search(text)]
+        assert not crossed, f"{rule} crossed the newline in {text!r}: {crossed}"
+
+    @pytest.mark.parametrize(
+        ("rule", "text"),
+        [
+            ("vcs_directory_deletion", "rm -f .git"),
+            ("vcs_directory_deletion", "rm .hg/store"),
+            ("hidden_glob_destruction", "rm -fr foo .*"),
+            ("hidden_glob_destruction", "rm .* x -rf"),
+            ("ssh_known_hosts_manipulation", "rm -f .ssh/known_hosts"),
+            ("history_evasion_extended", "rm -f ~/.zsh_history"),
+        ],
+    )
+    def test_same_line_target_still_matches(self, safety_rules_path, rule, text):
+        engine = RuleEngine(safety_rules_path)
+        assert any(p.search(text) for p in engine.compiled_patterns[rule]), f"{rule} lost {text!r}"
+
+    @pytest.mark.parametrize(
+        "command",
+        ["rm -f\n.git", "rm -f\n.hg", "rm -f\n.ssh/known_hosts", "rm -f\n.bash_history"],
+    )
+    def test_target_on_a_later_line_is_not_a_deletion(self, safety_rules_path, command):
+        """End to end: `rm -f` with no operand, then a bare path on its own line, deletes nothing."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} rated {result.risk_level.name} via {result.matched_rules}"
+
+    @pytest.mark.parametrize(
+        ("command", "rule", "risk"),
+        [
+            # matched on the reconstructed command: bashlex drops the continuation, the raw text keeps the newline
+            ("rm -f x \\\n.git", "vcs_directory_deletion", RiskLevel.HIGH),
+            ("rm -f foo\nrm .git/config", "vcs_directory_deletion", RiskLevel.HIGH),  # a bare newline yields its own rm segment
+            ("rm -fr .*", "hidden_glob_destruction", RiskLevel.BLOCKED),
+        ],
+    )
+    def test_target_in_the_same_command_is_still_rated(self, safety_rules_path, command, rule, risk):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert rule in result.matched_rules
+        assert result.risk_level == risk

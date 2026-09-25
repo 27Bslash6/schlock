@@ -20,9 +20,9 @@ rules:
     description: rm -rf .* can delete parent directory via .. glob expansion
     risk_level: BLOCKED
     patterns:
-      # rm with recursive flags and .* glob
-      - '\brm\s+[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&]*\s+\.\*(\s|$)'
-      - '\brm\s+\.\*[^;|&]*(-rf|-fr|-r\s+-f|-f\s+-r)'
+      # rm with recursive flags and .* glob; spans stop at a newline (see vcs_directory_deletion)
+      - '\brm\s+[^;|&\n]*(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&\n]*\s+\.\*(\s|$)'
+      - '\brm\s+\.\*[^;|&\n]*(-rf|-fr|-r\s+-f|-f\s+-r)'
       # Direct .* at end of rm command
       - '\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?\.\*\s*$'
     alternatives:
@@ -53,12 +53,23 @@ rules:
     description: Deleting version control directories destroys project history
     risk_level: HIGH
     patterns:
+      # The operand spans stop at a newline as well as at `;|&`. A bare newline
+      # ends a command exactly as `;` does, and `[^;|&]*` crossed it, pairing
+      # `rm -f` on one line with `.git` on a later one. Cost was the sharper
+      # reason: `\brm` anchors at every line and each anchor dragged both spans
+      # to the end of the command, so a 200-line `rm -rf <path>` cleanup cost
+      # over a second (a 40KB one, several) on a hook that runs before every
+      # Bash call. Accepted residual: a newline INSIDE one word -- quoted, or in
+      # a `$( )` -- is data, not a boundary, yet now also ends the span, so that
+      # shape is rated only by whatever else matches it (recursive_delete when a
+      # `-r` flag is present). hidden_glob_destruction above carries the same
+      # change.
       # .git directory deletion
-      - '\brm\s+[^;|&]*\.git(/|\s|$)'
-      - '\brm\s+[^;|&]*-[rf]+[^;|&]*\.git(/|\s|$)'
+      - '\brm\s+[^;|&\n]*\.git(/|\s|$)'
+      - '\brm\s+[^;|&\n]*-[rf]+[^;|&\n]*\.git(/|\s|$)'
       # .hg (Mercurial), .svn (Subversion)
-      - '\brm\s+[^;|&]*\.(hg|svn)(/|\s|$)'
-      - '\brm\s+[^;|&]*-[rf]+[^;|&]*\.(hg|svn)(/|\s|$)'
+      - '\brm\s+[^;|&\n]*\.(hg|svn)(/|\s|$)'
+      - '\brm\s+[^;|&\n]*-[rf]+[^;|&\n]*\.(hg|svn)(/|\s|$)'
     alternatives:
       - "Use 'git clean -fd' to remove untracked files"
       - "Backup .git directory before deletion"

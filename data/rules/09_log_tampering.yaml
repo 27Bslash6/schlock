@@ -29,7 +29,8 @@ rules:
       - '\bcat\s+/dev/null\s*>\s*~/?\.(bash_history|zsh_history)'
       # Other shell histories
       - '>\s*~/?\.(zsh_history|fish_history|ash_history)'
-      - '\brm\s+[^;|&]*\.(bash_history|zsh_history|fish_history)'
+      # `[^;|&\n]`: a bare newline ends the rm, see vcs_directory_deletion in 02_file_destruction
+      - '\brm\s+[^;|&\n]*\.(bash_history|zsh_history|fish_history)'
       # Shell option manipulation
       - '\bset\s+\+o\s+history'
       - '\bshopt\s+-u\s+histappend'
