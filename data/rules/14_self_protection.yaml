@@ -63,3 +63,21 @@ rules:
     alternatives:
       - "Edit schlock configuration manually outside of Claude Code"
       - "Use /schlock:setup to configure schlock interactively"
+
+  # bin/ (parser binaries + MANIFEST) and vendor/ (bashlex, yaml) feed every rule: a swap is a
+  # global under-block. The path part is case-insensitive (APFS and NTFS default) and accepts
+  # `//` and `/./` respellings; the verb forms stop at a command separator, so a read chained
+  # after an unrelated write (`rm -rf build && cat .claude-plugin/bin/MANIFEST.json`) is not a hit.
+  - name: schlock_plugin_binary_write
+    description: "Self-protection: Write to schlock's vendored parser binaries or dependencies"
+    risk_level: BLOCKED
+    patterns:
+      # Output redirect (> or >>)
+      - '>>?\s*\S*(?i:\.claude-plugin/(?:\.?/)*(?:bin|vendor))\b'
+      # Copy/move/link, delete, permissions, raw write, archive extraction, download
+      - '\b(tee|cp|mv|install|ln|rsync|dd|rm|unlink|truncate|shred|chmod|chown|chattr|tar|unzip|curl|wget)\b[^;&|\n]*(?i:\.claude-plugin/(?:\.?/)*(?:bin|vendor))\b'
+      # In-place edit (short and GNU long-form flags)
+      - '\b(sed|perl)\b[^;&|\n]*(-i|--in-?place|-pi)[^;&|\n]*(?i:\.claude-plugin/(?:\.?/)*(?:bin|vendor))\b'
+    alternatives:
+      - "Rebuild the parser binaries with tools/schlock-parse/build.sh outside Claude Code"
+      - "Reinstall the plugin: /plugin install schlock@schlock"

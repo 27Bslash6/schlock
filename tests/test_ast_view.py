@@ -292,6 +292,7 @@ class TestRedirects:
 
     def test_heredoc(self):
         (cmd,) = view("cat <<EOF\nhi\nEOF")
+        assert cmd.pos == (0, 9)  # stops at the delimiter word like bashlex; the body hangs off .heredoc
         redirect = cmd.parts[1]
         assert redirect.type == "<<"
         assert redirect.output.word == "EOF"
@@ -322,29 +323,60 @@ class TestPanelFindings:
         (cmd,) = view("2>&1 cmd")
         assert cmd.pos == (0, 8)
 
-    def test_backslash_escape_in_word_raises(self):
-        # Panel CRIT: bashlex unescapes `r\m` to `rm`; passing the raw escaped
-        # text through would defeat every rule keyed on the command name.
-        # Until T3 implements the per-WordPart unescape, escapes must raise
-        # (→ bashlex tier, which unescapes correctly today).
-        with pytest.raises(UnmappedNodeError, match="escape"):
-            view("rm\\ -rf\\ /")
-        with pytest.raises(UnmappedNodeError, match="escape"):
-            view("r\\m -rf /")
+    def test_backslash_escape_in_word_is_unescaped(self):
+        # Panel CRIT / spec §4a: bashlex's `.word` unescapes `r\m` → `rm` and
+        # `rm\ -rf\ /` → `rm -rf /`; T3's per-WordPart unescape reproduces that
+        # so the AST rule keyed on the decoded command still fires (the `:268`
+        # anchor). The raw escaped form would ALLOW.
+        (cmd,) = view("rm\\ -rf\\ /")
+        assert cmd.parts[0].word == "rm -rf /"
+        (cmd,) = view("r\\m -rf /")
+        assert cmd.parts[0].word == "rm"
 
-    def test_backslash_in_single_quotes_is_literal_and_allowed(self):
+    def test_double_quoted_backslash_matches_bashlex(self):
+        # bashlex applies the same backslash removal INSIDE double quotes
+        # (verified: `"a\bar"` → `abar`, `"a\$b"` → `a$b`). Matching it keeps
+        # the superset oracle's word comparison exact.
+        (cmd,) = view('echo "a\\bar"')
+        assert cmd.parts[1].word == "abar"
+        (cmd,) = view('echo "a\\$b"')
+        assert cmd.parts[1].word == "a$b"
+
+    def test_backslash_in_single_quotes_is_literal(self):
         # Single quotes disable escape processing in bash, so a backslash
-        # there is plain text — no divergence from bashlex, no raise.
+        # there is plain text — verbatim, like bashlex.
         (cmd,) = view("echo 'a\\b'")
         assert cmd.parts[1].word == "a\\b"
 
-    def test_non_ascii_input_raises(self):
-        # Panel CRIT: mvdan emits BYTE offsets; the walkers char-index the
-        # string, and a mis-sliced segment is silently DROPPED by their
-        # bounds guard. Until T3 lands byte→char conversion, any non-ASCII
-        # input must raise (→ bashlex tier).
-        with pytest.raises(UnmappedNodeError, match="ASCII"):
-            view("X=café; rm -rf /")
+    def test_ansi_c_quote_still_raises(self):
+        # mvdan's typed-JSON does NOT decode $'…' (verified: Value is the raw
+        # `\x72\x6d`), so mapping it would under-decode vs real bash. Raising is
+        # fail-closed and strictly superset-safe; decoding it to reveal MORE
+        # danger than bashlex's buggy `$x72x6d` is a follow-up, not a parity fix.
+        with pytest.raises(UnmappedNodeError, match="ANSI-C"):
+            view("echo $'\\x72\\x6d'")
+
+    def test_non_ascii_offsets_are_char_based(self):
+        # Panel CRIT / spec §4b: mvdan emits BYTE offsets, but the walkers
+        # char-index the command string. A multibyte word before a dangerous
+        # one must not shift the later node's span — else the mis-sliced segment
+        # matches no rule and ALLOWs. `café` is 5 bytes / 4 code points, so the
+        # `rm -rf /` segment is byte-offset 12 but char-offset 11.
+        command = "echo café; rm -rf /"
+        nodes = view(command)
+        segments = BashCommandParser().extract_command_segments(command, nodes)
+        assert segments == ["echo café", "rm -rf /"]
+
+    def test_multibyte_string_literal_span_is_char_based(self):
+        # A quoted literal whose content follows a multibyte char must slice on
+        # code-point offsets; the quote-inclusive check `command[start] == '"'`
+        # depends on it landing on the real quote.
+        command = 'echo "café" "rm -rf /"'
+        (cmd,) = view(command)
+        literals = BashCommandParser().extract_string_literals(command, [cmd])
+        # Both quoted words recorded, positions INSIDE the quotes, char-indexed.
+        assert command[literals[0][0] : literals[0][1]] == "café"
+        assert command[literals[1][0] : literals[1][1]] == "rm -rf /"
 
     def test_structurally_malformed_json_raises_bridge_error(self):
         # Panel MAJ: a KeyError escaping build_ast_view would bypass T5's
@@ -526,6 +558,41 @@ class TestParserWalkerIntegration:
     def test_extract_commands_with_args(self):
         extracted = BashCommandParser().extract_commands_with_args(view("X=1 nc -e /bin/bash host"))
         assert extracted == [("nc", ["-e", "/bin/bash", "host"])]
+
+
+def _nested_cmdsubst(depth: int) -> "tuple[str, dict]":
+    """`$(`×depth + `a` + `)`×depth as typed-JSON, built iteratively (a recursive builder would
+    overflow first). Spans are uniform: the converter overflows before any consumer reads them."""
+    command = "$(" * depth + "a" + ")" * depth
+    span = {"Pos": {"Offset": 0}, "End": {"Offset": len(command)}}
+    part: dict = {"Type": "Lit", **span, "Value": "a"}
+    for _ in range(depth):
+        stmt = {**span, "Cmd": {"Type": "CallExpr", **span, "Args": [{**span, "Parts": [part]}]}}
+        part = {"Type": "CmdSubst", **span, "Stmts": [stmt]}
+    stmt = {**span, "Cmd": {"Type": "CallExpr", **span, "Args": [{**span, "Parts": [part]}]}}
+    return command, {"Type": "File", **span, "Stmts": [stmt]}
+
+
+class TestRecursionRouting:
+    """Both RecursionError sites re-raise as NativeBridgeError; neither test needs the binary."""
+
+    def test_json_scanner_overflow_routes_to_fallback(self, monkeypatch):
+        # The overflow depth depends on interpreter and stack size, so the trigger is faked.
+        def overflow(_text):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(json, "loads", overflow)
+        with pytest.raises(NativeBridgeError, match="too deeply nested"):
+            build_ast_view("echo hi", "{}")
+
+    def test_converter_overflow_routes_to_fallback(self):
+        # Pre-decoded dict: bypasses json.loads, so only the recursive converter can trip
+        # (~6 frames per level against the 1000-frame limit). The cause pin rejects a
+        # KeyError from a mis-built fixture masquerading as the same "malformed" message.
+        command, typed_json = _nested_cmdsubst(500)
+        with pytest.raises(NativeBridgeError, match="malformed") as excinfo:
+            build_ast_view(command, typed_json)
+        assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
 class TestJsonEntryPoint:

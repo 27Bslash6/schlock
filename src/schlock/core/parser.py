@@ -8,12 +8,16 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import bisect
+import json
 import logging
+from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 import bashlex
 import bashlex.errors
 
+from schlock.core.ast_view import UnmappedNodeError
+from schlock.core.native_bridge import NativeBridge, NativeBridgeError
 from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
@@ -119,6 +123,142 @@ def _apply_andor_substitution_correction() -> None:
 
 
 _apply_andor_substitution_correction()
+
+
+def parse_bashlex(command: str) -> list[Any]:
+    """The in-process bashlex tier: parse or raise `ParseError` (never returns a partial AST).
+
+    Runs with the AND-OR substitution correction above applied. This is also the LAST tier
+    of `TieredParser`: when it raises, nothing rescues the command and validator.py blocks.
+    """
+    try:
+        return bashlex.parse(command)
+    except bashlex.errors.ParsingError as e:
+        # Preserve original bashlex error for debugging
+        raise ParseError(
+            f"Failed to parse bash command: {command!r}",
+            original_error=e,
+        )
+    except Exception as e:
+        # Catch any other unexpected bashlex errors
+        logger.error(f"Unexpected error parsing command: {e}")
+        raise ParseError(
+            f"Unexpected parsing error for command: {command!r}",
+            original_error=e,
+        )
+
+
+# --- Parser tiers: `SCHLOCK_PARSER` switch + fail-closed state machine (spec §6, LAB-409 T5) ---
+
+PARSER_TIER_ENV = "SCHLOCK_PARSER"
+PARSER_TIERS = frozenset({"auto", "native", "bashlex"})
+DEFAULT_PARSER_TIER = "auto"
+
+
+def _user_settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def resolve_parser_tier(user_settings: Optional[Path] = None) -> str:
+    """Resolve the forced parser tier from `SCHLOCK_PARSER` (spec §6).
+
+    `auto` (default) runs the fail-closed chain native → bashlex → deny. `bashlex` skips the
+    native tier entirely (the kill-switch: never spawns). `native` is native-ONLY: every native
+    failure denies with no bashlex rescue, so CI can prove the native path on its own and a
+    native under-block cannot pass green on a bashlex save.
+
+    The value is read from the `env` block of the USER-scope Claude Code settings file
+    (`~/.claude/settings.json`) and from nothing else. The process environment is deliberately
+    NOT consulted: Claude Code applies every settings file's `env` block to the session and its
+    subprocesses, project over user, so an environment variable carries no provenance — a
+    hostile checkout's `.claude/settings.json` can override or junk the user's value, and
+    refusing "project-looking" values would still leave the user's kill-switch defeated. The
+    one file a checkout cannot write is the user's own; that is the same trust line as the
+    project-scope whitelist ban. CI pins a tier by writing that file. Anything unreadable or
+    outside the allowlist resolves to `auto` with one warning. Never raises.
+    """
+    try:
+        path = _user_settings_path() if user_settings is None else user_settings
+        if not path.is_file():
+            return DEFAULT_PARSER_TIER
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - HOME unresolvable, unreadable or malformed: the switch is unknowable
+        logger.warning(f"Cannot read {PARSER_TIER_ENV} from user settings ({exc}); using {DEFAULT_PARSER_TIER}")
+        return DEFAULT_PARSER_TIER
+    env_block = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env_block, dict):
+        return DEFAULT_PARSER_TIER
+    # Case-insensitive key: Windows environments are, and a user's own typo is not a threat.
+    raw = next((v for k, v in env_block.items() if str(k).upper() == PARSER_TIER_ENV), None)
+    if raw is None:
+        return DEFAULT_PARSER_TIER
+    tier = str(raw).strip().lower()
+    if tier not in PARSER_TIERS:
+        logger.warning(
+            f"Ignoring {PARSER_TIER_ENV}={raw!r} in {path} (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}"
+        )
+        return DEFAULT_PARSER_TIER
+    return tier
+
+
+class TieredParser:
+    """Spec §6 state machine: native → in-process bashlex → deny.
+
+    Every `parse` exit returns a mapped AST or raises `ParseError`; validator.py's parse-failure
+    path then BLOCKS (or, for a heredoc parse failure, re-validates the command before the
+    heredoc — that special case keys off bashlex's own message, which is why the bashlex tier's
+    `ParseError` is the one that propagates). The deny tier is terminal in every mode; no path
+    allows on failure.
+
+    Args:
+        tier: one of PARSER_TIERS; defaults to `resolve_parser_tier()`.
+        bridge: the native tier (tests inject scripted binaries and short timeouts).
+
+    T8 must hold ONE instance per process (inside the cached `BashCommandParser`): the
+    once-per-process warning below is per instance.
+    """
+
+    def __init__(self, tier: Optional[str] = None, bridge: Optional[NativeBridge] = None):
+        self.tier = resolve_parser_tier() if tier is None else tier
+        if self.tier not in PARSER_TIERS:
+            raise ValueError(f"unknown parser tier {self.tier!r}; expected one of {sorted(PARSER_TIERS)}")
+        self._bridge = NativeBridge() if bridge is None else bridge
+        self._warned = False
+
+    def parse(self, command: str) -> list[Any]:
+        if self.tier == "bashlex":
+            return parse_bashlex(command)
+        try:
+            return self._bridge.parse(command)
+        except Exception as exc:  # noqa: BLE001 - spec §6: ANY native failure moves to the next tier
+            self._note_native_failure(exc)
+            if self.tier == "native":
+                # Native-only: no rescue. A native parse error is already a ParseError; wrap the rest.
+                if isinstance(exc, ParseError):
+                    raise
+                raise ParseError(
+                    f"native parser failed and {PARSER_TIER_ENV}=native forbids the bashlex fallback: {exc}",
+                    original_error=exc,
+                ) from exc
+        return parse_bashlex(command)  # raises ParseError itself when bashlex also fails → deny
+
+    def _note_native_failure(self, exc: Exception) -> None:
+        if isinstance(exc, (ParseError, UnmappedNodeError)):
+            # Designed, per-command outcomes (exit 2; a construct ast_view has not mapped): debug only.
+            logger.debug(f"native parser tier declined the command: {exc}")
+            return
+        # Everything else — no binary, crash, timeout, guard trip, malformed output — says the
+        # native tier is broken on this machine, and a silent permanent degrade to bashlex would
+        # hide it. One warning per process is the noise budget (the hook is one process per
+        # command; the hook's root logger sits at INFO, so debug never reaches stderr).
+        if self._warned:
+            return
+        self._warned = True
+        action = f"denying ({PARSER_TIER_ENV}=native)" if self.tier == "native" else "using bashlex"
+        in_contract = isinstance(exc, NativeBridgeError)
+        contract = "" if in_contract else f" ({type(exc).__name__} is outside the bridge's exception contract)"
+        logger.warning(f"native parser tier failed{contract}: {exc}; {action}", exc_info=not in_contract)
+
 
 # Interpreters that EXECUTE their standard input as a program when given no program source.
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
@@ -600,21 +740,7 @@ class BashCommandParser:
         if not command.strip():
             raise ValueError("Command cannot be whitespace-only")
 
-        try:
-            return bashlex.parse(command)
-        except bashlex.errors.ParsingError as e:
-            # Preserve original bashlex error for debugging
-            raise ParseError(
-                f"Failed to parse bash command: {command!r}",
-                original_error=e,
-            )
-        except Exception as e:
-            # Catch any other unexpected bashlex errors
-            logger.error(f"Unexpected error parsing command: {e}")
-            raise ParseError(
-                f"Unexpected parsing error for command: {command!r}",
-                original_error=e,
-            )
+        return parse_bashlex(command)
 
     def extract_commands(self, ast_nodes: list[Any]) -> list[str]:
         """Extract all command names from AST.

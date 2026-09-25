@@ -31,12 +31,11 @@ construct parses: `!` and `(( ))` both look trivially mappable and both
 measurably weakened the walkers when tried — the reason lives at each raise site
 (`convert_stmt`, `_clause_test`), which is where the next person will look.
 
-Remaining ceilings, ALL fail-closed by raising into the fallback tier: backslash
-escapes in word text, ANSI-C `$'…'` and non-ASCII input (T3 owns the per-WordPart
-unescape and byte→char conversion — passing raw escapes or byte offsets through
-would silently weaken the walkers, LAB-911 panel CRITs); plus `!`, `coproc`,
-`(( ))`, indexed/naked assignments, redirects on a compound statement, and a
-trailing `# comment` (comments are parsed off, so one reads as a prefix parse).
+Every span a node carries is a code-point offset (`_Converter._cpos`) and `Lit`
+text is bashlex-unescaped (`_unescape_lit`): the walkers char-index the string.
+Everything else still raises `UnmappedNodeError` (→ deny under native-only,
+→ bashlex under auto, so each ceiling is strictly superset-safe); the WHY lives
+at each raise site, which is where the next person will look.
 """
 
 import json
@@ -207,8 +206,40 @@ class AstView:
         return f"AstView(kind={self.kind!r}, pos={self.pos}{', ' if extras else ''}{extras})"
 
 
-def _pos(node: dict) -> "tuple[int, int]":
-    return (node["Pos"]["Offset"], node["End"]["Offset"])
+def _unescape_lit(value: str) -> str:
+    """Reproduce bashlex's `.word` backslash-unescape for a `Lit` part (spec §4a).
+
+    mvdan keeps escapes structural: the `Lit` value for `rm\\ -rf\\ /` is the raw
+    `rm\\ -rf\\ /`, whereas bashlex's `.word` is already `rm -rf /`. Passing the
+    raw form through defeats every rule keyed on the decoded command (the `:268`
+    under-block), so this closes the gap by decoding the same way bashlex does.
+
+    bashlex applies one uniform rule outside single quotes — INCLUDING inside
+    double quotes (verified: `"a\\bar"` → `abar`, `"a\\$b"` → `a$b`): a backslash
+    escapes the next character (the backslash is dropped, the character kept),
+    `\\<newline>` is line continuation (both dropped), and a trailing backslash
+    with nothing after it stays literal. Single-quoted content never reaches
+    here — bash keeps its backslashes literal, so `WORD_PART_MAP` maps `SglQuoted`
+    straight to its value. Matching bashlex exactly (not "more correct than bash")
+    is deliberate: the migration invariant is never turning a bashlex BLOCK into
+    an ALLOW, and identical decoding makes the superset oracle's word comparison
+    exact rather than merely one-directional.
+    """
+    if "\\" not in value:
+        return value
+    out: list[str] = []
+    i, n = 0, len(value)
+    while i < n:
+        ch = value[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = value[i + 1]
+            if nxt != "\n":  # line continuation drops both; every other escape keeps the char
+                out.append(nxt)
+            i += 2
+        else:  # a lone trailing backslash is literal
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def _node(mvdan_type: str, pos: "tuple[int, int]", child: Any = None, **attrs: Any) -> AstView:
@@ -229,13 +260,49 @@ class _Converter:
     """One conversion pass over a single command's typed-JSON."""
 
     def __init__(self, command: str):
-        # mvdan offsets are BYTE offsets; slicing happens on the encoded form.
-        # Byte→char conversion for the walkers' `.pos` consumers is T3; a
-        # multibyte slice that splits a code point raises (fail closed).
-        self._src = command.encode("utf-8")
+        # mvdan emits BYTE offsets; the walkers char-index the original string
+        # (`command[start:end]`, `command[start] == '"'`), so every offset this
+        # converter puts on a node MUST be a code-point offset or a multibyte
+        # command mis-slices and the mangled segment matches no rule → ALLOW
+        # (spec §4b, panel CRIT #3).
+        self._command = command
+        # Fast path: for an all-ASCII command every byte IS its own code point,
+        # so `_char` is the identity and there is no map to build — this covers
+        # the overwhelming majority of commands and keeps the hot path allocation
+        # free. `_b2c` is built only when a multibyte code point actually shifts
+        # the offsets: it maps each byte offset that BEGINS a code point (plus the
+        # end-of-input offset) to that code point's index, and `_char` rejects any
+        # offset landing mid-character (fail closed).
+        if command.isascii():
+            self._b2c: Optional[dict[int, int]] = None
+        else:
+            b2c: dict[int, int] = {}
+            byte = 0
+            for char_index, ch in enumerate(command):
+                b2c[byte] = char_index
+                byte += len(ch.encode("utf-8"))
+            b2c[byte] = len(command)
+            self._b2c = b2c
+
+    def _char(self, byte_offset: int) -> int:
+        if self._b2c is None:  # all-ASCII: byte offset == code-point offset
+            return byte_offset
+        try:
+            return self._b2c[byte_offset]
+        except KeyError:
+            # A boundary inside a multibyte code point means mvdan and this map
+            # disagree about the source; denying the native tier is safer than
+            # emitting an offset the walkers would mis-slice.
+            raise NativeBridgeError(f"native byte offset {byte_offset} does not fall on a character boundary")
+
+    def _cpos(self, node: dict) -> "tuple[int, int]":
+        """A node's span as (start, end) CODE-POINT offsets, from its byte offsets."""
+        return (self._char(node["Pos"]["Offset"]), self._char(node["End"]["Offset"]))
 
     def _slice(self, start: int, end: int) -> str:
-        return self._src[start:end].decode("utf-8")
+        # start/end are code-point offsets (from `_cpos`); slice the original
+        # string, not the encoded bytes.
+        return self._command[start:end]
 
     # -- statements ---------------------------------------------------------
 
@@ -263,7 +330,7 @@ class _Converter:
     def _separator(self, stmt: dict) -> "Optional[AstView]":
         if "Semicolon" not in stmt:
             return None
-        offset = stmt["Semicolon"]["Offset"]
+        offset = self._char(stmt["Semicolon"]["Offset"])
         op = "&" if stmt.get("Background") else ";"
         return AstView("operator", (offset, offset + len(op)), op=op)
 
@@ -329,11 +396,11 @@ class _Converter:
         if node_type == "BinaryCmd":
             return self._convert_binary(cmd)
         if node_type in ("Subshell", "Block"):
-            return _node(node_type, _pos(cmd), child=self.stmts_to_nodes(cmd.get("Stmts", [])))
+            return _node(node_type, self._cpos(cmd), child=self.stmts_to_nodes(cmd.get("Stmts", [])))
         clause = _CLAUSE_CHILDREN.get(node_type)
         if clause is None:
             raise UnmappedNodeError(f"unmapped typed-JSON node type: {node_type}")
-        return _node(node_type, _pos(cmd), child=clause(self, cmd))
+        return _node(node_type, self._cpos(cmd), child=clause(self, cmd))
 
     def _convert_call(self, cmd: dict, redirects: "list[AstView]") -> AstView:
         parts = [self.convert_assign(a) for a in cmd.get("Assigns", [])]
@@ -348,12 +415,14 @@ class _Converter:
         # The span must also cover a trailing escaped blank (`echo hi \ `):
         # _locate_segment gives that blank back after stripping, and only a
         # span that already contains it keeps the rebased literal-range bound
-        # on the node end. Inert until T3 unescapes — convert_word raises on
-        # backslash escapes today — but it is a span requirement, not a nicety.
-        start, end = _pos(cmd)
+        # on the node end. A span requirement, not a nicety.
+        start, end = self._cpos(cmd)
         if parts:
             start = min(start, parts[0].pos[0])
-            end = max(end, *(p.pos[1] for p in parts))
+            # bashlex stops a command's span at a heredoc's delimiter word; the body
+            # hangs off `.heredoc` PAST the span and _close_heredocs re-attaches it, so
+            # reaching over it here would put the body in the segment text twice.
+            end = max(end, *(p.output.pos[1] if hasattr(p, "heredoc") else p.pos[1] for p in parts))
         return _node("CallExpr", (start, end), child=parts)
 
     def _convert_binary(self, cmd: dict) -> AstView:
@@ -361,7 +430,7 @@ class _Converter:
         if op_code not in BINARY_OPS:
             raise UnmappedNodeError(f"unmapped BinaryCmd op code: {op_code}")
         op_text, container_kind, separator_kind = BINARY_OPS[op_code]
-        op_offset = cmd["OpPos"]["Offset"]
+        op_offset = self._char(cmd["OpPos"]["Offset"])
         separator_attr = {"operator": {"op": op_text}, "pipe": {"pipe": op_text}}[separator_kind]
         separator = AstView(separator_kind, (op_offset, op_offset + len(op_text)), **separator_attr)
 
@@ -370,7 +439,7 @@ class _Converter:
             separator,
             *self._binary_side(cmd["Y"], container_kind),
         ]
-        return AstView(container_kind, _pos(cmd), parts=parts)
+        return AstView(container_kind, self._cpos(cmd), parts=parts)
 
     def _binary_side(self, stmt: dict, container_kind: str) -> "list[AstView]":
         """Convert one side of a BinaryCmd, flattening same-kind chains.
@@ -461,7 +530,7 @@ class _Converter:
 
     def convert_word(self, word: dict) -> AstView:
         text, children = self._word_content(word)
-        return _node("Word", _pos(word), child=children, word=text)
+        return _node("Word", self._cpos(word), child=children, word=text)
 
     def _word_content(self, word: dict) -> "tuple[str, list[AstView]]":
         parts = word.get("Parts")
@@ -481,22 +550,25 @@ class _Converter:
             raise UnmappedNodeError(f"unmapped WordPart type: {part_type}")
         if handler == "value":
             if part_type == "SglQuoted" and part.get("Dollar"):
-                # ANSI-C $'…' decoding is T3 oracle territory (bashlex's own
-                # decode is buggy); route to the fallback tier until then.
+                # ANSI-C $'…' — mvdan's typed-JSON does NOT decode it (verified:
+                # `$'\x72\x6d'` → Value `\x72\x6d`, raw), so mapping it to that
+                # raw value would let native decode LESS than real bash. Raising
+                # keeps the native tier fail-closed (→ deny under native-only,
+                # → bashlex under auto): strictly superset-safe, never an
+                # under-block. Decoding $'…' to reveal MORE danger than bashlex's
+                # own buggy `$x72x6d` is a genuine improvement, not a parity fix,
+                # and belongs in its own ticket.
                 raise UnmappedNodeError("ANSI-C quoted string ($'...') is not mapped yet")
             value = part.get("Value", "")
-            if part_type == "Lit" and "\\" in value:
-                # bashlex unescapes Lit text (`r\m` → `rm`); passing the raw
-                # escaped form through would defeat every rule keyed on the
-                # unescaped command (panel CRIT, LAB-911 review). Until T3
-                # lands the per-WordPart unescape, escapes raise → bashlex
-                # tier, which unescapes correctly today. SglQuoted content is
-                # exempt: bash keeps its backslashes literal, no divergence.
-                raise UnmappedNodeError("backslash escape in word text is not mapped yet (T3 unescape)")
-            return value
+            if part_type == "Lit":
+                # bashlex unescapes Lit text (`r\m` → `rm`, `rm\ -rf\ /` →
+                # `rm -rf /`); the raw escaped form defeats every rule keyed on
+                # the decoded command (spec §4a, the `:268` under-block).
+                return _unescape_lit(value)
+            return value  # SglQuoted: bash keeps backslashes literal — verbatim
         if handler == "quoted":
             return "".join(self._word_part_text(p) for p in part.get("Parts", []))
-        return self._slice(*_pos(part))  # "source"
+        return self._slice(*self._cpos(part))  # "source"
 
     def _word_part_children(self, part: dict) -> "list[AstView]":
         part_type = part.get("Type")
@@ -508,22 +580,22 @@ class _Converter:
         if part_type not in _STRUCTURAL_WORD_PARTS:
             return []
         if part_type == "ParamExp":
-            # `_pos(part)` spans the WHOLE `${…}`, not just the parameter name:
+            # `_cpos(part)` spans the WHOLE `${…}`, not just the parameter name:
             # `extract_string_literals`' LAB-1584 filter needs it to CONTAIN the
             # words spliced in below, or their quoted literals suppress rules.
-            return [_node("ParamExp", _pos(part), value=part["Param"]["Value"]), *self._param_exp_words(part)]
+            return [_node("ParamExp", self._cpos(part), value=part["Param"]["Value"]), *self._param_exp_words(part)]
         if part_type == "CmdSubst":
             inner = self.stmts_to_single_node(part.get("Stmts", []), "command substitution")
-            return [_node("CmdSubst", _pos(part), child=inner)]
+            return [_node("CmdSubst", self._cpos(part), child=inner)]
         if part_type == "ArithmExp":
             # `$(( $(rm -rf /) + 1 ))` executes inside the arithmetic; the
             # operand words carry that substitution to SubstitutionValidator.
-            return [_node("ArithmExp", _pos(part), child=self._expr_words(part.get("X")))]
+            return [_node("ArithmExp", self._cpos(part), child=self._expr_words(part.get("X")))]
         # ProcSubst
         if part.get("Op") not in PROC_SUBST_OPS:
             raise UnmappedNodeError(f"unmapped ProcSubst op code: {part.get('Op')}")
         inner = self.stmts_to_single_node(part.get("Stmts", []), "process substitution")
-        return [_node("ProcSubst", _pos(part), child=inner)]
+        return [_node("ProcSubst", self._cpos(part), child=inner)]
 
     def _param_exp_words(self, part: dict) -> "list[AstView]":
         """Structural children of the words a `${…}` expansion EVALUATES, spliced in beside the parameter node.
@@ -585,7 +657,7 @@ class _Converter:
         else:
             value_text, children = self._word_content(value)
         word = assign["Name"]["Value"] + operator + value_text
-        return _node("Assign", _pos(assign), child=children, word=word)
+        return _node("Assign", self._cpos(assign), child=children, word=word)
 
     def _convert_array_assign(self, assign: dict, operator: str) -> AstView:
         """`a=(1 2 3)` — bashlex cannot parse this, so there is no shape to match.
@@ -601,8 +673,8 @@ class _Converter:
             elements.extend(self._expr_words(elem.get("Index")))  # a=([i+1]=x)
             if elem.get("Value"):
                 elements.append(self.convert_word(elem["Value"]))
-        word = assign["Name"]["Value"] + operator + self._slice(*_pos(array))
-        return _node("Assign", _pos(assign), child=elements, word=word)
+        word = assign["Name"]["Value"] + operator + self._slice(*self._cpos(array))
+        return _node("Assign", self._cpos(assign), child=elements, word=word)
 
     def convert_redirect(self, redir: dict) -> AstView:
         op_code = redir["Op"]
@@ -628,11 +700,11 @@ class _Converter:
         if "Hdoc" in redir:
             if redirect_type not in _HEREDOC_TYPES:
                 raise UnmappedNodeError(f"heredoc body on a {redirect_type!r} redirect is not mapped")
-            hdoc_pos = _pos(redir["Hdoc"])
+            hdoc_pos = self._cpos(redir["Hdoc"])
             # bashlex's heredoc value includes the terminator line; the source
             # slice reproduces that exactly (mvdan's End already covers it).
             attrs["heredoc"] = AstView("heredoc", hdoc_pos, value=self._slice(*hdoc_pos))
-        return _node("Redir", _pos(redir), child=output, **attrs)
+        return _node("Redir", self._cpos(redir), child=output, **attrs)
 
 
 #: Clause node type → the `_Converter` method producing its `compound.list`.
@@ -683,15 +755,10 @@ def build_ast_view(command: str, typed_json: "Union[str, bytes, dict]") -> "list
         got = f"Type={typed_json.get('Type')!r}" if isinstance(typed_json, dict) else type(typed_json).__name__
         raise UnmappedNodeError(f"expected a File root, got: {got}")
 
+    # mvdan emits BYTE offsets and the full-span check below compares against the
+    # BYTE length; `_Converter` translates every node offset to a code-point
+    # offset for the walkers (spec §4b). Non-ASCII input is handled, not refused.
     source = command.encode("utf-8")
-    if len(source) != len(command):
-        # mvdan emits BYTE offsets; the walkers char-index the string, and a
-        # mis-sliced segment is silently DROPPED by their bounds guard — the
-        # under-block direction (panel CRIT, LAB-911 review; spec §4b).
-        # Until T3 lands the byte→char conversion, non-ASCII input raises →
-        # bashlex tier, whose offsets are already char-based.
-        raise UnmappedNodeError("non-ASCII input needs byte→char offset conversion (T3); routing to fallback")
-
     try:
         parsed_end = typed_json["End"]["Offset"]
         if source[parsed_end:].strip():

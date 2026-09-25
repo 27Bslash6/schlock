@@ -2,11 +2,12 @@
 
 Slice T2a of the native-parser migration (spec §3.1/§3.2): resolve the binary
 for this platform, hand it a command on stdin, and read its typed-JSON AST back
-under a hard output bound. Turning that JSON into an `AstView` the existing
-walkers can read is T2b; the final size constants are T4; the tier/fallback
-state machine is T5.
+under a hard output bound and a hard deadline. Turning that JSON into an
+`AstView` the existing walkers can read is `ast_view.py`; the tier/fallback state
+machine that decides what happens when this bridge raises is
+`parser.TieredParser` (spec §6).
 
-Two invariants carry the security weight here:
+Three invariants carry the security weight here:
 
 1. **Bounded read, not `capture_output`.** `subprocess.run(capture_output=True)`
    buffers stdout without limit. This bridge runs behind a PreToolUse hook on
@@ -17,29 +18,68 @@ Two invariants carry the security weight here:
    command. Returning the bytes we did read would hand the walkers a prefix AST
    with a trailing `; rm -rf /` silently dropped, so every non-zero exit raises
    and the accumulated output is discarded (spec §3.1, §11 finding 10).
+3. **Never exec an unverified binary.** A swapped `schlock-parse` that emits a
+   benign AST defeats every rule at once, so before the first spawn the binary's
+   SHA-256 must equal the digest `MANIFEST.json` records for this platform; a
+   mismatch, or no digest at all, raises `NativeBridgeError` and
+   `parser.TieredParser` moves to its next tier (spec §6 row 2, §7). Both files
+   are read only as bounded regular files: the check runs before the spawn
+   deadline, and a hook held past its own timeout fails open.
+
+Layering (spec §7): the hash check proves the binary is the one MANIFEST names,
+not that MANIFEST is honest — a commit updating both would still match. The CI
+rebuild from pinned source, asserting byte-equality with the committed binaries,
+is what establishes that. Keeping writes out of `.claude-plugin/bin/` is the
+self-protection layers' job (validator SELF_PROTECTION_PATHS,
+hooks/self_protect.py, the schlock_plugin_binary_write rule).
 """
 
+import contextlib
+import hashlib
+import json
 import os
 import platform
+import signal
+import stat
 import subprocess
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Optional
 
 from schlock.exceptions import ParseError
 
 BINARY_NAME = "schlock-parse"
+MANIFEST_NAME = "MANIFEST.json"
 
 # Vendored binaries live beside the plugin manifest (spec §7); same root walk as
 # validator.py's project_root.
 DEFAULT_BIN_ROOT = Path(__file__).parent.parent.parent.parent / ".claude-plugin" / "bin"
 
-# Anti-OOM output bound (spec §5). Deliberately above the ~8.8 MB legitimate
-# worst case for a 64 KB input, so it trips only on subprocess pathology.
-# T4 owns the final constants, including the pre-spawn 64 KB input guard.
+# Size guards (spec §5, LAB-528). Both fail-closed: a trip raises
+# NativeBridgeError and the caller falls back to bashlex.
+#
+# Input guard, checked on the UTF-8 byte length BEFORE spawning (the CLI reads
+# bytes). Shared with integrations/commit_filter.py, which counts code points
+# and fails toward skip-extraction rather than raising — see its docstring.
+MAX_COMMAND_SIZE = 64 * 1024
+
+# Anti-OOM output bound on the incremental stdout read: a memory budget against a
+# runaway or tampered binary (decoded JSON costs ~40 B of Python heap per byte).
+# It clears the sparse `echo a;` shape at 64 KiB (~7.9 MiB) but NOT dense ones —
+# `a;`, `x=1;` and bare pipeline chains reach ~410× amplification (25.6 MiB on
+# mvdan v3.13.1) and trip it → bashlex. Deliberate: those shapes also blow the
+# §6 250 ms timeout, so native never serves them anyway, and a bound that admitted
+# them would let one 64 KiB command cost the hook ~1 GiB.
 MAX_AST_JSON_SIZE = 12 * 1024 * 1024
 
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_STDERR_BYTES = 8 * 1024
+
+# Read bounds for the integrity check (spec §7). It runs before the spawn deadline, so a FIFO
+# or a sparse multi-GiB file standing in for either file would otherwise hold the hook past
+# its own timeout. The real binaries are ~2.4 MB; the MANIFEST is under 1 KB.
+_MAX_BINARY_SIZE = 16 * 1024 * 1024
+_MAX_MANIFEST_SIZE = 64 * 1024
 
 # The GOOS/GOARCH pairs T1 cross-compiles (spec §7). Anything else has no native
 # tier at all — resolution raises so the caller falls back rather than guessing.
@@ -49,6 +89,13 @@ _GOARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "ar
 # Exit-code contract of tools/schlock-parse/main.go (spec §3.1).
 EXIT_OK = 0
 EXIT_PARSE_ERROR = 2
+
+# Spec §6 deadline, ~50-100x a typical parse (~5 ms measured). Bounds the whole exchange —
+# not just the child's lifetime: a hung binary, a dense 64 KiB shape (0.4-1.2 s on the Go
+# side) or a forked grandchild holding stdout open all end here, with the process group
+# killed and the child reaped, and the caller falls back to bashlex. A hook blocked past its
+# own timeout is fail-OPEN (Claude Code proceeds), so this is load-bearing.
+NATIVE_TIMEOUT = 0.25
 
 
 class NativeBridgeError(Exception):
@@ -73,26 +120,80 @@ def platform_dir() -> str:
 
 
 def resolve_binary(bin_root: Optional[Path] = None) -> Path:
-    """Locate the vendored `schlock-parse` for this platform.
+    """Locate the vendored `schlock-parse` for this platform and verify it against MANIFEST.json.
 
     Raises:
-        NativeBridgeError: platform unsupported, binary absent, or not executable.
-            Never returns None — a missing parser must surface as a failure the
-            fallback chain can see, not as a silent allow.
+        NativeBridgeError: platform unsupported, binary absent, not executable, or not
+            the binary MANIFEST.json records. Never returns None — a missing or swapped
+            parser must surface as a failure the fallback chain can see, not as a silent
+            allow.
     """
     root = DEFAULT_BIN_ROOT if bin_root is None else bin_root
     suffix = ".exe" if platform.system().lower() == "windows" else ""
-    path = root / platform_dir() / f"{BINARY_NAME}{suffix}"
+    key = f"{platform_dir()}/{BINARY_NAME}{suffix}"
+    path = root / key
     if not path.is_file():
         raise NativeBridgeError(f"native parser binary not found: {path}")
     if not os.access(path, os.X_OK):
         raise NativeBridgeError(f"native parser binary not executable: {path}")
+    _verify_digest(path, root / MANIFEST_NAME, key)
     return path
+
+
+def _open_bounded(path: Path, limit: int) -> BinaryIO:
+    """Open `path` for reading only if it is a regular file of at most `limit` bytes."""
+    # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer. It does not
+    # change reads from a regular file.
+    handle = os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), "rb")
+    info = os.fstat(handle.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        handle.close()
+        raise NativeBridgeError(f"{path} is not a regular file of at most {limit} bytes; refusing to trust it")
+    return handle
+
+
+def _verify_digest(path: Path, manifest: Path, key: str) -> None:
+    """Raise unless `path`'s SHA-256 is the digest `manifest` records under `key` (spec §7).
+
+    Fails closed: an absent or unreadable MANIFEST, or one without this platform's entry, is
+    an integrity failure, never "nothing to check".
+    """
+    try:
+        with _open_bounded(manifest, _MAX_MANIFEST_SIZE) as handle:
+            expected = json.loads(handle.read(_MAX_MANIFEST_SIZE))["binaries"][key]
+    except (OSError, ValueError, LookupError, TypeError) as exc:
+        raise NativeBridgeError(f"no MANIFEST SHA-256 for {key} in {manifest}: {exc!r}; refusing to execute {path}")
+    digest = hashlib.sha256()
+    try:
+        # Chunked: read_bytes() made the check ~2.6 ms cold, chunked it is ~1.7 ms. The
+        # `remaining` cap also bounds a file that reports a small size and reads on and on.
+        with _open_bounded(path, _MAX_BINARY_SIZE) as binary:
+            remaining = _MAX_BINARY_SIZE + 1
+            while remaining > 0 and (chunk := binary.read(min(_READ_CHUNK_SIZE, remaining))):
+                digest.update(chunk)
+                remaining -= len(chunk)
+    except OSError as exc:
+        raise NativeBridgeError(f"cannot hash native parser binary {path}: {exc}")
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise NativeBridgeError(
+            f"native parser binary failed its integrity check (possible tampering): SHA-256 of {path} is "
+            f"{actual}, MANIFEST records {expected!r}; refusing to execute it"
+        )
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the child and anything it forked (same session, see start_new_session) — no-op if gone."""
+    if hasattr(os, "killpg"):
+        # ProcessLookupError once reaped, PermissionError never in practice; proc.kill() covers the parent.
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    proc.kill()  # polls first: a no-op on an exited child
 
 
 def _kill_and_reap(proc: subprocess.Popen) -> None:
     """Kill the child and collect it — `kill()` alone leaves a zombie."""
-    proc.kill()
+    _kill_tree(proc)
     proc.wait()
 
 
@@ -100,25 +201,40 @@ class NativeBridge:
     """Runs `schlock-parse` and returns its raw typed-JSON AST.
 
     Args:
-        binary_path: explicit binary, bypassing platform resolution (tests, and
-            T5's forced-tier switch).
+        binary_path: explicit binary, bypassing platform resolution AND the MANIFEST
+            check — the caller vouches for it. Tests only; production (`TieredParser`)
+            always resolves.
         max_ast_json_size: output bound in bytes; overflow kills the child.
+        timeout: seconds the exchange may take before the child is killed (spec §6).
     """
 
     def __init__(
         self,
         binary_path: Optional[Path] = None,
         max_ast_json_size: int = MAX_AST_JSON_SIZE,
+        timeout: float = NATIVE_TIMEOUT,
     ):
         self._binary_path = binary_path
+        self._resolve_error: Optional[NativeBridgeError] = None
         self._max_ast_json_size = max_ast_json_size
+        self._timeout = timeout
 
     def _binary(self) -> Path:
-        # Resolved lazily and cached on success only, so a machine without a
-        # vendored binary keeps raising (→ fallback) instead of caching a lie.
-        if self._binary_path is None:
-            self._binary_path = resolve_binary()
-        return self._binary_path
+        # Resolved — and SHA-256-verified against MANIFEST.json — lazily at the first exec,
+        # then cached either way: a missing or tampered binary keeps raising the same error
+        # (spec §6 row 2) without being re-hashed on every parse() of a command.
+        # ponytail: verified once per bridge, i.e. once per hook process (T8 holds one), not
+        # once per spawn — it guards the file at rest. Re-verify per spawn if the bridge ever
+        # becomes long-lived.
+        if self._binary_path is not None:
+            return self._binary_path
+        if self._resolve_error is None:
+            try:
+                self._binary_path = resolve_binary()
+                return self._binary_path
+            except NativeBridgeError as exc:
+                self._resolve_error = exc
+        raise self._resolve_error
 
     def parse(self, command: str) -> "list":
         """Parse `command` into bashlex-shaped `AstView` nodes (spec §3.2).
@@ -140,9 +256,19 @@ class NativeBridge:
 
         Raises:
             ParseError: the binary rejected the command as unparseable (exit 2).
-            NativeBridgeError: any other failure — spawn error, output overflow,
-                stdin/stdout error (exit 3/4), crash, or undecodable output.
+            NativeBridgeError: any other failure — no binary, oversized input, timeout,
+                output overflow, stdin/stdout error (exit 3/4), crash, or
+                undecodable output.
         """
+        try:
+            command_bytes = command.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            # A lone surrogate arrives via a `\ud800` escape in the hook's JSON stdin.
+            raise NativeBridgeError(f"command is not UTF-8 encodable: {exc}")
+        if len(command_bytes) > MAX_COMMAND_SIZE:
+            raise NativeBridgeError(
+                f"command exceeds native parser input bound ({len(command_bytes)} > {MAX_COMMAND_SIZE} bytes)"
+            )
         binary = self._binary()
         try:
             proc = subprocess.Popen(
@@ -150,14 +276,12 @@ class NativeBridge:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,  # own process group, so _kill_tree reaches forked children
             )
         except OSError as exc:
             raise NativeBridgeError(f"failed to spawn native parser {binary}: {exc}")
 
-        # Popen as a context manager closes the three pipes and reaps the child
-        # even on the raising paths below.
-        with proc:
-            payload, stderr, returncode = self._exchange(proc, command, binary)
+        payload, stderr, returncode = self._exchange_within_deadline(proc, command_bytes, binary)
 
         if returncode == EXIT_OK:
             try:
@@ -172,14 +296,48 @@ class NativeBridge:
         # whatever landed on stdout is a prefix, so it is dropped, not returned.
         raise NativeBridgeError(f"native parser exited {returncode}: {detail}")
 
-    def _exchange(self, proc: subprocess.Popen, command: str, binary: Path) -> "tuple[bytes, bytes, int]":
+    def _exchange_within_deadline(
+        self, proc: subprocess.Popen, command_bytes: bytes, binary: Path
+    ) -> "tuple[bytes, bytes, int]":
+        """Run `_exchange` on a worker thread and wait at most `timeout` for it (spec §6).
+
+        The deadline bounds the CALLER, not the child: a blocking `read()` cannot be
+        interrupted, and killing the child does not end it when a forked grandchild still
+        holds the stdout pipe open. So the exchange runs on a daemon thread; if it has not
+        finished at the deadline the process group is killed, the child reaped, and the
+        caller raises — whatever the pipe is doing. A worker that finishes first wins
+        outright: returncode, not the clock, decides success.
+        """
+        outcome: dict = {}
+
+        def run() -> None:
+            try:
+                outcome["result"] = self._exchange(proc, command_bytes, binary)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, name="schlock-parse-exchange", daemon=True)
+        # Popen as a context manager closes the three pipes and reaps the child even on the
+        # raising paths — including a worker thread that fails to start.
+        with proc:
+            worker.start()
+            worker.join(self._timeout)
+            if worker.is_alive():
+                _kill_and_reap(proc)
+                # Whatever reached stdout is a prefix of a parse that never finished.
+                raise NativeBridgeError(f"native parser timed out after {self._timeout * 1000:.0f} ms; killed {binary}")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    def _exchange(self, proc: subprocess.Popen, command_bytes: bytes, binary: Path) -> "tuple[bytes, bytes, int]":
         """Feed stdin, read stdout under the bound, and collect the exit code."""
         if proc.stdin is None or proc.stdout is None or proc.stderr is None:
             _kill_and_reap(proc)
             raise NativeBridgeError("native parser pipes unavailable")
 
         try:
-            proc.stdin.write(command.encode("utf-8"))
+            proc.stdin.write(command_bytes)
             proc.stdin.close()
         except OSError as exc:
             # Child exited before consuming stdin, so it only ever saw a prefix.
@@ -188,8 +346,8 @@ class NativeBridge:
 
         # ponytail: write-then-read is deadlock-free only because the CLI does
         # io.ReadAll(stdin) before writing a byte of stdout. A tampered binary
-        # that floods stdout first could block the write above; T5's 250 ms
-        # timeout (spec §6) is what closes that window.
+        # that floods stdout first could block the write above; the NATIVE_TIMEOUT
+        # deadline in _exchange_within_deadline closes that window.
         chunks: list[bytes] = []
         total = 0
         while True:
