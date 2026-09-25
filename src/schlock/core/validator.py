@@ -2401,12 +2401,9 @@ def _escalate_past_heredoc(
     The rewritten command is validated through the front door, so it gets the
     whole pipeline - segments, substitutions, dangerous flags, rules - rather
     than a second hand-rolled approximation of it. Its segments are then
-    validated individually as well, because a whitelist entry covering the whole
-    line short-circuits the whole-command pass before the per-segment loop it
-    relies on. A whitelisted *prefix* used to do the same; #146 (LAB-2752) narrowed
-    that gate to a full-span match and LAB-4290 to an entry that declares every
-    command in the line (`is_whitelisted_whole`), so only a deliberate pipeline
-    entry still reaches it - but one such entry is enough.
+    validated individually as well, because a whitelist entry that declares every
+    command in the line (`is_whitelisted_whole`) short-circuits the whole-command
+    pass before the per-segment loop it relies on; one such entry is enough.
     Neither pass subsumes the other: the whole-command pass is the only one that
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
     whitelist cannot silence.
@@ -2414,7 +2411,7 @@ def _escalate_past_heredoc(
     Both passes run with ShellCheck off, and ShellCheck runs once here, on the
     whole rewrite. It is a subprocess per call, so leaving it on in every pass
     cost N+2 spawns for a heredoc followed by N commands (LAB-2780). It cannot
-    simply stay on in the whole-command pass alone: a full-span whitelist entry
+    simply stay on in the whole-command pass alone: a whole-line whitelist entry
     short-circuits that pass before its ShellCheck step, and the per-segment
     pass is then the only place the trailing commands are ShellChecked at all -
     `"rm" -rf /` and `rm -$''rf /` are caught by nothing else. Running it here

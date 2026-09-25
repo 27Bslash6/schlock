@@ -18,15 +18,35 @@ from schlock.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
-# Counts the command separators a whitelist pattern's SOURCE writes, so `is_whitelisted_whole`
-# can ask how many commands the entry claims to describe. Longest alternative first, so `&&`
-# counts once rather than twice. A literal pipe is matched as a regex spells it (`\|`, `\|\|`
-# or `[|]`); `&` and `;` are not regex metacharacters and already mean themselves. A BARE `|`
-# is deliberately absent: in a regex it is alternation, which is what `(node_modules|dist)`
-# uses and what must NOT count. Ceiling: a pipe spelled `\x7c`, `\174` or inside a wider class
-# is not recognised, so such an entry is read as describing one command and clears no line --
-# the fail-closed direction, costing a false positive on an exotic spelling, never a denial.
-_DECLARED_SEPARATORS = re.compile(r"&&|\\\|\\\||\\\||\[\|\]|;|&")
+# One token of a whitelist pattern's SOURCE: an escape, a bracket expression, or one character.
+_SOURCE_TOKEN = re.compile(r"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|.", re.DOTALL)
+# The tokens that write a command separator, so `is_whitelisted_whole` can ask how many commands
+# an entry claims to describe. A literal pipe is matched as a regex spells it (`\|` or `[|]`);
+# `&` and `;` are not metacharacters and mean themselves. A BARE `|` is deliberately absent: it
+# is alternation, which is what `(node_modules|dist)` uses and what must NOT count. A bracket
+# expression is one character SLOT, so `[^;]` or `[\w;]` mentions `;` without writing a boundary
+# -- only a class holding nothing but the separator writes one. Ceiling: a pipe spelled `\x7c` or
+# `\174` is not recognised, so such an entry is read as describing fewer commands and clears no
+# line -- the fail-closed direction, costing a false positive on an exotic spelling, never a
+# denial.
+_SEPARATOR_TOKENS = frozenset({"\\|", "[|]", ";", "\\;", "[;]", "&", "\\&", "[&]"})
+# Whitespace that `\s` and `str.strip` accept but bash does not treat as blank: \r, \v, \f,
+# \x1c-\x1f and the Unicode spaces are WORD characters to bash. Only space, tab and newline aren't.
+_NON_BASH_BLANK = re.compile(r"[^\S \t\n]")
+
+
+def _declared_separators(source: str) -> int:
+    """Count the command separators a whitelist pattern's source writes.
+
+    Adjacent separator tokens are one separator: `&&`, `\\|\\|` and `\\|&` each join two commands.
+    """
+    count, previous = 0, False
+    for token in _SOURCE_TOKEN.findall(source):
+        current = token in _SEPARATOR_TOKENS
+        if current and not previous:
+            count += 1
+        previous = current
+    return count
 
 
 class RiskLevel(Enum):
@@ -668,23 +688,30 @@ class RuleEngine:
         If bash finds more commands than the entry declared, the extra ones are not the author's
         and the entry does not cover them.
 
-        Counting is what makes this hold where the two weaker tests do not:
+        Counting is what makes this hold for entries nobody has vetted -- a user's own included,
+        where the two weaker tests do not:
 
-        * Consuming the line is not sufficient. A pattern can be anchored AND open-ended -- the
-          shipped cleanup entry ends `(/.*)?$`, whose `.*` eats `&& rm -rf /` quite legitimately.
-          It declares no separator, so it now speaks for one command and clears no line.
-        * Writing a separator is not sufficient either. `\\S+` matches `;`, so
-          `docker login ghcr.io -u foo;sudo;true --password-stdin` satisfies the gh/docker entry
-          end to end while bash runs four commands. Declared two, found four: refused.
+        * Consuming the line is not sufficient. A pattern can be anchored AND open-ended -- an
+          entry ending `(/.*)?$` has a `.*` that eats `&& rm -rf /` quite legitimately. It
+          declares no separator, so it speaks for one command and clears no line.
+        * Writing a separator is not sufficient either. Had the gh/docker entry's user slot been
+          `\\S+`, which matches `;`, `docker login ghcr.io -u foo;sudo;true --password-stdin`
+          would satisfy it end to end while bash runs four commands. Declared two, found four:
+          refused.
         * And a newline is a separator to bash while `\\s` matches one, so an entry's own
           whitespace could span a line break its author never wrote. Counting sees through that
           too -- and, unlike rejecting newlines outright, it still clears the LEGAL multi-line
           spelling, `gh auth token |` + newline + `docker login ...`, which bash reads as one
           two-command pipeline because the newline follows a pipe.
 
-        What this deliberately does NOT judge is how loose a single command's arguments are. The
-        same `\\S+` also accepts `>/path`, a redirection rather than a command, which leaves the
-        count at two. That is the entry's own shape to fix, not this gate's.
+        `\\s` also matches characters bash does NOT treat as blank (\\r, \\v, \\f, \\x1c-\\x1f,
+        Unicode spaces), and the parser drops a line made only of them without counting it, so
+        a line holding one is never cleared here. Refusing the whitelist is not refusing the
+        command: the line is then judged one command at a time.
+
+        What this deliberately does NOT judge is how loose a single command's arguments are. A
+        `\\S+` slot also accepts `>/path`, a redirection rather than a command, which leaves the
+        count unchanged. That is the entry's own shape to fix, not this gate's.
 
         Args:
             command: Full command line being validated
@@ -693,12 +720,15 @@ class RuleEngine:
         Returns:
             True if a whitelist entry declares exactly this many commands and matches them all
         """
+        if _NON_BASH_BLANK.search(command):
+            return False
         # Surrounding blank space is not executable content, and `$` matches BEFORE a trailing
         # newline while `fullmatch` would have to consume it -- without this, a trailing "\n"
-        # unseats the anchored entry and lands the pipeline on BLOCKED.
+        # unseats the anchored entry and lands the pipeline on BLOCKED. After the guard above,
+        # only space, tab and newline are left for this to strip.
         command = command.strip()
         for pattern in self.whitelist_patterns:
-            declared = len(_DECLARED_SEPARATORS.findall(pattern.pattern))
+            declared = _declared_separators(pattern.pattern)
             if declared and declared + 1 == segment_count and pattern.fullmatch(command):
                 return True
         return False

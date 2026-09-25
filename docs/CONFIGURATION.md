@@ -121,10 +121,6 @@ whitelist:
 
 - Patterns are regex, matched against the start of a **single command** (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
-- For a **chained** command (`a; b`, `a && b`, `a | b`), a prefix match is not enough: each
-  segment is validated on its own unless a pattern writes every separator and spans the
-  *entire* command (see below). `^ls\b` allows `ls -la`, but `ls; rm -rf /` is still BLOCKED
-  on the `rm`
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
@@ -184,13 +180,12 @@ Use `$` at the end when you want to match the exact command. Without `$`, the pa
 any command that starts with the pattern text — including extra arguments you did not intend
 to allow, so `^chmod\s+[0-7]{3}\s+/tmp/` also clears `chmod 755 /tmp/x /etc/shadow`.
 
-`$` on its own is not enough if what precedes it is open-ended: `^mytool\s+.*$` is anchored
-and still matches anything. Spell out the characters each slot accepts (e.g. `[\w./:-]+`)
-rather than using `.*` or `\S+`, which match `;`, `&`, `|`, `>` and `${IFS}` happily.
+Spell out the characters each slot accepts (e.g. `[\w./:-]+`) rather than using `.*` or `\S+`,
+which match `;`, `&`, `|`, `>` and `${IFS}` happily.
 
-Spelling out separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..`
-and `host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf`
-and `gh auth token` entries in `00_whitelist.yaml` show the shape.
+Excluding separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..` and
+`host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf` and
+`gh auth token` entries in `00_whitelist.yaml` show the shape.
 
 #### Security: User-Level Only
 

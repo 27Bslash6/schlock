@@ -579,9 +579,9 @@ class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
         "git status && bash -c 'rm -rf /'",
         "chmod 755 /tmp/x && rm -rf /",
         # Anchoring an entry is NOT enough, which is why the guard asks a second question.
-        # The build-cleanup entry ends `(/.*)?$`, and that `.*` consumes the chained payload,
-        # so the pattern genuinely fullmatches the whole line. One trailing slash was the
-        # difference between `rm -rf dist` (denied) and `rm -rf dist/ && rm -rf /` (allowed).
+        # The build-cleanup entry used to end `(/.*)?$`, whose `.*` consumed the chained
+        # payload, so the pattern genuinely fullmatched the whole line. The tightened entry now
+        # refuses these itself; loosen it again and the count still does (tests/test_rules.py).
         "rm -rf dist/ && rm -rf /",
         "rm -rf dist/; rm -rf /",
         "rm -rf dist/ | rm -rf /",
@@ -621,21 +621,22 @@ class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
         # without stripping first, one stray newline lands this pipeline on BLOCKED.
         assert validate_command(command + "\n").risk_level == RiskLevel.SAFE
 
-    def test_a_payload_cannot_ride_a_slot_of_an_entry_that_does_declare_a_separator(self):
-        # Writing a separator is not sufficient either: `\S+` matches `;` and `&`, so a payload
-        # rides the entry's own argument slots and the pattern still matches end to end. The
-        # entry declared TWO commands; bash finds four. Both payloads are denied bare.
-        for sep in (";", "&"):
-            for payload in ("sudo", "mkfs.ext4"):
-                command = f"gh auth token | docker login ghcr.io -u foo{sep}{payload}{sep}true --password-stdin"
-                assert validate_command(command).risk_level == RiskLevel.BLOCKED
-
     def test_a_newline_is_a_separator_the_pattern_writes_for_the_author(self):
         # `\s` matches a newline, but bash SPLITS on one. So the entry's own whitespace spans a
-        # line break its author never wrote, and one regex "command" is several to bash.
-        injected = "gh auth token | docker login\n{}\n-u\nfoo\n--password-stdin"
+        # line break its author never wrote, and one regex "command" is several to bash. The
+        # shipped entry matches this end to end -- its user slot takes the payload -- so the
+        # segment count at the call site is the only thing that refuses it.
+        injected = "gh auth token | docker login ghcr.io -u\n{}\n--password-stdin"
         for payload in ("sudo", "mkfs.ext4"):
             assert validate_command(injected.format(payload)).risk_level == RiskLevel.BLOCKED
+
+    def test_whitespace_bash_reads_as_a_word_cannot_carry_a_rider(self):
+        # `\s` and `strip()` accept \x1c, NBSP and friends, which bash reads as a WORD -- and the
+        # parser drops a line made only of them, so the count alone would not see the rider.
+        pipeline = "gh auth token | docker login ghcr.io -u me --password-stdin"
+        for blank in ("\r", "\x0b", "\x1c", "\xa0", "\u3000"):
+            for command in (pipeline + "\n" + blank, blank + "\n" + pipeline):
+                assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
     def test_the_legal_multi_line_spelling_of_the_pipeline_still_clears(self):
         # A newline AFTER `|` is a bash continuation, not a separator — still one two-command

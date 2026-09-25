@@ -112,24 +112,11 @@ rules:
         engine = RuleEngine(test_rules_file)
         assert engine.is_whitelisted(command) == should_be_whitelisted
 
-    @pytest.mark.parametrize("command", ["git status; rm -rf /", "git status && rm -rf /", "git status | rm -rf /"])
-    def test_prefix_entry_does_not_cover_the_chain(self, test_rules_file, command):
-        """LAB-2752: a prefix entry must not vouch for the commands chained after it."""
-        engine = RuleEngine(test_rules_file)
-        assert not engine.is_whitelisted_whole(command, 2)
-
     def test_is_whitelisted_keeps_prefix_semantics(self, test_rules_file):
         """AC-5: the prefix contract (issue #66) is untouched for single-segment callers."""
         engine = RuleEngine(test_rules_file)
         assert engine.is_whitelisted("git status --short")
         assert engine.is_whitelisted("git status; rm -rf /")
-
-    def test_is_whitelisted_whole_ignores_trailing_whitespace(self, tmp_path):
-        """A "\\s*" tail and the strip must agree: trailing blank space never unseats an entry."""
-        rules = tmp_path / "trailing.yaml"
-        rules.write_text("whitelist:\n  - ^foo\\s*\\|\\s*bar\\s*$\nrules: []\n")
-        engine = RuleEngine(rules)
-        assert engine.is_whitelisted_whole("foo | bar  ", 2)
 
     def test_match_command_can_skip_the_whitelist(self, test_rules_file):
         """use_whitelist=False lets the multi-segment fallback re-check a command whose
@@ -497,6 +484,49 @@ rules: []
         # But `\s` also spans a line break the author never wrote, turning one regex "command"
         # into several for bash. The count sees through that where the pattern cannot.
         assert not engine.is_whitelisted_whole("gh auth token | docker login\nsudo\n--password-stdin", 4)
+
+    def test_a_bracket_expression_is_a_slot_not_a_declared_separator(self, tmp_path):
+        """`[^;]` and `[\\w;]` mention `;` without writing a boundary, so neither declares one."""
+        rules_dir = tmp_path / "classes"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^mytool\s+[^;]+$
+  - ^cd\s+[\w;]+\s*&&\s*make$
+  - ^foo\s*[;]\s*bar$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # A negated class writes no separator: this entry speaks for one command, however well
+        # it matches a longer line.
+        assert engine.whitelist_patterns[0].fullmatch("mytool x && rm -rf /")
+        assert not engine.is_whitelisted_whole("mytool x && rm -rf /", 2)
+        # A class holding `;` among other characters does not add to the one `&&` declares.
+        assert engine.is_whitelisted_whole("cd src && make", 2)
+        assert not engine.is_whitelisted_whole("cd a;rm && make", 3)
+        # A class holding nothing but the separator is the separator.
+        assert engine.is_whitelisted_whole("foo; bar", 2)
+
+    def test_whitespace_bash_reads_as_a_word_never_clears_a_line(self, tmp_path):
+        """Only space, tab and newline are blank to bash; `\\s` and `strip()` accept far more."""
+        rules_dir = tmp_path / "blanks"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+        pipeline = "gh auth token | docker login ghcr.io -u me --password-stdin"
+
+        assert engine.is_whitelisted_whole(" \t\n" + pipeline + " \t\n", 2)
+        for blank in ("\r", "\x0b", "\x0c", "\x1c", "\x1f", "\x85", "\xa0", "\u2028", "\u3000"):
+            assert not engine.is_whitelisted_whole(pipeline + "\n" + blank, 2)
+            assert not engine.is_whitelisted_whole(blank + "\n" + pipeline, 2)
+            assert not engine.is_whitelisted_whole(pipeline.replace("|", "|\n" + blank + "\n"), 2)
 
     def test_directory_files_loaded_in_order(self, rules_directory):
         """Test that files are loaded in alphabetical order."""

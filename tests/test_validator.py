@@ -927,7 +927,11 @@ class TestMultiSegmentWhitelistBypass:
         ],
     )
     def test_greedy_whitelist_pattern_cannot_span_a_chain(self, command):
-        """A full-span match only means "vetted" if the pattern excludes separators."""
+        """A whole-line match only means "vetted" if the pattern excludes separators.
+
+        Each row is refused twice over: the shipped slots exclude separators, and none of these
+        entries declares the separators the line holds (`is_whitelisted_whole` counts them).
+        """
         result = validate_command(command)
         assert not result.allowed
         assert result.risk_level == RiskLevel.BLOCKED
@@ -2771,8 +2775,8 @@ class TestSiblingSubstitutionsRateTheWorst:
         "command",
         [
             'echo "$(x=1) $(echo b)"',
-            # Multi-segment. The full-command whitelist check is span-anchored, so
-            # this row never reaches that short-circuit; it pins the join of the
+            # Multi-segment. `^ls\b` declares no separator, so this row never
+            # reaches the whole-line short-circuit; it pins the join of the
             # deferred denial with the segment verdict instead. The short-circuit is
             # pinned by test_full_span_whitelist_does_not_clear_a_deferred_denial.
             "ls $(x=1); echo hi",
