@@ -9,6 +9,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import bisect
 import logging
+import re
 import shlex
 from typing import Any, NamedTuple, Optional
 
@@ -241,7 +242,14 @@ _MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
 # - Execution: env, command, xargs, parallel (modify execution context)
 # - Multicall: busybox, toybox (can invoke any applet)
 # - Namespace: chroot, nsenter, unshare (container/namespace operations)
-WRAPPER_COMMANDS: frozenset[str] = frozenset(
+#
+# This is also the set the `exec`/`eval` wrapper-bypass scan in `has_dangerous_constructs` keys
+# on: it TREATS a bare `exec`/`eval` word after one of these as the shell builtin (an
+# over-approximation - `sudo exec bash` blocks). A launcher whose own subcommand vocabulary is
+# `exec`/`eval` (`uv run … exec`, `firejail … eval`) must therefore NOT go here; it goes in
+# `_LAUNCHER_COMMANDS` below. Mirrors PR #204's `_EXEC_BYPASS_SCAN_WRAPPERS` split so the two
+# land cleanly in either merge order (LAB-5180).
+_EXEC_BYPASS_SCAN_WRAPPERS: frozenset[str] = frozenset(
     {
         # Privilege escalation
         "sudo",  # Run as superuser
@@ -256,6 +264,7 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
         "time",  # Times execution
         "chrt",  # Real-time scheduler control
         "taskset",  # CPU affinity
+        "prlimit",  # Resource-limit wrapper, `prlimit --opts CMD`
         # Execution context
         "env",  # Modifies environment then executes
         "command",  # Bypasses shell functions/aliases
@@ -281,19 +290,30 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
         "setarch",  # Architecture override
         "linux32",  # 32-bit mode
         "linux64",  # 64-bit mode
+        "i386",  # setarch personality alias
+        "uname26",  # setarch personality alias (UNAME26)
         "arch",  # Architecture override (setarch alias), `arch -x86_64 CMD`
-        # Sandbox / environment launchers that exec a caller-supplied command (LAB-5180).
-        # These run their operand with their own stdin, so a shell operand gets the heredoc
-        # body as code exactly as `env bash <<EOF` does.
-        "uv",  # `uv run CMD`
-        "fakeroot",  # `fakeroot CMD`
-        "firejail",  # `firejail [--opts] CMD`
-        "caffeinate",  # macOS: `caffeinate -i CMD`
-        "prlimit",  # `prlimit --opts CMD`
+        "caffeinate",  # macOS keep-awake wrapper, `caffeinate -i CMD`
         "dbus-run-session",  # `dbus-run-session -- CMD`
+        "fakeroot",  # `fakeroot CMD`
         "script",  # `script [-c CMD] file` runs $SHELL on stdin when no -c is given
     }
 )
+
+# Launchers that run a caller-supplied command inside an environment or sandbox but use `exec`/
+# `eval` as their OWN subcommand (`uv run pytest -k exec`, `firejail --noprofile make eval`).
+# They are wrappers for owner/here-string/delegation purposes but are kept out of the exec/eval
+# bypass scan so those benign subcommand names are not read as the shell builtin (LAB-5180).
+_LAUNCHER_COMMANDS: frozenset[str] = frozenset(
+    {
+        "uv",  # `uv run CMD`
+        "firejail",  # `firejail [--opts] CMD`
+    }
+)
+
+# Every base name whose operands the owner / here-string / delegation scans treat as a
+# pass-through command. Public: the validator imports it.
+WRAPPER_COMMANDS: frozenset[str] = _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMANDS
 
 # A basename that means "the interpreter is a shell we cannot name more precisely" - a
 # `$SHELL`-exec wrapper run with no command operand, an `env -S` string whose first token is a
@@ -313,72 +333,449 @@ def has_expansion_char(word: str) -> bool:
     return any(ch in word for ch in _EXPANSION_METACHARS)
 
 
-# Wrappers that, given no COMMAND operand, run the user's shell (or /bin/sh) on their stdin -
-# a heredoc or here-string included (verified against real bash with a `touch` witness). The
-# value maps each wrapper to (leading positional operands it consumes before the COMMAND,
-# short options that take a separate value). Enough option arity to locate the first COMMAND;
-# unlisted options are treated as flags, which over-reads a following value as a COMMAND and so
-# fails toward "inert" only where a value option was omitted from the table (LAB-5180).
-_SHELL_EXEC_WRAPPER_ARITY: "dict[str, tuple[int, frozenset[str]]]" = {
-    "unshare": (0, frozenset({"-S", "-G", "-R", "-w"})),
-    "nsenter": (0, frozenset({"-t", "-S", "-G"})),
-    "chroot": (1, frozenset()),  # NEWROOT [COMMAND]
-    "setarch": (1, frozenset()),  # ARCH [COMMAND]
-    "linux32": (0, frozenset()),
-    "linux64": (0, frozenset()),
-    "runuser": (1, frozenset({"-g", "-G", "-s", "-w"})),  # [-] USER [COMMAND]
-    "su": (1, frozenset({"-g", "-G", "-s", "-w"})),  # [-] USER [COMMAND]
-}
-# These carry a `-c`/`--command` escape that supplies the program instead of running the shell
-# on stdin, so a heredoc alongside `<wrapper> ... -c CMD` is inert stdin, not code.
-_SHELL_EXEC_DASH_C_WRAPPERS = frozenset({"runuser", "su", "script"})
+class _WrapperSpec(NamedTuple):
+    """How a wrapper's operands are laid out, enough to locate its COMMAND operand.
 
-
-def _wrapper_runs_default_shell(base: str, args: list[str]) -> bool:
-    """True if `$SHELL`-exec wrapper `base` would run its default shell on stdin given `args`.
-
-    `unshare -U` / `chroot /` / `nsenter -t 1 -m` / `runuser - root` / `script -q /dev/null`
-    run a shell because no COMMAND operand follows; `unshare cat` / `chroot / cat` do not. A
-    `-c CMD` escape (runuser/su/script) also means a shell is not reading stdin.
+    ``leading`` positional operands are consumed before the command (timeout's DURATION,
+    chroot's NEWROOT, su's USER). ``value_opts`` consume the next token; ``flag_opts`` take
+    none. For a ``shell_exec`` wrapper an option in NEITHER set is treated as UNCERTAIN and
+    resolves to the default shell (fail closed, LAB-5180) - for the rest it degrades to a flag.
+    ``assignments`` skips a leading run of ``NAME=VALUE`` (env). ``dash_c`` means a
+    ``-c``/``--command`` escape supplies the program, so the wrapper is not reading stdin as a
+    shell. ``file_positional`` means the positional is a FILE, never a command (script).
     """
-    if base == "script":
-        # script always runs $SHELL and records it, unless -c supplies the program.
-        return not any(a == "-c" or a.startswith("-c") for a in args)
-    spec = _SHELL_EXEC_WRAPPER_ARITY.get(base)
-    if spec is None:
-        return False
-    leading, value_opts = spec
-    if base in _SHELL_EXEC_DASH_C_WRAPPERS and any(a in ("-c", "--command") for a in args):
-        return False
+
+    leading: int = 0
+    value_opts: frozenset = frozenset()
+    flag_opts: Optional[frozenset] = None
+    assignments: bool = False
+    shell_exec: bool = False
+    dash_c: bool = False
+    file_positional: bool = False
+
+
+# util-linux / coreutils option grammar, read from each tool's --help. `shell_exec=True` wrappers
+# run $SHELL on their stdin when no command operand is present; their option sets are complete so
+# an unknown option fails closed to the shell rather than being guessed a flag (LAB-5180).
+_WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
+    "unshare": _WrapperSpec(
+        shell_exec=True,
+        value_opts=frozenset(
+            {
+                "-S",
+                "-G",
+                "-R",
+                "-w",
+                "-l",
+                "--setuid",
+                "--setgid",
+                "--root",
+                "--wd",
+                "--load-interp",
+                "--map-user",
+                "--map-group",
+                "--map-users",
+                "--map-groups",
+                "--setgroups",
+                "--propagation",
+                "--monotonic",
+                "--boottime",
+                "--kill-child",
+            }
+        ),
+        flag_opts=frozenset(
+            {
+                "-m",
+                "-u",
+                "-i",
+                "-n",
+                "-p",
+                "-U",
+                "-C",
+                "-T",
+                "-r",
+                "-c",
+                "-f",
+                "-h",
+                "-V",
+                "--mount",
+                "--uts",
+                "--ipc",
+                "--net",
+                "--pid",
+                "--user",
+                "--cgroup",
+                "--time",
+                "--mount-proc",
+                "--mount-binfmt",
+                "--map-root-user",
+                "--map-current-user",
+                "--map-auto",
+                "--fork",
+                "--keep-caps",
+                "--help",
+                "--version",
+            }
+        ),
+    ),
+    "nsenter": _WrapperSpec(
+        shell_exec=True,
+        value_opts=frozenset({"-t", "-N", "-W", "--target", "--net-socket", "--wdns"}),
+        flag_opts=frozenset(
+            {
+                "-a",
+                "-m",
+                "-u",
+                "-i",
+                "-n",
+                "-p",
+                "-C",
+                "-U",
+                "-T",
+                "-S",
+                "-G",
+                "-r",
+                "-w",
+                "-e",
+                "-c",
+                "-F",
+                "-h",
+                "-V",
+                "--all",
+                "--mount",
+                "--uts",
+                "--ipc",
+                "--net",
+                "--pid",
+                "--cgroup",
+                "--user",
+                "--user-parent",
+                "--time",
+                "--setuid",
+                "--setgid",
+                "--preserve-credentials",
+                "--keep-caps",
+                "--root",
+                "--wd",
+                "--env",
+                "--no-fork",
+                "--join-cgroup",
+                "--help",
+                "--version",
+            }
+        ),
+    ),
+    "chroot": _WrapperSpec(
+        leading=1,  # NEWROOT
+        shell_exec=True,
+        value_opts=frozenset({"--userspec", "--groups"}),
+        flag_opts=frozenset({"--skip-chdir", "--help", "--version"}),
+    ),
+    "setarch": _WrapperSpec(
+        leading=1,  # ARCH
+        shell_exec=True,
+        flag_opts=frozenset(
+            {
+                "-B",
+                "-F",
+                "-I",
+                "-L",
+                "-R",
+                "-S",
+                "-T",
+                "-X",
+                "-Z",
+                "-3",
+                "-v",
+                "-h",
+                "-V",
+                "--32bit",
+                "--fdpic-funcptrs",
+                "--short-inode",
+                "--addr-compat-layout",
+                "--addr-no-randomize",
+                "--whole-seconds",
+                "--sticky-timeouts",
+                "--read-implies-exec",
+                "--mmap-page-zero",
+                "--3gb",
+                "--4gb",
+                "--uname-2.6",
+                "--verbose",
+                "--list",
+                "--show",
+                "--help",
+                "--version",
+            }
+        ),
+    ),
+    "linux32": _WrapperSpec(shell_exec=True, flag_opts=frozenset()),
+    "linux64": _WrapperSpec(shell_exec=True, flag_opts=frozenset()),
+    "i386": _WrapperSpec(shell_exec=True, flag_opts=frozenset()),
+    "uname26": _WrapperSpec(shell_exec=True, flag_opts=frozenset()),
+    "arch": _WrapperSpec(shell_exec=True, flag_opts=None),  # arch alias; -x86_64 etc caught by shell-scan
+    "runuser": _WrapperSpec(
+        leading=1,  # USER
+        shell_exec=True,
+        dash_c=True,
+        value_opts=frozenset(
+            {
+                "-g",
+                "-G",
+                "-s",
+                "-w",
+                "--group",
+                "--supp-group",
+                "--shell",
+                "--whitelist-environment",
+                "-c",
+                "--command",
+                "--session-command",
+            }
+        ),
+        flag_opts=frozenset(
+            {
+                "-m",
+                "-p",
+                "-l",
+                "-f",
+                "-P",
+                "-h",
+                "-V",
+                "--preserve-environment",
+                "--login",
+                "--fast",
+                "--pty",
+                "--help",
+                "--version",
+            }
+        ),
+    ),
+    "su": _WrapperSpec(
+        leading=1,  # USER
+        shell_exec=True,
+        dash_c=True,
+        value_opts=frozenset(
+            {
+                "-g",
+                "-G",
+                "-s",
+                "-w",
+                "--group",
+                "--supp-group",
+                "--shell",
+                "--whitelist-environment",
+                "-c",
+                "--command",
+                "--session-command",
+            }
+        ),
+        flag_opts=frozenset(
+            {
+                "-m",
+                "-p",
+                "-l",
+                "-f",
+                "-P",
+                "-h",
+                "-V",
+                "--preserve-environment",
+                "--login",
+                "--fast",
+                "--pty",
+                "--help",
+                "--version",
+            }
+        ),
+    ),
+    "script": _WrapperSpec(shell_exec=True, dash_c=True, file_positional=True),
+    "fakeroot": _WrapperSpec(
+        shell_exec=True,
+        value_opts=frozenset({"-l", "--lib", "-f", "--faked", "-s", "--save", "-i", "--load"}),
+        flag_opts=None,
+    ),
+    "firejail": _WrapperSpec(shell_exec=True, flag_opts=None),  # options are --opt / --opt=val
+    # Non-shell-exec wrappers: locate the command operand for the expansion check only.
+    "env": _WrapperSpec(assignments=True, value_opts=frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"})),
+    "timeout": _WrapperSpec(leading=1, value_opts=frozenset({"-s", "--signal", "-k", "--kill-after"})),  # DURATION
+    "nice": _WrapperSpec(value_opts=frozenset({"-n", "--adjustment"})),
+    "ionice": _WrapperSpec(value_opts=frozenset({"-c", "--class", "-n", "--classdata", "-p", "--pid", "-u", "--uid"})),
+    "stdbuf": _WrapperSpec(value_opts=frozenset({"-i", "--input", "-o", "--output", "-e", "--error"})),
+    "sudo": _WrapperSpec(
+        value_opts=frozenset(
+            {
+                "-u",
+                "--user",
+                "-g",
+                "--group",
+                "-C",
+                "--close-from",
+                "-h",
+                "--host",
+                "-p",
+                "--prompt",
+                "-r",
+                "--role",
+                "-t",
+                "--type",
+                "-T",
+                "--command-timeout",
+                "-R",
+                "--chroot",
+                "-U",
+                "--other-user",
+                "-D",
+                "--chdir",
+            }
+        )
+    ),
+    "doas": _WrapperSpec(value_opts=frozenset({"-u", "-C"})),
+    "flock": _WrapperSpec(leading=1, value_opts=frozenset({"-w", "--timeout", "-E", "--conflict-exit-code"})),  # FILE/FD
+    "sg": _WrapperSpec(leading=1),  # GROUP
+    "strace": _WrapperSpec(value_opts=frozenset({"-o", "-e", "-p", "-s", "-a", "-E", "-P", "-I", "-b", "-x", "-X"})),
+    "ltrace": _WrapperSpec(value_opts=frozenset({"-o", "-e", "-p", "-s", "-a", "-l", "-x"})),
+    "setpriv": _WrapperSpec(
+        value_opts=frozenset(
+            {
+                "--reuid",
+                "--regid",
+                "--groups",
+                "--securebits",
+                "--pdeathsig",
+                "--selinux-label",
+                "--apparmor-profile",
+                "--ambient-caps",
+                "--inh-caps",
+                "--bounding-set",
+                "--reset-env",
+            }
+        )
+    ),
+    "systemd-run": _WrapperSpec(
+        value_opts=frozenset(
+            {"-p", "--property", "-u", "--unit", "-M", "--machine", "--on-active", "--on-calendar", "--slice", "-E", "--setenv"}
+        )
+    ),
+    "chrt": _WrapperSpec(value_opts=frozenset({"-p"})),
+    "taskset": _WrapperSpec(leading=1, value_opts=frozenset({"-p"})),  # MASK
+    "prlimit": _WrapperSpec(
+        value_opts=frozenset(
+            {
+                "--cpu",
+                "--fsize",
+                "--data",
+                "--stack",
+                "--core",
+                "--rss",
+                "--nproc",
+                "--nofile",
+                "--memlock",
+                "--as",
+                "--locks",
+                "--sigpending",
+                "--msgqueue",
+                "--nice",
+                "--rtprio",
+                "--rttime",
+                "-p",
+            }
+        )
+    ),
+    "caffeinate": _WrapperSpec(value_opts=frozenset({"-t", "-w"})),
+    "dbus-run-session": _WrapperSpec(value_opts=frozenset({"--config-file", "--dbus-daemon"})),
+    "command": _WrapperSpec(),
+    "nohup": _WrapperSpec(),
+    "setsid": _WrapperSpec(),
+    "time": _WrapperSpec(value_opts=frozenset({"-o", "--output", "-f", "--format"})),
+    "unbuffer": _WrapperSpec(),
+    "pkexec": _WrapperSpec(value_opts=frozenset({"--user"})),
+    "busybox": _WrapperSpec(),
+    "toybox": _WrapperSpec(),
+    "uv": _WrapperSpec(),
+}
+
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _short_cluster_consumes_next(token: str, spec: _WrapperSpec) -> "Optional[bool]":
+    """For a short-option group like ``-rS``: True if it consumes the next token, False if not,
+    None if it contains an option unknown to a fail-closed (shell_exec) wrapper.
+
+    getopt semantics: a value option ends the group and takes the rest as its value, or the next
+    token when it is last (`-rS 0` -> `-r` flag, `-S` takes `0`). Verified against util-linux.
+    """
+    body = token[1:]
+    for idx, ch in enumerate(body):
+        opt = f"-{ch}"
+        if opt in spec.value_opts:
+            # value option: rest of the group is its value, else it consumes the next token
+            return idx == len(body) - 1
+        if spec.flag_opts is not None and opt not in spec.flag_opts:
+            return None  # unknown short option in a fail-closed wrapper
+    return False  # all flags
+
+
+def _scan_wrapper_operands(  # noqa: PLR0911, PLR0912 - getopt walk: guard clauses over nesting
+    base: str, operands: list[str]
+) -> "tuple[Optional[str], bool]":
+    """Return ``(command_operand, runs_default_shell)`` for wrapper ``base`` given ``operands``.
+
+    ``command_operand`` is the program the wrapper runs (first operand past its options, value
+    options, leading positionals and env assignments), or None when there is none.
+    ``runs_default_shell`` is True when the wrapper would run its default shell on stdin: a
+    ``shell_exec`` wrapper with no command operand and no ``-c`` escape, or one whose options
+    could not be resolved (fail closed). A ``-c`` escape makes stdin inert data, not a shell.
+    """
+    spec = _WRAPPER_SPECS.get(base, _WrapperSpec())
+    if spec.dash_c and any(a in ("-c", "--command", "--session-command") or a.startswith("-c") for a in operands):
+        return (None, False)  # -c supplies the program; stdin is data
+    if spec.file_positional:
+        return (None, spec.shell_exec)  # e.g. script: the positional is a file, never a command
     i = 0
     positionals = 0
-    while i < len(args):
-        arg = args[i]
+    while i < len(operands):
+        arg = operands[i]
         if arg == "--":
             i += 1
             break
-        if arg == "-":  # runuser/su login marker, not an operand
+        if arg == "-":  # su/runuser login marker (or stdin), not an operand
             i += 1
             continue
-        if arg.startswith("-"):
-            if arg in value_opts:
-                i += 2  # option consumes the next token as its value
-            else:
+        if spec.assignments and _ASSIGNMENT_RE.match(arg):
+            i += 1
+            continue
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0]
+            if name in spec.value_opts and "=" not in arg:
+                i += 2
+            elif name in spec.value_opts or name in (spec.flag_opts or frozenset()) or spec.flag_opts is None or "=" in arg:
                 i += 1
+            else:
+                return (None, True)  # unknown long option in a fail-closed wrapper
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            if arg in spec.value_opts:
+                i += 2
+                continue
+            consumes = _short_cluster_consumes_next(arg, spec)
+            if consumes is None:
+                return (None, True)  # unknown short option in a fail-closed wrapper
+            i += 2 if consumes else 1
             continue
         # A positional operand.
-        if positionals < leading:
+        if positionals < spec.leading:
             positionals += 1
             i += 1
             continue
-        return False  # a COMMAND operand is present -> the wrapper does not run the shell
-    # Any operands after `--` are the COMMAND.
-    return i >= len(args)
+        return (operands[i], False)  # command operand present
+    if i < len(operands):
+        return (operands[i], False)  # first operand after `--` is the command
+    return (None, spec.shell_exec)  # no command operand
 
 
 def _is_dynamic_loader(base: str) -> bool:
     """True for the ELF dynamic loader run as a program launcher (`ld-linux-x86-64.so.2 bash`)."""
-    return base == "ld.so" or (base.startswith(("ld-linux", "ld-musl")) and ".so" in base)
+    return base == "ld.so" or (base.startswith(("ld-linux", "ld-musl", "ld64", "ld-2")) and ".so" in base)
 
 
 def expand_env_split_string(base: str, args: list[str]) -> list[str]:
@@ -539,48 +936,57 @@ def _command_words(node: Any) -> "list[str]":
 
 
 def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses over nesting
-    """The name of what runs a command node's heredoc, basename only; None when unresolved.
+    """The name of what runs a command node's heredoc, basename only; None only when it has no word.
 
     Built on `_command_words`, so an assignment prefix is skipped: `FOO=1 bash` runs `bash`.
     Taking the first part that merely HAS a `.word` read it as a command named `FOO=1`, and
     a shell behind any assignment was then treated as an inert heredoc consumer.
 
     A wrapper execs its command with its own stdin, so `env bash <<EOF` hands the body to
-    bash; busybox and toybox are wrappers here too (`busybox sh`). The owner is then the
-    first shell among ALL the wrapper's operands, or the wrapper's own name when none is a
-    shell. Not the first operand: the shell need not be it (`timeout 5 sh`). The cost is an
-    over-read - `flock ./bash cat` names bash, though it locks a file called `bash` and runs
-    cat - which only rescans a body that may not run: the fail-closed direction.
+    bash; busybox and toybox are wrappers here too (`busybox sh`). The owner is the first shell
+    among ALL the wrapper's operands (`timeout 5 sh`), else what `_scan_wrapper_operands` reads
+    as the wrapper's command operand.
 
-    Returns None - which the callers scan as code, failing closed - for an owner this parser
-    cannot resolve to a definite inert reader (LAB-5180):
-      - an owner word (or a wrapper operand) still carrying an expansion metacharacter
-        (`$'bash'`, `{bash,}`, `${X:-bash}`, `/bin/b?sh`, `env $'bash'`);
-      - `xargs`/`parallel`, which run their stdin as commands;
-      - `.`/`source`, which read their stdin (or a file) as shell.
-    Returns `_DEFAULT_SHELL` for a `$SHELL`-exec wrapper run with no command operand
-    (`unshare -U`, `chroot /`, `nsenter -t 1 -m`, `setarch x86_64`, `runuser - root`,
-    `script -q /dev/null`), so both the quoted and unquoted paths treat the body as code.
+    The value the callers key on is whether the owner is a shell. So an owner this parser cannot
+    resolve to a definite inert reader resolves to `_DEFAULT_SHELL`, NOT None - both the quoted
+    re-validation path (`_shell_heredoc_bodies`) and the unquoted regex-suppression path
+    (`extract_heredoc_ranges`, keyed on `_HEREDOC_SHELL_COMMANDS`) then treat the body as code.
+    None is inert on the unquoted path, so returning it for an uncertain owner reopened the very
+    bypass this guards - `env FOO=$X bash <<EOF` went SAFE (LAB-5180). Resolves to the shell for:
+      - a head, or the wrapper's COMMAND operand, still carrying an expansion metacharacter
+        (`$'bash'`, `{bash,}`, `${SHELL:-/bin/sh}`, `/bin/b?sh`, `env $'bash'`) - checked on the
+        RAW word so a `${…}/…` basename cannot drop the `$`;
+      - `xargs`/`parallel`, which run their stdin as commands, and `.`/`source`, which source it;
+      - a `$SHELL`-exec wrapper with no command operand (`unshare -U`, `chroot /`,
+        `nsenter --target 1 -m`), read through `_scan_wrapper_operands`' option arity.
+    The expansion check is applied ONLY to the command-position operand: an assignment prefix
+    (`env FOO=$X cat`) or an option value (`timeout $T cat`) with a `$` no longer forces the body
+    to be rescanned as code (LAB-5180).
     """
     raw = _command_words(node)
-    words = [word.split("/")[-1] for word in raw]
-    if not words:
+    if not raw:
         return None
-    head = words[0]
-    if has_expansion_char(head):
-        return None
+    head_raw = raw[0]
+    head = head_raw.split("/")[-1]
+    # Item 5: the metacharacter check runs on the RAW word - `${SHELL:-/bin/sh}` basenames to
+    # `sh}`, which drops the `$` and `{`.
+    if has_expansion_char(head_raw):
+        return _DEFAULT_SHELL
     if head in ("xargs", "parallel", ".", "source"):
-        return None
+        return _DEFAULT_SHELL
     if head in WRAPPER_COMMANDS or _is_dynamic_loader(head):
-        operands = [op.split("/")[-1] for op in expand_env_split_string(head, raw[1:])]
-        if any(has_expansion_char(op) for op in operands):
-            return None
-        shell = next((op for op in operands if op in _HEREDOC_SHELL_COMMANDS), None)
+        operands = expand_env_split_string(head, raw[1:])
+        # Scan every operand for a shell FIRST, before any bail-out: `env FOO=$X bash`,
+        # `timeout $T bash`, `flock ./bash sh` all name a shell regardless of where it sits.
+        shell = next((op for op in operands if op.split("/")[-1] in _HEREDOC_SHELL_COMMANDS), None)
         if shell is not None:
-            return shell
-        if _wrapper_runs_default_shell(head, operands):
+            return shell.split("/")[-1]
+        cmd_op, runs_shell = _scan_wrapper_operands(head, operands)
+        if runs_shell:
             return _DEFAULT_SHELL
-        return head
+        if cmd_op is not None and has_expansion_char(cmd_op):
+            return _DEFAULT_SHELL  # the command itself is expansion-spelled (`env $'bash'`)
+        return head  # a resolved non-shell command, or a dash-c escape: inert
     return head
 
 
@@ -590,20 +996,30 @@ def shell_wrapping_functions(nodes: "list[Any]") -> "set[str]":
     `f() { bash; }; f <<'EOF' … EOF` hands the heredoc to `f`'s stdin, and the `bash` inside `f`
     inherits it and runs it as code. Such a function's heredoc must be scanned as code, not
     trusted as inert stdin to an unknown command (LAB-5180). A body command whose `heredoc_owner`
-    is a shell, or is None (itself unresolved), makes the function shell-wrapping.
+    is a shell makes the function shell-wrapping.
+
+    Wrapping is TRANSITIVE and computed to a fixed point: `g() { bash; }; f() { g; }; f` wraps a
+    shell through `g`, so calling a known wrapping function counts as wrapping (declaration order
+    is irrelevant - the fixed point covers a forward call). Bounded: each pass can only add names,
+    the name set is finite, so it converges (LAB-5180).
     """
-    result: set[str] = set()
+    # Collect each function's name and the command names its body runs, once.
+    bodies: dict[str, list[str]] = {}
+    direct: set[str] = set()
 
     def walk(n: Any) -> None:
         if getattr(n, "kind", None) == "function":
             name = getattr(getattr(n, "name", None), "word", None)
             body = getattr(n, "body", None)
             if name and body is not None:
+                called: list[str] = []
                 for cmd in _command_nodes(body):
-                    owner = heredoc_owner(cmd)
-                    if owner is None or owner in _HEREDOC_SHELL_COMMANDS:
-                        result.add(name)
-                        break
+                    if heredoc_owner(cmd) in _HEREDOC_SHELL_COMMANDS:
+                        direct.add(name)
+                    words = _command_words(cmd)
+                    if words:
+                        called.append(words[0].split("/")[-1])
+                bodies[name] = called
         for value in vars(n).values():
             for child in value if isinstance(value, list) else (value,):
                 if hasattr(child, "kind"):
@@ -611,38 +1027,36 @@ def shell_wrapping_functions(nodes: "list[Any]") -> "set[str]":
 
     for n in nodes:
         walk(n)
+
+    result = set(direct)
+    changed = True
+    while changed:
+        changed = False
+        for name, called in bodies.items():
+            if name not in result and any(c in result for c in called):
+                result.add(name)
+                changed = True
     return result
 
 
-def command_position_substitutions(nodes: "list[Any]") -> "set[int]":
-    """`id()` of every command substitution whose OUTPUT is executed as a command.
+def command_position_substitution(command_node: Any) -> "Optional[Any]":
+    """The command substitution in COMMAND POSITION of one command node, else None.
 
     `$(cat <<'EOF' … )` in command position runs what cat prints, so the heredoc body is code;
     `x=$(cat <<'EOF' … )` (assignment) and `git commit -m "$(cat <<'EOF' … )"` (argument) are
-    data (LAB-5180). A substitution is in command position when it is the whole first word of a
-    command node - not an assignment prefix, not a later argument, not a fragment glued to text.
+    data (LAB-5180). A substitution is in command position when it is the whole first word of the
+    command - not an assignment prefix, not a later argument, not a fragment glued to text.
     """
-    found: set[int] = set()
-
-    def walk(n: Any) -> None:
-        if getattr(n, "kind", None) == "command":
-            for part in getattr(n, "parts", []):
-                pk = getattr(part, "kind", None)
-                if pk in ("assignment", "redirect"):
-                    continue
-                if pk == "word":
-                    wp = getattr(part, "parts", [])
-                    if len(wp) == 1 and getattr(wp[0], "kind", None) == "commandsubstitution":
-                        found.add(id(wp[0]))
-                break  # only the first word is the command
-        for value in vars(n).values():
-            for child in value if isinstance(value, list) else (value,):
-                if hasattr(child, "kind"):
-                    walk(child)
-
-    for n in nodes:
-        walk(n)
-    return found
+    for part in getattr(command_node, "parts", []):
+        pk = getattr(part, "kind", None)
+        if pk in ("assignment", "redirect"):
+            continue
+        if pk == "word":
+            wp = getattr(part, "parts", [])
+            if len(wp) == 1 and getattr(wp[0], "kind", None) == "commandsubstitution":
+                return wp[0]
+        return None  # only the first word is the command
+    return None
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -1679,7 +2093,8 @@ class BashCommandParser:
                     # Scan all words looking for exec/eval as a command (not as arg to another tool)
                     # Allow: sudo kubectl exec (kubectl handles exec as subcommand)
                     # Block: sudo exec bash (exec IS the command)
-                    elif cmd_name in WRAPPER_COMMANDS:
+                    # NOT the launchers: their `exec`/`eval` is a subcommand (see _LAUNCHER_COMMANDS).
+                    elif cmd_name in _EXEC_BYPASS_SCAN_WRAPPERS:
                         words = _get_all_words(node)
                         # Container tools that use "exec" as a subcommand (not shell exec)
                         container_tools = {"kubectl", "docker", "podman", "nerdctl", "crictl", "ctr"}

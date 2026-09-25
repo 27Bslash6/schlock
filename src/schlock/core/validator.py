@@ -27,7 +27,7 @@ from .cache import ValidationCache
 from .parser import (
     WRAPPER_COMMANDS,
     BashCommandParser,
-    command_position_substitutions,
+    command_position_substitution,
     expand_env_split_string,
     has_expansion_char,
     heredoc_owner,
@@ -712,8 +712,12 @@ def _shell_delegated_payloads(
                         found.extend(_shell_delegated_payloads([(scan_args[i], scan_args[i + 1 :])], _seen=seen))
                     elif has_expansion_char(word):
                         # An operand we cannot resolve (`env $'bash' -c PROG`) might be a shell.
-                        # Fail closed: if a `-c PROG` follows it, extract PROG (LAB-5180).
-                        found.append(_dash_c_payload(scan_args[i + 1 :], operand_ends_options=False))
+                        # Fail closed: extract the `-c PROG` that DIRECTLY follows it, as a shell's
+                        # own would. operand_ends_options=True stops at an intervening program, so
+                        # `timeout $T python3 -c 'print(1)'` and `env DB=$X psql -c '…'` - where the
+                        # -c belongs to python3/psql, not to the unresolved word - are not extracted
+                        # (LAB-5180 review: item 2 over-block, item 5).
+                        found.append(_dash_c_payload(scan_args[i + 1 :], operand_ends_options=True))
 
         payloads.extend(p for p in found if p and p.strip())
     # The same program can still surface from more than one delegator (`su su bash -c PROG`:
@@ -1947,33 +1951,39 @@ def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHered
 
     Owner is also None for a heredoc inside a command substitution in COMMAND POSITION
     (`$(cat <<'EOF' … )`), whose output is executed, and for one owned by a function that
-    wraps a shell (`f() { bash; }; f <<'EOF' … `) - both run the body as code (LAB-5180).
+    wraps a shell (`f() { bash; }; f <<'EOF' … `, transitively) - both run the body as code
+    (LAB-5180). `body_is_code` carries "an enclosing construct runs this body as code" - a
+    process substitution's reader, or a command-position substitution's output - so it is not
+    named for process substitution alone.
     """
     found: list[_BashlexHeredoc] = []
-    cmd_position_subs = command_position_substitutions(nodes)
     wrapping_funcs = shell_wrapping_functions(nodes)
+    cmd_position_sub_ids: set[int] = set()  # filled as command nodes are visited, before their subs
 
-    def visit(node: Any, owner: Optional[str], in_substitution: bool, in_process: bool) -> None:
+    def visit(node: Any, owner: Optional[str], in_substitution: bool, body_is_code: bool) -> None:
         kind = getattr(node, "kind", None)
         if kind == "command":
-            owner = None if in_process else heredoc_owner(node)
+            owner = None if body_is_code else heredoc_owner(node)
             if owner in wrapping_funcs:
                 owner = None
+            sub = command_position_substitution(node)
+            if sub is not None:
+                cmd_position_sub_ids.add(id(sub))  # its output is run: inner heredoc bodies are code
         elif kind == "compound":
             owner = None
         elif kind == "commandsubstitution":
             in_substitution = True
-            if id(node) in cmd_position_subs:
-                in_process = True  # its output is run: inner heredoc bodies are code
+            if id(node) in cmd_position_sub_ids:
+                body_is_code = True
         elif kind == "processsubstitution":
-            in_substitution = in_process = True
+            in_substitution = body_is_code = True
         if kind == "redirect" and getattr(node, "heredoc", None) is not None:
             start, end = node.pos
             found.append(_BashlexHeredoc(parse_target.find("<<", start, end), owner, node.output.word, in_substitution))
         for value in vars(node).values():
             for child in value if isinstance(value, list) else (value,):
                 if hasattr(child, "kind"):
-                    visit(child, owner, in_substitution, in_process)
+                    visit(child, owner, in_substitution, body_is_code)
 
     for node in nodes:
         visit(node, None, False, False)
@@ -3096,13 +3106,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         if match.risk_level == RiskLevel.BLOCKED and match.rule and match.rule.name == "shell_delegated_payload":
             stdin_hints = _procsub_stdin_alternatives(commands_with_args)
             if stdin_hints:
-                match = RuleMatch(
-                    matched=True,
-                    rule=match.rule,
-                    risk_level=match.risk_level,
-                    message=match.message,
-                    alternatives=list(dict.fromkeys([*match.alternatives, *stdin_hints])),
-                )
+                match = replace(match, alternatives=list(dict.fromkeys([*match.alternatives, *stdin_hints])))
 
         # Step 6: ShellCheck integration (if available)
         # ShellCheck can catch issues our regex patterns miss, like $'' expansions
