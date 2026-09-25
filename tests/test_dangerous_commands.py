@@ -261,15 +261,7 @@ class TestEdgeCasesAndEscapes:
             # Heredocs with dangerous content
             ("cat << EOF\nrm -rf /\nEOF", "Heredoc with rm -rf (inert body)", False),
             ("bash << EOF\nrm -rf /\nEOF", "Unquoted shell heredoc (body is code)", True),
-            pytest.param(
-                "bash << 'EOF'\nrm -rf /\nEOF",
-                "Quoted-delimiter shell heredoc (body is code)",
-                True,
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    reason="LAB-4367: quoted-delimiter shell heredoc body not validated by fallback path",
-                ),
-            ),
+            ("bash << 'EOF'\nrm -rf /\nEOF", "Quoted-delimiter shell heredoc (body is code)", True),
             # Command substitution
             ("echo $(rm -rf /)", "Command substitution with rm", True),
             ("echo `rm -rf /`", "Backtick substitution", True),
