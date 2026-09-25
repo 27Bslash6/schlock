@@ -53,10 +53,10 @@ from platformdirs import user_data_dir
 
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
-# Per-entry size cap on the logged command, in bytes. Entries the commit filter judged keep the whole
-# command up to the filter's own bound (MAX_COMMAND_SIZE, 64 KiB) so the log shows what the
-# filter saw - a `git commit -F - <<'EOF'` body lives past byte 500 and is the very part that
-# after-the-fact analysis needs. Everything else keeps this short cap.
+# How many of the command's own bytes an entry logs, redacted - a marker longer than the secret it replaced
+# makes the entry longer. Entries the commit filter judged keep the whole command up to the filter's own
+# bound (MAX_COMMAND_SIZE, 64 KiB) so the log shows what the filter saw - a `git commit -F - <<'EOF'` body
+# lives past byte 500 and is the very part that after-the-fact analysis needs. Everything else keeps this.
 COMMAND_LOG_LIMIT = 500
 
 # Key names that mark the following value as a secret, shared by the key=value and JSON-field scrub rules.
@@ -152,11 +152,12 @@ class AuditLogger:
         # the closing quote. The value ends at its closing quote and the rule never fires without one - and never
         # crosses a single quote, a line end, `$(` or a backtick. In `grep '"token": "' f; rm -rf ~/w; echo "x"` the
         # next `"` belongs to a later shell word, and running to it would hide the chained command from the log;
-        # a substitution is executed code, not a secret. The key is bounded because an unbounded [\w.-]* on both
-        # sides of the key word backtracks quadratically.
+        # a substitution is executed code, not a secret. The key word is found by a lookahead: Python does not
+        # backtrack into one, whereas [\w.-]* on both sides of the key word re-scans the key once per repeat
+        # and goes quadratic on a long run of repeated key words.
         (
             re.compile(
-                rf"""("[\w.-]{{0,32}}{_CREDENTIAL_KEY_NAMES}[\w.-]{{0,32}}"\s*:\s*")"""
+                rf"""("(?=[\w.-]*{_CREDENTIAL_KEY_NAMES})[\w.-]+"\s*:\s*")"""
                 r"""(?:\\[^'\n]|\$(?!\()|[^"'\\\n$`])*(?=")""",
                 re.I,
             ),
@@ -198,11 +199,16 @@ class AuditLogger:
         self.log_file = log_file
         self._ensure_log_directory()
 
-    def _scrub_secrets(self, command: str) -> str:
+    def _scrub_secrets(self, command: str, cut: Optional[int] = None) -> str:
         """Redact secrets from command before logging.
 
         Args:
             command: Original command string
+            cut: Return only the redacted form of the command's first `cut` characters (default: all).
+                Every rule still sees the whole command, because a rule anchored AFTER its secret - URL
+                userinfo ends at `@` - cannot see a secret the cut has split from its anchor. The cut is
+                carried through each pass rather than taken on the result: a marker outgrows a short
+                secret, so enough of them would push a chained command inside the window out of the log.
 
         Returns:
             Command with secrets redacted as ***REDACTED***
@@ -213,8 +219,30 @@ class AuditLogger:
         """
         scrubbed = command
         for pattern, replacement in self.SECRET_PATTERNS:
+            if cut is not None:
+                cut = self._follow_cut(pattern, replacement, scrubbed, cut)
             scrubbed = pattern.sub(replacement, scrubbed)
-        return scrubbed
+        return scrubbed if cut is None else scrubbed[:cut]
+
+    @staticmethod
+    def _follow_cut(pattern: re.Pattern[str], replacement: str, text: str, cut: int) -> int:
+        """Where `cut` lands in `text` once `pattern.sub(replacement, text)` has run.
+
+        It moves by the growth of every replacement before it, and stops at the first match that ends past it.
+        A cut before that match, or inside text its replacement copies unchanged (a header name, a JSON key,
+        whitespace - unbounded runs), maps one to one; a cut inside the redacted part moves past the whole
+        replacement, so a split secret is logged as its whole marker.
+        """
+        growth = 0
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            replaced = match.expand(replacement)
+            if end > cut:
+                if cut - start <= len(os.path.commonprefix([match.group(), replaced])):
+                    return cut + growth
+                return start + growth + len(replaced)
+            growth += len(replaced) - (end - start)
+        return cut + growth
 
     def _get_default_log_path(self) -> Path:
         """Get default audit log path.
@@ -286,7 +314,7 @@ class AuditLogger:
         """Log a command validation event.
 
         Args:
-            command: The bash command that was validated (will be scrubbed, then capped)
+            command: The bash command that was validated (its first bytes, up to the cap, are logged redacted)
             risk_level: Risk level (SAFE, LOW, MEDIUM, HIGH, BLOCKED)
             violations: List of rule violations
             decision: "allow", "block", or "warn"
@@ -302,23 +330,24 @@ class AuditLogger:
         event_type_map = {"allow": "allow", "block": "block", "warn": "warn"}
         event_type = event_type_map.get(decision, "validation")
 
-        # Scrub the whole command, then cap. A rule anchored AFTER its secret - URL userinfo ends at `@` -
-        # cannot see a secret the cut has split from its anchor, so the scrub needs every byte. The scrub is
-        # linear in its length, and a command is model output, so the model's output budget bounds it.
-        # The cap counts the COMMAND's bytes: a command that fits is logged whole, so a redaction marker longer
-        # than the secret it replaced never pushes the command's tail - a chained command - out of the log.
-        # Both caps bound BYTES, which is what a log line costs and what MAX_COMMAND_SIZE is named for - a
-        # 40k-character CJK command is 120 KB, near twice the 64 KiB budget, and a character count let all
-        # of it through. "surrogatepass" is load-bearing, not tidiness: these lines sit OUTSIDE log_event's
-        # suppress, so a lone surrogate under a plain encode would raise out of a hook that must fail open.
-        # It is asymmetric - the decode drops a lone surrogate, and a code point split by the cut, only on
-        # the truncated path; an untruncated command skips the re-decode.
-        scrubbed_command = self._scrub_secrets(command)
+        # The cap picks the COMMAND's first bytes and the entry is their redacted form (see _scrub_secrets), so
+        # it runs past the cap by the markers' growth - a few times the cap at the adversarial worst. The scrub
+        # reads the whole command; it is linear, and a command is model output, so the model's output budget
+        # bounds it. Both caps bound BYTES, which is what a log line costs and what MAX_COMMAND_SIZE is named
+        # for - a 40k-character CJK command is 120 KB, near twice the 64 KiB budget, and a character count let
+        # all of it through; the cut backs off to a code-point boundary. "surrogatepass" is load-bearing, not
+        # tidiness: these lines sit OUTSIDE log_event's suppress, so a lone surrogate under a plain encode or
+        # decode would raise out of a hook that must fail open.
         cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
-        encoded = scrubbed_command.encode("utf-8", "surrogatepass")
-        command_truncated = len(encoded) > cap and len(command.encode("utf-8", "surrogatepass")) > cap
+        encoded = command.encode("utf-8", "surrogatepass")
+        command_truncated = len(encoded) > cap
+        cut = None
         if command_truncated:
-            scrubbed_command = encoded[:cap].decode("utf-8", "ignore")
+            boundary = cap
+            while encoded[boundary] & 0xC0 == 0x80:  # a UTF-8 continuation byte: the cap is inside a code point
+                boundary -= 1
+            cut = len(encoded[:boundary].decode("utf-8", "surrogatepass"))
+        scrubbed_command = self._scrub_secrets(command, cut)
 
         event = AuditEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),

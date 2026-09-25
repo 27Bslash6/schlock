@@ -176,6 +176,10 @@ class TestSecretScrubbing:
                 """aws configure import <<EOF\n{"secretAccessKey": "***REDACTED***"}\nEOF""",
             ),
             (
+                "curl -d '{\"" + "a" * 33 + "token" + "a" * 33 + '":"SECRET"}\' https://x',
+                "curl -d '{\"" + "a" * 33 + "token" + "a" * 33 + '":"***REDACTED***"}\' https://x',
+            ),
+            (
                 """curl -d '{"max_tokens": 1024, "model": "m"}' https://x""",
                 """curl -d '{"max_tokens": 1024, "model": "m"}' https://x""",
             ),
@@ -199,6 +203,7 @@ class TestSecretScrubbing:
             "runs-before-key-equals",
             "dotted-key",
             "key-word-mid-name",
+            "long-key",
             "non-string-value",
             "stops-at-shell-quote",
             "stops-at-line-end",
@@ -211,12 +216,12 @@ class TestSecretScrubbing:
         it would hide a chained command from the log."""
         assert AuditLogger()._scrub_secrets(command) == expected
 
-    def test_json_key_bound_keeps_scrub_linear(self):
-        """The scrub runs on the whole command, so each rule must stay linear. An unbounded key around the key word
-        backtracks quadratically on a run of repeated key words - seconds at 64 KiB."""
+    def test_json_key_scan_stays_linear(self):
+        """The scrub runs on the whole command, so each rule must stay linear. Without the lookahead, [\\w.-]* on
+        both sides of the key word backtracks quadratically on a run of repeated key words - seconds at 64 KiB."""
         start = time.time()
         AuditLogger()._scrub_secrets('"' + "token" * 13000)
-        assert time.time() - start < 1.0
+        assert time.time() - start < 0.25
 
     def test_long_flag_password_redacted(self):
         """--password VALUE should be redacted."""

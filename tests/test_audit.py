@@ -480,7 +480,45 @@ class TestCommandLength:
         entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=is_git_commit)
         assert entry["command_truncated"] is True
         assert "TOPSECRET" not in entry["command"]
-        assert entry["command"].endswith("://***REDACTED***@")  # redacted in full, then cut at the cap
+        assert entry["command"].endswith("://***REDACTED***@")  # the split secret is logged as its whole marker
+
+    @pytest.mark.parametrize("is_git_commit", [False, True], ids=["short-cap", "commit-cap"])
+    def test_redaction_growth_does_not_push_window_text_out(self, tmp_path, is_git_commit):
+        """The cap picks which of the COMMAND's bytes are logged, and redaction never changes that pick. Each
+        marker outgrows its one-byte secret by 13 bytes, so counted after scrubbing, enough of them pushed a
+        chained command that sits well inside the window past the cut."""
+        cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
+        command = "curl -d '" + '{"token":"s"}' * (cap // 25) + "' https://x; echo KEEP-ME " + "x" * cap + " token=LATER"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=is_git_commit)
+        assert entry["command_truncated"] is True
+        assert "KEEP-ME" in entry["command"]
+        # The cut falls in the filler, so the entry is the redacted window - nothing from past it, not even the
+        # later secret's marker.
+        assert entry["command"] == AuditLogger()._scrub_secrets(command[:cap])
+
+    def test_secret_straddling_the_cut_is_logged_as_its_whole_marker(self, tmp_path):
+        """A secret the cut splits is logged as its complete marker, and nothing from past the cut follows it."""
+        command = 'curl -d \'{"token":"' + "S" * COMMAND_LOG_LIMIT + "\"}' https://x; echo AFTER"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert entry["command"] == 'curl -d \'{"token":"***REDACTED***'
+        assert entry["command_truncated"] is True
+
+    def test_cut_inside_text_a_replacement_copies_maps_one_to_one(self, tmp_path):
+        """A replacement copies a header name, a JSON key or whitespace unchanged, and those runs are unbounded.
+        A cut inside one keeps the command's own bytes - keeping the whole replacement logged text from past the
+        cut, a whole 2 KB header scheme under a 500-byte cap."""
+        command = "curl -H 'Authorization: " + "A" * 2000 + " x' https://x"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert entry["command"] == command[:COMMAND_LOG_LIMIT]
+        assert entry["command_truncated"] is True
+
+    def test_lone_surrogates_do_not_move_the_cut(self, tmp_path):
+        """The hook's json.load turns a `\\ud800` escape into a lone surrogate. The cut must count it as the
+        three bytes surrogatepass encodes, or it lands early and drops the chained command after it."""
+        command = "echo " + "\ud800" * 150 + "; echo KEEP-ME " + "x" * COMMAND_LOG_LIMIT
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert "KEEP-ME" in entry["command"]
+        assert entry["command_truncated"] is True
 
     def test_redaction_marker_does_not_push_a_fitting_command_out(self, tmp_path):
         """The cap counts the command's own bytes. The marker is longer than a short secret, so a cap counted
