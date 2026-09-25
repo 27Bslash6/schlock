@@ -24,7 +24,18 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
+from .parser import (
+    DASH_C_WRAPPERS,
+    WRAPPER_COMMANDS,
+    BashCommandParser,
+    command_position_substitution,
+    expand_env_split_string,
+    heredoc_owner,
+    is_wrapper,
+    names_unresolved_program,
+    runner_option_kind,
+    shell_wrapping_functions,
+)
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -460,12 +471,11 @@ def _check_dangerous_command_flags(
 # parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
 _SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "rbash"})
 
-# Not shells, but their `-c` argument is a command string they hand to one. Their leading
-# operand is a user/group/file rather than a script, so it must NOT end option parsing
-# (`sg root -c PROG`, `su postgres -c PROG`).
-_DASH_C_RUNNERS: frozenset[str] = frozenset({"su", "runuser", "sg", "script"})
-
-_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
+# Not shells, but their `-c` argument is a command string they hand to one: `DASH_C_WRAPPERS`,
+# the table the parser's owner resolution reads too. Their leading operand is a user/group/file
+# rather than a script, so it must NOT end option parsing (`sg root -c PROG`, `su postgres -c
+# PROG`), and they parse with getopt, so `-cPROG` carries its program attached.
+_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | DASH_C_WRAPPERS
 
 # Depth cap for re-entering validation on a payload. Reachable in practice only by chaining
 # `watch` (shell quoting collapses before `bash -c` can nest this far), so it is a backstop,
@@ -577,7 +587,9 @@ def _find_exec_clauses(args: list[str]) -> list[list[str]]:
     return clauses
 
 
-def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> Optional[str]:
+def _dash_c_payload(  # noqa: PLR0912 - one branch per getopt case
+    words: list[str], *, operand_ends_options: bool = True, runner: Optional[str] = None
+) -> Optional[str]:
     """Return the program a `-c` hands to a shell, given the words following the command name.
 
     The shell's own getopt is the specification, and it says the program is always the NEXT
@@ -588,8 +600,18 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
     A `--` between `-c` and the program is skipped, because the shell skips it too
     (`bash -c -- 'echo hi'` prints hi). A `--` *before* any `-c` ends option parsing, so
     there is no inline program at all.
+
+    ``runner`` names a getopt runner (`DASH_C_WRAPPERS`: `script`, `su`, `runuser`, `sg`), where
+    the rest of the cluster after `c` is the program: `script -q "-c'rm' -rf /" f` runs `'rm' -rf /`.
+    Its own grammar decides which word is `-c`: `runuser -s/bin/csh root -c X` sets the shell
+    `/bin/csh` and runs X, where reading the `c` in `csh` as `-c` took `sh` as the program and
+    dropped X; `runuser -w -cfoo -c X root` whitelists `-cfoo` and runs X (LAB-5180).
     """
+    value_next = False
     for i, word in enumerate(words):
+        if value_next:
+            value_next = False
+            continue  # the runner's value option took this word (`-w -cfoo`)
         if word == "--":
             return None  # end of options: a later -c is an argument, not a flag
         if not word.startswith("-"):
@@ -600,8 +622,24 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True) -> O
             if i == 0 and operand_ends_options:
                 return None
             continue
-        if word.startswith("--") or "c" not in word[1:]:
+        kind = runner_option_kind(runner, word) if runner is not None else None
+        if kind == "value":
+            value_next = True
             continue
+        if word.startswith("--"):
+            # su, runuser, script and fish also spell it `--command PROG` / `--command=PROG`.
+            name, has_value, value = word.partition("=")
+            if name not in ("--command", "--session-command"):
+                continue
+            if has_value:
+                return value or None
+        elif "c" not in word[1:]:
+            continue
+        elif runner is not None:
+            if kind != "dash_c":
+                continue  # a value option took the rest of the cluster (`-s/bin/csh`, `-gcdrom`)
+            if word[word.index("c", 1) + 1 :]:
+                return word[word.index("c", 1) + 1 :]
         rest = words[i + 1 :]
         while rest and rest[0] == "--":
             rest = rest[1:]
@@ -627,7 +665,7 @@ def _watch_payload(args: list[str]) -> Optional[str]:
     return " ".join(args[i:]) or None
 
 
-def _shell_delegated_payloads(
+def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator kind
     commands_with_args: list[tuple[str, list[str]]],
     *,
     _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
@@ -691,8 +729,14 @@ def _shell_delegated_payloads(
                 found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
-                found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
-            if base in WRAPPER_COMMANDS:
+                found.append(
+                    _dash_c_payload(
+                        args,
+                        operand_ends_options=base in _SHELL_COMMANDS,
+                        runner=base if base in DASH_C_WRAPPERS else None,
+                    )
+                )
+            if is_wrapper(base):
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
                 # operand semantics, `watch`, `find`, and nested wrappers all thread for free
@@ -704,15 +748,57 @@ def _shell_delegated_payloads(
                 # would otherwise be picked as a decoy that ends the scan and drops the real
                 # payload behind it. Re-validating a benign decoy is harmless over-approximation;
                 # missing a payload is a bypass. Terminates: each re-entry passes `args[i+1:]`.
-                words = [a.rsplit("/", 1)[-1] for a in args]
+                #
+                # `env -S 'bash -c PROG'` hands env one word it re-splits into a command line, so
+                # expand it first (`env -Sbash`, `--split-string=`) to expose the `bash` delegator
+                # (LAB-5180).
+                scan_args = expand_env_split_string(base, args)
+                words = [a.rsplit("/", 1)[-1] for a in scan_args]
                 for i, word in enumerate(words):
                     if word in _DELEGATOR_COMMANDS:
-                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])], _seen=seen))
+                        found.extend(_shell_delegated_payloads([(scan_args[i], scan_args[i + 1 :])], _seen=seen))
+                    elif names_unresolved_program(scan_args[i]):
+                        # An operand we cannot resolve (`env $'bash' -c PROG`) might be a shell.
+                        # Fail closed: extract the `-c PROG` that DIRECTLY follows it, as a shell's
+                        # own would. operand_ends_options=True stops at an intervening program, so
+                        # `timeout $T python3 -c 'print(1)'` and `env DB=$X psql -c '…'` - where the
+                        # -c belongs to python3/psql, not to the unresolved word - are not extracted
+                        # (LAB-5180).
+                        found.append(_dash_c_payload(scan_args[i + 1 :], operand_ends_options=True))
 
         payloads.extend(p for p in found if p and p.strip())
     # The same program can still surface from more than one delegator (`su su bash -c PROG`:
     # each `su` owns a -c AND wraps the next). Validating it once is enough.
     return list(dict.fromkeys(payloads))
+
+
+# File-content flags that also read stdin when handed `-`. A process substitution feeding one
+# of these (`git commit -F <(…)`, `gh pr create --body-file <(…)`) is over-blocked when its body
+# is treated as code, so the refusal points at the stdin spelling, which stays allowed (LAB-5180).
+# This is GUIDANCE only - the refusal itself does not change. Keying the workaround on the reader
+# was ruled out (it reopened 7 bypasses); precision here would be an allowlist of read-only
+# readers, tracked separately.
+_STDIN_FILE_FLAGS: frozenset[str] = frozenset({"-F", "--file", "--body-file"})
+
+
+def _procsub_stdin_alternatives(commands_with_args: list[tuple[str, list[str]]]) -> list[str]:
+    """Guidance for a process substitution feeding a file-content flag: use its stdin spelling.
+
+    `git commit -F <(…)` -> `git commit -F -`; `gh pr create --body-file <(…)` -> `--body-file -`.
+    Only a `<(…)` operand directly after a known stdin-capable flag qualifies, so a real shell
+    delegation (`bash <(…)`, `source <(…)`) is never handed a workaround (LAB-5180).
+    """
+    hints: list[str] = []
+    for _cmd, args in commands_with_args:
+        for i, arg in enumerate(args):
+            if not arg.startswith("<("):
+                continue
+            flag = args[i - 1] if i > 0 else ""
+            if flag in _STDIN_FILE_FLAGS:
+                hint = f"Pass the content on stdin instead: `{flag} -` with a heredoc, which stays allowed"
+                if hint not in hints:
+                    hints.append(hint)
+    return hints
 
 
 def _check_contextual_high_risk(
@@ -1909,26 +1995,42 @@ def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHered
     command word, or any heredoc inside a process substitution. What reads `<( … )` may
     run what it prints (`bash < <(cat <<'EOF' … )`), and nothing here knows the reader,
     so the command inside is not what decides whether the body is code.
+
+    Owner is also None for a heredoc inside a command substitution in COMMAND POSITION
+    (`$(cat <<'EOF' … )`), whose output is executed, and for one owned by a function that
+    wraps a shell (`f() { bash; }; f <<'EOF' … `, transitively) - both run the body as code
+    (LAB-5180). `body_is_code` carries "an enclosing construct runs this body as code" - a
+    process substitution's reader, or a command-position substitution's output - so it is not
+    named for process substitution alone.
     """
     found: list[_BashlexHeredoc] = []
+    wrapping_funcs = shell_wrapping_functions(nodes)
+    cmd_position_sub_ids: set[int] = set()  # filled as command nodes are visited, before their subs
 
-    def visit(node: Any, owner: Optional[str], in_substitution: bool, in_process: bool) -> None:
+    def visit(node: Any, owner: Optional[str], in_substitution: bool, body_is_code: bool) -> None:
         kind = getattr(node, "kind", None)
         if kind == "command":
-            owner = None if in_process else heredoc_owner(node)
+            owner = None if body_is_code else heredoc_owner(node)
+            if owner in wrapping_funcs:
+                owner = None
+            sub = command_position_substitution(node)
+            if sub is not None:
+                cmd_position_sub_ids.add(id(sub))  # its output is run: inner heredoc bodies are code
         elif kind == "compound":
             owner = None
         elif kind == "commandsubstitution":
             in_substitution = True
+            if id(node) in cmd_position_sub_ids:
+                body_is_code = True
         elif kind == "processsubstitution":
-            in_substitution = in_process = True
+            in_substitution = body_is_code = True
         if kind == "redirect" and getattr(node, "heredoc", None) is not None:
             start, end = node.pos
             found.append(_BashlexHeredoc(parse_target.find("<<", start, end), owner, node.output.word, in_substitution))
         for value in vars(node).values():
             for child in value if isinstance(value, list) else (value,):
                 if hasattr(child, "kind"):
-                    visit(child, owner, in_substitution, in_process)
+                    visit(child, owner, in_substitution, body_is_code)
 
     for node in nodes:
         visit(node, None, False, False)
@@ -3046,6 +3148,15 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 )
             if match.risk_level == RiskLevel.BLOCKED:
                 break
+
+        # A process substitution feeding a file-content flag (`git commit -F <(…)`) is code to the
+        # extractor above, so it lands here BLOCKED with no way forward. The block stands (keying on
+        # the reader reopens bypasses); the refusal just points at the stdin spelling that stays
+        # allowed (LAB-5180 AC6).
+        if match.risk_level == RiskLevel.BLOCKED and match.rule and match.rule.name == "shell_delegated_payload":
+            stdin_hints = _procsub_stdin_alternatives(commands_with_args)
+            if stdin_hints:
+                match = replace(match, alternatives=list(dict.fromkeys([*match.alternatives, *stdin_hints])))
 
         # Step 6: ShellCheck integration (if available)
         # ShellCheck can catch issues our regex patterns miss, like $'' expansions
