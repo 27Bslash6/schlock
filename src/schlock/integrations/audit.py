@@ -23,8 +23,9 @@ Log Format (JSONL):
 
 Security:
     Secrets (passwords, tokens, API keys) are automatically redacted before logging.
-    Patterns like password=secret, --token VALUE, Authorization: <scheme> CREDENTIAL are scrubbed,
-    as are HTTP credentials in curl -u/--user user:pass and URL userinfo (scheme://user:pass@host).
+    Patterns like password=secret, "password": "secret" JSON fields, --token VALUE and
+    Authorization: <scheme> CREDENTIAL are scrubbed, as are HTTP credentials in curl -u/--user user:pass
+    and URL userinfo (scheme://user:pass@host).
 
 Thread Safety:
     File writes are atomic (append mode with single write call).
@@ -145,13 +146,20 @@ class AuditLogger:
             ),
             r"\1",
         ),
-        # "password": "VALUE", "authToken":"VALUE" - the key=value rule below in JSON syntax (request bodies, config
-        # written through a heredoc). Runs first so that rule's \S+ cannot eat the closing quote out from under it.
-        # The value runs to its closing quote and the rule never fires without one, so an unterminated string cannot
-        # swallow a chained command. The key is bounded because [\w-]* on both sides of the keyword backtracks
-        # quadratically on a long run of repeated keywords.
+        # "password": "VALUE", "authToken":"VALUE" - a JSON field whose key name contains a key=value key word
+        # anywhere: single-quoted request bodies and JSON written through a heredoc (JSON escaped inside a
+        # double-quoted shell string waits for the tokenizer). Runs before the key=value rule, whose \S+ would eat
+        # the closing quote. The value ends at its closing quote and the rule never fires without one - and never
+        # crosses a single quote, a line end, `$(` or a backtick. In `grep '"token": "' f; rm -rf ~/w; echo "x"` the
+        # next `"` belongs to a later shell word, and running to it would hide the chained command from the log;
+        # a substitution is executed code, not a secret. The key is bounded because an unbounded [\w.-]* on both
+        # sides of the key word backtracks quadratically.
         (
-            re.compile(rf'("[\w-]{{0,32}}{_CREDENTIAL_KEY_NAMES}[\w-]{{0,32}}"\s*:\s*")(?:\\.|[^"\\\n])*(?=")', re.I),
+            re.compile(
+                rf"""("[\w.-]{{0,32}}{_CREDENTIAL_KEY_NAMES}[\w.-]{{0,32}}"\s*:\s*")"""
+                r"""(?:\\[^'\n]|\$(?!\()|[^"'\\\n$`])*(?=")""",
+                re.I,
+            ),
             r"\1***REDACTED***",
         ),
         # password=VALUE, token=VALUE, api-key=VALUE, secret=VALUE
@@ -296,18 +304,19 @@ class AuditLogger:
 
         # Scrub the whole command, then cap. A rule anchored AFTER its secret - URL userinfo ends at `@` -
         # cannot see a secret the cut has split from its anchor, so the scrub needs every byte. The scrub is
-        # linear - about 5 ms per 64 KiB of ordinary text, under 30 ms adversarial - and a command is model
-        # output, so the model's output budget bounds its length.
+        # linear in its length, and a command is model output, so the model's output budget bounds it.
+        # The cap counts the COMMAND's bytes: a command that fits is logged whole, so a redaction marker longer
+        # than the secret it replaced never pushes the command's tail - a chained command - out of the log.
         # Both caps bound BYTES, which is what a log line costs and what MAX_COMMAND_SIZE is named for - a
         # 40k-character CJK command is 120 KB, near twice the 64 KiB budget, and a character count let all
-        # of it through. "surrogatepass" is load-bearing, not tidiness: this line sits OUTSIDE log_event's
+        # of it through. "surrogatepass" is load-bearing, not tidiness: these lines sit OUTSIDE log_event's
         # suppress, so a lone surrogate under a plain encode would raise out of a hook that must fail open.
         # It is asymmetric - the decode drops a lone surrogate, and a code point split by the cut, only on
-        # the truncated path; an untruncated command is logged as-is.
+        # the truncated path; an untruncated command skips the re-decode.
         scrubbed_command = self._scrub_secrets(command)
         cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
         encoded = scrubbed_command.encode("utf-8", "surrogatepass")
-        command_truncated = len(encoded) > cap
+        command_truncated = len(encoded) > cap and len(command.encode("utf-8", "surrogatepass")) > cap
         if command_truncated:
             scrubbed_command = encoded[:cap].decode("utf-8", "ignore")
 

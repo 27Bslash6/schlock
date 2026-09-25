@@ -461,14 +461,9 @@ class TestCommandLength:
         assert entry["command_truncated"] is True
         assert entry["command"].endswith("中")  # cut landed on a code point, not inside one
 
-    @pytest.mark.parametrize(
-        "secret_arg",
-        ["'https://x/?token=sk-live-abc123'", """-d '{"authToken":"sk-live-abc123"}' https://x"""],
-        ids=["key-equals-value", "json-field"],
-    )
-    def test_secret_past_short_cap_is_redacted_in_full_commit_entry(self, tmp_path, secret_arg):
-        """Redaction runs over the whole kept command, not just its first 500 bytes."""
-        command = "git commit -m '" + "x" * 600 + "' && curl " + secret_arg
+    def test_secret_past_short_cap_is_redacted_in_full_commit_entry(self, tmp_path):
+        """Redaction runs over the whole command, not just its first 500 bytes."""
+        command = "git commit -m '" + "x" * 600 + "' && curl 'https://x/?token=sk-live-abc123'"
         entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
         assert "***REDACTED***" in entry["command"]
         assert "sk-live-abc123" not in entry["command"]
@@ -480,8 +475,20 @@ class TestCommandLength:
         secret with nothing to match, so the scrub runs before the cut, whichever cap applies."""
         cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
         clone = "git clone https://alice:TOPSECRET"
-        command = "echo " + "x" * (cap - len(clone) - 9) + " && " + clone + "@github.com/o/r"
+        command = "echo " + "x" * (cap - len(clone) - len("echo  && ")) + " && " + clone + "@github.com/o/r"
         assert len(command.encode()) - len("@github.com/o/r") == cap  # the cut lands between secret and `@`
         entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=is_git_commit)
         assert entry["command_truncated"] is True
         assert "TOPSECRET" not in entry["command"]
+        assert entry["command"].endswith("://***REDACTED***@")  # redacted in full, then cut at the cap
+
+    def test_redaction_marker_does_not_push_a_fitting_command_out(self, tmp_path):
+        """The cap counts the command's own bytes. The marker is longer than a short secret, so a cap counted
+        after scrubbing cut the tail off a command that fit - here, the chained command."""
+        head, tail = "mysql --password p -e 'SELECT 1' ", " && rm -rf /tmp/x"
+        command = head + "x" * (COMMAND_LOG_LIMIT - len(head) - len(tail)) + tail
+        assert len(command.encode()) == COMMAND_LOG_LIMIT
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert entry["command_truncated"] is False
+        assert entry["command"].endswith(tail)
+        assert " p " not in entry["command"]

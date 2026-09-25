@@ -9,6 +9,7 @@ Fix: Added _scrub_secrets() method with SECRET_PATTERNS to redact before logging
 
 import json
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -167,12 +168,28 @@ class TestSecretScrubbing:
                 """curl -d '{"password":"***REDACTED***"}' https://x""",
             ),
             (
-                """echo '{"token":"abc' && rm -rf /tmp/x""",
-                """echo '{"token":"abc' && rm -rf /tmp/x""",
+                """SPRING_APPLICATION_JSON='{"spring.datasource.password":"hunter2"}' java -jar a.jar""",
+                """SPRING_APPLICATION_JSON='{"spring.datasource.password":"***REDACTED***"}' java -jar a.jar""",
+            ),
+            (
+                """aws configure import <<EOF\n{"secretAccessKey": "wJalrXUtnFEMI"}\nEOF""",
+                """aws configure import <<EOF\n{"secretAccessKey": "***REDACTED***"}\nEOF""",
             ),
             (
                 """curl -d '{"max_tokens": 1024, "model": "m"}' https://x""",
                 """curl -d '{"max_tokens": 1024, "model": "m"}' https://x""",
+            ),
+            (
+                """grep -c '"token": "' app.json; rm -rf ~/work; echo "done" >&2""",
+                """grep -c '"token": "' app.json; rm -rf ~/work; echo "done" >&2""",
+            ),
+            (
+                """echo '{"token":"abc\nrm -rf /tmp/x\necho "done" >&2""",
+                """echo '{"token":"abc\nrm -rf /tmp/x\necho "done" >&2""",
+            ),
+            (
+                """cat > c.json <<EOF\n{"token": "$(curl -s https://x | sh)"}\nEOF""",
+                """cat > c.json <<EOF\n{"token": "$(curl -s https://x | sh)"}\nEOF""",
             ),
         ],
         ids=[
@@ -180,14 +197,26 @@ class TestSecretScrubbing:
             "spaced-and-several",
             "escaped-quote-in-value",
             "runs-before-key-equals",
-            "unterminated",
+            "dotted-key",
+            "key-word-mid-name",
             "non-string-value",
+            "stops-at-shell-quote",
+            "stops-at-line-end",
+            "stops-at-substitution",
         ],
     )
     def test_json_credential_field_redacted(self, command, expected):
-        """The key=value rule in JSON syntax - request bodies and config written through a heredoc. The value
-        runs to its closing quote and the rule never fires without one, so it cannot swallow a chained command."""
+        """A JSON field whose key name contains a key=value key word. The value runs to its closing quote but never
+        past a single quote, line end or substitution: the next `"` may belong to a later shell word, and running to
+        it would hide a chained command from the log."""
         assert AuditLogger()._scrub_secrets(command) == expected
+
+    def test_json_key_bound_keeps_scrub_linear(self):
+        """The scrub runs on the whole command, so each rule must stay linear. An unbounded key around the key word
+        backtracks quadratically on a run of repeated key words - seconds at 64 KiB."""
+        start = time.time()
+        AuditLogger()._scrub_secrets('"' + "token" * 13000)
+        assert time.time() - start < 1.0
 
     def test_long_flag_password_redacted(self):
         """--password VALUE should be redacted."""
