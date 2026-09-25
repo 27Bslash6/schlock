@@ -31,7 +31,9 @@ from .parser import (
     command_position_substitution,
     expand_env_split_string,
     heredoc_owner,
+    is_wrapper,
     names_unresolved_program,
+    runner_option_kind,
     shell_wrapping_functions,
 )
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
@@ -585,7 +587,9 @@ def _find_exec_clauses(args: list[str]) -> list[list[str]]:
     return clauses
 
 
-def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True, attached: bool = False) -> Optional[str]:
+def _dash_c_payload(  # noqa: PLR0912 - one branch per getopt case
+    words: list[str], *, operand_ends_options: bool = True, runner: Optional[str] = None
+) -> Optional[str]:
     """Return the program a `-c` hands to a shell, given the words following the command name.
 
     The shell's own getopt is the specification, and it says the program is always the NEXT
@@ -597,10 +601,17 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True, atta
     (`bash -c -- 'echo hi'` prints hi). A `--` *before* any `-c` ends option parsing, so
     there is no inline program at all.
 
-    ``attached`` is for the getopt runners (`script`, `su`, `runuser`), where the rest of the
-    cluster after `c` is the program: `script -q "-c'rm' -rf /" f` runs `'rm' -rf /`.
+    ``runner`` names a getopt runner (`DASH_C_WRAPPERS`: `script`, `su`, `runuser`, `sg`), where
+    the rest of the cluster after `c` is the program: `script -q "-c'rm' -rf /" f` runs `'rm' -rf /`.
+    Its own grammar decides which word is `-c`: `runuser -s/bin/csh root -c X` sets the shell
+    `/bin/csh` and runs X, where reading the `c` in `csh` as `-c` took `sh` as the program and
+    dropped X; `runuser -w -cfoo -c X root` whitelists `-cfoo` and runs X (LAB-5180).
     """
+    value_next = False
     for i, word in enumerate(words):
+        if value_next:
+            value_next = False
+            continue  # the runner's value option took this word (`-w -cfoo`)
         if word == "--":
             return None  # end of options: a later -c is an argument, not a flag
         if not word.startswith("-"):
@@ -611,6 +622,10 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True, atta
             if i == 0 and operand_ends_options:
                 return None
             continue
+        kind = runner_option_kind(runner, word) if runner is not None else None
+        if kind == "value":
+            value_next = True
+            continue
         if word.startswith("--"):
             # su, runuser, script and fish also spell it `--command PROG` / `--command=PROG`.
             name, has_value, value = word.partition("=")
@@ -620,8 +635,11 @@ def _dash_c_payload(words: list[str], *, operand_ends_options: bool = True, atta
                 return value or None
         elif "c" not in word[1:]:
             continue
-        elif attached and word[word.index("c", 1) + 1 :]:
-            return word[word.index("c", 1) + 1 :]
+        elif runner is not None:
+            if kind != "dash_c":
+                continue  # a value option took the rest of the cluster (`-s/bin/csh`, `-gcdrom`)
+            if word[word.index("c", 1) + 1 :]:
+                return word[word.index("c", 1) + 1 :]
         rest = words[i + 1 :]
         while rest and rest[0] == "--":
             rest = rest[1:]
@@ -701,9 +719,13 @@ def _shell_delegated_payloads(
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(
-                    _dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS, attached=base in DASH_C_WRAPPERS)
+                    _dash_c_payload(
+                        args,
+                        operand_ends_options=base in _SHELL_COMMANDS,
+                        runner=base if base in DASH_C_WRAPPERS else None,
+                    )
                 )
-            if base in WRAPPER_COMMANDS:
+            if is_wrapper(base):
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
                 # operand semantics, `watch`, `find`, and nested wrappers all thread for free
