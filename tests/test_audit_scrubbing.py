@@ -130,7 +130,7 @@ class TestSecretScrubbing:
             "quote-after-colon",
             "token-param-last",
             "bare-first-token",
-            "cap-cut-quote",
+            "unterminated-quote",
             "concatenated-segments",
             "credential-in-next-segment",
             "mixed-quote-styles",
@@ -143,8 +143,50 @@ class TestSecretScrubbing:
         """Quoted: the credential runs to the end of the shell WORD (Digest and AWS4 carry the secret in a
         later parameter), and adjacent quote segments concatenate into that same word, so redaction crosses
         them - but stops at an unquoted space or shell operator, so a chained command stays in the log. Bare:
-        one token. Cap-cut: no closing quote, redact to end of line. A marker the command merely contains is
+        one token. Unterminated: no closing quote, redact to end of line. A marker the command merely contains is
         not an anchor."""
+        assert AuditLogger()._scrub_secrets(command) == expected
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            (
+                """curl -d '{"authToken":"sk-live-SECRET"}' https://x""",
+                """curl -d '{"authToken":"***REDACTED***"}' https://x""",
+            ),
+            (
+                """curl -d '{"user": "bob", "password" : "hunter 2", "api_key": "k"}' https://x""",
+                """curl -d '{"user": "bob", "password" : "***REDACTED***", "api_key": "***REDACTED***"}' https://x""",
+            ),
+            (
+                """curl -d '{"client_secret":"a\\"b"}' https://x""",
+                """curl -d '{"client_secret":"***REDACTED***"}' https://x""",
+            ),
+            (
+                """curl -d '{"password":"hunter2 token=SECRET"}' https://x""",
+                """curl -d '{"password":"***REDACTED***"}' https://x""",
+            ),
+            (
+                """echo '{"token":"abc' && rm -rf /tmp/x""",
+                """echo '{"token":"abc' && rm -rf /tmp/x""",
+            ),
+            (
+                """curl -d '{"max_tokens": 1024, "model": "m"}' https://x""",
+                """curl -d '{"max_tokens": 1024, "model": "m"}' https://x""",
+            ),
+        ],
+        ids=[
+            "camel-case-key",
+            "spaced-and-several",
+            "escaped-quote-in-value",
+            "runs-before-key-equals",
+            "unterminated",
+            "non-string-value",
+        ],
+    )
+    def test_json_credential_field_redacted(self, command, expected):
+        """The key=value rule in JSON syntax - request bodies and config written through a heredoc. The value
+        runs to its closing quote and the rule never fires without one, so it cannot swallow a chained command."""
         assert AuditLogger()._scrub_secrets(command) == expected
 
     def test_long_flag_password_redacted(self):

@@ -7,9 +7,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+import pytest
 from platformdirs import user_data_dir
 
 from schlock.integrations.audit import (
+    COMMAND_LOG_LIMIT,
     AuditContext,
     AuditEvent,
     AuditLogger,
@@ -459,10 +461,27 @@ class TestCommandLength:
         assert entry["command_truncated"] is True
         assert entry["command"].endswith("中")  # cut landed on a code point, not inside one
 
-    def test_secret_past_short_cap_is_redacted_in_full_commit_entry(self, tmp_path):
+    @pytest.mark.parametrize(
+        "secret_arg",
+        ["'https://x/?token=sk-live-abc123'", """-d '{"authToken":"sk-live-abc123"}' https://x"""],
+        ids=["key-equals-value", "json-field"],
+    )
+    def test_secret_past_short_cap_is_redacted_in_full_commit_entry(self, tmp_path, secret_arg):
         """Redaction runs over the whole kept command, not just its first 500 bytes."""
-        command = "git commit -m '" + "x" * 600 + "' && curl 'https://x/?token=sk-live-abc123'"
+        command = "git commit -m '" + "x" * 600 + "' && curl " + secret_arg
         entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
         assert "***REDACTED***" in entry["command"]
         assert "sk-live-abc123" not in entry["command"]
         assert entry["command_truncated"] is False
+
+    @pytest.mark.parametrize("is_git_commit", [False, True], ids=["short-cap", "commit-cap"])
+    def test_url_credential_split_by_the_cut_is_redacted(self, tmp_path, is_git_commit):
+        """The userinfo rule anchors on the `@` that FOLLOWS the secret. A cut between the two left the
+        secret with nothing to match, so the scrub runs before the cut, whichever cap applies."""
+        cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
+        clone = "git clone https://alice:TOPSECRET"
+        command = "echo " + "x" * (cap - len(clone) - 9) + " && " + clone + "@github.com/o/r"
+        assert len(command.encode()) - len("@github.com/o/r") == cap  # the cut lands between secret and `@`
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=is_git_commit)
+        assert entry["command_truncated"] is True
+        assert "TOPSECRET" not in entry["command"]

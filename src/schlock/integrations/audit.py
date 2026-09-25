@@ -58,6 +58,9 @@ from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 # after-the-fact analysis needs. Everything else keeps this short cap.
 COMMAND_LOG_LIMIT = 500
 
+# Key names that mark the following value as a secret, shared by the key=value and JSON-field scrub rules.
+_CREDENTIAL_KEY_NAMES = r"(?:password|passwd|pwd|token|secret|api[-_]?key)"
+
 
 def get_null_device() -> str:
     """Get platform-specific null device.
@@ -142,8 +145,17 @@ class AuditLogger:
             ),
             r"\1",
         ),
+        # "password": "VALUE", "authToken":"VALUE" - the key=value rule below in JSON syntax (request bodies, config
+        # written through a heredoc). Runs first so that rule's \S+ cannot eat the closing quote out from under it.
+        # The value runs to its closing quote and the rule never fires without one, so an unterminated string cannot
+        # swallow a chained command. The key is bounded because [\w-]* on both sides of the keyword backtracks
+        # quadratically on a long run of repeated keywords.
+        (
+            re.compile(rf'("[\w-]{{0,32}}{_CREDENTIAL_KEY_NAMES}[\w-]{{0,32}}"\s*:\s*")(?:\\.|[^"\\\n])*(?=")', re.I),
+            r"\1***REDACTED***",
+        ),
         # password=VALUE, token=VALUE, api-key=VALUE, secret=VALUE
-        (re.compile(r"(password|passwd|pwd|token|secret|api[-_]?key)=\S+", re.I), r"\1=***REDACTED***"),
+        (re.compile(rf"({_CREDENTIAL_KEY_NAMES})=\S+", re.I), r"\1=***REDACTED***"),
         # --password VALUE, --token VALUE, --api-key VALUE
         (re.compile(r"(--(password|passwd|token|secret|api[-_]?key)\s+)\S+", re.I), r"\1***REDACTED***"),
         # -p PASSWORD (but not -p in other contexts like docker -p for ports)
@@ -266,7 +278,7 @@ class AuditLogger:
         """Log a command validation event.
 
         Args:
-            command: The bash command that was validated (will be capped, then scrubbed)
+            command: The bash command that was validated (will be scrubbed, then capped)
             risk_level: Risk level (SAFE, LOW, MEDIUM, HIGH, BLOCKED)
             violations: List of rule violations
             decision: "allow", "block", or "warn"
@@ -282,19 +294,22 @@ class AuditLogger:
         event_type_map = {"allow": "allow", "block": "block", "warn": "warn"}
         event_type = event_type_map.get(decision, "validation")
 
-        # Cap first (bounds the scrub regexes too), then scrub. A secret split by the cut either
-        # still matches `token=\S+` on what remains or has lost its value entirely.
+        # Scrub the whole command, then cap. A rule anchored AFTER its secret - URL userinfo ends at `@` -
+        # cannot see a secret the cut has split from its anchor, so the scrub needs every byte. The scrub is
+        # linear - about 5 ms per 64 KiB of ordinary text, under 30 ms adversarial - and a command is model
+        # output, so the model's output budget bounds its length.
         # Both caps bound BYTES, which is what a log line costs and what MAX_COMMAND_SIZE is named for - a
         # 40k-character CJK command is 120 KB, near twice the 64 KiB budget, and a character count let all
         # of it through. "surrogatepass" is load-bearing, not tidiness: this line sits OUTSIDE log_event's
         # suppress, so a lone surrogate under a plain encode would raise out of a hook that must fail open.
         # It is asymmetric - the decode drops a lone surrogate, and a code point split by the cut, only on
         # the truncated path; an untruncated command is logged as-is.
+        scrubbed_command = self._scrub_secrets(command)
         cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
-        encoded = command.encode("utf-8", "surrogatepass")
+        encoded = scrubbed_command.encode("utf-8", "surrogatepass")
         command_truncated = len(encoded) > cap
-        kept = encoded[:cap].decode("utf-8", "ignore") if command_truncated else command
-        scrubbed_command = self._scrub_secrets(kept)
+        if command_truncated:
+            scrubbed_command = encoded[:cap].decode("utf-8", "ignore")
 
         event = AuditEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),
