@@ -326,7 +326,6 @@ class TestParameterExpansionSubstitutions:
             'echo ${z/x/$(echo "rm -rf /")}',  # replacement
             'echo ${z:$(echo "rm -rf /"):1}',  # substring offset
             'echo ${a[$(echo "rm -rf /")]}',  # subscript
-            'echo ${z:-$(echo "a${y:-$(echo "rm -rf /")}b")}',  # two splices deep
         ],
     )
     def test_nested_expansion_words_create_no_literal_suppression_ranges(self, command):
@@ -341,6 +340,15 @@ class TestParameterExpansionSubstitutions:
         parser = BashCommandParser()
         assert parser.extract_string_literals(command, NativeBridge().parse(command)) == []
         assert parser.extract_string_literals(command, parser.parse(command)) == []
+
+    def test_two_splices_deep_fails_closed_on_the_bashlex_tier(self):
+        # bashlex ends the outer `${` at the inner `}` (see TestKnownBashlexUnderDecode), so its
+        # quote re-read (parser._expand_word_internal) meets an unbalanced `"` and refuses the word -
+        # no suppression range can survive a parse that does not happen.
+        command = 'echo ${z:-$(echo "a${y:-$(echo "rm -rf /")}b")}'
+        assert BashCommandParser().extract_string_literals(command, NativeBridge().parse(command)) == []
+        with pytest.raises(ParseError, match="Quoted word"):
+            BashCommandParser().parse(command)
 
     @pytest.mark.parametrize(
         ("command", "expected"),
@@ -420,9 +428,9 @@ class TestKnownBashlexUnderDecode:
     """Divergences the sweep found where native is RIGHT and bashlex is wrong.
 
     Pinned so T3 inherits them, and so a bashlex upgrade that changes the
-    fallback tier's decode trips a test. Safe to diverge: the mangling needs an
-    adjacent literal, so the mangled word always carries that literal too and can
-    never collapse to a bare dangerous command.
+    fallback tier's decode trips a test. (bashlex's quote removal used to be one
+    of these - `'a"b'x` read as `abx` - until LAB-4960 showed the same mangling
+    hid `rm -rf '/'` from the `-c` check; parser._expand_word_internal now re-reads it.)
     """
 
     def test_nested_expansion_span_stops_at_the_first_brace(self):
@@ -442,12 +450,11 @@ class TestKnownBashlexUnderDecode:
         assert parser.extract_string_literals(command, parser.parse(command)) == [(21, 24)]
         assert parser.extract_string_literals(command, NativeBridge().parse(command)) == []
 
-    def test_single_quotes_concatenated_with_a_literal(self):
-        # bash's value for `'a"b'x` is `a"bx`; bashlex drops the inner quotes
-        # whenever a SglQuoted part is concatenated with a Lit.
+    def test_single_quotes_concatenated_with_a_literal_now_agree(self):
+        # bash's value for `'a"b'x` is `a"bx`; bashlex alone drops the inner quotes.
         parser = BashCommandParser()
         command = "echo 'a\"b'x"
-        assert parser.extract_commands_with_args(parser.parse(command)) == [("echo", ["abx"])]
+        assert parser.extract_commands_with_args(parser.parse(command)) == [("echo", ['a"bx'])]
         assert parser.extract_commands_with_args(NativeBridge().parse(command)) == [("echo", ['a"bx'])]
 
 
