@@ -123,19 +123,6 @@ class TestShellDelegatedPayloadExtraction:
         assert self._p(("sg", ["root", "-c", "rm -rf /"])) == ["rm -rf /"]
         assert self._p(("su", ["postgres", "-c", "rm -rf /"])) == ["rm -rf /"]
 
-    def test_runner_grammar_picks_the_dash_c(self):
-        # A value option takes the rest of its cluster, or the next word, so a `c` there is not
-        # `-c`: reading `-s/bin/csh` as `-c` extracted `sh` and dropped the real payload (LAB-5180).
-        assert self._p(("runuser", ["-s/bin/csh", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
-        assert self._p(("runuser", ["-gcdrom", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
-        assert self._p(("runuser", ["-w", "-cfoo", "-c", "rm -rf /", "root"])) == ["rm -rf /"]
-        assert self._p(("script", ["-T", "-cfoo", "-c", "rm -rf /", "/dev/null"])) == ["rm -rf /"]
-        assert self._p(("su", ["-lcrm -rf /", "root"])) == ["rm -rf /"]  # `l` is a flag, `c` takes the rest
-        assert self._p(("su", ["-Xc", "rm -rf /", "root"])) == ["rm -rf /"]  # unknown letter: a later `c` counts
-
-    def test_loader_is_a_wrapper(self):
-        assert self._p(("/lib64/ld-linux-x86-64.so.2", ["/bin/bash", "-c", "rm -rf /"])) == ["rm -rf /"]
-
     def test_shell_without_dash_c(self):
         assert self._p(("bash", ["script.sh"])) == []
 

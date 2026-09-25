@@ -404,7 +404,7 @@ class _WrapperSpec(NamedTuple):
     permute: bool = False
     assignments: bool = False
     subcommand: Optional[str] = None
-    drops_leading: frozenset = frozenset()
+    drops_leading: frozenset[str] = frozenset()
     template: bool = False
 
 
@@ -506,26 +506,28 @@ _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
     "arch": _WrapperSpec(values=_opts("-arch -d -e"), flags=_opts("-x86_64 -arm64 -arm64e -i386 -32 -64 -c -h")),  # macOS
     "xargs": _WrapperSpec(values=_opts("-a -d -E -I -L -n -P -s"), flags=_opts("-0 -e -i -l -o -p -r -t -x")),
     # GNU parallel runs its input lines as commands when it has no template, so it is `shell_exec`:
-    # an option it does not list reads as the shell. From parallel(1); only options whose arity
-    # the man page states are listed. Optional-argument options (`-e`, `-i`, `-l`, `--replace`)
-    # take their argument attached, so as a separate word they are flags.
+    # an option it does not list reads as the shell. parallel parses with Perl Getopt::Long, where
+    # an OPTIONAL-argument option (`:s`/`:f`, e.g. `-i`/`--replace`, `-e`/`--eof`, `-l`/`--max-lines`)
+    # takes the next word only conditionally - so it is listed as NEITHER value nor flag, which reads
+    # it as unknown -> shell and fails closed on either reading (`parallel -i echo` runs every line).
+    # Only the unambiguous required-argument (`=s`) options and the true no-argument flags are listed.
     "parallel": _WrapperSpec(
         shell_exec=True,
         template=True,
         values=_opts(
-            "-a -C -d -E -I -j -J -L -n -N -P -S -s --arg-file --arg-file-sep --arg-sep --basefile --bf --block"
+            "-a -C -d -I -j -J -N -P -S --arg-file --arg-file-sep --arg-sep --basefile --bf --block"
             " --block-size --colsep --compress-program --decompress-program --delay --delimiter --env --filter"
             " --group-by --halt --halt-on-error --header --jobs --joblog --limit --load --max-args --max-chars"
-            " --max-lines --max-procs --max-replace-args --memfree --memsuspend --nice --profile --recend"
+            " --max-procs --max-replace-args --memfree --memsuspend --nice --profile --recend"
             " --recstart --res --results --retries --return --rpl --ssh --sshdelay --sshlogin --sshloginfile"
             " --slf --tag-string --tagstring --template --termseq --tf --timeout --tmpdir --transferfile --trc"
             " --trim --wd --workdir"
         ),
         flags=_opts(
-            "-0 -e -g -h -i -k -l -m -p -q -r -t -u -v -V -x -X --bar --bg --cat --cleanup --csv --dry-run"
+            "-0 -g -h -k -m -p -r -t -u -v -V -x -X --bar --bg --cat --cleanup --csv --dry-run"
             " --dryrun --eta --fg --fifo --files --group --keep-order --lb --line-buffer --linebuffer"
             " --no-notice --no-run-if-empty --nonall --null --onall --pipe --pipepart --plus --progress --quote"
-            " --replace --resume --resume-failed --retry-failed --round-robin --semaphore --shuf --spreadstdin"
+            " --resume --resume-failed --retry-failed --round-robin --semaphore --shuf --spreadstdin"
             " --tag --tee --transfer --ungroup --verbose --version --will-cite --xargs"
         ),
     ),
@@ -552,6 +554,11 @@ _WRAPPER_SPECS: "dict[str, _WrapperSpec]" = {
     ),
 }
 _DEFAULT_SPEC = _WrapperSpec()
+# The short single-letter value options of each `-c` runner, so the validator can tell an attached
+# `-c` program (`-c'rm'`) from a `c` that sits inside another option's attached value (`-Tclock.log`).
+DASH_C_VALUE_LETTERS: "dict[str, frozenset[str]]" = {
+    base: frozenset(o[1] for o in _WRAPPER_SPECS[base].values if len(o) == 2 and o.startswith("-")) for base in DASH_C_WRAPPERS
+}
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -579,22 +586,9 @@ def _option_kind(arg: str, spec: _WrapperSpec, dash_c: bool) -> str:  # noqa: PL
     return "flag"
 
 
-def runner_option_kind(runner: str, word: str) -> str:
-    """How `DASH_C_WRAPPERS` member `runner` reads option `word`: `dash_c`, `value`, `flag` or `unknown`.
-
-    Read as getopt does: a value option earlier in a cluster takes the rest as its value, so
-    `runuser -s/bin/csh` sets a shell and `-gcdrom` a group, not `-c`; a `value` takes the next
-    word, so `runuser -w -cfoo` whitelists `-cfoo` (LAB-5180). A letter the spec does not know
-    ends the reading of a short cluster, and then any later `c` counts - the fail-closed direction.
-    """
-    kind = _option_kind(word, _WRAPPER_SPECS.get(runner, _DEFAULT_SPEC), dash_c=True)
-    if kind == "unknown" and not word.startswith("--") and "c" in word[1:]:
-        return "dash_c"
-    return kind
-
-
-def _sets_option(arg: str, spec: _WrapperSpec, names: frozenset) -> bool:
-    """True if option word ``arg`` sets one of ``names``: `--user`, `--user=x`, `-u`, `-lu`."""
+def _sets_option(arg: str, spec: _WrapperSpec) -> bool:
+    """True if option word ``arg`` sets one of ``spec.drops_leading``: `--user`, `--user=x`, `-u`, `-lu`."""
+    names = spec.drops_leading
     if arg.startswith("--"):
         return arg.partition("=")[0] in names
     for ch in arg[1:]:
@@ -605,45 +599,42 @@ def _sets_option(arg: str, spec: _WrapperSpec, names: frozenset) -> bool:
     return False
 
 
-def _template_runs_code(words: list[str]) -> bool:  # noqa: PLR0911 - one return per way a line runs
-    """True if a GNU parallel command template may run its input line as code.
+# Commands that only read or transform their input and never run it as code. Small on purpose:
+# anything that can execute (eval, awk, sed's `e`, perl, python, node, find, xargs, env, the
+# shells) stays OUT, so it reads as code. A template head outside this set fails closed (LAB-5180).
+_INERT_TEMPLATE_COMMANDS = _opts(
+    "echo printf cat tac gzip gunzip zcat bzip2 bunzip2 xz unxz zstd wc grep egrep fgrep head tail"
+    " sort uniq cut tr nl rev base64 basename dirname true false seq"
+    " md5sum sha1sum sha224sum sha256sum sha384sum sha512sum cksum b2sum"
+)
+# A metacharacter in the joined template means it is more than one simple command - a pipe, a
+# redirect, a `;`/`&&`, a substitution, a newline - so it runs the line as code.
+_TEMPLATE_CODE_CHARS = frozenset("|&;<>()$`\n")
 
-    parallel joins the template words, appends each line (quoted) and runs the result through
-    `$SHELL`, so the template is parsed as the shell snippet it is: `'sh -c'`, `'echo {} | sh'`,
-    `'{}'` and `env` all run the line, `echo {}` and `gzip -9` do not. No template (only `:::`
-    arguments) or one this parser cannot read is code - fail closed.
 
-    Never recursive: a template whose own command is another template runner (`parallel parallel
-    …`) is code outright rather than parsed again, so the cost is one parse however the words nest.
-    Recursing there cost two operand scans per level - exponential in the nesting - and a hook
-    that outlives its timeout fails open.
+def _template_runs_code(words: list[str]) -> bool:
+    """True if a GNU parallel command template may run its appended input line as code.
+
+    parallel joins the template, appends each input line and runs the result through `$SHELL`.
+    An allowlist, not a parse: a bashlex re-parse here reopened an unfixed `_paramexpand` infinite
+    loop (LAB-4959) on a template like `echo "$(cat <<X … ${ … )"`, which a hook cannot survive
+    (LAB-5180). No template (only `:::` arguments), any shell metacharacter in the joined text, an
+    unsplittable template, or a first word whose basename is not a known inert reader all read as
+    code. So `eval {}`, `'echo {} | sh'`, `'{}'`, `env` and `timeout 5 env` are code while
+    `echo {}`, `gzip -9` and `sha256sum {}` are not. The cost is a compound inert template
+    (`'echo {}; ls'`), which fails closed.
     """
     template = list(itertools.takewhile(lambda word: not word.startswith(":::"), words))
     if not template:
         return True
-    try:
-        nodes = bashlex.parse(" ".join(template))
-    except Exception:  # noqa: BLE001 - a template bashlex cannot read is one we cannot vouch for
+    joined = " ".join(template)
+    if any(ch in _TEMPLATE_CODE_CHARS for ch in joined):
         return True
-    for node in nodes:
-        for cmd in _command_nodes(node):
-            cmd_words = _command_words(cmd)
-            if not cmd_words or names_unresolved_program(cmd_words[0]):
-                return True  # `X=1` or `$CMD`: the appended line is, or picks, the command
-            head = cmd_words[0].split("/")[-1]
-            if head in _HEREDOC_SHELL_COMMANDS or head in (".", "source"):
-                return True
-            if not is_wrapper(head):
-                continue
-            if _WRAPPER_SPECS.get(head, _DEFAULT_SPEC).template:
-                return True
-            operands = expand_env_split_string(head, cmd_words[1:])
-            if any(word.split("/")[-1] in _HEREDOC_SHELL_COMMANDS for word in operands):
-                return True
-            candidates, runs_code = _scan_wrapper_operands(head, operands)
-            if runs_code or not candidates:
-                return True  # `env`, `timeout 5`: the appended line becomes the command
-    return False
+    try:
+        tokens = shlex.split(joined)
+    except ValueError:
+        return True
+    return not tokens or tokens[0].split("/")[-1] not in _INERT_TEMPLATE_COMMANDS
 
 
 def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], bool]":  # noqa: PLR0912
@@ -660,7 +651,7 @@ def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], 
     """
     spec = _WRAPPER_SPECS.get(base, _DEFAULT_SPEC)
     dash_c = base in DASH_C_WRAPPERS
-    leading, slack, positionals, positional_at = spec.leading, 0, [], []
+    leading, slack, positionals, first_candidate_at = spec.leading, 0, [], None
     awaiting_subcommand, options_done, i = spec.subcommand is not None, False, 0
     while i < len(operands) and (spec.permute or len(positionals) <= leading + slack):
         arg = operands[i]
@@ -672,7 +663,8 @@ def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], 
                 awaiting_subcommand = arg != spec.subcommand
             elif not (spec.assignments and not positionals and _ASSIGNMENT_RE.match(arg)):
                 positionals.append(arg)
-                positional_at.append(i - 1)
+                if len(positionals) == leading + 1:
+                    first_candidate_at = i - 1
             continue
         if arg == "--":
             options_done = True
@@ -685,7 +677,7 @@ def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], 
                 return [], True
             slack += 1
             continue
-        if spec.drops_leading and _sets_option(arg, spec, spec.drops_leading):
+        if spec.drops_leading and _sets_option(arg, spec):
             leading = 0
         if kind == "value":
             i += 1
@@ -693,7 +685,7 @@ def _scan_wrapper_operands(base: str, operands: list[str]) -> "tuple[list[str], 
         return [], False
     candidates = positionals[leading : leading + slack + 1]
     if spec.template and candidates:
-        return candidates, _template_runs_code(operands[positional_at[leading] :])
+        return candidates, _template_runs_code(operands[first_candidate_at:])
     runs_code = any(names_unresolved_program(word) for word in candidates) or (spec.shell_exec and not candidates)
     return candidates, runs_code
 
@@ -703,12 +695,7 @@ def _is_dynamic_loader(base: str) -> bool:
     return base == "ld.so" or (base.startswith(("ld-linux", "ld-musl", "ld64", "ld-2")) and ".so" in base)
 
 
-def is_wrapper(word: str) -> bool:
-    """True if `word`, read as a command, execs its operands: a `WRAPPER_COMMANDS` member or the loader.
-
-    The one predicate for heredoc owners, here-string sinks and `-c` delegation, so the three
-    cannot disagree about which words pass a command through (LAB-5180).
-    """
+def _is_wrapper(word: str) -> bool:
     base = word.split("/")[-1]
     return base in WRAPPER_COMMANDS or _is_dynamic_loader(base)
 
@@ -722,22 +709,6 @@ def _sources_stdin(args: list[str]) -> bool:
         return True
     path = posixpath.normpath(target)  # `/dev/fd//0`, `/dev/fd/./0`, `/dev/../dev/stdin` are all stdin
     return path in ("-", "stdin") or path.endswith(("/stdin", "/fd/0"))
-
-
-def _builtin_invoked(words: list[str]) -> list[str]:
-    """`words` past any leading `command`/`builtin` and their options: the builtin that runs.
-
-    `command . FILE` and `builtin source FILE` run `.` itself, on the same stdin `. FILE` reads
-    (LAB-5180). Only these two prefixes reach a builtin; an exec wrapper (`timeout 5 . FILE`)
-    finds no program named `.`. Every dashed word is skipped, so `command -v . FILE` (which only
-    prints) over-reads - the fail-closed direction.
-    """
-    at = 0
-    while at < len(words) - 1 and words[at] in ("command", "builtin"):
-        at += 1
-        while at < len(words) - 1 and words[at].startswith("-"):
-            at += 1
-    return words[at:]
 
 
 def expand_env_split_string(base: str, args: list[str]) -> list[str]:
@@ -916,19 +887,17 @@ def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses 
         option its spec does not know;
       - `xargs` whose command is itself a wrapper, so a body line supplies the command
         (`xargs env`), and GNU `parallel` with no template or one that runs its line as code;
-      - `.`/`source` of stdin or of a file this parser cannot name, also behind `command`/`builtin`.
+      - `.`/`source` of stdin or of a file this parser cannot name.
     """
     raw = _command_words(node)
     if not raw:
         return None
-    builtin = _builtin_invoked(raw)
-    if names_unresolved_program(builtin[0]):
-        return _DEFAULT_SHELL  # `$'bash'`, or `builtin $X /dev/stdin`
-    name = builtin[0].split("/")[-1]
-    if name in (".", "source"):
-        return _DEFAULT_SHELL if _sources_stdin(builtin[1:]) else name
+    if names_unresolved_program(raw[0]):
+        return _DEFAULT_SHELL
     head = raw[0].split("/")[-1]
-    if not is_wrapper(head):
+    if head in (".", "source"):
+        return _DEFAULT_SHELL if _sources_stdin(raw[1:]) else head
+    if not _is_wrapper(head):
         return head
     operands = expand_env_split_string(head, raw[1:])
     shell = next((word.split("/")[-1] for word in operands if word.split("/")[-1] in _HEREDOC_SHELL_COMMANDS), None)
@@ -937,7 +906,7 @@ def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses 
     candidates, runs_code = _scan_wrapper_operands(head, operands)
     if runs_code:
         return _DEFAULT_SHELL
-    if head == "xargs" and any(map(is_wrapper, candidates)):
+    if head == "xargs" and any(map(_is_wrapper, candidates)):
         return _DEFAULT_SHELL  # `xargs env`: a body line supplies the wrapped command
     return head
 
@@ -1041,7 +1010,7 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args):
         return (name, here_string)
 
-    if is_wrapper(name):
+    if name in WRAPPER_COMMANDS:
         for at, arg in enumerate(args):
             interpreter = arg.split("/")[-1]
             if interpreter in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(interpreter, args[at + 1 :]):
@@ -1709,12 +1678,8 @@ class BashCommandParser:
             is_shell=True means the heredoc will be executed by a shell.
         """
         heredoc_ranges = []
-        # A function that runs a shell on its stdin (`f() { bash; }; f <<EOF`) runs its heredoc as
-        # code, as `_bashlex_heredocs` reads it (LAB-5180). Only a heredoc can be affected.
-        wrapping_funcs = shell_wrapping_functions(ast_nodes or []) if "<<" in command else set()
-        code_subs: set[int] = set()  # command-position substitutions, filled before they are visited
 
-        def visit(node, parent_cmd=None, body_is_code=False):
+        def visit(node, parent_cmd=None, in_process=False):
             """Recursively visit AST nodes to find heredocs."""
             if hasattr(node, "kind"):
                 # A heredoc under an unquoted process substitution feeds `cat` (inert), but the
@@ -1722,27 +1687,21 @@ class BashCommandParser:
                 # `source <( … )` - so its body is code, exactly as the quoted twin is treated
                 # None in `_bashlex_heredocs`. Mark every heredoc below the procsub is_shell
                 # (LAB-5180). The reader is not known here, so this over-reads rather than
-                # trusting the inner command's name. A substitution in command position
-                # (`$(cat <<EOF … )`) runs its output, so the same holds below it.
-                if node.kind == "processsubstitution" or id(node) in code_subs:
-                    body_is_code = True
+                # trusting the inner command's name.
+                if node.kind == "processsubstitution":
+                    in_process = True
 
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
                     cmd_name = heredoc_owner(node)
-                    if cmd_name in wrapping_funcs:
-                        cmd_name = _DEFAULT_SHELL
-                    sub = command_position_substitution(node)
-                    if sub is not None:
-                        code_subs.add(id(sub))
 
                 # Check for redirect nodes with heredocs
                 if node.kind == "redirect" and hasattr(node, "heredoc"):
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = body_is_code or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
+                        is_shell = in_process or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -1751,9 +1710,9 @@ class BashCommandParser:
                         child = getattr(node, attr)
                         if isinstance(child, list):
                             for item in child:
-                                visit(item, cmd_name or parent_cmd, body_is_code)
+                                visit(item, cmd_name or parent_cmd, in_process)
                         elif child:
-                            visit(child, cmd_name or parent_cmd, body_is_code)
+                            visit(child, cmd_name or parent_cmd, in_process)
 
         for node in ast_nodes or []:
             visit(node)

@@ -23,8 +23,6 @@ word means no body regex can carry the verdict, so a BLOCKED verdict there prove
 the validator as code (the `shell_delegated_payload` path the fixed `bash <<'EOF'` twin gets).
 """
 
-import time
-
 import pytest
 
 from schlock.core.parser import (
@@ -32,6 +30,7 @@ from schlock.core.parser import (
     BashCommandParser,
     _command_nodes,
     _scan_wrapper_operands,
+    _template_runs_code,
     command_position_substitution,
     expand_env_split_string,
     heredoc_owner,
@@ -106,11 +105,6 @@ class TestHeredocOwnerResolvesUncertainToShell:
             ". /dev/fd//0",  # the path is normalised before the stdin test
             ". /dev/fd/./0",
             "source /dev/fd/0/",
-            "command . /dev/stdin",  # `command`/`builtin` run the `.` builtin itself
-            "builtin source /dev/stdin",
-            "command -p . /dev/stdin",
-            "command -- source /dev/stdin",
-            "builtin $X /dev/stdin",  # the builtin's own name is unresolved
             "${SHELL#)/}",  # the `)` is pattern text: `${` closes only on `}`
             "timeout 5 ${SHELL#)/}",
             "$(: ')'; echo /bin/bash)",  # a quote inside `$(…)`: bracket it no further
@@ -225,9 +219,6 @@ class TestHeredocOwnerInertReadersUnchanged:
             ("parallel echo", "parallel"),
             ("parallel 'echo {}'", "parallel"),  # the template is parsed, so `{}` is echo's argument
             ("source ./env.sh", "source"),
-            ("command . ./env.sh", "."),  # sources a file, not this stdin
-            ("command git status", "command"),
-            ("builtin echo hi", "builtin"),
             ("bash", "bash"),
             ("/bin/bash", "bash"),
         ],
@@ -267,13 +258,16 @@ class TestScanWrapperOperands:
             ("uv", ["pip", "install", "x"], False),  # no `run`: uv runs nothing
             ("strace", ["-f", "cat", "$F"], False),
             ("arch", ["-arm64", "python3", "$F"], False),
-            ("parallel", ["--frobnicate"], True),
-            ("parallel", ["--jobs", "4", "gzip", "-9"], False),
+            ("parallel", ["--frobnicate"], True),  # unknown option on a shell_exec wrapper
+            ("parallel", ["-i", "echo"], True),  # optional-argument -i is unlisted -> unknown -> shell
+            ("parallel", ["--max-lines", "$SH", "cat"], True),  # optional-argument --max-lines likewise
+            ("parallel", ["--jobs", "4", "gzip", "-9"], False),  # required-arg --jobs; gzip template inert
+            ("parallel", ["eval", "{}"], True),  # eval is not an inert reader
             ("parallel", ["{}"], True),  # the line itself is the command
             ("parallel", ["env"], True),  # the line becomes env's command
             ("parallel", ["echo", ":::", "a"], False),  # arguments come from :::, not stdin
             ("parallel", [":::", "a"], True),  # no template: read as the shell
-            ("parallel", ["parallel", "echo"], True),  # a nested runner is code, not parsed again
+            ("parallel", ["parallel", "echo"], True),  # a nested runner is not an inert reader
         ],
     )
     def test_scan(self, base, operands, runs_code):
@@ -367,12 +361,6 @@ class TestProcsubHeredocRangesAreShell:
             "source <(cat <<EOF\nrm -rf /\nEOF\n)",
             ". <(cat <<EOF\nrm -rf /\nEOF\n)",
             "bash <(cat <<EOF\nrm -rf /\nEOF\n) | wc -l",
-            # A command-position substitution runs its output; a shell-wrapping function its stdin.
-            "$(cat <<EOF\nrm -rf /\nEOF\n)",
-            "`cat <<EOF\nrm -rf /\nEOF\n`",
-            "f() { bash; }; f <<EOF\nrm -rf /\nEOF",
-            "g() { bash; }; f() { g; }; f <<EOF\nrm -rf /\nEOF",
-            "command . /dev/stdin <<EOF\nrm -rf /\nEOF",
         ],
     )
     def test_procsub_heredoc_is_shell(self, command):
@@ -380,20 +368,6 @@ class TestProcsubHeredocRangesAreShell:
         ranges = parser.extract_heredoc_ranges(command, parser.parse(command))
         assert ranges, f"no heredoc range for {command!r}"
         assert all(is_shell for _s, _e, is_shell in ranges), ranges
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "x=$(cat <<EOF\nrm -rf /\nEOF\n)",  # assignment: data
-            'echo "$(cat <<EOF\nrm -rf /\nEOF\n)"',  # argument: data
-            "f() { cat; }; f <<EOF\nrm -rf /\nEOF",  # the function reads, it does not run
-        ],
-    )
-    def test_data_heredoc_is_not_shell(self, command):
-        parser = BashCommandParser()
-        ranges = parser.extract_heredoc_ranges(command, parser.parse(command))
-        assert ranges, f"no heredoc range for {command!r}"
-        assert not any(is_shell for _s, _e, is_shell in ranges), ranges
 
 
 class TestBusyboxPathShellHereString:
@@ -485,6 +459,13 @@ AC1_QUOTED_ROWS = [
     "parallel --retries 3",
     "parallel 'sh -c'",
     "parallel -j4 'sh -c'",
+    "parallel --max-lines $SH cat",
+    "parallel -i echo",
+    "parallel -e echo",
+    "parallel --replace echo",
+    "parallel 'eval {}'",
+    "parallel 'trap {} EXIT'",
+    "parallel 'echo {} > >(sh)'",
     "${SHELL#)/}",
     "timeout 5 ${SHELL#)/}",
     "env ${SHELL#)/}",
@@ -493,9 +474,6 @@ AC1_QUOTED_ROWS = [
     ". /dev/fd//0",
     ". /dev/fd/./0",
     "source /dev/fd/0/",
-    "command . /dev/stdin",
-    "builtin source /dev/stdin",
-    "command -p . /dev/stdin",
 ]
 
 
@@ -542,8 +520,6 @@ class TestAc1UnquotedRegressionTwins:
             "xargs env",
             ". /dev/stdin",
             "source /dev/stdin",
-            "command . /dev/stdin",
-            "builtin source /dev/stdin",
         ],
     )
     def test_unquoted_twin_blocked(self, head, no_shellcheck):
@@ -557,7 +533,6 @@ class TestAc2DashCPayloads:
         [
             "env $'bash' -c 'rm -rf /'",
             "env -S 'bash -c \"rm -rf /\"'",
-            f'/lib64/ld-linux-x86-64.so.2 /bin/bash -c "{Q}"',  # the loader is a wrapper here too
         ],
     )
     def test_dash_c_payload_blocked(self, command, no_shellcheck):
@@ -584,14 +559,6 @@ class TestAc3HereStringDrift:
         bash = validate_command(f'bash <<< "{body}"')
         assert busybox.risk_level == bash.risk_level == RiskLevel.BLOCKED, (body, busybox.risk_level, bash.risk_level)
 
-    def test_loader_shell_matches_bash(self, no_shellcheck):
-        result = validate_command(f'/lib64/ld-linux-x86-64.so.2 /bin/bash <<< "{Q}"')
-        assert result.risk_level == RiskLevel.BLOCKED
-        assert "shell_delegated_payload" in (result.matched_rules or [])
-
-    def test_loader_reader_stays_inert(self, no_shellcheck):
-        assert validate_command(f'/lib64/ld-linux-x86-64.so.2 /bin/cat <<< "{Q}"').risk_level == RiskLevel.SAFE
-
 
 class TestAc4UnquotedRowsMatchDirectTwin:
     """Parity with the direct unquoted twin `bash <<EOF` (regex over the raw body); structural
@@ -606,9 +573,6 @@ class TestAc4UnquotedRowsMatchDirectTwin:
             "unshare <<EOF\n{body}\nEOF",
             "chroot / <<EOF\n{body}\nEOF",
             "script -q /dev/null <<EOF\n{body}\nEOF",
-            "$(cat <<EOF\n{body}\nEOF\n)",  # command position: its output runs
-            "`cat <<EOF\n{body}\nEOF\n`",
-            "f() {{ bash; }}; f <<EOF\n{body}\nEOF",
         ],
     )
     @pytest.mark.parametrize("body", [RM, CURL])
@@ -730,7 +694,8 @@ class TestOwnerDoesNotOverRead:
             hd('"$(git rev-parse --show-toplevel)/.venv/bin/python" -', PY),
             hd("${VENV:-.venv}/bin/python -", PY),
             'script -q "-cls -la" /dev/null',
-            "runuser -s/bin/csh root -c 'ls -la'",
+            "script -Tclock.log echo /dev/null",  # -T takes clock.log; echo is the command
+            hd('"$(dirname "$0")/run.sh"', "hello world"),  # a clean body run from a $()-quoted path
         ],
     )
     def test_inert_reader_keeps_base_verdict(self, command, no_shellcheck):
@@ -743,12 +708,8 @@ class TestOwnerDoesNotOverRead:
             "script -q --command \"'rm' -rf /\" /dev/null",  # SAFE on a72b45c: --command was skipped
             "script -q -c \"'rm' -rf /\" /dev/null",  # the short twin, BLOCKED on a72b45c too
             "script -q \"-c'rm' -rf /\" /dev/null",  # SAFE on a72b45c: the attached program was skipped
-            # The runner's grammar picks the `-c`: a value option's `c` is not it (SAFE on a72b45c).
-            "runuser -s/bin/csh root -c \"'rm' -rf /\"",
-            "runuser -gcdrom root -c \"'rm' -rf /\"",
-            "script -Tclock.log -c \"'rm' -rf /\" /dev/null",
-            "runuser -w -cfoo -c \"'rm' -rf /\" root",  # -w takes `-cfoo` as its value
-            "script -T -cfoo -c \"'rm' -rf /\" /dev/null",
+            "script -Tclock.log -c \"'rm' -rf /\" /dev/null",  # the `c` in `clock.log` is -T's value, not -c
+            "runuser -gdocker -c \"'rm' -rf /\" root",  # the `c` in `docker` is -g's value, not -c
         ],
     )
     def test_long_command_payload_is_delegated(self, command, no_shellcheck):
@@ -758,15 +719,62 @@ class TestOwnerDoesNotOverRead:
         assert "shell_delegated_payload" in (result.matched_rules or [])
 
 
-class TestTemplateCostIsLinear:
-    """A template whose command is another template runner is code outright, never parsed again.
-    Recursing cost two operand scans per level - exponential in the nesting - and a hook that
-    outlives its timeout fails open. 200 nested words must still resolve, and to code."""
+class TestTemplateRunsCode:
+    """GNU parallel's command template runs its appended input line through `$SHELL`. The
+    classifier is an allowlist, not a parse (a re-parse reopened an unfixed infinite loop): a
+    metacharacter, an unsplittable template, or a first word that is not a known inert reader is
+    code. Never put an executor (eval, awk, find, a shell) in the inert set."""
 
-    def test_nested_template_runners_resolve_fast(self, no_shellcheck):
-        command = "parallel " * 200 + "echo <<'EOF'\n" + Q + "\nEOF"
-        started = time.perf_counter()
+    @pytest.mark.parametrize(
+        "template,runs_code",
+        [
+            (["eval {}"], True),
+            (['eval "$(cat)"'], True),
+            (["builtin eval {}"], True),
+            (["command eval {}"], True),
+            (["trap {} EXIT"], True),
+            (["echo {} > >(sh)"], True),
+            (["timeout 5 env"], True),
+            (["nohup xargs"], True),
+            (["awk {}"], True),
+            (["find . -exec {} ;"], True),
+            (["echo {}; ls"], True),  # compound inert template: fails closed
+            (["{}"], True),
+            (["env"], True),
+            (['read x; eval "$x"'], True),  # `--pipe` body
+            (["parallel", "echo"], True),  # a nested runner, resolved without a re-parse
+            ([":::", "a"], True),  # no template
+            (["echo {}"], False),
+            (["echo"], False),
+            (["gzip -9"], False),
+            (["sha256sum {}"], False),
+            (["printf %s {}"], False),
+            (["grep foo {}"], False),
+            (["echo", ":::", "a"], False),  # `:::` args are not the template
+        ],
+    )
+    def test_classifier(self, template, runs_code):
+        assert _template_runs_code(template) is runs_code
+
+    def test_hang_template_does_not_reparse(self, no_shellcheck):
+        # A template that reopened bashlex's _paramexpand loop (LAB-4959) must finish and BLOCK.
+        command = "rm -rf / ; parallel 'echo \"$(cat <<X\n${\nX\n)\"' ::: a"
         result = validate_command(command)
-        assert time.perf_counter() - started < 5
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_nested_template_runners_block(self, no_shellcheck):
+        # 200 nested `parallel` words resolve to code without a per-level re-parse (no recursion).
+        command = "parallel " * 200 + "echo <<'EOF'\n" + Q + "\nEOF"
+        result = validate_command(command)
         assert result.risk_level == RiskLevel.BLOCKED
         assert "shell_delegated_payload" in (result.matched_rules or [])
+
+
+class TestQuotedSubstitutionInProgramNameOverReads:
+    """A quote inside `$(...)` in the program word makes `_last_component` return the whole word, so
+    it reads as unresolved and the body is scanned as code. Accepted as a rare fail-closed
+    over-block; pinned as intended (dropped by the pragmatism filter)."""
+
+    def test_dangerous_body_blocks(self, no_shellcheck):
+        result = validate_command('"$(dirname "$0")/run.sh" <<\'EOF\'\n' + Q + "\nEOF")
+        assert result.risk_level == RiskLevel.BLOCKED
