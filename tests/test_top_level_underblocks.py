@@ -411,6 +411,21 @@ class TestSubscriptedAssignmentPrefix:
     def test_benign_prefixed_command_scores_as_its_plain_twin(self, command, twin):
         assert validate_command(command).risk_level == validate_command(twin).risk_level
 
+    @pytest.mark.parametrize(
+        ("prefix", "opener", "body"),
+        [
+            ("a[0]=1 bash", "<<'EOF'", "rm -rf /\nEOF"),
+            ("a[0]=1 bash", "<<EOF", "rm -rf /\nEOF"),
+            ("a[k]=v bash", "<<'EOF'", "rm -rf /\nEOF"),
+            ("a[0]=1 sh", "<<'EOF'", "rm -rf /\nEOF"),
+            ("a[0]=1 bash", "<<'A;B'", "rm -rf /\nA;B"),
+        ],
+    )
+    def test_heredoc_consumer_scores_as_its_plain_twin(self, prefix, opener, body):
+        twin = prefix.replace(prefix.split()[0], "FOO=1", 1)
+        command, plain = f"{prefix} {opener}\n{body}", f"{twin} {opener}\n{body}"
+        assert validate_command(command).risk_level == validate_command(plain).risk_level
+
     @pytest.mark.parametrize("command", ["a[0]=1", "arr[i]+=x", "echo a[0]=1", "echo x | grep a[0]=1"])
     def test_array_assignment_and_operand_stay_safe(self, command):
         assert validate_command(command).risk_level == RiskLevel.SAFE
