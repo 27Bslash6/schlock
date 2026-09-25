@@ -665,7 +665,7 @@ def _watch_payload(args: list[str]) -> Optional[str]:
     return " ".join(args[i:]) or None
 
 
-def _shell_delegated_payloads(
+def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator kind
     commands_with_args: list[tuple[str, list[str]]],
     *,
     _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
