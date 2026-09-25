@@ -48,7 +48,7 @@ _GIT_WORD_RE = re.compile(r"\bgit\b")
 _COMMIT_WORD_RE = re.compile(r"\bcommit\b")
 
 
-def _git_then_commit(command: str) -> bool:
+def git_then_commit(command: str) -> bool:
     """Tolerant recognizer fallback: a ``git`` word with a ``commit`` word somewhere after it.
 
     One positional pass. The equivalent ``\\bgit\\b.*?\\bcommit\\b`` re-scans the tail once per
@@ -267,14 +267,14 @@ class CommitMessageFilter:
             return False
         # Oversized: skip bashlex (DoS guard) and use a tolerant regex.
         if len(command) > MAX_COMMAND_SIZE:
-            return _git_then_commit(command)
+            return git_then_commit(command)
         # Precise: bashlex AST, tolerant of global options. AST detection also avoids the old
         # `\bgit\s+commit\b` false positive on strings like `echo "git commit"`. A parse failure
         # must not silently disable detection, so fall back to a tolerant regex (over-detect-safe).
         try:
             return bool(self._commit_arg_word_lists(command))
         except Exception:  # noqa: BLE001 - bashlex raises various types; fail-open to regex
-            return _git_then_commit(command)
+            return git_then_commit(command)
 
     # Git global options that redirect which repository a commit lands in. A `git log` run in
     # the process working directory says nothing about such a commit, so the post-commit

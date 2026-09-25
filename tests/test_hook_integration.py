@@ -624,6 +624,15 @@ class TestAuditCommandLength:
         assert entry["command"] == command
         assert entry["command_truncated"] is False
 
+    def test_commit_logged_in_full_when_filter_unavailable(self, tmp_path):
+        """The commit cap must not hinge on the filter loading: get_filter() is None when its
+        config fails to load, and the commit still reaches the audit log."""
+        command = "git commit -m '" + "x" * 2_000 + "'"
+        with patch("pre_tool_use.get_filter", return_value=None):
+            entry = self._run(tmp_path, command)
+        assert entry["command"] == command
+        assert entry["command_truncated"] is False
+
     def test_non_commit_command_is_capped_and_marked(self, tmp_path):
         """Everything the filter did not judge keeps the short cap, and the entry says it was cut."""
         entry = self._run(tmp_path, "echo " + "x" * 10_000)

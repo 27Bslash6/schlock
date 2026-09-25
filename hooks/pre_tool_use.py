@@ -34,7 +34,7 @@ import yaml  # noqa: E402 - vendored dependency
 
 from schlock import RiskLevel, ValidationResult, validate_command  # noqa: E402
 from schlock.integrations.audit import AuditContext, get_audit_logger  # noqa: E402
-from schlock.integrations.commit_filter import CommitMessageFilter, load_filter_config  # noqa: E402
+from schlock.integrations.commit_filter import CommitMessageFilter, git_then_commit, load_filter_config  # noqa: E402
 from schlock.integrations.shellcheck import (  # noqa: E402
     format_findings_message,
     get_security_findings,
@@ -192,7 +192,7 @@ def get_filter():
     """Initialize filter singleton.
 
     Returns:
-        CommitMessageFilter instance or None if disabled/unavailable
+        CommitMessageFilter instance, or None if initialization failed
 
     Unlike validator (which is critical), filter failure is non-fatal.
     Returns None to disable filtering (fail-open).
@@ -432,9 +432,11 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
 
         # 2. FILTER FIRST (before safety validation)
         filter_instance = get_filter()
+        # Selects the audit log's command cap, which must hold when the filter failed to load: without an
+        # instance, the tolerant recognizer over-detects safely.
+        is_git_commit = filter_instance.is_git_commit_command(command) if filter_instance else git_then_commit(command)
         if filter_instance:
             filter_result = filter_instance.filter_commit_message(command)
-            is_git_commit = filter_instance.is_git_commit_command(command)  # selects the audit log's command cap
 
             # DENY if advertising patterns were matched (not just whitespace changes)
             if filter_result.patterns_removed:

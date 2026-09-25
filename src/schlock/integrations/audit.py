@@ -272,7 +272,7 @@ class AuditLogger:
             decision: "allow", "block", or "warn"
             execution_time_ms: Validation duration in milliseconds
             context: Optional context metadata
-            is_git_commit: True when the commit filter recognized a `git commit`; selects the
+            is_git_commit: True when the command was recognized as a `git commit`; selects the
                 MAX_COMMAND_SIZE cap instead of COMMAND_LOG_LIMIT.
         """
         if context is None:
