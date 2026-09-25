@@ -628,9 +628,16 @@ def _parallel_executes_perl(words: list[str]) -> bool:
     `{= perl =}` is an inline Perl replacement string and `--rpl 'X perl'` defines one, so
     `parallel echo {= system "id" =}` and `parallel --rpl '{U} uq' 'echo {U}'` execute code in
     parallel itself, not in the template's first word (LAB-5180). Checked on the raw words, so it
-    holds whether the `{= =}` is one quoted template word or split across argv.
+    holds whether the `{= =}` is one quoted template word or split across argv. Getopt::Long
+    abbreviates options and `rpl` is parallel's only `--rp*` one, so `--rp` is `--rpl` too.
     """
-    return any("{=" in word or word == "--rpl" or word.startswith("--rpl=") for word in words)
+    return any("{=" in word or _is_rpl_option(word) for word in words)
+
+
+def _is_rpl_option(word: str) -> bool:
+    """True if `word` is `--rpl` or an unambiguous abbreviation (`--rp`), with or without `=`."""
+    name = word.split("=", 1)[0]
+    return name.startswith("--rp") and "--rpl".startswith(name)
 
 
 # A metacharacter in the joined template means it is more than one simple command - a pipe, a
@@ -2057,7 +2064,10 @@ class BashCommandParser:
 
                     # GNU parallel's `{= perl =}` / `--rpl` run Perl in parallel itself, so they
                     # are code with no heredoc and no template head to classify (LAB-5180).
-                    if cmd_name in ("parallel", "env_parallel") and _parallel_executes_perl(_get_all_words(node)):
+                    # `:::` input is data parallel never evaluates, so only the words before it count.
+                    if cmd_name in ("parallel", "env_parallel") and _parallel_executes_perl(
+                        list(itertools.takewhile(lambda w: not w.startswith(":::"), _get_all_words(node)))
+                    ):
                         dangers.append("parallel replacement string executes Perl code")
 
                     # Direct eval/exec invocation

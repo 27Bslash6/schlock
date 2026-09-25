@@ -862,7 +862,20 @@ class TestParallelPerlReplacement:
             "parallel 'echo {= uq =}' <<EOF\n;rm -rf /\nEOF",
             "parallel --rpl '{U} uq' 'echo {U}' <<'EOF'\n" + Q + "\nEOF",
             "parallel --rpl='{U} uq' 'echo {U}' <<'EOF'\n" + Q + "\nEOF",
+            # Getopt::Long auto_abbrev: `--rp` is the only `--rp*` option, so it is `--rpl`
+            "parallel --rp '{X} system\"id\"' 'echo {X}' ::: a",
+            "parallel --rp='{X} system\"id\"' 'echo {X}' ::: a",
         ],
     )
     def test_perl_replacement_blocks(self, command, no_shellcheck):
         assert validate_command(command).risk_level == RiskLevel.BLOCKED, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "parallel echo {} ::: '{=a=}'",  # `:::` input is data, never a replacement string
+            "parallel echo ::: '{=x}'",
+        ],
+    )
+    def test_perl_replacement_in_input_is_safe(self, command, no_shellcheck):
+        assert validate_command(command).risk_level == RiskLevel.SAFE, command
