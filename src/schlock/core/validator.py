@@ -24,7 +24,15 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
+from .parser import (
+    WRAPPER_COMMANDS,
+    BashCommandParser,
+    command_position_substitutions,
+    expand_env_split_string,
+    has_expansion_char,
+    heredoc_owner,
+    shell_wrapping_functions,
+)
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -693,15 +701,53 @@ def _shell_delegated_payloads(
                 # would otherwise be picked as a decoy that ends the scan and drops the real
                 # payload behind it. Re-validating a benign decoy is harmless over-approximation;
                 # missing a payload is a bypass. Terminates: each re-entry passes `args[i+1:]`.
-                words = [a.rsplit("/", 1)[-1] for a in args]
+                #
+                # `env -S 'bash -c PROG'` hands env one word it re-splits into a command line, so
+                # expand it first (`env -Sbash`, `--split-string=`) to expose the `bash` delegator
+                # (LAB-5180).
+                scan_args = expand_env_split_string(base, args)
+                words = [a.rsplit("/", 1)[-1] for a in scan_args]
                 for i, word in enumerate(words):
                     if word in _DELEGATOR_COMMANDS:
-                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])], _seen=seen))
+                        found.extend(_shell_delegated_payloads([(scan_args[i], scan_args[i + 1 :])], _seen=seen))
+                    elif has_expansion_char(word):
+                        # An operand we cannot resolve (`env $'bash' -c PROG`) might be a shell.
+                        # Fail closed: if a `-c PROG` follows it, extract PROG (LAB-5180).
+                        found.append(_dash_c_payload(scan_args[i + 1 :], operand_ends_options=False))
 
         payloads.extend(p for p in found if p and p.strip())
     # The same program can still surface from more than one delegator (`su su bash -c PROG`:
     # each `su` owns a -c AND wraps the next). Validating it once is enough.
     return list(dict.fromkeys(payloads))
+
+
+# File-content flags that also read stdin when handed `-`. A process substitution feeding one
+# of these (`git commit -F <(…)`, `gh pr create --body-file <(…)`) is over-blocked when its body
+# is treated as code, so the refusal points at the stdin spelling, which stays allowed (LAB-5180).
+# This is GUIDANCE only - the refusal itself does not change. Keying the workaround on the reader
+# was ruled out (it reopened 7 bypasses); precision here would be an allowlist of read-only
+# readers, tracked separately.
+_STDIN_FILE_FLAGS: frozenset[str] = frozenset({"-F", "--file", "--body-file"})
+
+
+def _procsub_stdin_alternatives(commands_with_args: list[tuple[str, list[str]]]) -> list[str]:
+    """Guidance for a process substitution feeding a file-content flag: use its stdin spelling.
+
+    `git commit -F <(…)` -> `git commit -F -`; `gh pr create --body-file <(…)` -> `--body-file -`.
+    Only a `<(…)` operand directly after a known stdin-capable flag qualifies, so a real shell
+    delegation (`bash <(…)`, `source <(…)`) is never handed a workaround (LAB-5180).
+    """
+    hints: list[str] = []
+    for _cmd, args in commands_with_args:
+        for i, arg in enumerate(args):
+            if not arg.startswith("<("):
+                continue
+            flag = args[i - 1] if i > 0 else ""
+            if flag in _STDIN_FILE_FLAGS:
+                hint = f"Pass the content on stdin instead: `{flag} -` with a heredoc, which stays allowed"
+                if hint not in hints:
+                    hints.append(hint)
+    return hints
 
 
 def _check_contextual_high_risk(
@@ -1898,17 +1944,27 @@ def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHered
     command word, or any heredoc inside a process substitution. What reads `<( … )` may
     run what it prints (`bash < <(cat <<'EOF' … )`), and nothing here knows the reader,
     so the command inside is not what decides whether the body is code.
+
+    Owner is also None for a heredoc inside a command substitution in COMMAND POSITION
+    (`$(cat <<'EOF' … )`), whose output is executed, and for one owned by a function that
+    wraps a shell (`f() { bash; }; f <<'EOF' … `) - both run the body as code (LAB-5180).
     """
     found: list[_BashlexHeredoc] = []
+    cmd_position_subs = command_position_substitutions(nodes)
+    wrapping_funcs = shell_wrapping_functions(nodes)
 
     def visit(node: Any, owner: Optional[str], in_substitution: bool, in_process: bool) -> None:
         kind = getattr(node, "kind", None)
         if kind == "command":
             owner = None if in_process else heredoc_owner(node)
+            if owner in wrapping_funcs:
+                owner = None
         elif kind == "compound":
             owner = None
         elif kind == "commandsubstitution":
             in_substitution = True
+            if id(node) in cmd_position_subs:
+                in_process = True  # its output is run: inner heredoc bodies are code
         elif kind == "processsubstitution":
             in_substitution = in_process = True
         if kind == "redirect" and getattr(node, "heredoc", None) is not None:
@@ -3032,6 +3088,21 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 )
             if match.risk_level == RiskLevel.BLOCKED:
                 break
+
+        # A process substitution feeding a file-content flag (`git commit -F <(…)`) is code to the
+        # extractor above, so it lands here BLOCKED with no way forward. The block stands (keying on
+        # the reader reopens bypasses); the refusal just points at the stdin spelling that stays
+        # allowed (LAB-5180 AC6).
+        if match.risk_level == RiskLevel.BLOCKED and match.rule and match.rule.name == "shell_delegated_payload":
+            stdin_hints = _procsub_stdin_alternatives(commands_with_args)
+            if stdin_hints:
+                match = RuleMatch(
+                    matched=True,
+                    rule=match.rule,
+                    risk_level=match.risk_level,
+                    message=match.message,
+                    alternatives=list(dict.fromkeys([*match.alternatives, *stdin_hints])),
+                )
 
         # Step 6: ShellCheck integration (if available)
         # ShellCheck can catch issues our regex patterns miss, like $'' expansions

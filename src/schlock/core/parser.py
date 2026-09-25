@@ -9,6 +9,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 
 import bisect
 import logging
+import shlex
 from typing import Any, NamedTuple, Optional
 
 import bashlex
@@ -280,8 +281,138 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
         "setarch",  # Architecture override
         "linux32",  # 32-bit mode
         "linux64",  # 64-bit mode
+        "arch",  # Architecture override (setarch alias), `arch -x86_64 CMD`
+        # Sandbox / environment launchers that exec a caller-supplied command (LAB-5180).
+        # These run their operand with their own stdin, so a shell operand gets the heredoc
+        # body as code exactly as `env bash <<EOF` does.
+        "uv",  # `uv run CMD`
+        "fakeroot",  # `fakeroot CMD`
+        "firejail",  # `firejail [--opts] CMD`
+        "caffeinate",  # macOS: `caffeinate -i CMD`
+        "prlimit",  # `prlimit --opts CMD`
+        "dbus-run-session",  # `dbus-run-session -- CMD`
+        "script",  # `script [-c CMD] file` runs $SHELL on stdin when no -c is given
     }
 )
+
+# A basename that means "the interpreter is a shell we cannot name more precisely" - a
+# `$SHELL`-exec wrapper run with no command operand, an `env -S` string whose first token is a
+# shell, etc. It is a member of `_HEREDOC_SHELL_COMMANDS` / `_SHELL_COMMANDS` so both the
+# quoted-body re-validation and the unquoted regex-suppression paths treat the body as code.
+_DEFAULT_SHELL = "sh"
+
+# Expansion metacharacters bashlex leaves in a word it did not resolve (`$'bash'` -> `$bash`,
+# `{bash,}`, `${X:-bash}`, `/bin/b?sh` -> `b?sh`). An owner word carrying one of these is a
+# name we cannot resolve, so the heredoc body is handed to the validator as code rather than
+# trusted as inert (fail closed, LAB-5180).
+_EXPANSION_METACHARS = "$`{*?["
+
+
+def has_expansion_char(word: str) -> bool:
+    """True when `word` still holds a shell metacharacter this parser did not resolve."""
+    return any(ch in word for ch in _EXPANSION_METACHARS)
+
+
+# Wrappers that, given no COMMAND operand, run the user's shell (or /bin/sh) on their stdin -
+# a heredoc or here-string included (verified against real bash with a `touch` witness). The
+# value maps each wrapper to (leading positional operands it consumes before the COMMAND,
+# short options that take a separate value). Enough option arity to locate the first COMMAND;
+# unlisted options are treated as flags, which over-reads a following value as a COMMAND and so
+# fails toward "inert" only where a value option was omitted from the table (LAB-5180).
+_SHELL_EXEC_WRAPPER_ARITY: "dict[str, tuple[int, frozenset[str]]]" = {
+    "unshare": (0, frozenset({"-S", "-G", "-R", "-w"})),
+    "nsenter": (0, frozenset({"-t", "-S", "-G"})),
+    "chroot": (1, frozenset()),  # NEWROOT [COMMAND]
+    "setarch": (1, frozenset()),  # ARCH [COMMAND]
+    "linux32": (0, frozenset()),
+    "linux64": (0, frozenset()),
+    "runuser": (1, frozenset({"-g", "-G", "-s", "-w"})),  # [-] USER [COMMAND]
+    "su": (1, frozenset({"-g", "-G", "-s", "-w"})),  # [-] USER [COMMAND]
+}
+# These carry a `-c`/`--command` escape that supplies the program instead of running the shell
+# on stdin, so a heredoc alongside `<wrapper> ... -c CMD` is inert stdin, not code.
+_SHELL_EXEC_DASH_C_WRAPPERS = frozenset({"runuser", "su", "script"})
+
+
+def _wrapper_runs_default_shell(base: str, args: list[str]) -> bool:
+    """True if `$SHELL`-exec wrapper `base` would run its default shell on stdin given `args`.
+
+    `unshare -U` / `chroot /` / `nsenter -t 1 -m` / `runuser - root` / `script -q /dev/null`
+    run a shell because no COMMAND operand follows; `unshare cat` / `chroot / cat` do not. A
+    `-c CMD` escape (runuser/su/script) also means a shell is not reading stdin.
+    """
+    if base == "script":
+        # script always runs $SHELL and records it, unless -c supplies the program.
+        return not any(a == "-c" or a.startswith("-c") for a in args)
+    spec = _SHELL_EXEC_WRAPPER_ARITY.get(base)
+    if spec is None:
+        return False
+    leading, value_opts = spec
+    if base in _SHELL_EXEC_DASH_C_WRAPPERS and any(a in ("-c", "--command") for a in args):
+        return False
+    i = 0
+    positionals = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg == "-":  # runuser/su login marker, not an operand
+            i += 1
+            continue
+        if arg.startswith("-"):
+            if arg in value_opts:
+                i += 2  # option consumes the next token as its value
+            else:
+                i += 1
+            continue
+        # A positional operand.
+        if positionals < leading:
+            positionals += 1
+            i += 1
+            continue
+        return False  # a COMMAND operand is present -> the wrapper does not run the shell
+    # Any operands after `--` are the COMMAND.
+    return i >= len(args)
+
+
+def _is_dynamic_loader(base: str) -> bool:
+    """True for the ELF dynamic loader run as a program launcher (`ld-linux-x86-64.so.2 bash`)."""
+    return base == "ld.so" or (base.startswith(("ld-linux", "ld-musl")) and ".so" in base)
+
+
+def expand_env_split_string(base: str, args: list[str]) -> list[str]:
+    """Expand `env -S`'s combined string into separate tokens, else return `args` unchanged.
+
+    `env -S 'bash -e'`, `env -Sbash`, `env --split-string=bash` all hand env a single word it
+    re-splits into a command line. Recovering the tokens lets the shell operand (`bash`) be seen
+    (LAB-5180). Only `env` is treated this way.
+    """
+    if base != "env":
+        return args
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        payload: Optional[str] = None
+        if arg in ("-S", "--split-string") and i + 1 < len(args):
+            payload = args[i + 1]
+            i += 2
+        elif arg.startswith("-S") and len(arg) > 2:
+            payload = arg[2:]
+            i += 1
+        elif arg.startswith("--split-string="):
+            payload = arg.split("=", 1)[1]
+            i += 1
+        else:
+            out.append(arg)
+            i += 1
+            continue
+        try:
+            out.extend(shlex.split(payload))
+        except ValueError:
+            out.append(payload)  # unbalanced quotes: keep the raw word, fails closed downstream
+    return out
 
 
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
@@ -407,8 +538,8 @@ def _command_words(node: Any) -> "list[str]":
     return words
 
 
-def heredoc_owner(node: Any) -> Optional[str]:
-    """The name of what runs a command node's heredoc, basename only; None when it has no word.
+def heredoc_owner(node: Any) -> Optional[str]:  # noqa: PLR0911 - guard clauses over nesting
+    """The name of what runs a command node's heredoc, basename only; None when unresolved.
 
     Built on `_command_words`, so an assignment prefix is skipped: `FOO=1 bash` runs `bash`.
     Taking the first part that merely HAS a `.word` read it as a command named `FOO=1`, and
@@ -420,13 +551,98 @@ def heredoc_owner(node: Any) -> Optional[str]:
     shell. Not the first operand: the shell need not be it (`timeout 5 sh`). The cost is an
     over-read - `flock ./bash cat` names bash, though it locks a file called `bash` and runs
     cat - which only rescans a body that may not run: the fail-closed direction.
+
+    Returns None - which the callers scan as code, failing closed - for an owner this parser
+    cannot resolve to a definite inert reader (LAB-5180):
+      - an owner word (or a wrapper operand) still carrying an expansion metacharacter
+        (`$'bash'`, `{bash,}`, `${X:-bash}`, `/bin/b?sh`, `env $'bash'`);
+      - `xargs`/`parallel`, which run their stdin as commands;
+      - `.`/`source`, which read their stdin (or a file) as shell.
+    Returns `_DEFAULT_SHELL` for a `$SHELL`-exec wrapper run with no command operand
+    (`unshare -U`, `chroot /`, `nsenter -t 1 -m`, `setarch x86_64`, `runuser - root`,
+    `script -q /dev/null`), so both the quoted and unquoted paths treat the body as code.
     """
-    words = [word.split("/")[-1] for word in _command_words(node)]
+    raw = _command_words(node)
+    words = [word.split("/")[-1] for word in raw]
     if not words:
         return None
-    if words[0] in WRAPPER_COMMANDS:
-        return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), words[0])
-    return words[0]
+    head = words[0]
+    if has_expansion_char(head):
+        return None
+    if head in ("xargs", "parallel", ".", "source"):
+        return None
+    if head in WRAPPER_COMMANDS or _is_dynamic_loader(head):
+        operands = [op.split("/")[-1] for op in expand_env_split_string(head, raw[1:])]
+        if any(has_expansion_char(op) for op in operands):
+            return None
+        shell = next((op for op in operands if op in _HEREDOC_SHELL_COMMANDS), None)
+        if shell is not None:
+            return shell
+        if _wrapper_runs_default_shell(head, operands):
+            return _DEFAULT_SHELL
+        return head
+    return head
+
+
+def shell_wrapping_functions(nodes: "list[Any]") -> "set[str]":
+    """Names of functions defined in `nodes` whose body runs a shell on its own stdin.
+
+    `f() { bash; }; f <<'EOF' … EOF` hands the heredoc to `f`'s stdin, and the `bash` inside `f`
+    inherits it and runs it as code. Such a function's heredoc must be scanned as code, not
+    trusted as inert stdin to an unknown command (LAB-5180). A body command whose `heredoc_owner`
+    is a shell, or is None (itself unresolved), makes the function shell-wrapping.
+    """
+    result: set[str] = set()
+
+    def walk(n: Any) -> None:
+        if getattr(n, "kind", None) == "function":
+            name = getattr(getattr(n, "name", None), "word", None)
+            body = getattr(n, "body", None)
+            if name and body is not None:
+                for cmd in _command_nodes(body):
+                    owner = heredoc_owner(cmd)
+                    if owner is None or owner in _HEREDOC_SHELL_COMMANDS:
+                        result.add(name)
+                        break
+        for value in vars(n).values():
+            for child in value if isinstance(value, list) else (value,):
+                if hasattr(child, "kind"):
+                    walk(child)
+
+    for n in nodes:
+        walk(n)
+    return result
+
+
+def command_position_substitutions(nodes: "list[Any]") -> "set[int]":
+    """`id()` of every command substitution whose OUTPUT is executed as a command.
+
+    `$(cat <<'EOF' … )` in command position runs what cat prints, so the heredoc body is code;
+    `x=$(cat <<'EOF' … )` (assignment) and `git commit -m "$(cat <<'EOF' … )"` (argument) are
+    data (LAB-5180). A substitution is in command position when it is the whole first word of a
+    command node - not an assignment prefix, not a later argument, not a fragment glued to text.
+    """
+    found: set[int] = set()
+
+    def walk(n: Any) -> None:
+        if getattr(n, "kind", None) == "command":
+            for part in getattr(n, "parts", []):
+                pk = getattr(part, "kind", None)
+                if pk in ("assignment", "redirect"):
+                    continue
+                if pk == "word":
+                    wp = getattr(part, "parts", [])
+                    if len(wp) == 1 and getattr(wp[0], "kind", None) == "commandsubstitution":
+                        found.add(id(wp[0]))
+                break  # only the first word is the command
+        for value in vars(n).values():
+            for child in value if isinstance(value, list) else (value,):
+                if hasattr(child, "kind"):
+                    walk(child)
+
+    for n in nodes:
+        walk(n)
+    return found
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -450,7 +666,12 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     if not words:
         return None
 
+    # Basename the resolved applet too: `busybox /bin/sh` resolves to `/bin/sh`, which is the
+    # same stdin-exec shell as `busybox sh`. Without this the here-string drifted from its
+    # heredoc twin - `busybox /bin/sh <<< X` scored HIGH while `busybox sh <<< X` was BLOCKED
+    # (LAB-5180).
     name, args = _resolve_multicall(words[0].split("/")[-1], words[1:])
+    name = name.split("/")[-1]
     if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args):
         return (name, here_string)
 
@@ -1123,9 +1344,18 @@ class BashCommandParser:
         """
         heredoc_ranges = []
 
-        def visit(node, parent_cmd=None):
+        def visit(node, parent_cmd=None, in_process=False):
             """Recursively visit AST nodes to find heredocs."""
             if hasattr(node, "kind"):
+                # A heredoc under an unquoted process substitution feeds `cat` (inert), but the
+                # command that READS `<( … )` may run what it prints - `bash <(cat <<EOF … )`,
+                # `source <( … )` - so its body is code, exactly as the quoted twin is treated
+                # None in `_bashlex_heredocs`. Mark every heredoc below the procsub is_shell
+                # (LAB-5180). The reader is not known here, so this over-reads rather than
+                # trusting the inner command's name.
+                if node.kind == "processsubstitution":
+                    in_process = True
+
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
@@ -1136,7 +1366,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
+                        is_shell = in_process or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -1145,9 +1375,9 @@ class BashCommandParser:
                         child = getattr(node, attr)
                         if isinstance(child, list):
                             for item in child:
-                                visit(item, cmd_name or parent_cmd)
+                                visit(item, cmd_name or parent_cmd, in_process)
                         elif child:
-                            visit(child, cmd_name or parent_cmd)
+                            visit(child, cmd_name or parent_cmd, in_process)
 
         for node in ast_nodes or []:
             visit(node)
