@@ -16,6 +16,7 @@ so another layer cannot hide a lost pattern.
 import pytest
 
 from schlock.core import validator
+from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import clear_caches, validate_command
 
@@ -57,6 +58,9 @@ class TestTheNextCommandDoesNotCompleteTheRule:
             'echo $(printf "(") && git commit -m "fix: hash password"',
             "chroot /srv $(printf '(') && sh build.sh",
             "cat $(echo ')') && git commit -m 'docs: .env'",
+            # Past the depth the gap balances, the blanked-body pass still stops at `&&`.
+            'cat $(printf %s $(dirname $(pwd)) | head -1)/x && git commit -m "docs: .env"',
+            'echo $(a $(b $(c)) | d) && git commit -m "fix: hash password"',
             # remote_execution: `| shasum` is not `| sh`, `rsync` is not `nc`.
             "npm install && curl -s localhost:3000 | shasum",
             "git commit -am x && git fetch && git log | sha512sum",
@@ -155,6 +159,8 @@ PAYLOADS = [
     ("recursive_permission_system_dirs", 'chown -R "u&g" /etc'),
     ("source_remote_script", "source /tmp/a/b/c.sh"),
     ("source_remote_script", 'source "/tmp/R&D/x.sh"'),
+    # Arithmetic closes as one piece at the gap. bashlex fails the parse, so pin the rule too.
+    ("credential_exposure", "cat $((0)) .env"),
     # Deeper than the `$(...)` piece balances, a `$(` walks on: one per gap.
     ("credential_exposure", "cat $(dirname $(dirname $(pwd)))/.env"),
     ("credential_exposure", "cat $(dirname $(dirname $(pwd)))/id_rsa"),
@@ -220,3 +226,33 @@ class TestOneCommandStillBlocks:
     @pytest.mark.parametrize(("rule", "command"), PAYLOADS)
     def test_the_rule_itself_still_matches(self, engine, rule, command):
         assert rule_matches(engine, rule, command), (rule, command)
+
+
+# (rule, command): a bare separator in a body nested deeper than the gap balances.
+# The rule cannot reach these as written; the validator matches them with each
+# substitution body blanked (BashCommandParser.mask_substitution_bodies).
+DEEP_PAYLOADS = [
+    ("credential_exposure", "cat $(printf %s $(dirname $(pwd)) | head -1)/.env"),
+    ("credential_exposure", "cat $(printf %s $(dirname $(pwd)) ; true)/.env"),
+    ("credential_exposure", "cat $(a $(b $(c)) | d)/id_rsa"),
+    ("credential_exposure", "echo $(a $(b $(c)) | d) password"),
+    ("credential_exposure", "true; cat $(a $(b $(c $(d)) | e) | f)/.env"),
+    ("extended_credential_exposure", "echo $(a $(b $(c)) | d) $GITHUB_TOKEN"),
+    ("hardcoded_secrets", "export A=$(a $(b $(c)) | d) MY_KEY=x"),
+    ("privilege_escalation_variants", "chroot $(a $(b $(c)) | d) /bin/bash"),
+    ("partition_manipulation", "parted $(a $(b $(c)) | d) /dev/sda"),
+    ("filesystem_wipe", "shred $(a $(b $(c)) | d) /dev/sda"),
+    ("source_remote_script", "source /tmp/$(a $(b $(c)) | d)/x.sh"),
+    ("recursive_permission_system_dirs", "chown -R $(a $(b $(c)) | d) /etc"),
+]
+
+
+class TestADeepSubstitutionIsOneWord:
+    @pytest.mark.parametrize(("rule", "command"), DEEP_PAYLOADS)
+    def test_is_blocked(self, rule, command, rules_dir_path):
+        assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
+
+    @pytest.mark.parametrize(("rule", "command"), DEEP_PAYLOADS)
+    def test_the_rule_matches_the_blanked_command(self, engine, rule, command):
+        parser = BashCommandParser()
+        assert rule_matches(engine, rule, parser.mask_substitution_bodies(command, parser.parse(command))), (rule, command)

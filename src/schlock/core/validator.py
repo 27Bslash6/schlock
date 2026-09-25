@@ -2844,6 +2844,26 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     heredoc_ranges=heredoc_ranges,
                 )
 
+            # A separator inside a substitution is data at any depth, and a rule's gap
+            # only balances so many levels of one. Match again with each body
+            # blanked, so the gap passes a substitution as one word. Every top-level
+            # separator survives the blanking, so this pass cannot pair two commands, and
+            # it only ever raises the verdict. Whitelist as the pass it shadows: a single
+            # segment's own prefix check, or none once is_fully_whitelisted has ruled.
+            if match.risk_level < RiskLevel.BLOCKED:
+                masked = parser.mask_substitution_bodies(parse_target, ast)
+                if masked != parse_target:
+                    masked_match = engine.match_command(
+                        masked,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        use_whitelist=len(segments) <= 1,
+                    )
+                    if masked_match.risk_level > match.risk_level:
+                        match = masked_match
+                        if all_matched_rules and masked_match.rule:
+                            all_matched_rules.append(masked_match.rule.name)
+
             # A `"$(…)"` body is code, which the passes above suppressed with its quoted
             # word. Matched once, over the whole AST, after the segments are rated: a `for`
             # word list is in no segment, and a body only ever raises the verdict those
