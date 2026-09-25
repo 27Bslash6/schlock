@@ -1894,29 +1894,33 @@ def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHered
     phantom refusals, the body lookup and the fallback's owner check - so they cannot
     disagree about which heredocs exist. It visits every child: list parts, substitutions,
     and a compound's own `redirects`. The owner is `heredoc_owner` - the shell a wrapper
-    runs, not the wrapper - and None for a compound's own redirect or a redirect with no
-    command word.
+    runs, not the wrapper - and None for a compound's own redirect, a redirect with no
+    command word, or any heredoc inside a process substitution. What reads `<( … )` may
+    run what it prints (`bash < <(cat <<'EOF' … )`), and nothing here knows the reader,
+    so the command inside is not what decides whether the body is code.
     """
     found: list[_BashlexHeredoc] = []
 
-    def visit(node: Any, owner: Optional[str], in_substitution: bool) -> None:
+    def visit(node: Any, owner: Optional[str], in_substitution: bool, in_process: bool) -> None:
         kind = getattr(node, "kind", None)
         if kind == "command":
-            owner = heredoc_owner(node)
+            owner = None if in_process else heredoc_owner(node)
         elif kind == "compound":
             owner = None
-        elif kind in ("commandsubstitution", "processsubstitution"):
+        elif kind == "commandsubstitution":
             in_substitution = True
+        elif kind == "processsubstitution":
+            in_substitution = in_process = True
         if kind == "redirect" and getattr(node, "heredoc", None) is not None:
             start, end = node.pos
             found.append(_BashlexHeredoc(parse_target.find("<<", start, end), owner, node.output.word, in_substitution))
         for value in vars(node).values():
             for child in value if isinstance(value, list) else (value,):
                 if hasattr(child, "kind"):
-                    visit(child, owner, in_substitution)
+                    visit(child, owner, in_substitution, in_process)
 
     for node in nodes:
-        visit(node, None, False)
+        visit(node, None, False, False)
     return found
 
 
@@ -2212,8 +2216,10 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
                     rewritten.append(_HEREDOC_PLACEHOLDER)
                     break
                 if not quoted and _HEREDOC_PLACEHOLDER in body:
-                    # A kept body line reading as the placeholder is where bashlex ends the
-                    # body and bash does not. (A quoted body is dropped, so it cannot.)
+                    # bashlex ends the kept body at a line equal to the placeholder (after the
+                    # `<<-` tab strip), and bash does not, so the command behind it would be
+                    # read as body. Containment is a strict superset of that line test, and
+                    # needs no copy of bashlex's strip. (A quoted body is dropped, so it cannot.)
                     raise ParseError("An unquoted heredoc body contains the rewrite delimiter")
                 body_lines.append(body)
             else:
@@ -2302,7 +2308,8 @@ def _unreadable_program(owner: Optional[str]) -> ValidationResult:
     """Refuse a heredoc whose body was discarded when that body may run as a program.
 
     ``owner`` is the shell that runs it, or None when the heredoc has no named command -
-    a compound's own redirect, whose body feeds a loop that may run it, or a bare redirect.
+    a compound's own redirect, whose body feeds a loop that may run it, a bare redirect,
+    or one inside a process substitution, whose reader may run what it prints.
     """
     runner = f"'{owner}'" if owner else "the command it feeds"
     return ValidationResult(
@@ -2439,10 +2446,11 @@ def _escalate_past_heredoc(
             )
     # A quoted body here was dropped, so a heredoc whose body runs as a program is a program
     # nothing read - a shell anywhere (in a loop, a group, a substitution, behind another
-    # heredoc), or a heredoc with no named command, whose body may feed one. Refused ahead of
-    # every verdict below, including the whitelist: whitelisting is a statement about the
-    # command, and here the command is not what runs. A shell is recognised by its own name;
-    # an unquoted shell body is refused too, for simplicity, though it was kept.
+    # heredoc or a wrapper), or a heredoc with no named command, whose body may feed one.
+    # Refused ahead of every verdict below, including the whitelist: whitelisting is a
+    # statement about the command, and here the command is not what runs. The owner is
+    # `_bashlex_heredocs`' reading; an unquoted shell body is refused too, for simplicity,
+    # though it was kept.
     for heredoc in heredocs:
         if heredoc.owner is None or heredoc.owner in _SHELL_COMMANDS:
             return _unreadable_program(heredoc.owner)

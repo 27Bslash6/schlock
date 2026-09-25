@@ -2915,24 +2915,69 @@ class TestQuotedHeredocDelimiter:
         assert result.allowed is False
 
     @pytest.mark.parametrize(
-        "head", ["env bash", "timeout 5 sh", "nice -n 5 bash", "env FOO=1 /bin/bash", "nohup env bash", "busybox sh"]
+        "head",
+        [
+            "env bash",
+            "timeout 5 sh",
+            "nice -n 5 bash",
+            "env FOO=1 /bin/bash",
+            "nohup env bash",
+            "busybox sh",
+            # The shell is not the wrapper's first operand, so reading only that one misses it.
+            "flock ./lock sh",
+            "strace -o out sh",
+            "stdbuf -o L bash",
+        ],
     )
     def test_a_wrapped_shell_heredoc_body_is_validated_as_code(self, safety_rules_path, head):
         """A wrapper execs the shell with its own stdin, so the heredoc is still that shell's program.
 
         Pre-fix the owner was the wrapper's name, not a shell, so the body was filed inert and
-        `env bash <<'EOF'` running `rm -rf /` scored SAFE.
+        `env bash <<'EOF'` running `rm -rf /` scored SAFE - and so did its unquoted twin.
         """
-        result = validate_command(f"{head} <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+        quoted = validate_command(f"{head} <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+        val_module._global_cache.clear()
+        bare = validate_command(f"{head} <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path)
+
+        assert quoted.risk_level == RiskLevel.BLOCKED
+        assert "shell_delegated_payload" in quoted.matched_rules
+        assert bare.risk_level == RiskLevel.BLOCKED
+        assert "system_destruction" in bare.matched_rules
+
+    @pytest.mark.parametrize("delimiter", ["'EOF'", "EOF"], ids=["quoted", "bare"])
+    def test_a_wrapped_non_shell_heredoc_body_stays_inert(self, safety_rules_path, delimiter):
+        """`timeout 5 cat` prints its heredoc: resolving the wrapper must not rescan it as code."""
+        result = validate_command(f"timeout 5 cat <<{delimiter}\nrm -rf /\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash < <(cat <<'EOF'\nrm -rf /\nEOF\n)",
+            "bash <(cat <<'EOF'\nrm -rf /\nEOF\n)",
+            "source <(cat <<'EOF'\nrm -rf /\nEOF\n)",
+            "bash < <(env cat <<'EOF'\nrm -rf /\nEOF\n)",
+        ],
+        ids=["stdin", "script-operand", "sourced", "wrapped-inner"],
+    )
+    def test_a_heredoc_in_a_process_substitution_is_validated_as_code(self, safety_rules_path, command):
+        """Whatever reads a process substitution may run what it prints, so its heredoc is code.
+
+        The owner used to be the command inside the substitution: `cat`, not a shell, so the
+        body was filed inert. `bash < <(cat <<'EOF' …)` then scored SAFE - BLOCKED on `main`
+        before this branch - and bash runs the body.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
-        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules
 
-    def test_a_wrapped_non_shell_heredoc_body_stays_inert(self, safety_rules_path):
-        """`timeout 5 cat` prints its heredoc: resolving the wrapper must not rescan it as code."""
-        result = validate_command("timeout 5 cat <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+    def test_a_benign_heredoc_in_a_process_substitution_stays_allowed(self, safety_rules_path):
+        """Its body is rescanned as code, and a body that is harmless as code passes."""
+        result = validate_command("diff <(cat <<'EOF'\nhello\nEOF\n) b.txt", config_path=safety_rules_path)
 
-        assert result.allowed is True
+        assert result.allowed is True, result.message
 
     def test_body_ends_where_bash_ends_it(self, safety_rules_path):
         """AC2: bash terminates at the bare delimiter, so what follows is shell.
@@ -3460,8 +3505,9 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
             ("ls <<'X'\nt\nX\nbash <<'A;B'\nrm -rf /\nA;B", "bash"),
             ("/bin/bash <<'A;B'\nrm -rf /\nA;B", "bash"),
             ("FOO=1 bash <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("env bash <<'A;B'\nrm -rf /\nA;B", "bash"),
         ],
-        ids=["for-loop", "if", "group", "behind-another-heredoc", "full-path", "assignment-prefix"],
+        ids=["for-loop", "if", "group", "behind-another-heredoc", "full-path", "assignment-prefix", "wrapped"],
     )
     def test_a_shell_anywhere_is_refused(self, safety_rules_path, command, shell):
         result = validate_command(command, config_path=safety_rules_path)
@@ -3469,9 +3515,18 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
         assert result.allowed is False
         assert f"Unreadable heredoc delimiter in front of shell interpreter '{shell}'" in (result.error or "")
 
-    def test_a_compounds_own_redirect_is_refused(self, safety_rules_path):
-        """The body feeds the loop's stdin, and this loop runs each line: `$l` executes `rm -rf /`."""
-        result = validate_command("while read l; do $l; done <<'A;B'\nrm -rf /\nA;B", config_path=safety_rules_path)
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "while read l; do $l; done <<'A;B'\nrm -rf /\nA;B",
+            "bash < <(cat <<'A;B'\nrm -rf /\nA;B\n)",
+            "bash <(cat <<'A;B'\nrm -rf /\nA;B\n)",
+        ],
+        ids=["loop-runs-each-line", "process-substitution-stdin", "process-substitution-script"],
+    )
+    def test_a_body_that_feeds_an_unnamed_program_is_refused(self, safety_rules_path, command):
+        """The loop runs each line (`$l` executes `rm -rf /`), and bash runs what `<(…)` prints."""
+        result = validate_command(command, config_path=safety_rules_path)
 
         assert result.allowed is False
         assert "the command it feeds" in (result.error or "")
@@ -3512,11 +3567,21 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
         assert result.allowed is False
         assert "ends in a backslash" in (result.error or "")
 
-    def test_a_kept_body_that_spells_the_placeholder_fails_closed(self, safety_rules_path):
-        """bashlex would end the kept body at that line, where bash does not."""
+    @pytest.mark.parametrize(
+        "opener,line", [("<<EOF", "SCHLOCK_HEREDOC"), ("<<-EOF", "\tSCHLOCK_HEREDOC")], ids=["plain", "tab-stripped"]
+    )
+    def test_a_kept_body_that_spells_the_placeholder_fails_closed(self, safety_rules_path, opener, line):
+        """bashlex would end the kept body at that line, where bash does not.
+
+        The line then opens two more heredocs to bashlex, and the second takes the command
+        bash runs after its real terminator as inert body. A quoted `'rm'` is what that
+        command is spelled as here, because a bare `rm -rf /` is denied on its own text
+        anyway: before this guard, this scored LOW and was allowed. The `<<-` row is the
+        one a line-equality check would miss, since bashlex strips the tab before comparing.
+        """
         result = validate_command(
-            "cat <<'A;B'\nx\nA;B\ncat <<EOF\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC\nEOF\n"
-            "rm -rf /\nSCHLOCK_HEREDOC",
+            f"cat <<'A;B'\nx\nA;B\ncat {opener}\n{line}\ncat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC\nEOF\n"
+            "'rm' -rf /\nSCHLOCK_HEREDOC",
             config_path=safety_rules_path,
         )
 
