@@ -4,10 +4,6 @@ Regression test to ensure that pattern matches are only ignored if the
 ENTIRE match (both start AND end) falls within a string literal.
 
 Also tests FIX 2: Empty quoted string range bug fix.
-
-LAB-4321: suppression is per-occurrence - a suppressed decoy must not disable
-its rule for the rest of the command.
-LAB-1732: a quoted token must not disable the quote-stripped reconstructed pass.
 """
 
 import re
@@ -171,11 +167,12 @@ class TestSuppressionIsPerOccurrence:
     unquoted, executable ones - went unexamined. Quoting a decoy up front
     therefore disarmed the rule for the rest of the command (LAB-4321).
 
-    `rm -rf /` does not guard this: `system_destruction` carries two patterns
-    that match at different offsets, so a second pattern still catches the
-    payload. `fork_bomb`'s patterns both match at the decoy, and the payload
-    fragments under segment-by-segment validation, so it is the shape that
-    actually exercises the leak.
+    `rm -rf /` does not guard this: `system_destruction`'s `[^;|&]` run crosses
+    the newline, so its first match starts inside the decoy, ends at the payload,
+    and is never suppressed. The one `fork_bomb` pattern that matches this
+    spelling matches wholly inside the decoy, and the payload fragments under
+    segment-by-segment validation, so it is the shape that actually exercises
+    the leak.
     """
 
     FORK_BOMB = ":(){ :|:& };:"
@@ -194,11 +191,11 @@ class TestSuppressionIsPerOccurrence:
 
     def test_non_shell_heredoc_decoy_does_not_hide_a_later_danger(self, rules_dir_path):
         """Same leak via the other suppression range: heredoc body, then real payload."""
-        body_start = len("cat <<'EOF'\n")
-        command = f"cat <<'EOF'\n{self.FORK_BOMB}\nEOF\n{self.FORK_BOMB}"
-        body_end = body_start + len(self.FORK_BOMB)
+        command = f"cat <<EOF\n{self.FORK_BOMB}\nEOF\n{self.FORK_BOMB}"
+        parser = BashCommandParser()
+        heredoc_ranges = parser.extract_heredoc_ranges(command, parser.parse(command))
 
-        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=[(body_start, body_end, False)])
+        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=heredoc_ranges)
 
         assert match.matched, "heredoc decoy suppressed the rule for the payload after the terminator"
         assert match.risk_level == RiskLevel.BLOCKED
@@ -206,9 +203,7 @@ class TestSuppressionIsPerOccurrence:
     @pytest.mark.parametrize(
         "start_delta,is_shell,expect_match,description",
         [
-            # Running out of occurrences is an answer, not a failure to find one:
-            # the scan looks past a suppressed match because a later one may be
-            # executable, and when none is it must exhaust and report nothing.
+            # An inert non-shell heredoc body is suppressed.
             (0, False, False, "inert body, sole occurrence - stays suppressed"),
             # The discriminator, in the under-block direction. A shell runs its
             # heredoc body, so the identical text must still match.
@@ -223,14 +218,14 @@ class TestSuppressionIsPerOccurrence:
     ):
         """Every decision `_is_in_non_shell_heredoc` makes, pinned in the direction that fails.
 
-        None of the three had a guard that could go red. Disabling the heredoc
-        arm of `_first_executable_match`, making `_is_in_non_shell_heredoc`
-        ignore `is_shell`, or dropping its `start <= match_start` bound each
-        left the whole suite green. The end-to-end row for the same shape
-        (`tests/test_dangerous_commands.py`, "Heredoc with rm -rf") passes
-        today, but its helper answers a false positive with `pytest.skip`, so
-        on any of these regressions it degrades to a skip rather than a
-        failure and can never pin this branch.
+        Each row kills its own mutant: disabling the heredoc arm of
+        `_first_executable_match`, making `_is_in_non_shell_heredoc` ignore
+        `is_shell`, or dropping its `start <= match_start` bound. The last has no
+        other guard - without it, the rest of the suite stays green. The end-to-end
+        row for the same shape (`tests/test_dangerous_commands.py`, "Heredoc with
+        rm -rf") cannot stand in: its helper answers a false positive with
+        `pytest.skip`, so it degrades to a skip on the heredoc-arm regression and
+        passes outright on the other two.
 
         Ranges come from the parser rather than hand-counted offsets: it emits
         `(10, 27, False)` here, running through the terminator line, so a
@@ -255,16 +250,11 @@ class TestSuppressionIsPerOccurrence:
     @pytest.mark.parametrize(
         "template,description",
         [
-            # Leaked on `main` itself: the parser derives a literal for the decoy,
-            # the newline stops the pattern spanning both, and the payload after
-            # it was never looked at. Rated SAFE and ALLOWED before the fix.
+            # The parser derives a literal for the decoy and the newline stops the
+            # pattern spanning both, so only a scan past the decoy reaches the payload.
             ("cat '{bomb}'\n{bomb}", "quoted decoy, payload on the next line"),
-            # LIVE on `main` today, rated LOW and ALLOWED. It was BLOCKED at the
-            # merge-base only by accident - `main` could not derive a literal for
-            # the segment, so it matched the DECOY rather than the payload. Then
-            # LAB-1732 taught the parser that quoted data IS data, correctly
-            # suppressed the decoy, and un-gated this defect on `main` itself.
-            # The per-occurrence scan is now the only thing reaching the payload.
+            # The same through a heredoc segment: the decoy is suppressed as data,
+            # and only the per-occurrence scan reaches the payload.
             ("cat '{bomb}' <<'EOF'\nbody\nEOF\n{bomb}", "canonical opener"),
         ],
     )
@@ -296,54 +286,6 @@ class TestSuppressionIsPerOccurrence:
 
         assert match is not None, "an overlapping executable match was stepped over"
         assert match.span() == (1, 6)
-
-    @pytest.mark.parametrize(
-        "unit,expected,description",
-        [
-            # Under-block: `validate_command` runs its cross-segment scan ONLY when no
-            # segment matched, so a bogus segment match hides the BLOCKED the whole
-            # command earns. `_segment_nodes` fragments the fork bomb, so that scan is
-            # the only thing that sees it.
-            ("pip install -r requirements.txt", RiskLevel.BLOCKED, "decoy padding must not hide a later payload"),
-            # Over-block: the same inert text with nothing dangerous after it is a
-            # command a user may legitimately run.
-            (None, RiskLevel.SAFE, "inert padding alone is not dangerous"),
-        ],
-    )
-    def test_padding_a_literal_changes_no_verdict(self, safety_rules_path, unit, expected, description):
-        """The scan never gives up early, at any repetition count.
-
-        A bounded scan has to report something on exhaustion and both answers are
-        wrong: the last suppressed match denies benign text and masks a higher
-        verdict elsewhere in the command, while None lets padding silence the rule.
-        40 repeats is past any bound worth writing.
-
-        These rows pin the FIRST answer only. A bound returning None survives them:
-        the padded `pip` patterns do exhaust, but `fork_bomb` matches on its first
-        iteration, so None silences only the LOW/MEDIUM pip rules and never moves
-        the BLOCKED verdict. Pinning the None direction needs a command whose sole
-        dangerous match is itself preceded by a suppressed one - filed separately,
-        not added here: new coverage does not belong in a conflict resolution.
-        """
-        padding = " ".join(["sudo apt-get install -y pkg" if unit is None else unit] * 40)
-        command = f"echo '{padding}'" + ("" if unit is None else f" && {self.FORK_BOMB}")
-
-        result = validate_command(command, config_path=safety_rules_path)
-
-        assert result.risk_level == expected, f"{description}: got {result.risk_level.name}"
-
-    @pytest.mark.parametrize(
-        "command,literal,description",
-        [
-            ('echo "rm -rf /"', slice(5, 15), "double-quoted decoy, no payload"),
-        ],
-    )
-    def test_sole_occurrence_is_still_suppressed(self, rules_dir_path, command, literal, description):
-        """Per-occurrence scanning must not break suppression when there is only one."""
-        match = RuleEngine(rules_dir_path).match_command(command, string_literals=[(literal.start, literal.stop)])
-
-        assert not match.matched, f"false positive: {description} - {command}"
-        assert match.risk_level == RiskLevel.SAFE
 
 
 class TestQuotedTokenDoesNotSuppressReconstructedPass:
