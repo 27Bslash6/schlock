@@ -1509,10 +1509,13 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     Returns ``(delimiter, offset just past the word)``.
 
     Raises:
-        ParseError: on an unterminated quote, an empty delimiter, or an escape
-            inside `$'…'`. A delimiter this cannot tokenize is a body boundary it
-            cannot locate, so the caller must not vouch for anything around it.
+        ParseError: on an unterminated quote, an empty delimiter, an escape
+            inside `$'…'`, or an expansion in the word: `${`, `$(`, `$[`, a
+            backtick, or a `<(` / `>(` glued to its end. A delimiter this cannot
+            tokenize is a body boundary it cannot locate, so the caller must not
+            vouch for anything around it.
     """
+    start = pos
     delimiter: list[str] = []
     while pos < len(text) and text[pos] not in _WORD_START_AFTER:
         char = text[pos]
@@ -1548,6 +1551,19 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
         else:
             delimiter.append(char)
             pos += 1
+
+    # bash removes a delimiter's quotes only at the top level of the word, not inside an
+    # expansion: `<<${a'b'}` ends at a line reading `${a'b'}`, and the body is expanded,
+    # while the loop above reads `${ab}`. An expansion also carries the word past where
+    # the loop stops: at `(` in `<<$(x)`, at the blank in `<<$[a b]'x'` (bash ends that at
+    # `$[a b]x`), and at `<` in `<<'E'<(true)` (bash ends that at `E<(true)`, but a blank
+    # before `<(` does end the word). Refused rather than modelled. That refuses quoted
+    # and escaped spellings too, such as `<<'$(x)'` or `<<"${x}"`, which bash reads
+    # literally, and it is deliberate: it only over-blocks, and telling them apart is the
+    # quote modelling this refusal exists to avoid.
+    word = text[start : pos + 1]  # with the character that stopped it
+    if any(s in word for s in ("${", "$(", "$[", "`")) or text[pos : pos + 2] in ("<(", ">("):
+        raise ParseError("Expansion in a heredoc delimiter; the line that ends its body is unknown")
 
     if not delimiter:
         # Also a quoted empty one (`<<''`): bash ends that at the first empty line, but
