@@ -885,6 +885,8 @@ class TestHeredocBenignUnchanged:
             ("env python3 <<EOF\nprint('chmod 777 f')\nEOF", RiskLevel.SAFE),
             # A wrapper around a non-shell consumer leaves the body inert text.
             ("env cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
+            # test_validator.py pins only `allowed` for this one; the risk level is pinned here.
+            ("timeout 5 cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
         ],
     )
     def test_benign_heredoc_verdict_unchanged(self, command, risk):
