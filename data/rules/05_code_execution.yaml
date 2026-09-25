@@ -167,8 +167,15 @@ rules:
       # ${IFS} usage (bypasses space detection)
       - '\$\{IFS\}'
       - '\$IFS'
-      # IFS override (changing field separator)
-      - '\bIFS\s*=\s*[^;\s]+'
+      # IFS override (changing field separator). A value must follow `=`
+      # directly, so a bare `IFS=` (the `while IFS= read -r line` idiom) does
+      # not match: an empty IFS disables word splitting and cannot hide words.
+      # A quoted empty value (IFS='') is NOT exempt: reconstructed text drops
+      # quotes, so `IFS=\'\'` (IFS is two quote characters) would read the same.
+      # The value class is bash's blanks, NOT `\s`: bash keeps CR, FF and VT
+      # inside a word, so `IFS=<CR>,` sets a live separator. `\<newline>` may
+      # split the name, because bash joins the lines before it parses them.
+      - '\bI(?:\\\n)*F(?:\\\n)*S(?:\\\n)*\s*=[^; \t\n]+'
       # IFS parameter expansion variants
       - '\$\{IFS[^}]*\}'
     alternatives:
@@ -182,7 +189,33 @@ rules:
     patterns:
       # base64 -d piped to shell
       - 'base64\s+(-d|--decode)[^;|&]*\|\s*(bash|sh|zsh|eval)'
-      - '(bash|sh|zsh).*<<<.*\$\(base64\s+(-d|--decode)'
+      # base64 decoded straight onto a shell's stdin. Written with two `.*` runs this
+      # was cubic in the density of shell names and `<<<` tokens: a command near the
+      # size limit took minutes to scan, on a matcher that runs before every bash call.
+      # Bounding them (`.{0,200}`) fixed the time and opened a bypass - 201 spaces of
+      # padding cleared a BLOCKED rule. So the runs stay unbounded and are made
+      # deterministic instead. The run before `<<<` stops at the next shell name (a
+      # substring; the leading alternation has no word boundary either): a here-string
+      # belongs to the nearest preceding shell, so the last one is enough. The run after
+      # `<<<` stops at the next `<<<` (backtracking tries every later `<<<` first) and
+      # at the decode, so the span ends at the decode feeding THIS here-string and
+      # literal suppression judges the right text. Every character is then scanned a
+      # bounded number of times across all start positions - linear, not cubic - and
+      # the set of matched strings is exactly what `.*` matched. One verdict moves: the
+      # span now starts at the LAST shell name before `<<<`, so a match wholly inside a
+      # quote is suppressed. `ssh host 'sh <<< "$(base64 -d x)"'` was BLOCKED only
+      # because `ssh` contains `sh`; it is SAFE now, like every other quoted remote
+      # payload (remote delegation is deliberately not covered - see validator.py). The
+      # same span leak also caught a payload quoted behind a local launcher outside the
+      # wrapper set (`uv run sh -c '...'`, `docker exec c sh -c '...'`); that is SAFE now
+      # too. It is not this regex's job to re-open by chasing `-c` spellings - a shell
+      # name plus a first-flag `-c` is trivially evaded (`bash --norc -c`), so it would
+      # be a bypass with a badge. The fix is the re-entry that already validates known
+      # wrappers and direct shells, widened to those launchers for every rule: LAB-4699.
+      # Do not narrow either run to a separator class: everything after `<<<` is
+      # here-string CONTENT, where `;` and `&&` are payload text, and `&` before it is
+      # part of `&>` and `2>&1`. Pinned by tests/test_herestring_base64_scaling.py.
+      - '(bash|sh|zsh)(?:(?!bash|sh|zsh).)*<<<(?:(?!<<<|\$\(base64\s+(?:-d|--decode)).)*\$\(base64\s+(-d|--decode)'
       # An `echo <base64> | base64 -d | sh` form was listed here too. It was
       # strictly subsumed by the first pattern above (which needs no echo prefix
       # and also covers zsh/eval), and its unanchored `{20,}` run followed by
