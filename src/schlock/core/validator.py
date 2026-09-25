@@ -628,7 +628,7 @@ def _watch_payload(args: list[str]) -> Optional[str]:
     return " ".join(args[i:]) or None
 
 
-def _shell_delegated_payloads(
+def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator shape, plus two ceilings
     commands_with_args: list[tuple[str, list[str]]],
     *,
     _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
@@ -653,7 +653,8 @@ def _shell_delegated_payloads(
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
 
-    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there).
+    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes or distinct payloads (fail
+    closed, see there).
     """
     # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
     # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
@@ -713,7 +714,14 @@ def _shell_delegated_payloads(
         payloads.extend(p for p in found if p and p.strip())
     # The same program can still surface from more than one delegator (`su su bash -c PROG`:
     # each `su` owns a -c AND wraps the next). Validating it once is enough.
-    return list(dict.fromkeys(payloads))
+    payloads = list(dict.fromkeys(payloads))
+    # Every payload re-enters validation. The suffix ceiling above does not count them, and one
+    # `git config` command yields a payload per candidate pair, so cap the distinct total as well
+    # (fail closed, same reason). git config takes at most three positionals, so no real command
+    # comes near this.
+    if len(payloads) > MAX_DELEGATOR_TOKENS:
+        raise ValueError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
+    return payloads
 
 
 def _check_contextual_high_risk(

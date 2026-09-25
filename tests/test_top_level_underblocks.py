@@ -578,6 +578,19 @@ class TestGitConfigWriteVerdicts:
         # The -c path this fix is the persisted twin of must not regress.
         assert validate_command("git -c core.pager='rm -rf /' log").risk_level == RiskLevel.BLOCKED
 
+    def test_payloads_past_the_ceiling_fail_closed(self):
+        # Every payload re-enters validation, and one command can now yield one per pair. Without
+        # a ceiling a 64 KiB `git config` line re-validated thousands of words and ran for tens of
+        # seconds; a hook that outlives its timeout fails OPEN. Exactly MAX_DELEGATOR_TOKENS pairs
+        # fit (the ceiling admits, it does not merely reject).
+        def pairs(n):
+            return "git config " + " ".join(f"core.pager p{i}" for i in range(n))
+
+        assert validate_command(pairs(val_module.MAX_DELEGATOR_TOKENS)).allowed
+        refused = validate_command(pairs(val_module.MAX_DELEGATOR_TOKENS + 1))
+        assert refused.risk_level == RiskLevel.BLOCKED
+        assert "distinct payloads" in (refused.error or "")
+
     def test_substitution_tier_judges_every_payload_itself(self):
         # The top level reaches `$()` bodies today, so a verdict test cannot tell whether this
         # tier's own judge still weighs past a decoy. Ask the judge directly: `core.pager.cfg` is
