@@ -3029,7 +3029,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     allowed=False,
                     risk_level=RiskLevel.BLOCKED,
                     message=str(e),
-                    alternatives=["Run the command directly instead of delegating it through wrappers or here-strings"],
+                    alternatives=[
+                        "Run the command directly instead of delegating it through wrappers, here-strings or heredocs"
+                    ],
                     exit_code=1,
                     error=None,
                 )
