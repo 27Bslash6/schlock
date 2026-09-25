@@ -1,5 +1,5 @@
 {
-  "description": "Schlock safety validation and session setup hooks",
+  "description": "Schlock safety validation and session setup hooks. The PreToolUse/Bash command blocks (exit 2) unless the hook both exits 0 and prints a decision, so a hook that cannot start, or starts something other than the hook, blocks the tool call; see tests/test_hook_manifest.py",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py"
+            "command": "out=$(python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\") || exit 2; case $out in *'\"permissionDecision\"'*) printf '%s\\n' \"$out\" ;; *) echo 'schlock: pre_tool_use.py returned no decision' >&2; exit 2 ;; esac"
           }
         ]
       },
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/self_protect.py"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/self_protect.py\""
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.py"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.py\""
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\""
           }
         ]
       }

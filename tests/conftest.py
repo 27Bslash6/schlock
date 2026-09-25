@@ -6,8 +6,20 @@ from pathlib import Path
 
 import pytest
 
+from schlock.core import validator
 from schlock.core.cache import ValidationCache
 from schlock.core.parser import BashCommandParser
+from schlock.core.validator import clear_caches
+
+
+@pytest.fixture
+def no_shellcheck(monkeypatch):
+    """Pin verdicts to schlock's rule and AST engine."""
+    monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
+    clear_caches()
+    yield
+    clear_caches()
+
 
 # A timing assertion grades the machine it runs on. On a shared CI runner that is
 # the runner, not schlock, so their verdicts are withheld there. Three test modules
