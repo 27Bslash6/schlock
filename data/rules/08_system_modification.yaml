@@ -144,7 +144,7 @@ rules:
     description: DNS manipulation enables phishing and C2 redirection
     risk_level: BLOCKED
     patterns:
-      # Runs are `[^;|&]{0,200}` so each `cat` or `echo` costs a bounded scan;
+      # Runs are `[^;|&]{0,200}` so each `cat`, `echo` or `nmcli` costs a bounded scan;
       # why 200: database_credential_theft in 03_credential_theft.yaml.
       #
       # /etc/hosts manipulation

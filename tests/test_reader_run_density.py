@@ -7,17 +7,21 @@ few bytes, so the cost grew with the square of the command's length. The runs ar
 bounded now; the YAML note on database_credential_theft in
 data/rules/03_credential_theft.yaml carries the why.
 
-The sweep takes every rule from the engine rather than a list, because a revert or
-a new unbounded rule can land anywhere. It runs at the regex layer: validating a
-large command also pays a linear parse cost that would blur the signal.
+The timing sweep takes every rule from the engine rather than a list, so a revert
+or a new unbounded run anchored on `cat` fails wherever it lands. It sees only runs
+the two padding units exercise: a run anchored on another word, or an inner run
+behind a literal neither unit contains, never executes. The static check pins
+every run in the rules bounded here, whatever anchors it. Both run at the regex
+layer: validating a large command also pays a linear parse cost that would blur
+the signal.
 """
 
+import re
 import time
 from pathlib import Path
 
 import pytest
 
-from schlock.core import validator as validator_module
 from schlock.core.rules import RuleEngine
 from schlock.core.validator import RiskLevel, validate_command
 
@@ -40,11 +44,12 @@ SMALL = 10 * BOUND
 RATIO = 5
 NOISE = 0.001
 
+# A reader run and its quantifier, e.g. `[^;|&]{0,200}`.
+RUN = re.compile(r"\[\^;\|&\](\*|\+|\{\d*,\d*\})")
 
-@pytest.fixture(autouse=True)
-def no_shellcheck(monkeypatch):
-    """ShellCheck is optional, so it must not be what produces these verdicts."""
-    monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+# The one run with a wider bound: aws_credential_theft's lookahead for the session
+# name, where a bound fails toward denying. See data/rules/12_cloud_security.yaml.
+SESSION_NAME_LOOKAHEAD = r"(?!\s+[^;|&]{0,1000}--role-session-name)"
 
 
 def _cost(patterns, text):
@@ -109,6 +114,54 @@ WITHIN_BOUND = [
 ]
 
 
+@pytest.mark.parametrize("rule", [row[0] for row in WITHIN_BOUND])
+def test_every_run_carries_the_bound(rule):
+    """Each run in these rules is `{0,BOUND}`: not unbounded, not wider, not narrower.
+
+    The timing sweep cannot see a run it never executes, and a wider bound stays
+    linear, so it passes there too. This reads the bound off the pattern instead.
+    """
+    sources = [pattern.pattern.replace(SESSION_NAME_LOOKAHEAD, "") for pattern in PATTERNS[rule]]
+    runs = [run for source in sources for run in RUN.findall(source)]
+
+    assert runs, f"{rule}: no reader run found"
+    assert set(runs) == {f"{{0,{BOUND}}}"}, f"{rule}: {sorted(set(runs))}"
+
+
+def test_session_name_lookahead_keeps_its_wider_bound():
+    assert any(SESSION_NAME_LOOKAHEAD in pattern.pattern for pattern in PATTERNS["aws_credential_theft"])
+
+
+# assume-role with MFA, an external id, a duration and tags: the session name sits
+# about 300 characters past the verb, beyond the reader bound and inside its own.
+ASSUME_ROLE = (
+    "aws sts assume-role --role-arn arn:aws:iam::123456789012:role/platform/deploy/ci-release-engineering"
+    " --serial-number arn:aws:iam::123456789012:mfa/release-engineer --token-code 123456"
+    " --external-id 7f3c9a2e-4b1d-4e8a-9c6f-2d5b8e1a0c34 --duration-seconds 3600"
+    " --tags Key=team,Value=platform Key=owner,Value=release-engineering"
+)
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+def test_session_name_past_the_reader_bound_is_still_seen(safety_rules_path):
+    result = validate_command(f"{ASSUME_ROLE} --role-session-name release", config_path=safety_rules_path)
+
+    assert "aws_credential_theft" not in result.matched_rules, result.matched_rules
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+def test_session_name_past_the_lookahead_bound_reads_as_missing(safety_rules_path):
+    tags = " ".join(f"Key=k{i},Value=v{i}" for i in range(80))
+    command = f"{ASSUME_ROLE} {tags} --role-session-name release"
+    assert command.index("--role-session-name") - len("aws sts assume-role ") > 1000
+
+    result = validate_command(command, config_path=safety_rules_path)
+
+    assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+    assert "aws_credential_theft" in result.matched_rules, result.matched_rules
+
+
+@pytest.mark.usefixtures("no_shellcheck")
 @pytest.mark.parametrize(("rule", "reader", "lead", "rest"), WITHIN_BOUND, ids=[row[0] for row in WITHIN_BOUND])
 def test_path_at_the_edge_of_the_bound_still_rates(rule, reader, lead, rest, safety_rules_path):
     command = f"{reader} {'a' * (BOUND - len(lead) - 1)} {lead}{rest}"
