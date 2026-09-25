@@ -13,6 +13,7 @@ import re
 from typing import Any, NamedTuple, Optional
 
 import bashlex
+import bashlex.ast
 import bashlex.errors
 
 from schlock.exceptions import ParseError
@@ -397,41 +398,79 @@ def _stdin_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
     return by_fd.get(0)
 
 
-# bashlex reads `FOO=1` in front of a command as an assignment node, but it reads `a[0]=1` as a
-# plain word, and so is every assignment after that word or after a redirect. Bash still makes each
-# one an assignment (``a[0]': not a valid identifier``) and then runs the command. The subscript
-# match runs to the LAST `]=` because bashlex has already dropped the quotes that can hide a `]`
-# (`a["]"]=1`).
+# bashlex reads a plain `FOO=1` in front of a command as an assignment node. It reads a subscripted
+# `a[0]=1` as a plain word, and the same goes for every assignment after that word or after a
+# redirect. Bash takes each of them as an assignment, rejects the subscripted ones
+# (``a[0]': not a valid identifier``) and runs the command anyway. The subscript match runs to the
+# LAST `]=` because bashlex has already dropped the quotes that can hide a `]` (`a["]"]=1`).
 _ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=", re.DOTALL)
-# A blank inside a subscript splits the word, so `a[ 0 ]=1` arrives as `a[`, `0`, `]=1`.
-_SUBSCRIPT_OPEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\[")
-_SUBSCRIPT_CLOSE = re.compile(r"\]\+?=")
+_SUBSCRIPT_START = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\[")
+# One unit of a subscript's source text, read as bash reads it: a backslash escape, a quoted string
+# or a plain `${...}` is opaque. `stop` is what this does not model: a backtick, `$'`, `$"`, a `$(`
+# bashlex did not parse as a substitution, any other `${`, or a quote that does not close.
+_SUBSCRIPT_TOKEN = re.compile(
+    r"""\\.|'[^']*'|"(?:[^"\\`$]|\\.|\$(?![({]))*"|\$\{[^{}'"`\\$]*\}|(?P<stop>[`'"]|\$[({'"])|.""",
+    re.DOTALL,
+)
 
 
-def _prefix_length(words: "list[str]") -> int:
-    """Count the leading words that bash treats as assignments before it reaches the command name."""
-    i = 0
-    while i < len(words):
-        if _ASSIGNMENT_WORD.match(words[i]):
-            i += 1
+def _subscript_closes(word: Any, command: str) -> bool:
+    """Whether the subscript opened by the first `[` of ``word`` also closes inside it.
+
+    Bash reads a subscript as one matched `[`...`]` pair, and blanks, `;`, `|`, `#` and newlines
+    inside it are ordinary characters. bashlex ends the word at the first of them. A command
+    substitution is skipped over using bashlex's own span for it. Anything this does not model
+    counts as not closing.
+    """
+    start, end = word.pos
+    skip = {n.pos[0]: n.pos[1] for n in word.parts if n.kind in ("commandsubstitution", "processsubstitution")}
+    depth, i = 0, command.index("[", start)
+    while i < end:
+        if i in skip:
+            i = skip[i]
             continue
-        if not _SUBSCRIPT_OPEN.match(words[i]):
-            break
-        close = next((j for j in range(i + 1, len(words)) if _SUBSCRIPT_CLOSE.search(words[j])), None)
-        if close is None:
-            break
-        i = close + 1
-    return i
+        token = _SUBSCRIPT_TOKEN.match(command, i, end)
+        if token is None or token.group("stop"):
+            return False
+        depth += {"[": 1, "]": -1}.get(token.group(), 0)
+        if depth == 0:
+            return True
+        i = token.end()
+    return False
+
+
+def _refuse_split_subscripts(command: str, nodes: "list[Any]") -> None:
+    """Raise ParseError when bash reads a subscript before the command name past bashlex's word.
+
+    `a[ ; ]=1 bash` is one assignment followed by `bash` to bash, but to bashlex it is two commands.
+    Once the word boundaries disagree, no reading of bashlex's tree can be trusted.
+    """
+
+    class _Visitor(bashlex.ast.nodevisitor):
+        def visitcommand(self, n: Any, parts: "list[Any]") -> None:
+            for part in parts:
+                if part.kind != "word":
+                    continue
+                if _SUBSCRIPT_START.match(command, part.pos[0], part.pos[1]) and not _subscript_closes(part, command):
+                    raise ParseError("Failed to parse bash command: a subscript before the command name is not closed")
+                if not _ASSIGNMENT_WORD.match(part.word):
+                    return
+
+    for node in nodes:
+        _Visitor().visit(node)
 
 
 def _command_words(node: Any) -> "list[str]":
-    """Word tokens (command name + args) of a command node, skipping assignment/redirect prefixes."""
+    """Word tokens (command name + args) of a command node, skipping its assignment and redirect prefix.
+
+    A word shaped like an assignment is skipped only before the command name: `echo a[0]=1` names `echo`.
+    """
     words = [
         part.word
         for part in getattr(node, "parts", [])
         if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
     ]
-    return words[_prefix_length(words) :]
+    return words[next((i for i, word in enumerate(words) if not _ASSIGNMENT_WORD.match(word)), len(words)) :]
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -592,7 +631,7 @@ class BashCommandParser:
             raise ValueError("Command cannot be whitespace-only")
 
         try:
-            return bashlex.parse(command)
+            nodes = bashlex.parse(command)
         except bashlex.errors.ParsingError as e:
             # Preserve original bashlex error for debugging
             raise ParseError(
@@ -606,6 +645,8 @@ class BashCommandParser:
                 f"Unexpected parsing error for command: {command!r}",
                 original_error=e,
             )
+        _refuse_split_subscripts(command, nodes)
+        return nodes
 
     def extract_commands(self, ast_nodes: list[Any]) -> list[str]:
         """Extract all command names from AST.

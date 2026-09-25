@@ -6,6 +6,7 @@ from schlock.core.parser import BashCommandParser, _command_words, _reads_stdin_
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import dangerous_find, dangerous_git_config, dangerous_kubectl
 from schlock.core.validator import validate_command
+from schlock.exceptions import ParseError
 
 
 class TestDangerousGitConfigHelper:
@@ -372,8 +373,8 @@ class TestSubscriptedAssignmentPrefix:
     """An element assignment in front of a command (`a[0]=1 bash`) names the command it prefixes.
 
     bashlex reads `FOO=1` as an assignment node but `a[0]=1` as a plain word, and every assignment
-    after it as a plain word too. Bash reports ``a[0]': not a valid identifier`` and runs the
-    command anyway, with its stdin.
+    after it, or after a redirect, as a plain word too. Bash rejects the element assignment
+    (``a[0]': not a valid identifier``) and runs the command anyway, with its stdin.
     """
 
     @pytest.mark.parametrize(
@@ -382,15 +383,11 @@ class TestSubscriptedAssignmentPrefix:
             (f"{_DOWNLOAD} | a[0]=1 bash", f"{_DOWNLOAD} | FOO=1 bash"),
             ("a[0]=1 exec bash", "FOO=1 exec bash"),
             ("a[0]=1 bash <<< 'rm -rf /'", "FOO=1 bash <<< 'rm -rf /'"),
-            (f"{_DOWNLOAD} | a[k]=v bash", f"{_DOWNLOAD} | FOO=1 bash"),
             (f"{_DOWNLOAD} | a[0]+=1 bash", f"{_DOWNLOAD} | FOO+=1 bash"),
             (f"{_DOWNLOAD} | a[0]=1 b=2 bash", f"{_DOWNLOAD} | FOO=1 b=2 bash"),
-            (f"{_DOWNLOAD} | a[ 0 ]=1 bash", f"{_DOWNLOAD} | FOO=1 bash"),
             (f'{_DOWNLOAD} | a["x y"]=1 bash', f"{_DOWNLOAD} | FOO=1 bash"),
             (f"{_DOWNLOAD} | >/dev/null a[0]=1 bash", f"{_DOWNLOAD} | >/dev/null FOO=1 bash"),
             (f"{_DOWNLOAD} | a[0]=1 2>/dev/null bash", f"{_DOWNLOAD} | FOO=1 2>/dev/null bash"),
-            ("echo 'rm -rf /' | a[0]=1 bash", "echo 'rm -rf /' | FOO=1 bash"),
-            ("a[ 0 ]=1 exec bash", "FOO=1 exec bash"),
             (f"{_DOWNLOAD} | FOO=1 >/dev/null b=2 bash", f"{_DOWNLOAD} | FOO=1 b=2 bash"),
             ("a[0]=1 b=2 bash <<< 'rm -rf /'", "FOO=1 b=2 bash <<< 'rm -rf /'"),
         ],
@@ -406,38 +403,88 @@ class TestSubscriptedAssignmentPrefix:
             ("a[0]=1 bash -c 'echo hi'", "FOO=1 bash -c 'echo hi'"),
             ("echo x | a[0]=1 grep x", "echo x | FOO=1 grep x"),
             ("a[0]=1 exec 3>&1", "FOO=1 exec 3>&1"),
+            # An assignment-only stage writes nothing into the pipe.
+            ("a[0]=1 | bash", "FOO=1 | bash"),
         ],
     )
     def test_benign_prefixed_command_scores_as_its_plain_twin(self, command, twin):
         assert validate_command(command).risk_level == validate_command(twin).risk_level
 
     @pytest.mark.parametrize(
-        ("prefix", "opener", "body"),
+        ("command", "twin"),
         [
-            ("a[0]=1 bash", "<<'EOF'", "rm -rf /\nEOF"),
-            ("a[0]=1 bash", "<<EOF", "rm -rf /\nEOF"),
-            ("a[k]=v bash", "<<'EOF'", "rm -rf /\nEOF"),
-            ("a[0]=1 sh", "<<'EOF'", "rm -rf /\nEOF"),
-            ("a[0]=1 bash", "<<'A;B'", "rm -rf /\nA;B"),
+            ("a[0]=1 bash <<'EOF'\nrm -rf /\nEOF", "FOO=1 bash <<'EOF'\nrm -rf /\nEOF"),
+            ("a[0]=1 bash <<EOF\nrm -rf /\nEOF", "FOO=1 bash <<EOF\nrm -rf /\nEOF"),
+            ("a[0]=1 bash <<'A;B'\nrm -rf /\nA;B", "FOO=1 bash <<'A;B'\nrm -rf /\nA;B"),
         ],
     )
-    def test_heredoc_consumer_scores_as_its_plain_twin(self, prefix, opener, body):
-        twin = prefix.replace(prefix.split()[0], "FOO=1", 1)
-        command, plain = f"{prefix} {opener}\n{body}", f"{twin} {opener}\n{body}"
-        assert validate_command(command).risk_level == validate_command(plain).risk_level
+    def test_heredoc_consumer_scores_as_its_plain_twin(self, command, twin):
+        assert validate_command(command).risk_level == validate_command(twin).risk_level
 
-    @pytest.mark.parametrize("command", ["a[0]=1", "arr[i]+=x", "echo a[0]=1", "echo x | grep a[0]=1"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "a[0]=1",
+            "arr[i]+=x",
+            'm["k"]=v',
+            "a[${#a[@]}]=x",
+            'for f in *; do c[$(basename "$f")]=1; done',
+            "(( a[0]++ ))",
+            "for k in x y; do (( n[$k]++ )); done",
+            "echo a[0]=1",
+            "echo a[ 0 ]",
+            "echo x | grep a[0]=1",
+        ],
+    )
     def test_array_assignment_and_operand_stay_safe(self, command):
         assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # bash reads the subscript to its matching `]`: blanks, operators, `#` and newlines inside
+            # it do not end the word, but they end bashlex's.
+            "a[ 0 ]=1 bash",
+            'a[ "]=" ]=1 bash',
+            "a[;0]=1 bash",
+            "a[|0]=1 bash",
+            "a[&0]=1 bash",
+            "a[<x]=1 bash",
+            "a[\n0]=1 bash",
+            "a[ # ]=1 exec bash",
+            "a[[]=1;x]=1 bash",
+            # The first `]` is quoted, escaped or inside an expansion, so it does not close.
+            'a["]";0]=1 bash',
+            'a["]=1 b";0]=1 bash',
+            "a[\\];0]=1 bash",
+            "a[${x:-]};0]=1 bash",
+            "a[$(echo ]);0]=1 bash",
+            "a[$'\\'];x']=1 bash",
+            "a[`echo`;0]=1 bash",
+            # Any prefix word, in any command the tree holds.
+            "b=1 a[;0]=1 bash",
+            "a[0]=1 b[;0]=1 bash",
+            "echo $(a[;0]=1 bash)",
+            "echo x > $(a[;0]=1 bash)",
+        ],
+    )
+    def test_subscript_bash_reads_past_the_word_is_blocked(self, command):
+        with pytest.raises(ParseError):
+            BashCommandParser().parse(command)
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    def test_split_subscript_is_not_routed_to_the_heredoc_fallback(self):
+        # validate_command hands a ParseError that mentions a heredoc to the heredoc fallback.
+        with pytest.raises(ParseError) as raised:
+            BashCommandParser().parse("heredoc[;0]=1 bash")
+        assert "here" not in str(raised.value).lower()
+        assert validate_command("a[ 0 ]=1 cat <<'EOF'\nhello\nEOF").risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         ("command", "words"),
         [
             ("a[0]=1 bash -s", ["bash", "-s"]),
             ("a[0]=1 b=2 c+=3 bash", ["bash"]),
-            ("a[ 0 ]=1 bash", ["bash"]),
-            ("a[ i + 1 ]+=x bash", ["bash"]),
-            ("a[ 0 ]=1 b[ 1 ]=2 bash", ["bash"]),
             # bashlex drops the quotes, so the subscript can hold a bare `]` or a newline.
             ('a["]"]=1 bash', ["bash"]),
             ('a["x\ny"]=1 bash', ["bash"]),
@@ -448,7 +495,6 @@ class TestSubscriptedAssignmentPrefix:
             ("bash a[0]=1", ["bash", "a[0]=1"]),
             # `a[0]` carries no `=`, so bash runs it as the command (a glob).
             ("a[0] bash", ["a[0]", "bash"]),
-            ("a[ 0 ] bash", ["a[", "0", "]", "bash"]),
         ],
     )
     def test_command_words_skip_the_assignment_prefix(self, command, words):
