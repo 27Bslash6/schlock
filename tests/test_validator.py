@@ -3344,7 +3344,7 @@ class TestHeredocBoundariesOnTheNativePath:
         assert refused.allowed is False
         assert refused.risk_level == RiskLevel.BLOCKED
         assert refused.error is None
-        assert "exceeded" in refused.message
+        assert "distinct payloads" in refused.message
         assert refused.alternatives
 
     def test_the_phantom_guard_does_not_refuse_the_standard_commit_form(self, safety_rules_path):

@@ -520,11 +520,15 @@ def _over_size_ceiling(command: str, *, derived: bool) -> Optional[ValidationRes
 # outlives its timeout fails OPEN. Pinned by test_sibling_chains_past_the_ceiling_fail_closed.
 # ponytail: each suffix costs O(len) for the `args[i+1:]` slice + tuple key, so the worst case
 # under this ceiling is ~0.2 s (measured); index-based re-entry would make it O(1) if needed.
+# Step 5c caps the distinct stdin programs (here-strings, heredoc bodies) at the same number.
 MAX_DELEGATOR_TOKENS = 256
 
 
 class _DelegatorCeilingError(ValueError):
-    """Raised past MAX_DELEGATOR_TOKENS; converted to a BLOCKED verdict by validate_command.
+    """Raised past MAX_DELEGATOR_TOKENS, by the extractor and by Step 5c's stdin-program count.
+
+    Converted to a BLOCKED verdict only by the `try` around Step 5c's payload collection in
+    `_validate_command`; raised anywhere else it reaches the catch-all.
 
     An exception rather than a threaded return value because the extractor is recursive and
     already unwinds. A subclass rather than a bare `except ValueError` at the call site: today
