@@ -6,10 +6,22 @@ This test suite ensures EVERY pattern in safety_rules.yaml has:
 - Edge cases and variations
 """
 
+import os
+import shutil
+import subprocess
+import sys
+
 import pytest
 
+from schlock.core import validator
 from schlock.core.rules import RiskLevel, RuleEngine
-from schlock.core.validator import validate_command
+from schlock.core.validator import clear_caches, validate_command
+
+# Python's `\s` class (== str.isspace). Wider than bash's blanks (space, tab, newline): bash keeps the rest in a word.
+_PY_WHITESPACE = [char for char in map(chr, range(sys.maxunicode + 1)) if char.isspace()]
+
+# Ground truth for the IFS sweeps: bash reports whether a command left IFS non-empty and changed.
+_IFS_IS_LIVE = "\n[[ -n $IFS && $IFS != $' \\t\\n' ]] && echo live"
 
 
 class TestBlockedPatternCoverage:
@@ -1190,6 +1202,150 @@ class TestObfuscationDetection:
         result = validate_command(cmd, config_path=safety_rules_path)
         assert result.risk_level in (RiskLevel.SAFE, RiskLevel.LOW), f"{cmd!r} -> {result.risk_level}"
         assert result.matched_rules == [], f"{cmd!r} -> {result.matched_rules}"
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "IFS+=,; x=ls,-la; $x",
+            "read -r IFS <<< ,; x=ls,-la; $x",
+            "printf -v IFS ,; x=ls,-la; $x",
+            "IFS[0]=,; x=rm,-rf,/; $x",
+            "for IFS in ,; do x=rm,-rf,/; $x; done",
+            "set -- ,; for IFS do :; done",
+            "IFS[a[0]]=,",
+            # bashlex reads an element assignment as plain words, a spaced subscript as three.
+            "IFS[ 0 ]=,",
+            "x[0]=1 IFS[0]=,",
+            "f(){ local IFS[0]=,; }; f",
+            "command declare 'IFS[0]=,'",
+            "let IFS[0]=1",
+            # An element assignment ahead of a writer does not hide it from the writer check.
+            "x[0]=1 printf -v IFS ,",
+            "a=1 x[0]=1 b=2 read IFS <<< ,",
+            "x[ 0 ]=1 read -r IFS <<< ,",
+            "sleep 0 & wait -n -p IFS",
+            "mapfile -t IFS <<< ,",
+            "readarray -t IFS <<< ,",
+            "read -a IFS <<< ,",
+            "read -raIFS <<< ,",
+            "getopts , IFS -,",
+            "printf -vIFS ,",
+            # An operand before the name can hold a quoted `;`, `|` or `&`.
+            "read -d ';' IFS <<< ,",
+            "read -p 'a|b' IFS <<< ,",
+            "read ${y:+;} IFS <<< ,",
+            "printf ${y:+;} -v IFS ,",
+            # The builtin reached through quoting or a wrapper.
+            "read -r 'IFS' <<< ,",
+            "$'read' IFS <<< ,",
+            "builtin read IFS <<< ,",
+            "command -p printf -v IFS ,",
+            "f(){ read IFS <<< ,; }; f",
+            "x=$(read -d ';' IFS <<< ,)",
+            "cat <<'X'\nhi\nX\nread -d ';' IFS <<< ,",
+            # bash joins `\<newline>` before it parses a loop.
+            "for I\\\nFS in ,; do :; done",
+            "f\\\nor IFS in ,; do :; done",
+            "for \\\nIFS in ,; do :; done",
+            # Brace and pathname expansion reach the builtin, not bashlex.
+            "read -r I{F,}S <<< ,",
+            "read -r {IFS,x} <<< ,",
+            "printf -v {IFS,} ,",
+            "read -r I?S <<< ,",
+            "mapfile -t I[F]S <<< ,",
+            # A quoted element write, and an option an expansion can reshape (`-${x}d`).
+            "read -r 'IFS[0]' <<< ,",
+            "printf -v 'IFS[0]' ,",
+            "read -${x}d IFS <<< ,",
+        ],
+    )
+    def test_ifs_written_as_operand_blocked(self, safety_rules_path, cmd):
+        """A builtin, loop or element write that sets IFS is the same override as `IFS=`."""
+        result = validate_command(cmd, config_path=safety_rules_path)
+        assert not result.allowed, f"{cmd!r} -> {result.risk_level}"
+        assert result.risk_level == RiskLevel.BLOCKED, f"{cmd!r} -> {result.risk_level}"
+        assert "ifs_obfuscation" in result.matched_rules, f"{cmd!r} -> {result.matched_rules}"
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_ifs_operand_follows_rule_override(self, monkeypatch):
+        """The AST half scores as the rule: a user's `allow_blocked_override` downgrade applies to it too."""
+        override = {"ifs_obfuscation": {"risk_level": "HIGH", "allow_blocked_override": True}}
+        monkeypatch.setattr(validator, "_load_rule_overrides", lambda: (override, {}, []))
+        clear_caches()
+        try:
+            result = validate_command("read -r IFS <<< ,")
+        finally:
+            clear_caches()
+        assert result.risk_level == RiskLevel.HIGH, result.risk_level
+        assert result.matched_rules == ["ifs_obfuscation"], result.matched_rules
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "printf '%s\\n' IFS",
+            "read -r x <<< IFS",
+            "grep -n 'for IFS' notes.txt",
+            # An element or loop spelling that no assignment or loop reads is data.
+            "echo IFS[0]",
+            "echo IFS[0]=,",
+            "grep -rn IFS\\[ src/",
+            "echo for IFS in values",
+            "declare -p IFS",
+            # An option's value is not a name, whatever it holds.
+            'read -rp "${PROMPT}" answer',
+            "read -p 'IFS? ' answer",
+            "read -d ';' -r field",
+            # An expanding command word is not assumed to be a writer: IFS here is a data argument.
+            "cmd=echo; $cmd IFS",
+            "cmd=grep; $cmd IFS notes.txt",
+            "cmd=ls; $cmd IFS",
+            "${PAGER:-cat} IFS",
+            # mapfile/readarray write only their first array operand; a trailing IFS is not a name.
+            "mapfile lines IFS <<< x",
+            "readarray lines IFS <<< x",
+        ],
+    )
+    def test_ifs_as_data_not_flagged(self, safety_rules_path, cmd):
+        """IFS as a value or a format argument writes nothing."""
+        result = validate_command(cmd, config_path=safety_rules_path)
+        assert result.matched_rules == [], f"{cmd!r} -> {result.matched_rules}"
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is the ground truth")
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "IFS+={c},",
+            "IFS[0]={c},",
+            "read -r IFS{c}<<< ,",
+            "read -r IFS <<< {c},",
+            "printf -v IFS{c},",
+            "printf -v IFS {c},",
+            "for IFS{c}in ,; do :; done",
+            "for IFS in {c},; do :; done",
+        ],
+    )
+    def test_ifs_whitespace_sweep_against_bash(self, safety_rules_path, template):
+        """Every `\\s` character after IFS or its operator: whatever leaves IFS live in bash is BLOCKED."""
+        live = []
+        for char in _PY_WHITESPACE:
+            cmd = template.format(c=char)
+            bash = subprocess.run(
+                ["bash", "-c", cmd + _IFS_IS_LIVE],
+                capture_output=True,
+                text=True,
+                env={"PATH": os.environ.get("PATH", os.defpath)},
+                check=False,
+            )
+            if bash.stdout.strip() != "live":
+                continue
+            live.append(char)
+            result = validate_command(cmd, config_path=safety_rules_path)
+            assert result.risk_level == RiskLevel.BLOCKED, f"{cmd!r} -> {result.risk_level}"
+            assert "ifs_obfuscation" in result.matched_rules, f"{cmd!r} -> {result.matched_rules}"
+        assert live, f"no character left IFS live in {template!r}: the sweep proved nothing"
 
     def test_base64_shell_execution_blocked(self, safety_rules_path):
         """Base64 decode to shell should be BLOCKED."""

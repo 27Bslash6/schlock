@@ -5,6 +5,7 @@ rule engine, and cache. It provides the main validate_command() API and
 handles configuration layering (plugin defaults → user → project).
 """
 
+import fnmatch
 import logging
 import re
 import subprocess
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+import bashlex.ast
 import yaml
 
 from schlock.exceptions import ConfigurationError, ParseError
@@ -446,6 +448,127 @@ def _check_dangerous_command_flags(
                 )
 
     return None
+
+
+# Builtins that write a variable named by an operand (`read IFS`, `printf -v IFS`), mapped to
+# (option letters that take a value, option letter whose value is a name). The names are read
+# off the AST: an operand before them can hold a quoted `;` or `|` (`read -d ';'`, `${y:+;}`),
+# which ends any regex scan of the operand list early.
+_NAME_WRITERS: dict[str, tuple[str, str]] = {
+    "read": ("dinNptu", "a"),
+    "readarray": ("dnOsuCc", ""),
+    "mapfile": ("dnOsuCc", ""),
+    "getopts": ("", ""),
+    "printf": ("", "v"),
+    "wait": ("", "p"),
+}
+
+# Builtins whose operands can be assignments (`declare IFS[0]=,`, `let IFS[0]=1`).
+_DECLARATIONS = frozenset({"declare", "typeset", "local", "export", "readonly", "let"})
+
+# A word bashlex leaves unclassified in a prefix run once an element assignment has started it:
+# `x[0]=1`, a plain `b=2` after it, or `x[` when a blank inside the subscript split the word.
+_ASSIGNMENT = re.compile(r"[A-Za-z_]\w*(?:\[|\+?=)")
+_SUBSCRIPT_END = re.compile(r"\]\+?=")
+
+# Characters that start a parameter, command, brace or pathname expansion, any of which can turn
+# a word into something else before bash reads it.
+_EXPANDS = frozenset("${}*?[`")
+
+
+def _may_name_ifs(word: str) -> bool:
+    """Whether ``word`` can reach bash as the name IFS, or as an element of it (`IFS[0]`).
+
+    Brace and pathname expansion run before the builtin sees the word and bashlex performs
+    neither, so a brace group is read as `*` and the word as a glob: `I{F,}S`, `{IFS,x}` and
+    `I?S` all match. `$` is dropped because bashlex reads `$'IFS'` as `$IFS`.
+    """
+    word = word.replace("$", "")
+    if word.startswith("IFS["):
+        return True
+    lo, hi = word.find("{"), word.rfind("}")
+    if 0 <= lo < hi:
+        word = word[:lo] + "*" + word[hi + 1 :]
+    return fnmatch.fnmatchcase("IFS", word)
+
+
+def _names_written(builtin: str, operands: list[str]) -> list[str]:
+    """The operands `builtin` treats as the names of variables it writes."""
+    value_letters, name_letter = _NAME_WRITERS[builtin]
+    names: list[str] = []
+    i = 0
+    while i < len(operands) and (operands[i].startswith("-") or not _EXPANDS.isdisjoint(operands[i])):
+        option = operands[i]
+        i += 1
+        if option == "--":
+            break
+        if option == "-" or not option.startswith("-") or not _EXPANDS.isdisjoint(option):
+            # An expansion can vanish or become any option cluster; every word from here may be a name.
+            return names + operands[i - 1 :]
+        for j, letter in enumerate(option[1:], start=2):
+            if letter in value_letters or letter == name_letter:
+                value = option[j:]
+                if not value and i < len(operands):
+                    value, i = operands[i], i + 1
+                if letter == name_letter:
+                    names.append(value)
+                break
+    rest = operands[i:]
+    if builtin == "printf":
+        return names
+    if builtin == "getopts":
+        # getopts OPTSTRING NAME [ARG...]: only the second operand is a variable it writes.
+        return rest[1:2]
+    if builtin in ("mapfile", "readarray"):
+        # One array operand; `mapfile lines IFS` writes `lines`, and bash rejects the extra word.
+        return names + rest[:1]
+    return names + rest
+
+
+def _loop_names(nodes: list[Any]) -> list[str]:
+    """The variable of every `for` loop in ``nodes``, nested ones included."""
+    names: list[str] = []
+
+    class _Loops(bashlex.ast.nodevisitor):
+        def visitfor(self, node: Any, parts: list[Any]) -> None:
+            names.append(getattr(parts[1], "word", ""))
+
+    for node in nodes:
+        _Loops().visit(node)
+    return names
+
+
+def _writes_ifs(words: list[str]) -> bool:
+    """Whether ``words`` (one command, as bashlex splits it) writes IFS through an operand or an element."""
+    # bashlex reads an element assignment (`IFS[0]=,`) as a plain word, so it and the assignments
+    # after it arrive ahead of the command name: skip them, then check the command they prefix
+    # (`x[0]=1 read IFS`). As an operand, `IFS[0]` is data (`echo IFS[0]`) unless a declaration
+    # builtin takes it as an assignment (`local IFS[0]=,`).
+    i = 0
+    while i < len(words) and (assignment := _ASSIGNMENT.match(words[i])):
+        if words[i].startswith("IFS["):
+            return True
+        while assignment.group().endswith("[") and i < len(words) and not _SUBSCRIPT_END.search(words[i]):
+            i += 1
+        i += 1
+    words = words[i:]
+    i = 0
+    while i < len(words) and (words[i] in ("builtin", "command") or (i and words[i].startswith("-"))):
+        i += 1
+    if i >= len(words):
+        return False
+    # bashlex reads `$'read'` as `$read`; dropping `$` restores that literal name. A command word
+    # that truly expands at runtime (`$c`, a glob, a brace group) can name any command, so from the
+    # text alone it is undecidable which builtin — if any — runs. Treating it as every writer
+    # over-blocks `$cmd IFS`, where `IFS` is a plain data argument to whatever `$cmd` is. Indirect
+    # naming of a writer (variable/glob dispatch, a function forwarding to `read`) is the LAB-5031
+    # class, not caught here; only a name that resolves to a literal writer is.
+    name = words[i].replace("$", "")
+    if name in _DECLARATIONS:
+        return any(word.startswith("IFS[") for word in words[i + 1 :])
+    if name not in _NAME_WRITERS:
+        return False
+    return any(_may_name_ifs(word) for word in _names_written(name, words[i + 1 :]))
 
 
 # LAB-2754: commands whose *argument* is a program, not data.
@@ -2956,6 +3079,24 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 error=str(e),
             )
             # Don't cache config errors
+
+        # Step 5a: the AST half of `ifs_obfuscation` (_writes_ifs, _loop_names), scored as the rule itself so an
+        # override or a custom rule set applies to both halves alike.
+        ifs_rule = next((rule for rule in engine.rules if rule.name == "ifs_obfuscation"), None)
+        if (
+            ifs_rule is not None
+            and ifs_rule.risk_level > match.risk_level
+            and (any(_writes_ifs([name, *args]) for name, args in commands_with_args) or "IFS" in _loop_names(ast))
+        ):
+            match = RuleMatch(
+                matched=True,
+                rule=ifs_rule,
+                risk_level=ifs_rule.risk_level,
+                message=ifs_rule.description,
+                alternatives=ifs_rule.alternatives,
+            )
+            if all_matched_rules:
+                all_matched_rules.append(ifs_rule.name)
 
         # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing).
         # Top-level parity with SubstitutionValidator (which BLOCKs these in $()); at the top level
