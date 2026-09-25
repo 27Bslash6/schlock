@@ -134,6 +134,9 @@ class TestBashCommandParser:
             # hides an rm -rf / from every pass.
             ("bash <<EOF | tee log\nrm -rf /\nEOF", ["bash <<EOF\nrm -rf /\nEOF", "tee log"]),
             ("/bin/bash <<EOF | x\nrm -rf /\nEOF", ["/bin/bash <<EOF\nrm -rf /\nEOF", "x"]),
+            # A wrapper runs its shell with the wrapper's stdin; wrapping cat keeps it inert.
+            ("env bash <<EOF | x\nrm -rf /\nEOF", ["env bash <<EOF\nrm -rf /\nEOF", "x"]),
+            ("timeout 5 cat <<EOF | x\nrm -rf /\nEOF", ["timeout 5 cat <<EOF\n\nEOF", "x"]),
             # Each heredoc is closed in opener order.
             ("cat <<A <<B | x\n1\nA\n2\nB", ["cat <<A <<B\n\nA\n\nB", "x"]),
             ("cat <<-EOF | x\n\tq\n\tEOF", ["cat <<-EOF\n\nEOF", "x"]),
@@ -793,6 +796,29 @@ class TestAnsiCWordDecoding:
         src = "$'a'" + tail
         with pytest.raises(ParseError, match="ANSI-C"):
             parser_mod._dequote(src, 0, 5, {})
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo \"$(echo \\\n hi; echo $'\\x72\\x6d')\"",
+            "echo $(echo \\\n hi; echo $'\\x72\\x6d')",
+            "x=`echo \\\n hi; echo $'\\x72\\x6d'`",
+            "cat <(echo \\\n hi; echo $'\\x72\\x6d')",
+            # enough continuations move the payload's span wholly off its `$'`, which used to
+            # leave it undecoded rather than refused
+            'echo "$(echo ' + "\\\n" * 12 + " x; $'\\x72\\x6d' -rf /)\"",
+            # conservative: a continuation after the substitution moves nothing, but is refused too
+            "echo \"$(echo hi)\"\\\n$'\\x72\\x6d'",
+        ],
+    )
+    def test_a_line_continuation_inside_a_substitution_fails_closed(self, command):
+        # bashlex parses the substitution from its word's text with each `\<newline>` cut out,
+        # so every later span inside the word lands two places early per continuation.
+        with pytest.raises(ParseError, match="line continuation inside a substitution"):
+            parser_mod.BashCommandParser().parse(command)
+
+    def test_a_line_continuation_outside_a_substitution_still_decodes(self):
+        assert _echo_arg("echo \\\n $'\\x72\\x6d'") == "rm"
 
     @pytest.mark.parametrize(
         ("word", "expected"),
