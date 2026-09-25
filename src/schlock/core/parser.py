@@ -1126,7 +1126,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in SHELL_COMMANDS if parent_cmd else False
+                        is_shell = parent_cmd in SHELL_COMMANDS
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes

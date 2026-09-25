@@ -456,16 +456,16 @@ def _check_dangerous_command_flags(
 # suppression - then treats it as an inert string. So `bash "-c" "rm -rf /"` came back SAFE
 # while the bare payload was BLOCKED. The fix re-enters validation on the payload.
 #
-# Shells: `-c PROG` runs PROG, and a LEADING operand is the script to run, which ends option
-# parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
-_SHELL_COMMANDS: frozenset[str] = SHELL_COMMANDS
-
+# Shells (the parser's SHELL_COMMANDS, the one shell set): `-c PROG` runs PROG, and a LEADING
+# operand is the script to run, which ends option parsing (`bash deploy.sh -c production`
+# passes -c to the script, not to bash).
+#
 # Not shells, but their `-c` argument is a command string they hand to one. Their leading
 # operand is a user/group/file rather than a script, so it must NOT end option parsing
 # (`sg root -c PROG`, `su postgres -c PROG`).
 _DASH_C_RUNNERS: frozenset[str] = frozenset({"su", "runuser", "sg", "script"})
 
-_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
+_DASH_C_PROGRAM_COMMANDS: frozenset[str] = SHELL_COMMANDS | _DASH_C_RUNNERS
 
 # Depth cap for re-entering validation on a payload. Reachable in practice only by chaining
 # `watch` (shell quoting collapses before `bash -c` can nest this far), so it is a backstop,
@@ -680,7 +680,7 @@ def _shell_delegated_payloads(
                 found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
-                found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
+                found.append(_dash_c_payload(args, operand_ends_options=base in SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
@@ -1975,7 +1975,7 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     bodies: list[str] = []
     for opener_start, body_start, body_end in blanked:
         owner = owners.get(opener_start)
-        if owner is not None and owner not in _SHELL_COMMANDS:
+        if owner is not None and owner not in SHELL_COMMANDS:
             continue
         if command[body_start:body_end].strip():
             bodies.append(command[body_start:body_end])
@@ -2452,7 +2452,7 @@ def _escalate_past_heredoc(
     # `_bashlex_heredocs`' reading; an unquoted shell body is refused too, for simplicity,
     # though it was kept.
     for heredoc in heredocs:
-        if heredoc.owner is None or heredoc.owner in _SHELL_COMMANDS:
+        if heredoc.owner is None or heredoc.owner in SHELL_COMMANDS:
             return _unreadable_program(heredoc.owner)
     segments = parser.extract_command_segments(neutered, nodes)
 
@@ -2786,9 +2786,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
             herestring_payloads = list(
                 dict.fromkeys(
-                    prog
-                    for name, prog in parser.extract_stdin_program_redirects(ast)
-                    if name in _SHELL_COMMANDS and prog.strip()
+                    prog for name, prog in parser.extract_stdin_program_redirects(ast) if name in SHELL_COMMANDS and prog.strip()
                 )
             )
 
