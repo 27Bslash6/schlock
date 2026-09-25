@@ -687,9 +687,10 @@ class TestACredentialNameNeedsAPosition:
     @pytest.mark.parametrize(
         "command",
         [
-            # The substitution validator does not recurse into a DOUBLE-QUOTED
-            # `$(...)`, so this rule is the only thing covering these. The
-            # unquoted twin is caught by environment_credential_extraction.
+            # Inside a double-quoted `$(...)` the substitution validator runs the inner
+            # command against the rules before any top-level pattern is consulted
+            # (LAB-4182), so the denial is attributed to environment_credential_extraction
+            # matching `printenv <NAME>`.
             'echo "$(printenv GITHUB_TOKEN)"',
             'printf "%s" "$(printenv AWS_SECRET_ACCESS_KEY)"',
             'echo "Bearer $(printenv GITHUB_TOKEN)"',
@@ -697,7 +698,8 @@ class TestACredentialNameNeedsAPosition:
     )
     def test_substituted(self, command, rules_dir_path):
         result = verdict(command, rules_dir_path)
-        assert "extended_credential_exposure" in result.matched_rules, command
+        assert result.risk_level is RiskLevel.BLOCKED, command
+        assert "environment_credential_extraction" in result.matched_rules, command
 
     @pytest.mark.parametrize(
         "command",
