@@ -418,16 +418,24 @@ class TestSubscriptedAssignmentPrefix:
     def test_benign_prefixed_command_scores_as_its_plain_twin(self, command, twin):
         assert validate_command(command).risk_level == validate_command(twin).risk_level
 
-    @pytest.mark.parametrize(
-        ("command", "twin"),
-        [
-            ("a[0]=1 bash <<'EOF'\nrm -rf /\nEOF", "FOO=1 bash <<'EOF'\nrm -rf /\nEOF"),
-            ("a[0]=1 bash <<EOF\nrm -rf /\nEOF", "FOO=1 bash <<EOF\nrm -rf /\nEOF"),
-            ("a[0]=1 bash <<'A;B'\nrm -rf /\nA;B", "FOO=1 bash <<'A;B'\nrm -rf /\nA;B"),
-        ],
-    )
+    _HEREDOC_TWINS = [
+        ("a[0]=1 bash <<'EOF'\nrm -rf /\nEOF", "FOO=1 bash <<'EOF'\nrm -rf /\nEOF"),
+        ("a[0]=1 bash <<EOF\nrm -rf /\nEOF", "FOO=1 bash <<EOF\nrm -rf /\nEOF"),
+        ("a[0]=1 bash <<'A;B'\nrm -rf /\nA;B", "FOO=1 bash <<'A;B'\nrm -rf /\nA;B"),
+    ]
+
+    @pytest.mark.parametrize(("command", "twin"), _HEREDOC_TWINS)
     def test_heredoc_consumer_scores_as_its_plain_twin(self, command, twin):
         assert validate_command(command).risk_level == validate_command(twin).risk_level
+
+    # The heredoc consumer lookup names the prefix (`FOO=1`, `a[0]=1`), not `bash`, so neither side
+    # is blocked yet and parity alone proves nothing. Strict, so the fix turns this red: drop the
+    # marker, and the parity test above is then redundant.
+    @pytest.mark.xfail(strict=True, reason="a heredoc's consumer is not named past an assignment prefix")
+    @pytest.mark.parametrize(("command", "twin"), _HEREDOC_TWINS)
+    def test_prefixed_heredoc_shell_is_blocked_like_its_plain_twin(self, command, twin):
+        assert validate_command(twin).risk_level == RiskLevel.BLOCKED
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         "command",
