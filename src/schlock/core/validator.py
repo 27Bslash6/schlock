@@ -1037,8 +1037,9 @@ def _match_original_and_reconstructed(
                         on `redirect.heredoc` never reaches a reconstruction, because
                         `_redirect_words` reads only `redirect.output`, the delimiter.
                         Two bodies still do: one carried verbatim inside a
-                        process-substitution word, which `_reconstruct` suppresses
-                        itself, and one inside a compound, where bashlex parses the
+                        command-substitution word, which `_reconstruct` suppresses
+                        itself (a `<( … )` body is never inert, so never suppressed),
+                        and one inside a compound, where bashlex parses the
                         body as commands (`{ cat <<EOF … } > f; echo b` reconstructs
                         with the body's words). The second can only over-block.
         use_whitelist: Whether the whitelist may short-circuit ANY of the three forms.

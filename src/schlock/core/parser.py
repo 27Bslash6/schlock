@@ -409,10 +409,9 @@ def has_compound_redirects(ast_nodes: list[Any]) -> bool:
     These are the redirections no segment can see: _segment_nodes recurses past the
     compound into its `.list`, so the redirection belongs to none of the resulting
     segments (LAB-2760). The multi-segment branch uses this to decide whether it
-    needs a whole-command pass at all - running that pass unconditionally is an
-    over-block, because a command-substitution word carries its heredoc body
-    VERBATIM into the reconstruction, where only `_reconstruct`'s own suppression
-    keeps an inert body away from the rules.
+    needs a whole-command pass at all. The gate is a latency guard: that pass costs
+    two more reconstructions and their match passes on every multi-segment command,
+    and only a compound redirect gives it text no segment already sees.
     """
 
     def visit(node) -> bool:
@@ -1025,10 +1024,11 @@ class BashCommandParser:
         suppression, never a missed match.
 
         For heredoc ranges it is the LIVE case, and both outcomes are load-bearing.
-        A heredoc nested in a substitution (`diff <(cat <<EOF ... EOF)`) sits INLINE
+        A heredoc nested in a substitution (`x=$(cat <<EOF ... EOF)`) sits INLINE
         in the slice - _close_heredocs only ever reaches a command's own redirects,
         so nothing else suppresses it, and `cat` merely emits that text. It is
-        inside the span, so it rebases and keeps suppressing. The segment's OWN
+        inside the span, so it rebases and keeps suppressing. (One inside `<( … )`
+        rebases too, but is is_shell, so it never suppresses.) The segment's OWN
         body sits PAST the span; _close_heredocs re-appends it at an offset this
         slice cannot describe, so it is dropped - correct twice over, because the
         only body it ever appends is a shell's, and a shell's body is code that
@@ -1276,8 +1276,8 @@ class BashCommandParser:
         # A command-substitution word carries its heredoc body VERBATIM (`$(cat <<EOF
         # … EOF)` is one word spanning the body), so the body reaches the
         # reconstruction where no heredoc range suppresses it - the original-form pass
-        # gets `heredoc_ranges`, this one never did. Suppress an inert one here, or the
-        # whole-command pass scores text that `cat` merely prints as an executed
+        # gets `heredoc_ranges`, this one never did. Suppress an inert one here, or every
+        # reconstruction pass scores text that `cat` merely prints as an executed
         # command. A body inside `<( … )` is never inert (`extract_heredoc_ranges`):
         # whatever reads the substitution may run it.
         #
@@ -1396,7 +1396,8 @@ class BashCommandParser:
 
         Returns:
             List of (start, end, is_shell) tuples for heredoc content ranges.
-            is_shell=True means the heredoc will be executed by a shell.
+            is_shell=True means the body may run as code: a shell owns it, or it
+            sits inside a process substitution, whose reader may run what it prints.
         """
         heredoc_ranges = []
 
