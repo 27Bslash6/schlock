@@ -12,6 +12,7 @@ Tests cover:
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -657,3 +658,153 @@ class TestUnscannableMessageHookHandling:
         assert block_calls, "expected a block audit entry on validation error"
         joined = " ".join(block_calls[-1].kwargs["violations"]).lower()
         assert "unscannable" in joined  # warn detection survives the error-deny path
+
+
+# Hostile dependencies, defined in the shim and raised by name. Both are legal Python that
+# a real broken dependency can produce, and both used to defeat the guard's failure handler.
+_UNRENDERABLE = (
+    'class BrokenText(BaseException):\n    def __str__(self):\n        raise RuntimeError("cannot render exception")\n'
+)
+_PRINTS_TO_STDOUT = (
+    "class NoisyError(ModuleNotFoundError):\n"
+    "    def __init__(self, *a):\n"
+    '        print("dependency-noise")\n'
+    "        super().__init__(*a)\n"
+)
+
+
+def _unimportable_shim(tmp_path, module, exc_type, prelude=""):
+    """Return a PYTHONPATH entry whose sitecustomize makes `module` raise on import.
+
+    A sys.meta_path finder rather than a shadowing file on PYTHONPATH: the hook
+    sys.path.insert(0)s its vendor and src directories, so a planted module loses to the
+    real one. meta_path runs ahead of sys.path entirely, so this works wherever the hook's
+    dependencies actually live. It also shadows any platform sitecustomize, which is why the
+    tests assert the shim's own marker rather than trusting that the guard is what fired.
+
+    `prelude` defines an exception class for `exc_type` to name; without it, `exc_type` has
+    to be a builtin.
+    """
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(
+        "import sys\n"
+        f"{prelude}"
+        f"_NAME = {module!r}\n"
+        "class _Blocker:\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        '        if fullname == _NAME or fullname.startswith(_NAME + "."):\n'
+        f'            raise {exc_type}("schlock test: " + fullname + " is unimportable")\n'
+        "        return None\n"
+        "sys.meta_path.insert(0, _Blocker())\n",
+        encoding="utf-8",
+    )
+    return str(shim)
+
+
+class TestHookSubprocess:
+    """Run the hook the way Claude Code runs it: a real process, stdin, exit code, stdout.
+
+    Every other test in this file imports pre_tool_use, so none of them can observe a
+    failure that happens *while* importing it. That failure mode is the dangerous one: with
+    empty stdout the harness treats a non-2 exit as a non-blocking error and runs the
+    command anyway, so the hook has to emit its deny from the import guard and exit 2.
+    """
+
+    HOOK = Path(__file__).parent.parent / "hooks" / "pre_tool_use.py"
+
+    def _run(self, stdin_payload, env_extra=None):
+        return subprocess.run(
+            [sys.executable, str(self.HOOK)],
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **(env_extra or {})},
+            timeout=120,
+            check=False,
+        )
+
+    @staticmethod
+    def _bash(command):
+        return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+
+    @staticmethod
+    def _decision(proc):
+        """Parse the hook's stdout and assert it is a PreToolUse decision object."""
+        assert proc.stdout, f"no decision on stdout (rc={proc.returncode}, stderr tail: {proc.stderr[-400:]!r})"
+        output = json.loads(proc.stdout)["hookSpecificOutput"]
+        assert output["hookEventName"] == "PreToolUse"
+        return output
+
+    def test_benign_command_is_allowed(self):
+        """Happy path is unchanged: exit 0 and an allow decision."""
+        proc = self._run(self._bash("echo hello"))
+        assert proc.returncode == 0
+        assert self._decision(proc)["permissionDecision"] == "allow"
+
+    def test_destructive_command_is_denied(self):
+        """Ordinary deny path is unchanged: a decision on stdout, exit 0."""
+        proc = self._run(self._bash("rm -rf /"))
+        assert proc.returncode == 0
+        assert self._decision(proc)["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize(
+        ("module", "exc_type", "prelude"),
+        [
+            ("yaml", "ModuleNotFoundError", ""),
+            ("schlock", "SystemExit", ""),
+            ("yaml", "NoisyError", _PRINTS_TO_STDOUT),
+        ],
+        ids=["vendored-dep-unreachable", "dependency-exits-on-import", "dependency-prints-on-import"],
+    )
+    def test_import_failure_denies_and_exits_2(self, tmp_path, module, exc_type, prelude):
+        """A dependency the hook cannot import must still deny — not exit 1 with no decision.
+
+        SystemExit is the param that pins `except BaseException`: it is not an Exception, so
+        narrowing the guard reopens the hole without a ModuleNotFoundError case noticing.
+        NoisyError pins that a dependency's own stdout cannot corrupt the decision — without
+        the redirect, `_decision` gets `dependency-noise\\n{...}` and fails to parse it.
+        """
+        shim = _unimportable_shim(tmp_path, module, exc_type, prelude)
+        proc = self._run(self._bash("rm -rf /"), {"PYTHONPATH": shim})
+        assert proc.returncode == 2
+        output = self._decision(proc)
+        assert output["permissionDecision"] == "deny"
+        reason = output["permissionDecisionReason"]
+        assert exc_type in reason  # names what broke
+        # The shim's own marker, not the module name: "schlock" appears in the guard's fixed
+        # prefix, so asserting the name would pass on any unrelated import failure.
+        assert f"{module} is unimportable" in reason
+
+    def test_import_failure_denies_when_the_error_cannot_be_rendered(self, tmp_path):
+        """An exception whose __str__ raises must not take the failure handler down with it.
+
+        The handler interpolates the exception to build its reason, so an unrenderable one
+        used to raise *inside* the guard: exit 1, empty stdout — the fail-open this whole
+        guard exists to close, reachable through it.
+        """
+        shim = _unimportable_shim(tmp_path, "yaml", "BrokenText", _UNRENDERABLE)
+        proc = self._run(self._bash("rm -rf /"), {"PYTHONPATH": shim})
+        assert proc.returncode == 2
+        output = self._decision(proc)
+        assert output["permissionDecision"] == "deny"
+        assert "could not be rendered" in output["permissionDecisionReason"]
+
+    def test_unparseable_stdin_denies_and_exits_2(self):
+        """The invalid-input deny also exits 2, so the block does not rest on stdout parsing."""
+        proc = self._run("this is not json")
+        assert proc.returncode == 2
+        assert self._decision(proc)["permissionDecision"] == "deny"
+
+    def test_non_mapping_stdin_denies_and_exits_2(self):
+        """Valid JSON that is not an object must reach main()'s fatal deny — and exit 2.
+
+        handle_pre_tool_use's own except clause also reads input_data as a mapping, so a list
+        raises again inside it and propagates. That is the one route to main()'s generic
+        handler, so this pins its exit code the way the invalid-JSON test pins the other.
+        """
+        proc = self._run("[]")
+        assert proc.returncode == 2
+        output = self._decision(proc)
+        assert output["permissionDecision"] == "deny"
+        assert "Fatal hook error" in output["permissionDecisionReason"]
