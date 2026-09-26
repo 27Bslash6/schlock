@@ -2931,6 +2931,8 @@ class TestDangerousAwkHelper:
             ["awk", '/[/]/ {print $1 "|" $2}'],  # `/` in a simple class does not open a pipe
             ["awk", '{gsub(/[[:space:]]+/, "|"); print}'],  # a POSIX class ends where all awks agree
             ["awk", '$1 ~ /^[[:alpha:]]+$/ {print $1 "|" $2}'],
+            ["awk", '{x /= 2; print x "|" $2}'],  # a bare-name lvalue at statement start: `/=` divides
+            ["awk", 'BEGIN{x = 8; y = x /= 2; print y "|" x}'],  # x after `=` is a fresh lvalue
         ],
     )
     def test_safe_awk(self, args):
@@ -3014,6 +3016,12 @@ class TestDangerousAwkHelper:
             ["awk", "BEGIN{c=ARGV[1]; y = /a/ /=/; print 1 | c}"],
             ["awk", "BEGIN{c=ARGV[1]; x=4; y = ++x /=/; print 1 | c}"],
             ["awk", "BEGIN{c=ARGV[1]; x=4; y = -x /=/; print 1 | c}"],
+            # a bare name is a `/=` lvalue only as a fresh primary: after a unary prefix (even spaced),
+            # or as the tail of a concatenation, it is a non-lvalue and gawk reads `/=` as a regex
+            ["awk", "BEGIN{c=ARGV[1]; x=4; y = ! x /=/; print 1 | c}"],
+            ["awk", "BEGIN{c=ARGV[1]; x=4; y = ++ x /=/; print 1 | c}"],
+            ["awk", 'BEGIN{c=ARGV[1]; a="p"; b="q"; y = a b /=/; print 1 | c}'],
+            ["awk", "BEGIN{c=ARGV[1]; x=2; y = length x /=/; print 1 | c}"],
         ],
     )
     def test_dangerous_awk(self, args):
