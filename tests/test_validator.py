@@ -6,6 +6,7 @@ Also includes FIX 5: matched_rules field population test.
 import json
 import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -3617,3 +3618,128 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
         )
 
         assert result.allowed is True, result.message
+
+
+class TestAPayloadSplitByABackslashNewlineBashJoins:
+    """A payload split by a backslash-newline that bash deletes before it acts (LAB-5318).
+
+    bash deletes an unquoted backslash-newline as it reads: from a command line before it
+    tokenizes, and from an unquoted heredoc body before it expands the body. So in an unquoted
+    body `$\\` + newline + `(` is `$(` and `r\\` + newline + `m` is `rm`, and on a command line
+    `$\\` + newline + `'…'` is the ANSI-C string `$'…'`. An EVEN backslash run is escaped
+    backslashes, not a continuation, and a quoted body is literal: bash joins neither.
+
+    What bash does with each row was established under bash 5.3 in a temp dir, by running a
+    hand-written twin with `touch SENTINEL` in place of `rm -rf /`, split the same way, and
+    checking the file system afterwards, never stdout. `test_bash_runs_each_row` re-runs it:
+
+    - cat-body-split-dollar-paren: bash expands the body, so the substitution runs;
+    - bash-body-split-command-word: bash reads the joined body line and runs `rm`;
+    - ansi-c-split-from-its-dollar: the join makes `$'…'`, which decodes to `rm`, and it runs;
+    - body-written-to-a-script-then-run: `s.sh` holds the joined line, and `bash s.sh` runs it;
+    - bash-body-split-dollar-paren: the body is expanded before bash reads it, so it runs;
+    - even-backslash-run, quoted-body: nothing runs, `cat` prints the text;
+    - prose-in-a-notes-file: nothing runs, the joined line is text in a file nobody executes.
+    """
+
+    ROWS = {
+        "cat-body-split-dollar-paren": "cat <<EOF\nx $\\\n(rm -rf /) y\nEOF",
+        "bash-body-split-command-word": "bash <<EOF\nr\\\nm -rf /\nEOF",
+        "ansi-c-split-from-its-dollar": "$\\\n'\\x72\\x6d' -rf /",
+        "body-written-to-a-script-then-run": "cat <<EOF > s.sh\nr\\\nm -rf /\nEOF\nbash s.sh",
+        "bash-body-split-dollar-paren": "bash <<EOF\necho $\\\n(rm -rf /)\nEOF",
+    }
+
+    # The command with the backslash-newline deleted, which is what bash runs.
+    TWINS = {
+        "cat-body-split-dollar-paren": "cat <<EOF\nx $(rm -rf /) y\nEOF",
+        "bash-body-split-command-word": "bash <<EOF\nrm -rf /\nEOF",
+        "body-written-to-a-script-then-run": "cat <<EOF > s.sh\nrm -rf /\nEOF\nbash s.sh",
+        "bash-body-split-dollar-paren": "bash <<EOF\necho $(rm -rf /)\nEOF",
+    }
+
+    CONTROLS = {
+        "dockerfile-continuation": (
+            "cat <<EOF > Dockerfile\nFROM debian\nRUN apt-get update && \\\n    apt-get install -y curl\nEOF"
+        ),
+        "build-script-continuation": "cat <<EOF > build.sh\n./configure --prefix=/usr \\\n  --enable-foo\nmake\nEOF",
+        "even-backslash-run": "cat <<EOF\nx $\\\\\n(rm -rf /) y\nEOF",
+        "quoted-body": "cat <<'EOF'\nx $\\\n(rm -rf /) y\nEOF",
+        "prose-in-a-notes-file": "cat <<EOF > notes.md\nr\\\nm -rf / is bad\nEOF",
+    }
+
+    # Hand-written, never derived from the rows by replacing the payload: a replace misses a
+    # payload the continuation splits, and would hand bash the real `rm -rf /`.
+    SENTINEL_TWINS = {
+        "cat-body-split-dollar-paren": ("cat <<EOF\nx $\\\n(touch SENTINEL) y\nEOF", True),
+        "bash-body-split-command-word": ("bash <<EOF\nt\\\nouch SENTINEL\nEOF", True),
+        "ansi-c-split-from-its-dollar": ("$\\\n'\\x74\\x6f\\x75\\x63\\x68' SENTINEL", True),
+        "body-written-to-a-script-then-run": ("cat <<EOF > s.sh\nt\\\nouch SENTINEL\nEOF\nbash s.sh", True),
+        "bash-body-split-dollar-paren": ("bash <<EOF\necho $\\\n(touch SENTINEL)\nEOF", True),
+        "even-backslash-run": ("cat <<EOF\nx $\\\\\n(touch SENTINEL) y\nEOF", False),
+        "quoted-body": ("cat <<'EOF'\nx $\\\n(touch SENTINEL) y\nEOF", False),
+        "prose-in-a-notes-file": ("cat <<EOF > notes.md\nt\\\nouch SENTINEL is bad\nEOF", False),
+    }
+
+    @pytest.fixture(
+        params=[
+            pytest.param("on", marks=pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")),
+            "skipped",
+            "unavailable",
+        ]
+    )
+    def validate(self, request, monkeypatch, safety_rules_path):
+        """`validate_command` with ShellCheck on, skipped by the caller, and not installed."""
+        if request.param == "unavailable":
+            monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+
+        def run(command):
+            clear_caches()
+            return validate_command(command, config_path=safety_rules_path, _shellcheck=request.param != "skipped")
+
+        yield run
+        clear_caches()
+
+    @pytest.mark.parametrize("row", list(ROWS))
+    def test_each_row_is_denied(self, validate, row):
+        result = validate(self.ROWS[row])
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("row", list(TWINS))
+    def test_each_heredoc_row_scores_as_the_command_bash_runs(self, validate, row):
+        """The split and its joined twin are one program to bash, so they get one verdict.
+
+        body-written-to-a-script-then-run: the twin is denied only by the whole-command rule
+        scan, which runs without heredoc ranges, so the `cat` body is not suppressed there.
+        `TestParseFailureFailsClosed::test_discarded_heredoc_body_is_a_documented_residual`
+        pins that twin as denied.
+        """
+        result, twin = validate(self.ROWS[row]), validate(self.TWINS[row])
+
+        assert (result.risk_level, result.allowed) == (twin.risk_level, twin.allowed)
+
+    @pytest.mark.parametrize("control", list(CONTROLS))
+    def test_a_continuation_that_changes_no_program_keeps_its_verdict(self, validate, control):
+        result = validate(self.CONTROLS[control])
+
+        assert result.risk_level == RiskLevel.SAFE, result.message
+        assert result.allowed is True
+
+    @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+    @pytest.mark.parametrize("row", list(SENTINEL_TWINS))
+    def test_bash_runs_each_row(self, tmp_path, row):
+        """The ground truth the class docstring records, read from the file system."""
+        command, runs = self.SENTINEL_TWINS[row]
+        assert "rm" not in command
+
+        subprocess.run(  # noqa: S603 - fixed argv, touch-only payload in a temp dir
+            ["bash", "-c", command],  # noqa: S607 - resolved via PATH by design; guarded by skipif
+            cwd=tmp_path,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+        assert (tmp_path / "SENTINEL").exists() is runs

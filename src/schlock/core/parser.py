@@ -822,6 +822,25 @@ def heredoc_owner(node: Any) -> Optional[str]:
     return words[0]
 
 
+# A backslash run ending at a newline, and not preceded by another backslash. Its pairs are
+# escaped backslashes; an odd one out, with the newline, is a continuation.
+_BODY_CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+
+
+def join_heredoc_continuations(body: str) -> str:
+    """An unquoted heredoc body as bash reads it, with each unescaped backslash-newline deleted.
+
+    bash deletes the pair as it reads the body, BEFORE it expands anything, so text split
+    across the join is one token to bash: `$\\` + newline + `(` is `$(`, and `r\\` + newline +
+    `m` is `rm` (LAB-5318). A line ending in an EVEN backslash run is escaped backslashes and
+    joins nothing - bash's reader passes the character after a backslash through, so the
+    pairs are consumed left to right and only an odd one out can take the newline.
+
+    For an unquoted body only. A quoted one is literal and bash never joins it.
+    """
+    return _BODY_CONTINUATION.sub(r"\1", body)
+
+
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     """Return (interpreter, here_string) if command node `sink` runs its stdin as a program.
 

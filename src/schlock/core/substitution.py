@@ -26,7 +26,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
-from .parser import without_fd_variables
+from .parser import join_heredoc_continuations, without_fd_variables
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1368,6 +1368,9 @@ class SubstitutionValidator:
             source = value
 
         body, _, _ = (source or value).rpartition("\n")
+        # Joined before the introducer check, because bash joins before it expands: the raw
+        # `$\` + newline + `(` carries no `$(` to find, and bash runs it (LAB-5318).
+        body = join_heredoc_continuations(body)
         if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS):
             return []
 
