@@ -15,7 +15,7 @@ with "option requires an argument", so an attached payload is not a thing.
 import pytest
 
 from schlock.core import validator
-from schlock.core.parser import BashCommandParser
+from schlock.core.parser import BashCommandParser, _parameter_runs_decode
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
     MAX_DELEGATOR_TOKENS,
@@ -933,3 +933,10 @@ class TestBase64DecodeAtCommandPosition:
     )
     def test_decode_as_data_is_not_escalated(self, command):
         assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    def test_a_body_that_will_not_parse_counts_as_a_decode(self):
+        # Running out of stack inside bashlex is a ParseError too: under `{ ` nested ~243 deep the
+        # body's parse failed where the substitution validator's shallower one did not, and
+        # reading that as "no decode" left `${v:-$(base64 -d x)}` at HIGH. Pinned on a body that
+        # never parses, since the stack depth that trips it depends on the caller.
+        assert _parameter_runs_decode("v:-$(base64 -d x) )", {}) is True

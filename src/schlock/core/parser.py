@@ -461,10 +461,13 @@ def _parameter_runs_decode(value: Any, seen: "dict[str, bool]") -> bool:
     """True if a `${…}` body runs a base-N decode: `${v:-$(base64 -d x)}`, when `v` is unset.
 
     bashlex leaves a parameter node childless, so the body is parsed here as the substitution
-    validator parses it (LAB-1731): `#` is not a comment inside `${…}`, so it is blanked. That
-    validator also refuses a body that will not parse, so False for one opens nothing. `seen`
-    holds the answer per body text, because every enclosing command walks the same body again:
-    without it a body nested N substitutions deep was parsed and walked N times.
+    validator parses it (LAB-1731): `#` is not a comment inside `${…}`, so it is blanked. A body
+    that will not parse counts as a decode. That validator already refuses a truly unparseable
+    one, so this costs nothing there, but `parse` also reports running out of stack as a
+    ParseError: under `{ ` nested 243 deep this parse failed where the validator's succeeded,
+    and reading that as "no decode" let the payload through at HIGH. `seen` holds the answer
+    per body text, because every enclosing command walks the same body again: without it a
+    body nested N substitutions deep was parsed and walked N times.
     """
     if not isinstance(value, str) or ("$(" not in value and "`" not in value):
         return False
@@ -472,8 +475,9 @@ def _parameter_runs_decode(value: Any, seen: "dict[str, bool]") -> bool:
         try:
             nodes = BashCommandParser().parse(value.replace("#", "_"))
         except ParseError:
-            nodes = []
-        seen[value] = any(_runs_decode(n, seen) for n in nodes)
+            seen[value] = True
+        else:
+            seen[value] = any(_runs_decode(n, seen) for n in nodes)
     return seen[value]
 
 
