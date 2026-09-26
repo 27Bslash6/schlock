@@ -1372,7 +1372,7 @@ def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str
     popping the `${…}` on it re-arms the very phantom opener this exists to
     prevent. At the top level both re-lex as shell and a heredoc inside them is
     real (`x=$(cat <<'E' … E)`), so they stay untracked and their openers are
-    found.
+    found - and, inside a backtick, refused (see `_rewrite_openers`).
     """
     for opener, owed in _EXPANSION_FRAMES:
         if line.startswith(opener, pos):
@@ -1688,10 +1688,10 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             if char == "`":
                 # A top-level backtick is shell again, exactly like `$(…)`, and
                 # `_expansion_frame_at` deliberately does not frame it so the
-                # heredocs inside it stay findable. It had no context of its
-                # own, so its contents were read against the *enclosing* one and
-                # an operator inside it reset the outer command position that
-                # was not its to reset. That invents an opener:
+                # heredocs inside it stay findable - to be refused at `<<`. It
+                # had no context of its own, so its contents were read against
+                # the *enclosing* one and an operator inside it reset the outer
+                # command position that was not its to reset. That invents an opener:
                 # `x=`ls | sort` y[1<<b]=1` is one assignment word to bash, which
                 # runs the line and opens no heredoc, while this read `b]=1` as a
                 # delimiter and deleted the next line as its body. One character
@@ -1833,6 +1833,14 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
         elif line.startswith("<<", pos) and not frames:
+            if any(context.backtick for context in scan.contexts):
+                # Bash ends a backtick at the first unescaped `` ` `` in the raw
+                # text, quotes included, and takes a heredoc body from inside
+                # it: `echo ` <<b `` then `rm -rf /` then `b` runs the `rm`
+                # (canary), while reading the body from the lines below deleted
+                # it. Where the backtick really ends is not something this scan
+                # can vouch for, so refuse rather than guess.
+                raise ParseError("Heredoc opener inside a backtick; bash reads its body from the substitution alone")
             opener_at = pos
             pos += 2
             strips_tabs = line.startswith("-", pos)

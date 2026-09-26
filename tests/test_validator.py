@@ -1748,6 +1748,7 @@ class TestHeredocSurroundings:
             ('a["]"<<b ]=1', [], "a quoted `]` does not close a subscript"),
             ("a[${x:-]}<<b ]=1", [], "a `]` inside `${…}` does not close a subscript"),
             ('echo "`date`" ; cat <<c', ["c"], "a backtick closes its own frame, it does not reopen it"),
+            ('echo "`cat <<b`" <<E', ["E"], 'a backtick inside `"…"` is a frame, not a context the refusal sees'),
             ("x=`ls | sort` y[1<<b]=1", [], "an operator inside a backtick is the backtick's, so the word is one assignment"),
             ("echo `ls | sort` y[1<<b]", ["b]"], "…but the word after one still follows `echo` into command-name position"),
             # A `#` is a comment only where a word could start. These ran real
@@ -2050,6 +2051,35 @@ class TestHeredocSurroundings:
         neutered, _ = val_module._neuter_heredocs("ls <<'A'\nz\nA\nx=`ls | sort` y[1<<b]=1\nrm -rf /")
 
         assert "rm -rf /" in neutered
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ` <<b `\nrm -rf /\nb",
+            "echo `cat <<b`\nrm -rf /\nb",
+            "echo `echo $(cat <<b)`\nrm -rf /\nb",  # the backtick is not the innermost context
+            "x=$(echo `cat <<b`)\nrm -rf /\nb",  # nor the outermost
+            "echo `cat <<b\n`\nrm -rf /\nb\n`",  # closes on a later line: parsed clean, and was allowed
+        ],
+    )
+    def test_a_heredoc_inside_a_backtick_is_refused(self, command):
+        """Bash ends a backtick at its first unescaped `` ` `` and reads the heredoc body from that text alone (LAB-4275).
+
+        Every row ran its `rm` in real bash (canary). On main the last row was
+        allowed LOW with ShellCheck off; the rest denied only by accident -
+        bashlex choked on the rewrite, or the delimiter swallowed the closing
+        backtick and never found a terminator. Pinned on the refusal's own
+        message so that neither accident can pass for it.
+        """
+        with pytest.raises(ParseError, match="inside a backtick"):
+            val_module._neuter_heredocs(command)
+
+    def test_a_heredoc_inside_a_backtick_is_denied_end_to_end(self, safety_rules_path, no_shellcheck):
+        """The row that got through: allowed LOW, the `rm` deleted before validation."""
+        result = validate_command("echo `cat <<b\n`\nrm -rf /\nb\n`", config_path=safety_rules_path)
+
+        assert not result.allowed
+        assert "inside a backtick" in result.message
 
     @pytest.mark.parametrize(
         "opener,tail",
