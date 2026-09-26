@@ -5,6 +5,7 @@ rule engine, and cache. It provides the main validate_command() API and
 handles configuration layering (plugin defaults → user → project).
 """
 
+import bisect
 import logging
 import re
 import subprocess
@@ -1194,6 +1195,36 @@ _OPAQUE_SPANS = {
 # Where `#` opens a comment and `case` is a keyword inside a `$(…)`: the same
 # places a word can start, plus the newline a comment ends on.
 _COMMENT_START_AFTER = _WORD_START_AFTER | frozenset("\n")
+# Where a `((` can start, for the candidate scan. Deliberately NOT a lexer: only
+# a backslash is honoured, so a `((` inside a quote, an expansion or a comment is
+# a candidate too. `_DoubleParen.is_arithmetic` decides each one on bash's real
+# rules, and this scan only chooses who gets asked.
+_OPENER_SCAN_RE = re.compile(r"[(\\]")
+
+# What a `<<` inside an arithmetic command is rewritten to. It MUST NOT contain a
+# `<`: the rewrite recurses through validate_command, and a replacement that
+# still looks like a shift would never converge. Beyond that, any two characters
+# with no shell meaning do; `==` is the same width, so the offsets of everything
+# after it are undisturbed, and it still reads as arithmetic in the parse-error
+# messages where the rewritten text reaches a human.
+_ARITH_SHIFT = "=="
+
+
+class _UnfollowableParenError(ParseError):
+    """The `((` reading could not be FOLLOWED, as opposed to provably not closing.
+
+    The difference decides a verdict. A pair that never closes is a bash syntax
+    error: bash runs none of the text, so an opener skipped for that reason
+    hides nothing. A pair this cannot follow - quoting nested deeper than the
+    interpreter recurses, a `case` or a heredoc inside a `$(…)` - says only that
+    schlock does not know, and bash may well evaluate the arithmetic and run the
+    lines after it. Skipping THAT is a bypass: `(( 1<<b + "${a:-…×500…}" ))`
+    followed by `rm -rf /` was allowed and rated SAFE while bash ran it, because
+    both causes arrived as one exception and were dropped alike.
+
+    Subclasses `ParseError` so every existing handler still catches it; only the
+    arithmetic guard, which must tell the two apart, looks for this type.
+    """
 
 
 class _DoubleParen:
@@ -1225,6 +1256,7 @@ class _DoubleParen:
     def __init__(self, text: str) -> None:
         self.text = text
         self.partners: dict[int, int] = {}
+        self.unclosable: set[int] = set()
 
     def is_arithmetic(self, pos: int) -> bool:
         """True when the `((` at ``pos`` is an arithmetic command, False when it is two subshells.
@@ -1240,15 +1272,79 @@ class _DoubleParen:
             try:
                 close = self._paren(pos + 1)
             except RecursionError:
-                raise ParseError("Quoting nested too deep inside `((` to follow") from None
+                raise _UnfollowableParenError("Quoting nested too deep inside `((` to follow") from None
         return self.text.startswith(")", close + 1)
 
+    def command_level_openers(self) -> list[int]:
+        """Offsets of every `((` that could be a command, ascending.
+
+        `is_arithmetic` answers *which reading* a `((` gets; it cannot be asked
+        *where a `((` is one*, because handed the inside of `echo '(( 1<<b ))'`
+        it reads bare parens and says arithmetic. This answers that, and it
+        answers it by OVER-APPROXIMATING on purpose: every `((` in the text is a
+        candidate, wherever it sits.
+
+        Tracking quotes, expansions and comments here was tried and removed. It
+        is the miss direction that fails open - a `((` not offered is a payload
+        left hidden - and three separate shapes reached it, each because bash
+        does not read the text the way a lexical scan does:
+
+        - a `'` in a heredoc BODY is not a quote to bash, but it pairs with a
+          later one and the span swallows the `((` between them, silently and
+          without raising, so no fallback can notice;
+        - bash does not splice `\\<newline>` inside a `#` comment, so removing
+          splices first buries a real opener inside what a scan then reads as
+          one comment line;
+        - `# ((\n1<<b\n))` - the opener is on the comment line, the `))` is not,
+          and bash runs the arithmetic.
+
+        Over-firing is NOT free on its own. An extra `((` that pairs up can
+        rewrite a real heredoc opener, and a later heredoc then swallows lines
+        bash runs (`: # ((` ... `# ))` straddling `cat <<'X'`). It is safe because
+        Step 3b joins the rewrite's verdict with the unrewritten one, so an
+        over-fire can only deny more.
+
+        A `$((` is excluded because it is an expansion, not an arithmetic
+        command, and its over-block is tracked separately (27Bslash6/schlock#112).
+        The backslash IS honoured, so `\\((` - an escaped backslash, then a real
+        opener - is still found; a `(?<![$\\])` lookbehind loses that one.
+
+        No word-start gate either: bash accepts `then((`, `{((`, `!((` and
+        `time((`, and what a gate would exclude (`x=((`, `echo a((`) is a syntax
+        error it runs nothing of.
+        """
+        openers: list[int] = []
+        pos = 0
+        while True:
+            found = _OPENER_SCAN_RE.search(self.text, pos)
+            if found is None:
+                return openers
+            pos = found.end()
+            if found.group() == "\\":
+                pos += 1  # whatever follows is literal, `\\(` included
+            elif self.text.startswith("(", pos) and (found.start() == 0 or self.text[found.start() - 1] != "$"):
+                openers.append(found.start())
+
     def _paren(self, opening: int) -> int:
-        """Offset of the `)` balancing the paren-level `(` at ``opening``, recording every pair passed."""
+        """Offset of the `)` balancing the paren-level `(` at ``opening``, recording every pair passed.
+
+        Records the parens that provably do NOT close as well. Running out of
+        text with a `(` still on the stack is a property of the text after that
+        `(`, not of the scan that happened to reach it, so every offset left on
+        the stack is answered from the memo next time. Without that, text with
+        no closers at all - `((((((…` - re-scans to the end once per opener:
+        8 KB of it cost 7.1 s of CPU, on a hook that runs before every Bash
+        call (0.6 ms with the memo).
+        """
+        if opening in self.unclosable:
+            raise ParseError("`((` never closes; bash reads no command from this text")
         stack = [opening]
         pos = opening + 1
         while stack:
-            found = self._stop(_PAREN_STOP_RE, pos, "`((`")
+            found = _PAREN_STOP_RE.search(self.text, pos)
+            if found is None:
+                self.unclosable.update(stack)
+                raise ParseError("`((` never closes; bash reads no command from this text")
             hit, pos = found.group(), found.end()
             if hit == "(":
                 stack.append(found.start())
@@ -1280,12 +1376,14 @@ class _DoubleParen:
                 if found.start() > start + 1 and self.text[found.start() - 1] not in _COMMENT_START_AFTER:
                     continue  # mid-word: `echo a#b`, `test-case`
                 if hit == "case":
-                    raise ParseError("`case` inside `$(…)` inside `((`; its patterns' `)` cannot be told from the closer")
+                    raise _UnfollowableParenError(
+                        "`case` inside `$(…)` inside `((`; its patterns' `)` cannot be told from the closer"
+                    )
                 pos = self._stop(_NEWLINE_RE, pos, "`$(`").end()
             elif hit == "<<":
                 if self.text.startswith("<", pos):
                     continue  # a here-string is a word
-                raise ParseError("a heredoc inside `$(…)` inside `((`; the closing paren cannot be located")
+                raise _UnfollowableParenError("a heredoc inside `$(…)` inside `((`; the closing paren cannot be located")
             else:
                 pos = self._skip(hit, found.start(), pos)
 
@@ -1334,6 +1432,105 @@ class _DoubleParen:
         if found is None:
             raise ParseError(f"{what} never closes; bash reads no command from this text")
         return found
+
+
+def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tuple[int, int]]:
+    """The outermost arithmetic regions among ``openers``, as ``(first offset inside, offset of the `)`)``.
+
+    Nested openers are dropped rather than yielded: every one of them lies
+    inside the region already collected, so collecting them again re-walks the
+    same text once per level. `(( (( (( … )) )) ))` is otherwise quadratic in
+    the nesting depth, on a hook that runs before every Bash call.
+
+    Only an opener whose pair provably NEVER CLOSES is skipped: that is a bash
+    syntax error, bash runs none of the text, so nothing is hidden behind it.
+    An opener `_DoubleParen` cannot FOLLOW is a different answer and propagates
+    as `_UnfollowableParenError` - bash may evaluate that arithmetic and run the
+    lines after it, so dropping it is a bypass rather than a conservative skip.
+    This is the LAB-4270 lesson ("a missed opener only ever denies" is false)
+    in its third spelling; do not collapse the two arms back together.
+    """
+    regions: list[tuple[int, int]] = []
+    collected_to = -1
+    for opener in openers:
+        if opener < collected_to:
+            continue
+        try:
+            if not dparen.is_arithmetic(opener):
+                continue
+        except _UnfollowableParenError:
+            raise  # not knowing is not the same as knowing bash runs nothing
+        except ParseError:
+            continue
+        closer = dparen.partners[opener + 1]
+        collected_to = closer
+        regions.append((opener + 2, closer))
+    return regions
+
+
+def _neuter_arithmetic_shifts(command: str) -> str:
+    """Rewrite a `<<` that bash reads as a left shift, not as a heredoc opener.
+
+    Bash reads `(( … ))` as one arithmetic command, so the `<<` in `(( 1<<b ))`
+    is a shift. bashlex reads the same bytes as two nested subshells, where
+    `1 <<b` is a command owning a heredoc delimited by `b` - and every line up to
+    a lone `b`, `rm -rf /` included, becomes a body that `extract_heredoc_ranges`
+    marks inert and no rule ever sees, while bash runs it (LAB-4317).
+
+    The two readings are told apart by `_DoubleParen`, which already models
+    bash's matched-pair rule for the heredoc-fallback tier: the construct is
+    arithmetic iff the partner of the second `(` is immediately followed by
+    another `)`. That test is not decoration - `( ( 1<<b ) )` really is two
+    subshells and its `<<` really does open a heredoc, so a guard that fired on
+    both would start deleting genuine heredoc bodies.
+
+    Only the shift is rewritten, not the arithmetic around it: an arithmetic
+    subscript can carry a command substitution (`(( a[$(id)] ))`), and blanking
+    the region would hide it from the substitution validator - trading this
+    fail-open for another one. `<<<` is the exception: it is a here-string, and
+    mangling it would corrupt a command bash runs correctly.
+
+    Inside a vouched region almost every `<<` is a shift, because the shell
+    context that could hold a real heredoc - a `$(…)` - is one `_DoubleParen`
+    refuses to vouch for. A BACKTICK is not: it re-lexes as shell and can hold a
+    real heredoc, but `_paren` skips it opaquely rather than refusing, so
+    `(( 1 + `cat <<Z … Z` ))` has its opener rewritten to `cat ==Z`. Removing a
+    real opener is not deny-side by itself - a later heredoc can then swallow
+    what followed the body - which is why the caller never trusts this rewrite
+    over the unrewritten text (Step 3b's join).
+    """
+    # Bash removes `\<newline>` before it tokenizes the shell, so `(\<newline>(`
+    # is the same opener as `((`, and the scan reads the splice-free text. The
+    # rewrite does NOT: bash leaves a splice alone inside a quoted heredoc body,
+    # so handing the spliced text on joined `body \` to its terminator line and
+    # filed the commands after it as body (`SAFE` while bash ran them). Each
+    # shift is written back where it sits in ``command``, found through
+    # ``splices`` - where each removed splice sits in the scanned text.
+    splices = [match.start() - 2 * k for k, match in enumerate(re.finditer(r"\\\n", command))]
+    spliced = command.replace("\\\n", "") if splices else command
+    if "((" not in spliced or "<<" not in spliced:
+        return command
+
+    dparen = _DoubleParen(spliced)
+    openers = dparen.command_level_openers()
+
+    rewritten: Optional[list[str]] = None
+    for start, closer in _arithmetic_regions(dparen, openers):
+        pos = start
+        while True:
+            shift = spliced.find("<<", pos, closer)
+            if shift < 0:
+                break
+            pos = shift + 2
+            if spliced.startswith("<", pos):
+                pos += 1  # `<<<` is a here-string, not a shift
+                continue
+            if rewritten is None:
+                rewritten = list(command)
+            for at, placeholder in zip((shift, shift + 1), _ARITH_SHIFT):
+                rewritten[at + 2 * bisect.bisect_right(splices, at)] = placeholder
+
+    return command if rewritten is None else "".join(rewritten)
 
 
 def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str, str]]:
@@ -2250,12 +2447,7 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
     return "\n".join(rewritten), base_command
 
 
-def _validate_heredoc_command(
-    command: str,
-    config_path: Optional[str] = None,
-    *,
-    _derived: bool = False,
-) -> Optional[ValidationResult]:
+def _validate_heredoc_command(command: str, config_path: Optional[str] = None) -> Optional[ValidationResult]:
     """Validate command containing heredoc that bashlex couldn't parse.
 
     bashlex reads a quoted heredoc delimiter as written (e.g. `<< 'EOF'` ends at a
@@ -2553,6 +2745,7 @@ def validate_command(
     _depth: int = 0,
     _shellcheck: bool = True,
     _derived: bool = False,
+    _as_written: bool = False,
 ) -> ValidationResult:
     """Validate a command for safety — the main validation API.
 
@@ -2563,12 +2756,18 @@ def validate_command(
     back down to HIGH merely by having a substitution appended. Whatever returns first, the
     worse verdict wins.
 
-    ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
+    ``_depth``, ``_shellcheck``, ``_derived`` and ``_as_written`` are internal, keyword-only; see
     :func:`_validate_command`.
     """
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
-        command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
+        command,
+        config_path,
+        _depth=_depth,
+        _deferred=deferred,
+        _shellcheck=_shellcheck,
+        _derived=_derived,
+        _as_written=_as_written,
     )
     if not deferred:
         return result
@@ -2602,6 +2801,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
     _deferred: Optional[list[SubstitutionValidationResult]] = None,
     _shellcheck: bool = True,
     _derived: bool = False,
+    _as_written: bool = False,
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
@@ -2640,6 +2840,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         _derived: Internal, keyword-only. True when ``command`` is text schlock produced from an
             admitted command (a heredoc rewrite or one of its segments), so the derived-text
             ceiling applies, not the caller's. Callers leave it False.
+        _as_written: Internal, keyword-only. True skips the Step 3b shift rewrite and judges
+            ``command`` as bashlex reads it - the other half of Step 3b's join - and leaves the
+            verdict out of the cache, since a fresh call would join it. Callers leave it False.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -2691,6 +2894,69 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         if special_check is not None:
             # Special case triggered, return result (don't cache, state may change)
             return special_check
+
+        # Step 3b: a `<<` inside `(( … ))` is a left shift to bash and a heredoc
+        # opener to bashlex, and the phantom body hides every line after it from
+        # the rules while bash runs them (LAB-4317). Rewriting the shift hands
+        # those lines back to the flow below, which validates them on their
+        # merits - so the verdict comes from the rule the payload matches. Only
+        # the arithmetic command is handled here; `$(( … ))` is an expansion and
+        # is tracked separately (27Bslash6/schlock#112).
+        #
+        # The rewrite is judged ALONGSIDE the command as written, never instead
+        # of it, and the worse verdict wins. `command_level_openers` offers every
+        # `((` in the text, and one bash reads as a comment, a quote or a heredoc
+        # body can still pair up and rewrite a REAL opener - which re-parents the
+        # body after it: `: # ((` over `cat <<'X'` ... `# ))` let a later heredoc
+        # swallow the lines bash ran, and the rewrite alone said SAFE. Joined, an
+        # over-fired rewrite can deny more than the unrewritten reading, never less.
+        # The price is measured and pinned: a benign shift keeps the deny bashlex's
+        # own reading gives it.
+        #
+        # Rewriting a shift creates no parens and no new `<<`, so the regions are
+        # the same on a second pass and this recurses exactly once. That is the
+        # whole of it: the recursion is gated on the rewrite having CHANGED
+        # something, so a shift missed on the first pass gets no second pass and
+        # stays hidden. Under-firing here is a live bypass, which is why
+        # `command_level_openers` over-approximates rather than lexes.
+        neutered = command
+        if not _as_written:
+            try:
+                neutered = _neuter_arithmetic_shifts(command)
+            except _UnfollowableParenError as unfollowable:
+                # The `((` reading could not be followed, so whether the lines after
+                # it are a heredoc body or commands bash runs is unknown - and the
+                # bashlex reading below, which would decide it, is the one that is
+                # wrong about `((`. Deny, naming the construct: this is the one exit
+                # here that is a schlock decision rather than a rule match, and it
+                # says so.
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: {unfollowable}",
+                    alternatives=[
+                        "Simplify the arithmetic command so its `))` can be located",
+                        "Run the commands after the arithmetic separately",
+                    ],
+                    exit_code=1,
+                    error=str(unfollowable),
+                )
+        if neutered != command:
+            # ShellCheck runs once, on the half that is the text the user typed.
+            rewritten = validate_command(neutered, config_path, _depth=_depth, _shellcheck=False, _derived=_derived)
+            as_written = validate_command(
+                command, config_path, _depth=_depth, _shellcheck=_shellcheck, _derived=_derived, _as_written=True
+            )
+
+            # A tie goes to the half that names a rule, then to the rewrite: a deny should say why.
+            def rank(result: ValidationResult) -> tuple[RiskLevel, bool, bool]:
+                return result.risk_level, not result.allowed, bool(result.matched_rules)
+
+            arithmetic_result = as_written if rank(as_written) > rank(rewritten) else rewritten
+            if _depth == 0 and _shellcheck:
+                # Cached under what the user typed; neither half cached itself.
+                _global_cache.set(command, arithmetic_result)
+            return arithmetic_result
 
         # Step 4: Parse command and extract AST context
         parser = _get_parser()
@@ -2807,7 +3073,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # fallback. The route keys on "here-document"/"heredoc" in the message.
             if "<<" in command and ("here-document" in str(e) or "heredoc" in str(e).lower()):
                 # Extract command before heredoc and validate that instead
-                heredoc_result = _validate_heredoc_command(command, config_path, _derived=_depth > 0 or _derived)
+                heredoc_result = _validate_heredoc_command(command, config_path)
                 if heredoc_result is not None:
                     return heredoc_result
             # Fall through to block if heredoc handling didn't work
@@ -2863,7 +3129,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         error=None,
                         matched_rules=[],
                     )
-                    if _depth == 0 and _shellcheck and not _deferred:
+                    if _depth == 0 and _shellcheck and not _deferred and not _as_written:
                         _global_cache.set(command, result)
                     return result
 
@@ -3133,8 +3399,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
         # Nor when a substitution verdict is still owed a join: the cached entry would be the
-        # pre-join verdict, and the next identical command would hit it and skip the join.
-        if _depth == 0 and _shellcheck and not _deferred:
+        # pre-join verdict, and the next identical command would hit it and skip the join. Nor
+        # the as-written half of Step 3b's join, for the same reason.
+        if _depth == 0 and _shellcheck and not _deferred and not _as_written:
             _global_cache.set(command, result)
 
         # Step 8: Return
