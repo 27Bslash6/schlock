@@ -33,9 +33,12 @@ jobs:
       run: uv run ruff check . && uv run ruff format --check .
 
     - name: Test
-      run: uv run pytest --cov=src/schlock --cov-report=xml --cov-report=term --junitxml=junit.xml -o junit_family=legacy
+      # Coverage on 3.14 only: 3.9 has no sys.monitoring, so tracing roughly doubles the leg.
+      # 3.9 still runs the full suite.
+      run: uv run pytest ${{ matrix.python-version == '3.14' && '--cov=src/schlock --cov-report=xml --cov-report=term' || '' }} --junitxml=junit.xml -o junit_family=legacy
 
     - name: Upload coverage
+      if: matrix.python-version == '3.14'
       uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
       with:
         files: ./coverage.xml
