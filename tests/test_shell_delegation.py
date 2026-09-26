@@ -897,6 +897,12 @@ class TestBase64DecodeAtCommandPosition:
             "$(echo ${v:-$(base64 -d x)})",
             # `#` is not a comment inside `${…}`: flock locks `#<first word>` and runs the rest.
             "${v:-flock #$(base64 -d x)}",
+            # A `{varname}` redirect prefix is never argv, so the decode is the command: bash ran each.
+            "{fd}>out $(base64 -d x)",
+            "{fd[1]}>out $(base64 -d x)",
+            "{fd}>out {g}>o2 $(base64 -d x)",
+            "$(true) {fd}>out $(base64 -d x)",
+            "env {fd}>out $(base64 -d x)",
         ],
     )
     def test_decode_run_as_a_command_is_blocked(self, command):
@@ -929,6 +935,8 @@ class TestBase64DecodeAtCommandPosition:
             # Also inside a `${…}` fallback.
             "echo ${v:-$(base64 -d x)}",
             "X=${v:-$(base64 -d x)}",
+            # Dropping a `{varname}` prefix does not promote the next word's argument.
+            "{fd}>out echo $(base64 -d x)",
         ],
     )
     def test_decode_as_data_is_not_escalated(self, command):

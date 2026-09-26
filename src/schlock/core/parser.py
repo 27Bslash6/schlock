@@ -868,16 +868,18 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     "The command" is every word bash may execute, not just the first: a leading bare expansion
     can vanish, and a wrapper (`env`, `nohup`, `timeout 5`, `builtin`) executes an operand. So the
     scan walks words until the first literal one, the command that actually runs; past a wrapper
-    it also steps over flags, `NAME=value` and numeric operands. It deliberately does NOT scan
-    every wrapper operand the way `_classify_sink` does: there a false hit only re-validates a
-    payload, here it is an un-promptable BLOCKED, and `timeout 30 curl -H "$(… | base64 -d)"`
-    or `sudo mysql -p"$(base64 -d pw)"` pass the decode as DATA to the command the wrapper runs.
+    it also steps over flags, `NAME=value` and numeric operands. A `{fd}` redirect prefix is no
+    word at all (see without_fd_variables): read as one, it ended the scan before `{fd}>o $(…)`.
+    It deliberately does NOT scan every wrapper operand the way `_classify_sink` does: there a
+    false hit only re-validates a payload, here it is an un-promptable BLOCKED, and
+    `timeout 30 curl -H "$(… | base64 -d)"` or `sudo mysql -p"$(base64 -d pw)"` pass the decode
+    as DATA to the command the wrapper runs.
     ponytail: a wrapper's literal operand ends the scan, so `flock /tmp/l $(base64 -d x)` and
     `timeout -s KILL 5 $(…)` stay at the substitution floor (HIGH). Per-wrapper operand arity
     would close that; nothing here models it yet.
     """
     in_wrapper = False
-    for word in getattr(node, "parts", []):
+    for word in without_fd_variables(getattr(node, "parts", None) or []):
         if getattr(word, "kind", None) in ("assignment", "redirect"):
             continue
         text = getattr(word, "word", "")
