@@ -658,11 +658,11 @@ class TestHereStringPayloadExtraction:
         assert self._extract('( timeout 5 bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
 
     def test_rbash_reads_stdin_as_program(self):
-        # rbash is in _SHELL_COMMANDS (the `-c` path caught it); the here-string surface must agree.
+        # rbash is in SHELL_COMMANDS (the `-c` path caught it); the here-string surface must agree.
         assert self._extract('rbash <<< "rm -rf /"') == [("rbash", "rm -rf /")]
 
     def test_csh_and_tcsh_read_stdin_as_program(self):
-        # LAB-4442: csh/tcsh are in _SHELL_COMMANDS (the `-c` path caught them); the here-string
+        # LAB-4442: csh/tcsh are in SHELL_COMMANDS (the `-c` path caught them); the here-string
         # surface must agree, the same drift rbash had.
         assert self._extract('csh <<< "rm -rf /"') == [("csh", "rm -rf /")]
         assert self._extract('tcsh <<< "rm -rf /"') == [("tcsh", "rm -rf /")]
@@ -814,3 +814,82 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+# A heredoc body is code when its consumer is a shell - the consumer as bash resolves it, past
+# assignment prefixes and wrappers, not the first word. `heredoc_owner` does that resolving.
+# These rows pin the shapes test_validator.py's TestQuotedHeredocDelimiter does not; each one
+# scored SAFE (or HIGH/allowed beside a matching sibling) before `heredoc_owner` existed.
+_HEREDOC_BODY = "\nrm -rf /\nEOF"
+
+
+class TestWrappedShellHeredoc:
+    """A wrapped or assignment-prefixed shell heredoc scores as its bare `bash <<EOF` twin."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "nohup bash <<EOF" + _HEREDOC_BODY,
+            "command bash <<EOF" + _HEREDOC_BODY,
+            "nice bash <<EOF" + _HEREDOC_BODY,
+            "env FOO=1 bash <<EOF" + _HEREDOC_BODY,
+            "/usr/bin/env bash <<EOF" + _HEREDOC_BODY,
+            "timeout -k 1 5 bash <<EOF" + _HEREDOC_BODY,
+            # ANY shell operand, and only a shell: flock locks a file named python3 and runs bash.
+            # Resolving against STDIN_EXEC_INTERPRETERS instead would stop at python3.
+            "flock ./python3 bash <<EOF" + _HEREDOC_BODY,
+            # A sibling segment that matches its own rule must not stand in for the body.
+            "env bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "FOO=1 bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "timeout 5 sh <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "nohup bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "flock ./python3 bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+        ],
+    )
+    def test_wrapped_shell_heredoc_blocks(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # No sibling match: these once blocked only via the raw whole-command rescan. Pinned
+            # so a change to that rescan cannot reopen them.
+            "env bash <<EOF && true" + _HEREDOC_BODY,
+            "env bash <<EOF | cat" + _HEREDOC_BODY,
+            # Controls that block on their own: the bare twin, and sudo's privilege rule.
+            "bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "sudo bash <<EOF" + _HEREDOC_BODY,
+            # Not gated on `-c`: that program can itself read the heredoc (`bash -c bash`).
+            "bash -c bash <<EOF" + _HEREDOC_BODY,
+            "bash -c bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "bash -c 'echo hi' <<EOF" + _HEREDOC_BODY,
+        ],
+    )
+    def test_shell_heredoc_stays_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+
+class TestHeredocBenignUnchanged:
+    """Non-shell heredoc consumers keep their verdicts, wrapped or not."""
+
+    @pytest.mark.parametrize(
+        ("command", "risk"),
+        [
+            ("kubectl apply -f - <<EOF\napiVersion: v1\nkind: Pod\nEOF", RiskLevel.HIGH),
+            # A Python body is not bash: text a bash rule would match stays unscanned.
+            ("python3 <<EOF\nprint('chmod 777 f')\nEOF", RiskLevel.SAFE),
+            ("env python3 <<EOF\nprint('chmod 777 f')\nEOF", RiskLevel.SAFE),
+            # A wrapper around a non-shell consumer leaves the body inert text.
+            ("env cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
+            # test_validator.py pins only `allowed` for this one; the risk level is pinned here.
+            ("timeout 5 cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
+        ],
+    )
+    def test_benign_heredoc_verdict_unchanged(self, command, risk):
+        result = validate_command(command)
+        assert result.risk_level == risk, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
