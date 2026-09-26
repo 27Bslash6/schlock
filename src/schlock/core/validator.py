@@ -13,8 +13,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
-import yaml
-
 from schlock.exceptions import ConfigurationError, ParseError
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 from schlock.integrations.shellcheck import (
@@ -23,6 +21,7 @@ from schlock.integrations.shellcheck import (
     run_shellcheck,
 )
 
+from .bounded_read import load_config
 from .cache import ValidationCache
 from .parser import WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
@@ -259,8 +258,7 @@ def _load_rule_overrides() -> tuple[dict, dict, list[str]]:
             if not config_path.exists():
                 continue
 
-            with open(config_path, encoding="utf-8") as f:
-                data = yaml.safe_load(f)
+            data = load_config(config_path)
 
             if not isinstance(data, dict):
                 continue
