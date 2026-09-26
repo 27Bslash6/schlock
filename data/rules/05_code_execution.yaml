@@ -167,8 +167,15 @@ rules:
       # ${IFS} usage (bypasses space detection)
       - '\$\{IFS\}'
       - '\$IFS'
-      # IFS override (changing field separator)
-      - '\bIFS\s*=\s*[^;\s]+'
+      # IFS override (changing field separator). A value must follow `=`
+      # directly, so a bare `IFS=` (the `while IFS= read -r line` idiom) does
+      # not match: an empty IFS disables word splitting and cannot hide words.
+      # A quoted empty value (IFS='') is NOT exempt: reconstructed text drops
+      # quotes, so `IFS=\'\'` (IFS is two quote characters) would read the same.
+      # The value class is bash's blanks, NOT `\s`: bash keeps CR, FF and VT
+      # inside a word, so `IFS=<CR>,` sets a live separator. `\<newline>` may
+      # split the name, because bash joins the lines before it parses them.
+      - '\bI(?:\\\n)*F(?:\\\n)*S(?:\\\n)*\s*=[^; \t\n]+'
       # IFS parameter expansion variants
       - '\$\{IFS[^}]*\}'
     alternatives:

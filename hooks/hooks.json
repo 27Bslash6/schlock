@@ -1,5 +1,5 @@
 {
-  "description": "Schlock safety validation and session setup hooks. The PreToolUse/Bash command ends with '|| exit 2' so that a hook which cannot start blocks the tool call; see tests/test_hook_manifest.py",
+  "description": "Schlock safety validation and session setup hooks. The PreToolUse/Bash command blocks (exit 2) unless the hook both exits 0 and prints a decision, so a hook that cannot start, or starts something other than the hook, blocks the tool call; see tests/test_hook_manifest.py",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\" || exit 2"
+            "command": "out=$(python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\") || exit 2; case $out in *'\"permissionDecision\"'*) printf '%s\\n' \"$out\" ;; *) echo 'schlock: pre_tool_use.py returned no decision' >&2; exit 2 ;; esac"
           }
         ]
       },
