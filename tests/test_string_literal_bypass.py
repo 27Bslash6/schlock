@@ -378,11 +378,9 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             ("bash <<EOF | tee log\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
             # A heredoc NESTED in a substitution is not a direct redirect, so
             # _close_heredocs never sees it and it rides inside the outer
-            # segment's slice as inert `cat` output that `diff` only reads.
-            # Its range is derived off the parent AST, so the segment reads the body
-            # as text (LAB-912). The whole-command scan still denies it, exactly as
-            # it does `echo lead && diff …` with the same body: a known fail-closed
-            # side effect tracked on LAB-4979, not the intended verdict.
+            # segment's slice. Its range is derived off the parent AST (LAB-912);
+            # inside `<( … )` that range is is_shell - whatever reads the
+            # substitution may run it - so the body is scanned as code.
             ("diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x", False, RiskLevel.BLOCKED),
         ],
     )

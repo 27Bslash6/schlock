@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
+from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -993,6 +993,7 @@ def _match_original_and_reconstructed(
     string_literals: list[tuple],
     quote_source: str,
     heredoc_ranges: Optional[list[tuple]] = None,
+    use_whitelist: bool = True,
 ) -> RuleMatch:
     """Match `command` against the rules as written AND quote/escape-stripped.
 
@@ -1032,9 +1033,23 @@ def _match_original_and_reconstructed(
                       not a silent wrong answer. Only quote detection uses it; the
                       ranges returned are offsets into the reconstruction, which
                       is built from `ast_nodes` alone either way.
-        heredoc_ranges: Heredoc ranges for the original-form pass only: heredoc
-                        bodies never reach the reconstruction, since
-                        _collect_words walks `.word` parts alone.
+        heredoc_ranges: Heredoc ranges for the original-form pass only. A body parked
+                        on `redirect.heredoc` never reaches a reconstruction, because
+                        `_redirect_words` reads only `redirect.output`, the delimiter.
+                        Two bodies still do: one carried verbatim inside a
+                        command-substitution word, which `_reconstruct` suppresses
+                        itself (a `<( … )` body is never inert, so never suppressed),
+                        and one inside a compound, where bashlex parses the
+                        body as commands (`{ cat <<EOF … } > f; echo b` reconstructs
+                        with the body's words). The second can only over-block.
+        use_whitelist: Whether the whitelist may short-circuit ANY of the three forms.
+                       One switch for all three, deliberately: the whitelist is
+                       prefix-based, so a caller that needs it off (the compound
+                       whole-command pass, where a leading `ls` would otherwise
+                       vouch for a later redirect) needs it off for the original
+                       form too. Applying it to the reconstructions alone worked
+                       only because a compound's reconstruction never equals its
+                       source, which is an accident of shape, not a guarantee.
 
     Returns:
         The higher-risk of the two matches.
@@ -1043,13 +1058,24 @@ def _match_original_and_reconstructed(
         command,
         string_literals=string_literals,
         heredoc_ranges=heredoc_ranges,
+        use_whitelist=use_whitelist,
     )
 
-    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes)
-    if reconstructed and reconstructed != command:
-        recon_match = engine.match_command(reconstructed, string_literals=suppression_ranges)
-        if recon_match.risk_level > match.risk_level:
-            return recon_match
+    # Three forms, highest risk wins. The two reconstructions are NOT a before/after
+    # pair - each is the only form a whole family of rules can match (LAB-2760):
+    # `>\s*/dev/sd[a-z]` needs the redirect present, while rule 08's `[^>]{0,200}`
+    # and rule 03's `^\s*env\s*$` only match once it is gone.
+    seen = {command}
+    for form, ranges in (
+        parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes),
+        parser.reconstruct_without_redirects(quote_source, ast_nodes),
+    ):
+        if not form or form in seen:
+            continue
+        seen.add(form)
+        form_match = engine.match_command(form, string_literals=ranges, use_whitelist=use_whitelist)
+        if form_match.risk_level > match.risk_level:
+            match = form_match
 
     return match
 
@@ -1159,13 +1185,13 @@ _FRESH, _TIME, _TIMEP, _REDIR, _ASSIGNED, _COPROC, _NAMED, _LOST = (
 )
 _RESERVED_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{"))
 _ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
-_REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
+_REDIRECT_WORD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
 # What a word may hold and still absorb a following `<` or `>`: an fd prefix,
 # or the first character of a two-character operator (`>>`, `<>`, `&>>`).
-_FD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\}|&)[<>]?")
+_FD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE}|&)[<>]?")
 # `2>&-` closes the descriptor: the `-` is the whole target even glued, so
 # `2>&-a[0]=1` is a redirection and then an assignment (verified).
-_FD_CLOSE_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]&")
+_FD_CLOSE_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]&")
 _ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=(…)` opens a compound assignment
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 # Blanks and control-operator characters end a word at the top level. `<` and
@@ -2895,6 +2921,34 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     if seg_match.risk_level > highest_risk:
                         highest_risk = seg_match.risk_level
                         highest_match = seg_match
+
+                # SECURITY (LAB-2760): a compound's redirections hang off the
+                # COMPOUND node, and _segment_nodes recurses past it into `.list`,
+                # so they belong to no segment and no per-segment reconstruction
+                # can carry them - `while true; do echo a; done > "/dev/sda"` was
+                # SAFE while the unquoted form was BLOCKED. Only a whole-command pass
+                # sees them. The whole-command scan below matches the unreconstructed
+                # text only, where two quote characters hide the target, so this
+                # pass matches the reconstructions and feeds its result into it.
+                # Whitelist OFF: it is prefix-based, so a leading `ls` would vouch
+                # for a later redirect. Safe to turn off here because this pass can
+                # only raise the verdict, never lower it.
+                if has_compound_redirects(ast):
+                    whole = _match_original_and_reconstructed(
+                        engine,
+                        parser,
+                        parse_target,
+                        ast,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        quote_source=parse_target,
+                        use_whitelist=False,
+                    )
+                    if whole.risk_level > highest_risk:
+                        highest_risk = whole.risk_level
+                        highest_match = whole
+                        if whole.matched and whole.rule:
+                            all_matched_rules.append(whole.rule.name)
 
                 if highest_match and highest_risk == RiskLevel.BLOCKED:
                     # Nothing ranks above BLOCKED, so the whole-command scan below cannot
