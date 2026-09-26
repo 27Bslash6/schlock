@@ -690,9 +690,7 @@ class TestACredentialNameNeedsAPosition:
             # Inside a double-quoted `$(...)` the substitution validator runs the inner
             # command against the rules before any top-level pattern is consulted
             # (LAB-4182), so the denial is attributed to environment_credential_extraction
-            # matching `printenv <NAME>`. A substitution denial carries no matched_rules,
-            # so the pin is the verdict plus the tier prefix and the inner rule's own
-            # description in the message.
+            # matching `printenv <NAME>`.
             'echo "$(printenv GITHUB_TOKEN)"',
             'printf "%s" "$(printenv AWS_SECRET_ACCESS_KEY)"',
             'echo "Bearer $(printenv GITHUB_TOKEN)"',
@@ -701,7 +699,7 @@ class TestACredentialNameNeedsAPosition:
     def test_substituted(self, command, rules_dir_path):
         result = verdict(command, rules_dir_path)
         assert result.risk_level is RiskLevel.BLOCKED, command
-        assert "Inner command blocked: Environment variables often contain API keys and tokens" in result.message, command
+        assert "environment_credential_extraction" in result.matched_rules, command
 
     @pytest.mark.parametrize(
         "command",
@@ -1017,13 +1015,16 @@ class TestDecoyPaddingIsScannedExactly:
 
     A bound here looks like cheap insurance and is not. An earlier cut capped the
     rescan and reported the last SUPPRESSED match on exhaustion, reasoning that
-    padding should buy a denial. It bought the opposite: `validate_command` runs
-    its cross-segment scan only when NO segment matched, so a bogus segment match
-    hides a BLOCKED the whole command would have earned. Padding with 32 repeats
-    of any unanchored low-risk pattern switched off every cross-segment rule.
-    Returning None on exhaustion is no better -- then padding silences the rule.
+    padding should buy a denial. It denies benign text instead: a quoted doc
+    listing many install lines. It also under-blocked while `validate_command`
+    ran its cross-segment scan only when no segment matched; that scan now runs
+    whatever the segments matched, so a bogus segment match no longer hides the
+    BLOCKED. Returning None on exhaustion is no better -- then padding silences
+    the rule.
 
-    Both directions are pinned below at 40 repeats, past where the cap sat.
+    Pinned below at 40 repeats, past where the cap sat. The over-block test is
+    what pins the last-suppressed-match bound; nothing here pins a bound that
+    returns None, because the fork bomb matches on its first iteration.
     Found by adversarial review of this branch (LAB-4321 / PR #170, whose
     rules.py this file's engine change is byte-identical to).
     """
@@ -1032,8 +1033,9 @@ class TestDecoyPaddingIsScannedExactly:
         """The under-block, and the serious one: a fork bomb behind the padding.
 
         `_segment_nodes` fragments `:(){ :|:& };:` into inert `:` segments, so the
-        whole-command scan is the ONLY thing that can see it. A bogus segment match
-        skips that scan.
+        whole-command scan is the ONLY thing that can see it. That scan runs
+        whatever the segments matched, so this is the end-to-end contract rather
+        than the guard on the bound.
         """
         padded = "echo '" + ("pip install -r requirements.txt " * 40) + "' && :(){ :|:& };:"
         assert not verdict(padded, rules_dir_path).allowed

@@ -21,17 +21,28 @@
      heredoc delimiter (`<< 'EOF'`) outright, so for those commands there is no AST to walk
      and the shell *around* the heredoc would otherwise never be validated (LAB-2765).
      `_neuter_heredocs` / `_rewrite_openers` in `src/schlock/core/validator.py` recover it
-     with a hand-written lexer. This is the only sanctioned non-AST parsing path, and it holds
-     only while all four constraints do:
-     1. **Last resort** — reachable only from `_validate_heredoc_command`, after bashlex has
-        already raised a heredoc-shaped error. It never runs on a command bashlex can parse.
+     with a hand-written lexer. This is the only sanctioned non-AST path that decides command
+     structure, and it holds only while all four constraints do:
+     1. **Bounded reach** — two call sites. The fallback (`_neuter_heredocs`) runs only from
+        `_validate_heredoc_command`, after bashlex has already raised a heredoc-shaped error.
+        `_normalise_heredoc_delimiters` runs the same lexer *before* bashlex on any command
+        containing `<<`, but its only output is a rewrite of **quoted** delimiters to their
+        bare spelling (and their bodies to same-length filler, since a quoted body is
+        literal): a command with no quoted delimiter reaches bashlex byte for byte. So it
+        changes what bashlex sees only on the inputs that used to reach the fallback, or that
+        bashlex misread (LAB-3094).
      2. **No verdicts** — it decides *where heredoc bodies begin and end*, nothing else. The
         recovered text is re-validated through `validate_command`'s front door, so rules,
-        segments, substitutions and dangerous-flag checks all still run on the AST.
+        segments, substitutions and dangerous-flag checks all still run on the AST. The only
+        verdicts its reading feeds are refusals when it and bashlex disagree about an opener.
      3. **Fails closed on uncertainty** — an untokenizable delimiter, a missing terminator,
         or a line that continues past an opener raises `ParseError`, which the caller turns
-        into `BLOCKED`. Note what this does *not* cover: the dangerous failure is not the
-        uncertain reading that raises, it is the confident wrong one that does not.
+        into `BLOCKED`; the pre-parse rewrite answers the same uncertainty by handing the
+        command back untouched, which sends it down that same route. Note what this does
+        *not* cover: the dangerous failure is not the uncertain reading that raises, it is
+        the confident wrong one that does not. The pre-parse rewrite shares that exposure on
+        the same inputs - it blanks what it reads as a quoted body - which is why its body
+        spans are pinned against an independent bash parser, not against bashlex.
      4. **Escalation is monotonic, which is not the same as safe** —
         `_escalate_past_heredoc` can worsen a verdict and never improve one, so a misread
         body *end* is bounded to a false positive. A misread body *start* is not: the
@@ -42,6 +53,27 @@
         verdict.
      Bash's tokenization is what it must match, so every behavioural change here is decided by
      running real bash first and pinned by a test that names what bash did.
+   - **Approved exception — re-reading one redirect target.** bashlex mis-dequotes some
+     targets (`/dev/$'sda'`, `""'/dev/sda'`), so `_redirect_words` in
+     `src/schlock/core/parser.py` re-reads the target's own source span with a quote-run regex
+     and `shlex`. It holds only while: bashlex has already fixed the word's boundaries; it
+     decides no structure and no verdict (the word still goes through every rule); and any span
+     it cannot read exactly (a backslash, or not one `shlex` word) keeps bashlex's word, less
+     its leading markers.
+   - **Approved exception — recognising a `{varname}` redirect prefix.** bashlex splits
+     `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
+     argument, so `_mark_fd_variables` in `src/schlock/core/parser.py` tags that one word at
+     parse time and every argv view drops it (LAB-4599). It decides only what it can know for
+     certain, from the word's RAW source span (bashlex's word has lost its quotes). In order:
+     a top-level `{`-word whose text, continuations joined first, has `}` then `<`/`>` (not a
+     `<(`/`>(` process substitution) **raises** - bashlex folded the operator in; a
+     backslash-newline in a candidate's enclosing top-level word **raises**, before any other
+     reading; a raw span not starting with `{` is an **argument**; a raw span fully matching
+     `_FD_VARIABLE_ALLOWED_RE` (`{name}` or `{name[sub]}`, `sub` only name/digit characters)
+     is **tagged**; **every other brace-shaped spelling raises `ParseError`**. Do not
+     widen the allowlist by modelling bash's subscript grammar: four review rounds of that
+     never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
+     must raise, never fall back to "argument". Every spelling is decided by real bash first.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
