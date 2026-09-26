@@ -430,11 +430,16 @@ _GIT_BOOLEAN_VALUES = frozenset({"true", "false", "yes", "no", "on", "off", "1",
 
 
 def _is_git_boolean(value: str) -> bool:
-    """True if `value` is a git boolean literal (so it names no executable program)."""
+    """True if `value` is a git boolean literal (so it names no executable program).
+
+    Strips, which is safe only for value-judged keys: a padded value such as `' on'` names the
+    same program the value check already judges `on` as. `_key_rated_value_is_inert` must not
+    strip, since there the exemption skips the only check (git trims neither value form).
+    """
     return value.strip().lower() in _GIT_BOOLEAN_VALUES
 
 
-# git config keys rated on the KEY alone, whatever the value. `git help <cmd>` shows the page
+# git config keys rated on the KEY, since their attack values look ordinary. `git help <cmd>` shows the page
 # through a viewer these keys choose: help.format picks man/info/web, man.viewer names the viewer,
 # and man.<tool>.cmd / man.<tool>.path give the program git runs for it. So
 # `git config man.viewer custom` plus `git config man.custom.cmd PROG` turn an everyday
@@ -456,7 +461,8 @@ _PATH_VALUED_GIT_CONFIGS = frozenset({"core.askpass", "core.fsmonitor", "core.ho
 # Each one undoes the whole write guard, so these are BLOCKED on the key at both tiers.
 _BOOTSTRAP_GIT_CONFIGS = frozenset({"include.path", "includeif.", "init.templatedir"})
 
-# Every key rated on the KEY, whatever the value (a worse value still gets its own verdict).
+# Every key rated on the KEY; `_key_rated_value_is_inert` names the few values that escape it
+# (a worse value still gets its own verdict).
 _KEY_RATED_GIT_CONFIGS = _VIEWER_GIT_CONFIGS | _PATH_VALUED_GIT_CONFIGS | _BOOTSTRAP_GIT_CONFIGS
 
 
@@ -525,8 +531,8 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     if not alias_value.lstrip().startswith("!"):
                         continue
                 else:
-                    # A boolean value selects a built-in and names no executable
-                    # (e.g. core.fsmonitor=true); only a path/command value is RCE. A bare
+                    # A boolean on a value-judged key names no executable (e.g.
+                    # core.pager=false switches paging off); only a command value is RCE. A bare
                     # `-c key` (no =VALUE) is key=true to git -> also benign. See #97.
                     # Not for a key-rated key: git reads man.viewer=true as a viewer NAMED
                     # `true`, so the key decides there, not the value.
@@ -536,7 +542,8 @@ def dangerous_git_config(args: list[str]) -> str | None:
                             continue
                     elif _is_git_boolean(value):
                         continue
-                return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
+                action = "loads config or hooks" if dangerous_prefix in _BOOTSTRAP_GIT_CONFIGS else "executes commands"
+                return f"git config {dangerous_prefix.rstrip('.')} {action} via -c flag"
     return None
 
 
@@ -661,33 +668,35 @@ def _rename_section_candidates(args: list[str]) -> list[str]:
     return rest if flagged or "rename-section" in rest else []
 
 
-def key_rated_git_config_write(args: list[str], keys: frozenset[str] = _KEY_RATED_GIT_CONFIGS) -> str | None:
-    """Return a reason if a `git config` command WRITES a key in `keys`, else None.
+def key_rated_git_config_write(args: list[str], keys: frozenset[str] = _DANGEROUS_GIT_CONFIGS) -> str | None:
+    """Return a reason if a `git config` command WRITES a key in `keys` on the key alone, else None.
 
-    The key decides, bar the values `_key_rated_value_is_inert` lets through: see
-    `_KEY_RATED_GIT_CONFIGS`. Reads
+    A direct write rates only the key-rated keys among `keys`, bar the values
+    `_key_rated_value_is_inert` lets through: see `_KEY_RATED_GIT_CONFIGS`. The value-judged rest
+    are judged on the value by `git_config_exec_payloads`. A `--rename-section` into or out of any
+    section in `keys` rates too, since a rename never shows the value it moves. Reads
     (`--get man.viewer`, `--list`) write nothing and stay unrated. Pure; `args` may or may not
-    include the leading "git" token. A value that is itself a dangerous command still gets that
-    command's own, worse verdict through `git_config_exec_payloads`, which covers the same keys.
-    `keys` narrows the check to a subset, as the top level does for `_BOOTSTRAP_GIT_CONFIGS`.
+    include the leading "git" token. `keys` narrows the check to a subset, as the top level does
+    for `_BOOTSTRAP_GIT_CONFIGS`.
 
     Over-approximates like the walk it shares: a `--file` operand spelled like one of these keys
     (`-f man.cfg`) rates too, and so does renaming the `man` section away.
     """
-    prefixes = tuple(keys)
+    key_rated = tuple(keys & _KEY_RATED_GIT_CONFIGS)
     for key, value in _git_config_writes(args):
-        prefix = next((p for p in prefixes if key.lower().startswith(p)), None)
+        prefix = next((p for p in key_rated if key.lower().startswith(p)), None)
         if prefix is None or _key_rated_value_is_inert(prefix, value):
             continue
         return f"git config {key} names a program or file that git runs or loads later"
     for word in _rename_section_candidates(args):
         # A rename writes every key of the section under its NEW name, so `foo.viewer custom`
-        # renamed into `man` arms the viewer without ever naming man.viewer. `help` holds
-        # help.format, `man.custom` holds man.custom.cmd. The OLD name matches too, which is what
-        # rates renaming `man` away.
+        # renamed into `man` arms the viewer without ever naming man.viewer, and `foo.smudge CMD`
+        # renamed into `filter.lfs` arms a checkout filter whose value no write ever showed. So
+        # every dangerous section rates on the name: `help` holds help.format, `core` holds
+        # core.pager. The OLD name matches too, which is what rates renaming `man` away.
         section = word.lower() + "."
-        if any(prefix.startswith(section) or section.startswith(prefix) for prefix in prefixes):
-            return f"git config renames a section named {word}, moving keys that choose a program git runs"
+        if any(prefix.startswith(section) or section.startswith(prefix) for prefix in keys):
+            return f"git config renames a section named {word}, moving keys that git runs or loads"
     return None
 
 

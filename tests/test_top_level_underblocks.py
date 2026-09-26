@@ -521,6 +521,7 @@ class TestGitConfigWriteVerdicts:
         "git config --get-color core.pager 'rm -rf /'",
         # A value-taking option before the read flag must not hide it.
         "git config --file cfg --get core.pager 'rm -rf /'",
+        "git config --get include.path",
     ]
     ORDINARY_WRITES = [
         "git config user.email a@b.com",
@@ -682,15 +683,28 @@ class TestGitConfigPersistenceKeys:
         "git config core.fsmonitor ' on'",
     ]
     ORDINARY_WRITES = [
-        "git config core.fsmonitor true",
         "git config --global filter.lfs.smudge 'git-lfs smudge -- %f'",
         "git config --global filter.lfs.required true",
         "git config --global mergetool.keepBackup false",
         "git config --global difftool.prompt false",
-        "git config --get include.path",
         # ssh.variant is an enum (ssh, plink, putty, ...). git compares it and never runs it:
         # verified against git 2.43 with a helper script as the value.
         "git config --global ssh.variant 'rm -rf /'",
+    ]
+    # A rename never shows the value it moves: `git config foo.smudge CMD` then a rename into
+    # `filter.lfs` runs CMD on checkout (verified, git 2.43). So a rename into or out of any
+    # dangerous section rates on the name, and a bootstrap section is BLOCKED like its write.
+    RENAMES_ASK = [
+        "git config --rename-section foo filter.x",
+        "git config --rename-section foo filter.lfs",
+        "git config --rename-section foo alias",
+        "git config --rename-section foo core",
+        "git config --rename-section foo gpg",
+    ]
+    RENAMES_BLOCKED = [
+        "git config --rename-section foo include",
+        "git config --rename-section foo includeIf.gitdir:x",
+        "git config --rename-section foo init",
     ]
     INJECTED = [
         "git -c include.path=/tmp/evil.gitconfig status",
@@ -725,6 +739,21 @@ class TestGitConfigPersistenceKeys:
         assert validate_command(command).risk_level == RiskLevel.SAFE
         assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.SAFE
 
+    @pytest.mark.parametrize("command", RENAMES_ASK)
+    def test_rename_into_a_dangerous_section_asks_and_is_denied_in_a_substitution(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", RENAMES_BLOCKED)
+    def test_rename_into_a_bootstrap_section_is_denied_at_both_tiers(self, command):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    def test_rename_between_ordinary_sections_stays_safe(self):
+        assert validate_command("git config --rename-section remote.origin remote.upstream").risk_level == RiskLevel.SAFE
+
     @pytest.mark.parametrize("command", INJECTED)
     def test_injected_form_is_denied(self, command):
         assert validate_command(command).risk_level == RiskLevel.BLOCKED
@@ -739,8 +768,7 @@ class TestGitConfigPersistenceKeys:
 
     def test_wrapped_bootstrap_write_asks(self):
         # Ceiling, pinned: the BLOCKED check reads git's own args, like the `-c` check beside it,
-        # so a wrapper reaches only the HIGH key-rated path. That still asks; `-c` through a
-        # wrapper reads SAFE.
+        # so a wrapper reaches only the HIGH key-rated path. That still asks.
         assert validate_command("timeout 5 git config include.path /tmp/evil").risk_level == RiskLevel.HIGH
 
 
