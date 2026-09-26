@@ -571,6 +571,9 @@ class TestP0FileTruncation:
             "true 2>| ~/.aws/credentials",
             ": 2> important.db",
             "echo -n 2> important.db",
+            # A quoted target is still a target.
+            'true 2> "my file"',
+            "true > 'my file'",
         ],
     )
     def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
@@ -593,6 +596,12 @@ class TestP0FileTruncation:
             # `30` belongs to the argument `10:30`; it is not a descriptor on `:`.
             "echo 10:30> out.txt",
             "cmd 2> err.log",
+            # Quoted examples are data: bash prints them and creates no file.
+            "echo ': > f'",
+            "echo ': 2> f'",
+            "echo ': &> f'",
+            "echo ': 2> f' x",
+            'printf "%s" "true 2> f"',
         ],
     )
     def test_fd_prefixed_non_truncation_allowed(self, safety_rules_path, command):
