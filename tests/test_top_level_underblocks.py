@@ -661,11 +661,16 @@ class TestGitConfigManViewerVerdicts:
         "git config --rename-section foo.custom man.custom",
         "git config --ren foo man",
         "git config rename-section foo help",
-        # Renaming a rated section AWAY moves its keys too: `man` renamed to `alias` turns
-        # man.viewer '!cmd' into a shell alias (verified against git 2.43).
+        # Renaming a rated section away rates too: the rename moves its keys either way.
         "git config --rename-section man alias",
         "git config --ren Man foo",
         "git config rename-section help foo",
+        # No position is trusted: after `--` a section may be named `-x` (git 2.43 arms the viewer
+        # through this), a value-taking option can swallow the `--`, and `find -exec` trails a `;`.
+        "git config --rename-section -- -x man",
+        "git config --rename-section -- man -x",
+        "git config -f -- --rename-section -- -x man",
+        "find . -maxdepth 0 -exec git config --rename-section man foo \\;",
         # A --file operand spelled like the rename flag must not hide the write behind it.
         "git config -f --ren man.viewer custom",
     ]

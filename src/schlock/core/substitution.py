@@ -440,7 +440,7 @@ def _is_git_boolean(value: str) -> bool:
 # `git config man.viewer custom` plus `git config man.custom.cmd PROG` turn an everyday
 # `git help add` into a run of PROG. The values an attack needs (`custom`, `web`, `/tmp/x.sh`)
 # are words no command rule can tell from ordinary ones, so judging the value, as
-# `git_config_exec_payload` does, cannot see this. Rate the write that arms the viewer, never
+# `git_config_exec_payloads` does, cannot see this. Rate the write that arms the viewer, never
 # `git help` itself: that is an everyday command.
 _KEY_RATED_GIT_CONFIGS = frozenset({"help.format", "man."})
 
@@ -604,22 +604,23 @@ def git_config_exec_payloads(args: list[str]) -> list[str]:
     return [p for p in payloads if p]
 
 
-def _renamed_section(args: list[str]) -> tuple[str, str] | None:
-    """Return the (OLD, NEW) names of `git config --rename-section OLD NEW`, else None.
+def _rename_section_candidates(args: list[str]) -> list[str]:
+    """Return every word that may name a section `git config --rename-section OLD NEW` renames, else [].
 
     git accepts any unambiguous abbreviation of a long option, so `--ren` already means
     --rename-section (`--re` is ambiguous: --remove-section, --replace-all). `rename-section` is
-    the subcommand spelling of newer git. The last two positionals are OLD and NEW: git stops
-    parsing options at the first positional and rejects a rename with any other count.
+    the subcommand spelling of newer git.
+
+    Every word after `config` is a candidate, not just the last two positionals, because no position
+    can be trusted: after `--` a section may be named `-x`, a value-taking option can swallow the
+    `--` itself (`-f -- --rename-section -- -x man`), and a `find -exec` clause trails a `;`. A decoy
+    word costs an over-rating, never a miss.
     """
     if "config" not in args:
-        return None
+        return []
     rest = args[args.index("config") + 1 :]
-    positionals = [arg for arg in rest if not arg.startswith("-")]
     flagged = any(len(arg) >= len("--ren") and "--rename-section".startswith(arg) for arg in rest)
-    if not (flagged or positionals[:1] == ["rename-section"]) or len(positionals) < 2:
-        return None
-    return positionals[-2], positionals[-1]
+    return rest if flagged or "rename-section" in rest else []
 
 
 def key_rated_git_config_write(args: list[str]) -> str | None:
@@ -634,21 +635,17 @@ def key_rated_git_config_write(args: list[str]) -> str | None:
     (`-f man.cfg`) rates too, and so does renaming the `man` section away.
     """
     prefixes = tuple(_KEY_RATED_GIT_CONFIGS)
-    renamed = _renamed_section(args)
-    if renamed is not None:
-        # A rename writes every key of the section under its NEW name, so `foo.viewer custom`
-        # renamed into `man` arms the viewer without ever naming man.viewer. `help` holds
-        # help.format, `man.custom` holds man.custom.cmd. The OLD name counts too: `man` renamed
-        # to `alias` turns man.viewer '!cmd' into a shell alias (verified against git 2.43).
-        old_section, new_section = renamed
-        for section in (old_section.lower() + ".", new_section.lower() + "."):
-            if any(prefix.startswith(section) or section.startswith(prefix) for prefix in prefixes):
-                return f"git config renames section {old_section} to {new_section}, moving keys that choose a program git runs"
-    # Every rename still falls through: stopping at the rename would let a `--file` operand
-    # spelled `--ren` hide a real write behind it.
     for key, _ in _git_config_writes(args):
         if key.lower().startswith(prefixes):
             return f"git config {key} chooses a program that git runs later"
+    for word in _rename_section_candidates(args):
+        # A rename writes every key of the section under its NEW name, so `foo.viewer custom`
+        # renamed into `man` arms the viewer without ever naming man.viewer. `help` holds
+        # help.format, `man.custom` holds man.custom.cmd. The OLD name matches too, which is what
+        # rates renaming `man` away.
+        section = word.lower() + "."
+        if any(prefix.startswith(section) or section.startswith(prefix) for prefix in prefixes):
+            return f"git config renames a section named {word}, moving keys that choose a program git runs"
     return None
 
 
