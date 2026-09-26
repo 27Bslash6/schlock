@@ -10,17 +10,20 @@ and a non-zero exit carrying no decision lets the tool call proceed.
 So the manifest carries the outermost guard: exit 2 is the one exit code that blocks a
 PreToolUse tool call on its own, whatever is or is not on stdout, and the command exits 2
 unless the hook both exits 0 and prints a decision. Exit status alone is not proof the hook
-ran — a `python3` that is not the expected binary can exit 0 having printed nothing. These
-tests read the command string out of hooks.json rather than restating it, so editing the
-guard away fails them.
+ran — a `python3` that is not the expected binary can exit 0 having printed nothing — and
+neither is a stray key name, so "a decision" means stdout is the envelope pre_tool_use.py
+writes, start to end. Whatever stdout carries is passed through on every exit, so a block
+keeps the reason the hook gave for it. These tests read the command string out of
+hooks.json rather than restating it, so editing the guard away fails them.
 """
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import pytest
 
@@ -54,15 +57,22 @@ def _all_commands() -> list:
     return [h["command"] for entries in events for e in entries for h in e["hooks"]]
 
 
+def _envelope(decision: str) -> str:
+    """The stdout pre_tool_use.py writes for one decision — the shape the guard accepts."""
+    return json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision}})
+
+
 def _run(
     command: str,
     plugin_root: Path,
-    payload: dict,
+    payload: Union[dict, str],
     *,
     home: Path,
     path: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Run a manifest command line the way the harness does: a POSIX shell, payload on stdin.
+
+    A `str` payload is sent verbatim, for input the harness would never produce.
 
     `home` is also used as the working directory, and both are throwaway and distinct from
     the repo: schlock resolves its user config under HOME and its project config under the
@@ -75,7 +85,7 @@ def _run(
     }
     return subprocess.run(
         ["/bin/sh", "-c", command],
-        input=json.dumps(payload),
+        input=payload if isinstance(payload, str) else json.dumps(payload),
         capture_output=True,
         text=True,
         cwd=home,
@@ -123,20 +133,60 @@ class TestPreToolUseFailsClosedOnStartupFailure:
         assert result.returncode == 2, f"expected a block, got rc={result.returncode} stdout={result.stdout!r}"
         assert result.stdout.strip() == "", "a file that will not compile emits no decision"
 
-    @pytest.mark.parametrize("stdout", ["", "hello"], ids=["silent", "not-a-decision"])
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            "",
+            "hello",
+            "{}",
+            '{"permissionDecision": "allow"}',
+            '{"hookSpecificOutput": {"hookEventName": "PreToolUse"}}',
+            'plugin/"permissionDecision"/hooks/pre_tool_use.py',
+            "banner\n" + _envelope("allow"),
+            _envelope("allow") + "\nbanner",
+        ],
+        ids=[
+            "silent",
+            "not-a-decision",
+            "empty-object",
+            "key-outside-the-envelope",
+            "envelope-without-a-decision",
+            "key-name-in-other-text",
+            "envelope-after-other-output",
+            "envelope-before-other-output",
+        ],
+    )
     def test_python3_that_exits_zero_without_a_decision_blocks(self, tmp_path, stdout):
-        """A shadowed `python3` that exits 0 never ran the hook: status 0 is not a decision."""
+        """A shadowed `python3` that exits 0 never ran the hook: status 0 is not a decision.
+
+        Nor is text that merely mentions one. The harness reads stdout as a single JSON object
+        and proceeds when it cannot, so anything but the whole envelope must block.
+        """
         root = _stub_plugin_root(tmp_path, "")
         fake_bin = tmp_path / "fake-bin"
         fake_bin.mkdir()
         fake = fake_bin / "python3"
-        fake.write_text(f"#!/bin/sh\nprintf '{stdout}'\nexit 0\n")
+        fake.write_text(f"#!/bin/sh\nprintf '%s' {shlex.quote(stdout)}\nexit 0\n")
         fake.chmod(0o755)
 
         result = _run(_hook_command("Bash"), root, BASH_PAYLOAD, home=tmp_path, path=f"{fake_bin}:/usr/bin:/bin")
 
         assert result.returncode == 2, f"expected a block, got rc={result.returncode} stdout={result.stdout!r}"
         assert result.stdout.strip() == "", "nothing the harness could read as a decision may pass through"
+
+    @pytest.mark.parametrize("decision", ["allow", "deny"])
+    def test_decision_followed_by_a_non_zero_exit_blocks_and_keeps_its_stdout(self, tmp_path, decision):
+        """A hook that printed a decision and then failed is still a failed hook -> exit 2.
+
+        Its stdout is passed through all the same, so a deny keeps the reason the model is
+        shown instead of degrading to whatever the hook logged on stderr.
+        """
+        root = _stub_plugin_root(tmp_path, f"import sys\nprint({_envelope(decision)!r})\nsys.exit(1)\n")
+
+        result = _run(_hook_command("Bash"), root, BASH_PAYLOAD, home=tmp_path)
+
+        assert result.returncode == 2, f"expected a block, got rc={result.returncode} stdout={result.stdout!r}"
+        assert result.stdout.strip() == _envelope(decision)
 
 
 class TestEveryHookStartsFromAPathContainingASpace:
@@ -149,12 +199,12 @@ class TestEveryHookStartsFromAPathContainingASpace:
 
     @pytest.mark.parametrize("command", _all_commands())
     def test_command_starts(self, tmp_path, command):
-        root = _stub_plugin_root(tmp_path / "plugin root", 'print(\'{"permissionDecision": "allow"}\')\n')
+        root = _stub_plugin_root(tmp_path / "plugin root", f"print({_envelope('allow')!r})\n")
 
         result = _run(command, root, BASH_PAYLOAD, home=tmp_path)
 
         assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr!r}"
-        assert json.loads(result.stdout) == {"permissionDecision": "allow"}
+        assert result.stdout.strip() == _envelope("allow")
 
 
 class TestPreToolUseStillDeliversOrdinaryDecisions:
@@ -163,6 +213,9 @@ class TestPreToolUseStillDeliversOrdinaryDecisions:
     it did not choose. `ask` is the case that matters: converting a prompt the user could
     approve into a hard block would take the choice away from them, which is the opposite of
     what the risk presets are for.
+
+    main()'s own error paths are the exception: they print a deny and exit 1, which the guard
+    turns into exit 2 — a block either way — while forwarding the deny so its reason survives.
     """
 
     @pytest.mark.parametrize(
@@ -184,6 +237,15 @@ class TestPreToolUseStillDeliversOrdinaryDecisions:
             f"rc={result.returncode} stderr={result.stderr[-500:]!r}"
         )
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == expected
+
+    def test_real_hook_error_path_deny_keeps_its_reason(self, tmp_path):
+        """Unparseable stdin takes main()'s JSONDecodeError path: a deny, then exit 1."""
+        result = _run(_hook_command("Bash"), REPO_ROOT, "not json", home=tmp_path)
+
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr[-500:]!r}"
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert output["permissionDecisionReason"] == "BLOCKED: Invalid hook input"
 
 
 class TestSelfProtectStaysFailOpen:
