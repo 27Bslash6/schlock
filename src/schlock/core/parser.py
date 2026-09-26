@@ -4,9 +4,10 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks. The one
-regex here (_QUOTED_RUN_OR_DOLLAR_MARKER) only re-reads the quoting of a single
-redirect target whose boundaries bashlex has already fixed; see _redirect_words.
+Regex-based parsing is explicitly NOT supported due to security risks. Two readers
+here work on single words whose boundaries bashlex has already fixed, _redirect_words
+and _mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE); CLAUDE.md lists
+both as approved exceptions and the constraints each must keep.
 """
 
 import bisect
@@ -168,6 +169,26 @@ _DATA_REDIRECT_OPERATORS = frozenset({"<<", "<<-", "<<<"})
 # noclobber overridden - strictly more dangerous, never less - and bash itself
 # reads `>& word` as `&> word` when no fd is given.
 _OPERATOR_ALIASES = {">|": ">", ">&": "&>"}
+
+# bash's `{varname}` redirect prefix: `{fd}>out` opens `out` on a fresh descriptor and
+# stores its number in $fd, and the `{fd}` word never reaches argv. validator.py's word
+# scanner builds its redirect regexes on this spelling. ASCII only: bash passes `{aé}>x`
+# as an argument.
+FD_VARIABLE = r"\{[A-Za-z_][A-Za-z0-9_]*\}"
+
+# A word bashlex spells as a name plus an optional `[…]` (quotes already removed) may be
+# a prefix; only such a word next to a redirect is looked at. Quote removal only ever
+# drops characters, so a real prefix always has this shape. DOTALL because bash consumes a
+# subscript holding a newline (`{fd["<newline>"]}`): without it that word is never looked
+# at, so it is neither tagged nor refused.
+_FD_VARIABLE_WORD_SHAPE_RE = re.compile(FD_VARIABLE.removesuffix(r"\}") + r"(\[.*\])?\}", re.DOTALL)
+# The only RAW spellings tagged as a prefix: a name, optionally one subscript of name or
+# digit characters. Anything else brace-shaped against a redirect raises (_mark_fd_variables).
+_FD_VARIABLE_ALLOWED_RE = re.compile(FD_VARIABLE.removesuffix(r"\}") + r"(\[[A-Za-z0-9_]+\])?\}")
+_NO_FD_VARIABLE_OPERATORS = frozenset({"&>", "&>>"})
+# Set on a word node by _mark_fd_variables. A boolean set only when true, so every other
+# node keeps its bashlex attributes (node equality and repr read the whole __dict__).
+_FD_VARIABLE_TAG = "schlock_fd_variable"
 
 # A quoted run or a `$$` (group 1, kept) or the `$` that opens `$'…'` / `$"…"` outside
 # any quotes (dropped by `.sub(r"\1", …)`). Matching the runs first consumes a `$`
@@ -586,7 +607,133 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     return [(operator, None), (word, None)]
 
 
-def _stdin_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
+def _unreadable(source: str, word: Any, cause: str) -> ParseError:
+    return ParseError(f"Cannot read the `{{varname}}` redirect prefix {word.word!r} in {source!r}: {cause}")
+
+
+def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
+    r"""Tag every word bash reads as the `{varname}` prefix of the redirection after it.
+
+    SECURITY (LAB-4599): bashlex hands the prefix over as an ordinary word, so every
+    word view passed it on as an argument bash never passes. Sitting between a command
+    and its arguments it unrated every rule and check keyed on argument shape:
+    `git {fd}>out push --force origin main` and `chmod {fd}>out 777 f` were SAFE, and
+    `{fd}>out git …` ran a command named `{fd}`.
+
+    Decided once, here, because only the parse still has the source. Leaving a real
+    prefix untagged is the bypass, so this decides only what it can know for certain.
+    Checks run in this order, the first that applies deciding:
+
+    1. A top-level word whose raw span starts with `{` and - continuations joined
+       first, then searched - has `}` then `<` or `>` (not `<(`/`>(`, a process
+       substitution) raises: bashlex folded the operator into the word
+       (`{fd}>\<newline>o`) and split the command where bash runs it whole.
+    2. Only a word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection
+       other than `&>`/`&>>`, is looked at further.
+    3. A line continuation anywhere in its enclosing top-level word raises: inside a
+       word that holds one, bashlex's offsets stop tracking the source. This comes
+       before rule 4, so a continuation is refused even around a quoted word.
+    4. A raw span starting with anything but `{` (`"{fd}"`, `\{fd}`) is an argument,
+       which is how bash reads it.
+    5. A raw span of exactly `{name}` or `{name[sub]}`, `sub` only name or digit
+       characters, is tagged. Anything else raises, which fails the command closed:
+       every quoted, expanded or escaped subscript.
+
+    Raises:
+        ParseError: on any of the uncertain readings above.
+    """
+    stack: list[tuple[Any, Optional[tuple]]] = [(node, None) for node in ast_nodes or []]
+    while stack:
+        node, enclosing = stack.pop()
+        parts = getattr(node, "parts", None)
+        if getattr(node, "kind", None) == "command" and parts:
+            for word, redirect in zip(parts, [*parts[1:], None]):
+                if not hasattr(word, "word") or not getattr(word, "pos", None):
+                    continue
+                raw = source[word.pos[0] : word.pos[1]]
+                if enclosing is None and raw.startswith("{") and re.search(r"\}[<>](?!\()", raw.replace("\\\n", "")):
+                    raise _unreadable(source, word, "a redirection operator bashlex folded into the word")
+                if redirect is None or not _fd_variable_candidate(word, redirect):
+                    continue
+                start, end = enclosing or word.pos
+                if "\\\n" in source[start:end]:
+                    raise _unreadable(source, word, "a line continuation in or around it")
+                if not raw.startswith("{"):
+                    continue  # quoted or escaped: an argument, as bash reads it
+                if source[redirect.pos[0] : redirect.pos[0] + 1] not in ("<", ">"):
+                    raise _unreadable(source, word, "its redirection is not where bashlex places it")
+                if not _FD_VARIABLE_ALLOWED_RE.fullmatch(raw):
+                    raise _unreadable(source, word, "a spelling outside {name} and {name[0-9A-Za-z_]}")
+                setattr(word, _FD_VARIABLE_TAG, True)
+        child_enclosing = enclosing
+        if enclosing is None and hasattr(node, "word") and getattr(node, "pos", None):
+            child_enclosing = node.pos
+        for value in vars(node).values():
+            stack.extend(
+                (child, child_enclosing) for child in (value if isinstance(value, list) else (value,)) if hasattr(child, "kind")
+            )
+
+
+def _fd_variable_candidate(word: Any, redirect: Any) -> bool:
+    """True when bashlex's word is shaped as a `{varname}` prefix of ``redirect``, glued to it.
+
+    Source-free. The prefix must end where the redirect starts (`{fd} >out` is an
+    argument), and `&>`/`&>>` take none.
+    """
+    pos, next_pos = getattr(word, "pos", None), getattr(redirect, "pos", None)
+    return bool(
+        _FD_VARIABLE_WORD_SHAPE_RE.fullmatch(word.word)
+        and getattr(redirect, "kind", None) == "redirect"
+        and pos
+        and next_pos
+        and next_pos[0] == pos[1]
+        and getattr(redirect, "type", None) not in _NO_FD_VARIABLE_OPERATORS
+    )
+
+
+def _is_fd_variable(part: Any) -> bool:
+    """True when ``part`` is a redirection's `{varname}` prefix (see _mark_fd_variables)."""
+    return getattr(part, _FD_VARIABLE_TAG, False)
+
+
+def without_fd_variables(parts: "list[Any]") -> "list[Any]":
+    """A command node's parts less every redirection's `{varname}` prefix.
+
+    For each word view that walks `.parts` itself: this module's argv views
+    (_command_words) and substitution.py's inner-command views.
+    """
+    return [part for part in parts if not _is_fd_variable(part)]
+
+
+def _command_part_words(
+    parts: "list[Any]", include_redirects: bool, command: Optional[str]
+) -> list[tuple[str, Optional[tuple]]]:
+    """One command node's reconstruction words, in source order (see BashCommandParser._collect_words).
+
+    A `{fd}` prefix is part of its redirection, not an argument: it leaves the
+    redirect-free form and rides on its operator in the other (`{fd}>out`). It rides
+    only on the part right after it - that is the redirection it prefixes - and is
+    spent there even when that redirection renders nothing (`{fd}<<<x`, `{fd}>&-`);
+    carried further, it glued onto an unrelated redirect (`{fd}<<<x > f` read as
+    `{fd}> f`, and `{fd}` then disowned the write).
+    """
+    words: list[tuple[str, Optional[tuple]]] = []
+    fd_prefix = None
+    for part in parts:
+        prefix, fd_prefix = fd_prefix, None
+        if _is_fd_variable(part):
+            fd_prefix = part.word
+        elif hasattr(part, "word"):
+            words.append((part.word, getattr(part, "pos", None)))
+        elif include_redirects and getattr(part, "kind", None) == "redirect":
+            redirect = _redirect_words(part, command)
+            if prefix and redirect:
+                redirect[0] = (prefix + redirect[0][0], None)
+            words.extend(redirect)
+    return words
+
+
+def _stdin_here_string(parts: "list[Any]") -> Optional[str]:
     """Content of the here-string a command's stdin ends up holding, else None.
 
     The here-string content is the redirect's target word (`.output`); a fd-duplication redirect
@@ -600,8 +747,11 @@ def _stdin_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
     not run (fails closed), under-surfacing misses one that does.
     """
     by_fd: dict[int, str] = {}
-    for part in redirect_nodes:
-        if getattr(part, "kind", None) != "redirect":
+    for previous, part in zip([None, *parts], parts):
+        # `{fd}<<< X` fills a fresh descriptor, never stdin, though bashlex leaves its
+        # `input` None exactly as for a bare `<<<` (LAB-4599). Only a command's `.parts`
+        # can carry the prefix; bashlex rejects it before a compound's `.redirects`.
+        if getattr(part, "kind", None) != "redirect" or _is_fd_variable(previous):
             continue
         fd = getattr(part, "input", None) or 0
         kind, target = getattr(part, "type", None), getattr(part, "output", None)
@@ -613,14 +763,16 @@ def _stdin_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
 
 
 def _command_words(node: Any) -> "list[str]":
-    """Word tokens (command name + args) of a command node, skipping assignment/redirect prefixes."""
-    words: list[str] = []
-    for part in getattr(node, "parts", []):
-        if getattr(part, "kind", None) in ("assignment", "redirect"):
-            continue
-        if hasattr(part, "word"):
-            words.append(part.word)
-    return words
+    """Word tokens (command name + args) of a command node.
+
+    Skips assignments, redirections and a redirection's `{varname}` prefix. Every argv
+    view in this module reads a command through here.
+    """
+    return [
+        part.word
+        for part in without_fd_variables(getattr(node, "parts", None) or [])
+        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
+    ]
 
 
 def heredoc_owner(node: Any) -> Optional[str]:
@@ -782,19 +934,9 @@ class BashCommandParser:
         if not hasattr(node, "parts"):
             return None
 
-        for part in node.parts:
-            # Skip assignment nodes (VAR=value prefixes)
-            if hasattr(part, "kind") and part.kind == "assignment":
-                continue
-            # Skip redirects
-            if hasattr(part, "kind") and part.kind == "redirect":
-                continue
-            # Found a word node - this is the command name
-            if hasattr(part, "word"):
-                cmd = part.word.split("/")[-1]
-                return cmd if cmd else None
-
-        return None
+        words = _command_words(node)
+        cmd = words[0].split("/")[-1] if words else ""
+        return cmd if cmd else None
 
     def parse(self, command: str) -> list[Any]:
         """Parse command into bashlex AST.
@@ -807,7 +949,9 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax
+            ParseError: If bashlex fails to parse the command syntax, or a
+                `{varname}` redirect prefix cannot be read with certainty
+                (see _mark_fd_variables)
 
         Example:
             >>> parser = BashCommandParser()
@@ -821,7 +965,7 @@ class BashCommandParser:
             raise ValueError("Command cannot be whitespace-only")
 
         try:
-            return bashlex.parse(command)
+            ast = bashlex.parse(command)
         except bashlex.errors.ParsingError as e:
             # Preserve original bashlex error for debugging
             raise ParseError(
@@ -835,6 +979,8 @@ class BashCommandParser:
                 f"Unexpected parsing error for command: {command!r}",
                 original_error=e,
             )
+        _mark_fd_variables(command, ast)
+        return ast
 
     def extract_commands(self, ast_nodes: list[Any]) -> list[str]:
         """Extract all command names from AST.
@@ -861,11 +1007,7 @@ class BashCommandParser:
             if hasattr(node, "kind"):
                 # Command nodes contain the actual command
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    # First part is typically the command name
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            commands.append(part.word)
-                            break  # Only take first word (command name)
+                    commands.extend(_command_words(node)[:1])
 
                 # Recursively visit child nodes
                 for attr in ["parts", "command", "list", "pipe", "compound"]:
@@ -909,16 +1051,7 @@ class BashCommandParser:
             if hasattr(node, "kind"):
                 # Command nodes contain the actual command and arguments
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
-                    words = []
-                    for part in node.parts:
-                        # Skip assignment nodes (VAR=value prefixes)
-                        if hasattr(part, "kind") and part.kind == "assignment":
-                            continue
-                        # Skip redirects (2>&1, >, <, etc.)
-                        if hasattr(part, "kind") and part.kind == "redirect":
-                            continue
-                        if hasattr(part, "word"):
-                            words.append(part.word)
+                    words = _command_words(node)
                     if words:
                         # First word is command, rest are arguments
                         results.append((words[0], words[1:]))
@@ -1218,11 +1351,7 @@ class BashCommandParser:
             if hasattr(node, "kind"):
                 # Command nodes - extract their word parts
                 if node.kind == "command" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "word"):
-                            words.append((part.word, getattr(part, "pos", None)))
-                        elif include_redirects and getattr(part, "kind", None) == "redirect":
-                            words.extend(_redirect_words(part, command))
+                    words.extend(_command_part_words(node.parts, include_redirects, command))
                     return  # Don't recurse further into this command
 
                 # Recursively visit child nodes for other structures
@@ -1721,18 +1850,7 @@ class BashCommandParser:
 
         def _get_all_words(node) -> list[str]:
             """Get ALL words from a command node, skipping assignments/redirects."""
-            words = []
-            if not hasattr(node, "parts"):
-                return words
-            for part in node.parts:
-                # Skip assignment and redirect prefixes
-                if hasattr(part, "kind") and part.kind in ("assignment", "redirect"):
-                    continue
-                if hasattr(part, "word"):
-                    cmd = part.word.split("/")[-1]
-                    if cmd:  # Skip empty strings
-                        words.append(cmd)
-            return words
+            return [cmd for word in _command_words(node) if (cmd := word.split("/")[-1])]
 
         def visit_children(node, visitor):
             """Recursively visit child nodes of an AST node."""
@@ -1856,17 +1974,7 @@ class BashCommandParser:
 
         def _stage_args(part) -> list[str]:
             """Word-args AFTER the command name for a pipeline stage command node."""
-            words = []
-            seen_name = False
-            for sub in getattr(part, "parts", []):
-                if getattr(sub, "kind", None) in ("assignment", "redirect"):
-                    continue
-                if hasattr(sub, "word"):
-                    if not seen_name:
-                        seen_name = True  # first word is the command name
-                        continue
-                    words.append(sub.word)
-            return words
+            return _command_words(part)[1:]  # the first word is the command name
 
         def stdin_program(c) -> list[str]:
             """Rule (2) on one command node: [interpreter] if it runs its stdin as a program, else [].

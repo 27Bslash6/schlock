@@ -60,6 +60,20 @@
      decides no structure and no verdict (the word still goes through every rule); and any span
      it cannot read exactly (a backslash, or not one `shlex` word) keeps bashlex's word, less
      its leading markers.
+   - **Approved exception — recognising a `{varname}` redirect prefix.** bashlex splits
+     `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
+     argument, so `_mark_fd_variables` in `src/schlock/core/parser.py` tags that one word at
+     parse time and every argv view drops it (LAB-4599). It decides only what it can know for
+     certain, from the word's RAW source span (bashlex's word has lost its quotes). In order:
+     a top-level `{`-word whose text, continuations joined first, has `}` then `<`/`>` (not a
+     `<(`/`>(` process substitution) **raises** - bashlex folded the operator in; a
+     backslash-newline in a candidate's enclosing top-level word **raises**, before any other
+     reading; a raw span not starting with `{` is an **argument**; a raw span fully matching
+     `_FD_VARIABLE_ALLOWED_RE` (`{name}` or `{name[sub]}`, `sub` only name/digit characters)
+     is **tagged**; **every other brace-shaped spelling raises `ParseError`**. Do not
+     widen the allowlist by modelling bash's subscript grammar: four review rounds of that
+     never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
+     must raise, never fall back to "argument". Every spelling is decided by real bash first.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
