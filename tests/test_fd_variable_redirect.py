@@ -109,6 +109,10 @@ class TestEverySpellingBashConsumes:
             "{fd[\\$'\\']}>o",
             "{fd['${']}>o",
             "{fd[$${]}]}>o",
+            "{fd[1,2]}<in",
+            # a newline in the subscript: the shape regex's DOTALL is what refuses these
+            '{fd["\n"]}>o',
+            "{fd['\n']}>o",
         ],
     )
     def test_spelling_outside_the_allowlist_fails_closed(self, redirect, safety_rules_path):
@@ -297,6 +301,9 @@ class TestLineContinuationsFailClosed:
             # a brace word that cannot be a prefix is never read, so it cannot fail closed
             ("n=$(# don't count\\\n awk '{n++} END {print n}'<&0)", (RiskLevel.SAFE, ())),
             ("x=$(awk \\\n '{print}' f)", (RiskLevel.SAFE, ())),
+            # a process substitution is an argument (`{fd}/dev/fd/63`), not a folded operator
+            ("git {fd}<(ls) push --force origin main", (RiskLevel.SAFE, ())),
+            ("diff {old}<(ls) x", (RiskLevel.SAFE, ())),
         ],
     )
     def test_unaffected(self, command, expected, safety_rules_path):

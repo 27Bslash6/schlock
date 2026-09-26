@@ -64,12 +64,13 @@
      `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
      argument, so `_mark_fd_variables` in `src/schlock/core/parser.py` tags that one word at
      parse time and every argv view drops it (LAB-4599). It decides only what it can know for
-     certain, from the word's RAW source span (bashlex's word has lost its quotes): a word glued
-     to a redirect is **tagged** only if the raw span fully matches `_FD_VARIABLE_ALLOWED_RE`
-     (`{name}` or `{name[sub]}`, `sub` only name/digit characters) and no backslash-newline
-     sits in its enclosing top-level word; it stays an **argument** if the raw span starts with
-     anything but `{`; **every other brace-shaped spelling raises `ParseError`**, as does a
-     top-level `{`-word with `}` then `<`/`>` in it (bashlex folded the operator in). Do not
+     certain, from the word's RAW source span (bashlex's word has lost its quotes). In order:
+     a top-level `{`-word whose text, continuations joined first, has `}` then `<`/`>` (not a
+     `<(`/`>(` process substitution) **raises** - bashlex folded the operator in; a
+     backslash-newline in a candidate's enclosing top-level word **raises**, before any other
+     reading; a raw span not starting with `{` is an **argument**; a raw span fully matching
+     `_FD_VARIABLE_ALLOWED_RE` (`{name}` or `{name[sub]}`, `sub` only name/digit characters)
+     is **tagged**; **every other brace-shaped spelling raises `ParseError`**. Do not
      widen the allowlist by modelling bash's subscript grammar: four review rounds of that
      never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
      must raise, never fall back to "argument". Every spelling is decided by real bash first.

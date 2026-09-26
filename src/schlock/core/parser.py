@@ -177,7 +177,9 @@ FD_VARIABLE = r"\{[A-Za-z_][A-Za-z0-9_]*\}"
 
 # A word bashlex spells as a name plus an optional `[…]` (quotes already removed) may be
 # a prefix; only such a word next to a redirect is looked at. Quote removal only ever
-# drops characters, so a real prefix always has this shape.
+# drops characters, so a real prefix always has this shape. DOTALL because bash consumes a
+# subscript holding a newline (`{fd["<newline>"]}`): without it that word is never looked
+# at, so it is neither tagged nor refused.
 _FD_VARIABLE_WORD_SHAPE_RE = re.compile(FD_VARIABLE.removesuffix(r"\}") + r"(\[.*\])?\}", re.DOTALL)
 # The only RAW spellings tagged as a prefix: a name, optionally one subscript of name or
 # digit characters. Anything else brace-shaped against a redirect raises (_mark_fd_variables).
@@ -578,20 +580,22 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
 
     Decided once, here, because only the parse still has the source. Leaving a real
     prefix untagged is the bypass, so this decides only what it can know for certain.
-    A word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection other than
-    `&>`/`&>>`, is:
+    Checks run in this order, the first that applies deciding:
 
-    - tagged when its raw span is `{name}` or `{name[sub]}` with `sub` only name or
-      digit characters, and no line continuation sits in its enclosing top-level word;
-    - left an argument when its raw span starts with anything but `{` (`"{fd}"`,
-      `\{fd}`), which bash never consumes;
-    - otherwise a ParseError, which fails the command closed. That covers every quoted,
-      expanded or escaped subscript, and any continuation around the prefix: inside a
-      word that holds one, bashlex's offsets stop tracking the source.
-
-    A top-level word whose raw span starts with `{` and, continuations joined, has `}`
-    then `<` or `>` raises too: bashlex folded the operator into the word
-    (`{fd}>\<newline>o`) and split the command where bash runs it whole.
+    1. A top-level word whose raw span starts with `{` and - continuations joined
+       first, then searched - has `}` then `<` or `>` (not `<(`/`>(`, a process
+       substitution) raises: bashlex folded the operator into the word
+       (`{fd}>\<newline>o`) and split the command where bash runs it whole.
+    2. Only a word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection
+       other than `&>`/`&>>`, is looked at further.
+    3. A line continuation anywhere in its enclosing top-level word raises: inside a
+       word that holds one, bashlex's offsets stop tracking the source. This comes
+       before rule 4, so a continuation is refused even around a quoted word.
+    4. A raw span starting with anything but `{` (`"{fd}"`, `\{fd}`) is an argument,
+       which is how bash reads it.
+    5. A raw span of exactly `{name}` or `{name[sub]}`, `sub` only name or digit
+       characters, is tagged. Anything else raises, which fails the command closed:
+       every quoted, expanded or escaped subscript.
 
     Raises:
         ParseError: on any of the uncertain readings above.
@@ -605,7 +609,7 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
                 if not hasattr(word, "word") or not getattr(word, "pos", None):
                     continue
                 raw = source[word.pos[0] : word.pos[1]]
-                if enclosing is None and raw.startswith("{") and re.search(r"\}[<>]", raw.replace("\\\n", "")):
+                if enclosing is None and raw.startswith("{") and re.search(r"\}[<>](?!\()", raw.replace("\\\n", "")):
                     raise _unreadable(source, word, "a redirection operator bashlex folded into the word")
                 if redirect is None or not _fd_variable_candidate(word, redirect):
                     continue
