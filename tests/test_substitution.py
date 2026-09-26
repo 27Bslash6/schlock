@@ -2918,6 +2918,17 @@ class TestDangerousAwkHelper:
             ["awk", "NR>1 {print $2}"],  # numeric comparison, not a redirect
             ["awk", "-v", "n=3", "{print $n}"],
             ["awk", "-F|", "{print $1}"],  # pipe as field separator, not pipe-to-command
+            ["awk", "$1 || $2 {print}"],  # logical OR, not a pipe (LAB-4832)
+            ["awk", "/error|warn/ {print}"],  # regex alternation, not a pipe
+            ["awk", '{print $1 "|" $2}'],  # a pipe character inside a string literal
+            ["awk", "{print $1} # x|y", "f"],  # a pipe inside a comment (LAB-4832 panel)
+            ["awk", "{n++} /a|b/ {print}"],  # only a `/` directly after ++ is ambiguous
+            ["awk", "NR == 1\n/a|b/ {print}"],  # a regex pattern opening the second line
+            # FP guards: legit one-liners a too-blunt fix would over-block
+            ["awk", '{gsub(/[ \\t]+/, "|"); print}'],  # `\t` in a bracket does not move its end
+            ["awk", '{$1 /= 100; print $1 "|" $2}'],  # a field is an lvalue: `/=` is compound-assign
+            ["awk", '{y = length($0) / 2; print y "|" $1}'],  # length(...) is a value: `/` divides
+            ["awk", '/[/]/ {print $1 "|" $2}'],  # `/` in a simple class does not open a pipe
         ],
     )
     def test_safe_awk(self, args):
@@ -2940,10 +2951,82 @@ class TestDangerousAwkHelper:
             ["awk", "-i", "inplace", "{print}"],
             ["awk", "-l", "ext", "{}"],
             ["awk", "-E", "prog.awk"],
+            # LAB-4832: the pipe target is a variable, so no string literal sits beside the `|`
+            ["awk", "BEGIN{c=ARGV[1]; print 1 | c}"],
+            ["awk", "{print | cmd}"],
+            ["awk", "BEGIN{c=ARGV[1]; c | getline l}"],
+            # LAB-4832 panel: a `/re/` in an operand position must be stripped as a regex, or its
+            # `"` pairs with a later quote and hides the pipe (verified executable on mawk/nawk).
+            ["awk", 'BEGIN{c=ARGV[1]; x = 1 + /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; x = ($0 ~ /[/]"/); print 1 | c; y = "a"}'],
+            # a backslash-newline continuation (a literal `\` then a newline) is a blank in code,
+            # as it is to awk, so `4 \<newline>/ 2` still divides and leaves `print 1 | c` bare
+            ["awk", "BEGIN{c=ARGV[1]; x = 4 \\\n/ 2; print 1 | c; y = 2 / 1}"],
+            ["awk", 'BEGIN{c=ARGV[1]; x = "a\\\nb"; print 1 | c; y = "z"}'],
+            # each row below ran `c` on at least one of gawk/mawk/nawk/busybox awk
+            ["awk", "BEGIN{c=ARGV[1]; x=4; y = x++ / 2; print 1 | c; z = 4 / 1}"],  # gawk, busybox
+            ["awk", 'BEGIN{c=ARGV[1]; x=4; y = x++ /"/; print 1 | c}'],  # mawk, nawk
+            ["awk", "BEGIN{c=ARGV[1]; x=4; y = x-- / 2; print 1 | c; z = 4 / 1}"],
+            ["awk", "BEGIN{c=ARGV[1]; case=4; y = case / 2; print 1 | c; z = 4 / 1}"],
+            ["awk", 'BEGIN{c=ARGV[1]; switch ("\\"") { case /"/: print 1 | c }}'],  # gawk
+            ["awk", "BEGIN{c=ARGV[1]; and=4; y = and / 2; print 1 | c; z = 4 / 1}"],
+            ["awk", "BEGIN{c=ARGV[1]; not=4; y = not / 2; print 1 | c; z = 4 / 1}"],
+            ["awk", "BEGIN{c=ARGV[1]; func=4; y = func / 2; print 1 | c; z = 4 / 1}"],
+            ["awk", 'BEGIN{c=ARGV[1]; if (1) /"/; print 1 | c}'],
+            ["awk", 'BEGIN{c=ARGV[1]; for (k in a) /"/; print 1 | c}'],
+            ["awk", 'BEGIN{c=ARGV[1]; x = 1\n/"/; print 1 | c}'],
+            ["awk", "BEGIN{c=ARGV[1] # x \\\n; print 1 | c}"],
+            ["awk", 'BEGIN{c=ARGV[1]; x = /a\\\n"/; print 1 | c; y = "b"}'],  # regex continues
+            # one row per word after which a `/` opens a regex (busybox alone for in/break/continue)
+            ["awk", 'BEGIN{c=ARGV[1]; print /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; printf /"/; print 1 | c; y = "a"}'],
+            ["awk", 'function f() { return /"/; } BEGIN{c=ARGV[1]; f(); print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN { exit /"/ } END { c=ARGV[1]; print 1 | c; y = "a" }'],
+            ["awk", 'BEGIN{c=ARGV[1]; if (0) x=1; else /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; do /"/; while (0); print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; x = 1 in /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; while (1) { break /"/ } print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; for (i=0;i<1;i++) { continue /"/ } print 1 | c; y = "a"}'],
+            # values: a `/` after them divides (getline's row is top-level: any getline denies here)
+            ["awk", "BEGIN{c=ARGV[1]; or=4; y = or / 2; print 1 | c; z = 4 / 1}"],
+            ["awk", "BEGIN{c=ARGV[1]; x = 1. / 2; print 1 | c; z = 4 / 1}"],
+            # a number glued to letters: busybox reads `0x1in` as `0x1 in`, mawk and nawk as `0 x1in`
+            ["awk", 'BEGIN{c=ARGV[1]; x = 1in /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; x = 0x1in /"/; print 1 | c; y = "a"}'],
+            ["awk", "BEGIN{c=ARGV[1]; x = 0x1in / 2; print 1 | c; z = 4 / 1}"],
+            # `length` with no args is a value in most awks but opens a regex in mawk
+            ["awk", 'BEGIN{c=ARGV[1]; y = length /"/; print 1 | c}'],
+            # `/=` after a non-lvalue value opens a regex in gawk, divides elsewhere
+            ["awk", "BEGIN{c=ARGV[1]; y = 4 /=/; print 1 | c}"],
+            ["awk", 'BEGIN{c=ARGV[1]; y = "q" /=/; print 1 | c}'],
+            ["awk", "BEGIN{c=ARGV[1]; y = (4) /=/; print 1 | c}"],
+            # a bracket the awks parse differently -> kept raw: `\]` (busybox closes, others escape),
+            # a leading `]` after `^`, a `[:class:]`
+            ["awk", "BEGIN{c=ARGV[1]; if ($0 ~ /[\\]/) x=1; print 1 | c}"],  # busybox
+            ["awk", 'BEGIN{c=ARGV[1]; if ("x" ~ /[^]/"]/) y=1; print 1 | c}'],  # mawk, gawk
+            ["awk", 'BEGIN{c=ARGV[1]; if ("x" ~ /[[:alpha:]/"]/) y=1; print 1 | c}'],  # mawk, gawk
+            # a `\<CR><LF>` continuation joins the line before the scan, as awk does
+            ["awk", "BEGIN{c=ARGV[1]; x = 8 \\\r\n/ 2; print 1 | c; z = 4 / 1}"],
         ],
     )
     def test_dangerous_awk(self, args):
         assert dangerous_awk(args) is not None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /')\"",
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; c | getline l; print l}' 'id')\"",  # AC-3 guard
+            # a regex-after-operator evasion the removed literal alternatives would have missed
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; x = 1 + /\"/; print 1 | c}' 'rm -rf /')\"",
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; x=4; y = x++ / 2; print 1 | c; z = 4 / 1}' 'rm -rf /')\"",
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; if (1) /\"/; print 1 | c}' 'rm -rf /')\"",
+        ],
+    )
+    def test_variable_pipe_target_blocked_in_substitution(self, command, monkeypatch):
+        """LAB-4832: the payload sits in a quoted argument, so no YAML rule backstops the scan."""
+        monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
+        assert validate_command(command).allowed is False
 
 
 class TestDangerousSedHelper:

@@ -595,15 +595,13 @@ def dangerous_find(args: list[str]) -> str | None:
 
 # awk constructs that execute commands or write files from inside the program text. Blunt regex
 # scan over ALL args (program text, -v values, separators alike): over-blocking a rare string
-# comparison like `$1 > "m"` inside a substitution is acceptable; missing system()/pipe-to-command/
-# file writes is not. Known ceiling: a pipe/redirect target held in a VARIABLE (`print | c`) evades
-# this text scan — the parser's pipe-to-shell layer and YAML rules remain as backstops. See #104.
+# comparison like `$1 > "m"` inside a substitution is acceptable; missing system()/getline/
+# file writes is not. Pipes to a command — literal, VARIABLE (`print | c`) or gawk `|&` — are
+# caught by awk_command_pipe below, not here. Covers literal redirect targets only (`> "file"`);
+# a computed redirect path is out of scope for this check (a file write, not an exec). See #104.
 _AWK_DANGEROUS_TEXT = re.compile(
     r"system\s*\("  # system("cmd") — arbitrary exec
     r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
-    r'|\|\s*"'  # print | "cmd" — pipe to a command
-    r'|"\s*\|'  # "cmd" | … — command string on the left of a pipe
-    r"|\|&"  # gawk |& coprocess
     r'|>\s*"'  # print > "file" / >> "file" — file write from inside awk
     r"|@load|@include"  # gawk: load extension / include external source
 )
@@ -611,6 +609,200 @@ _AWK_DANGEROUS_TEXT = re.compile(
 # awk flags that load external program code (contents unknown -> fail closed) or enable writes.
 # Prefix match covers attached forms (-fprog.awk). Case-sensitive: -F (field separator) is safe.
 _AWK_DANGEROUS_FLAG_PREFIXES = ("-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec")
+
+
+# A lone `|` (not `||`) is a command pipe: awk has no bitwise OR, so outside literals `|` only ever
+# joins print/printf to a command or a command to getline; `|&` is a gawk coprocess.
+_AWK_LONE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
+# Every awk command pipe touches one of these keywords, so a stripped program without one is not a
+# pipe to a command (`-F|`, `OFS=|`, a bare `a|b` in data).
+_AWK_PIPE_KEYWORD = re.compile(r"\b(?:printf?|getline)\b")
+# awk's lexer rule for `/`: after a value it divides, elsewhere it opens a regex. _awk_strip_literals
+# tracks what a `/` at the current point would do. _AWK_DIVIDE is a variable name (a `/=` after it is
+# the divide-assign operator); _AWK_NONVAR is a non-lvalue value (number, string, `)`) — gawk reads a
+# `/=` after one as a regex, the others as division, so `/=` there is ambiguous. _AWK_EITHER marks a
+# `/` the awks disagree on outright: after postfix `x++`/`x--` gawk and busybox divide while mawk and
+# nawk open a regex; after `case` gawk opens one (switch) while the others take `case` for a variable.
+# At an _AWK_EITHER `/` the rest of the program is kept raw, so a real pipe is over-read, never hidden.
+# _AWK_HEADER: an `if`/`while`/`for` whose `(...)` follows. LAB-4832.
+_AWK_DIVIDE, _AWK_NONVAR, _AWK_REGEX, _AWK_HEADER, _AWK_EITHER = "div", "nonvar", "regex", "header", "either"
+# What a `/` right after a word does; after any other name it divides. A word marked _AWK_REGEX that
+# some awk takes for a variable would strip real code, so each entry is what every awk accepting a `/`
+# there does: gawk, mawk, nawk and busybox checked. `getline`, `and`, `or`, `not`, `func` are values,
+# or variables in some awks; `length` is a value in most but opens a regex in mawk, so it is EITHER.
+_AWK_WORD_STATE = {
+    **dict.fromkeys(
+        ("print", "printf", "return", "exit", "else", "do", "in", "break", "continue"),
+        _AWK_REGEX,
+    ),
+    **dict.fromkeys(("if", "while", "for"), _AWK_HEADER),
+    **dict.fromkeys(("case", "length"), _AWK_EITHER),
+}
+_AWK_NUMBER = re.compile(r"\d+\.?\d*(?:[eE][+-]?\d+)?")
+# A `\` continues a line when a newline follows it (mawk also allows blanks between). Both wrong
+# readings — ending the statement, or ending a string/regex early — could strip a pipe, so treat it
+# as a join everywhere it can appear.
+_AWK_LINE_CONT = re.compile(r"\\[ \t\r]*\n")
+# A bracket expression all four awks agree ends at the same `]`: `[`, an optional `^`, then a run of
+# plain members (not `[`, `]`, `\`) and `\x` escapes (not `\]`), then `]`. A `\]` (busybox closes,
+# others escape), a `/` inside... no — `/` is a plain member here and closes consistently on the awks
+# that accept it. A nested `[`, a `[:class:]`, or a leading `]` (even after `^`) is parsed differently,
+# so a regex containing one is kept raw rather than guessed. The `^` is possessive so `[^]...]` cannot
+# backtrack into reading `^` as a member and `]` as the close.
+_AWK_SIMPLE_CLASS = re.compile(r"\[\^?+(?:[^\[\]\\\n]|\\[^\]\n])+\]")
+
+
+def _awk_skip_regex(prog: str, i: int) -> int | None:
+    """Return the index just past a `/regex/` literal opening at prog[i] == '/', or None if the
+    literal contains a bracket expression the awks parse differently (caller then keeps the rest raw).
+
+    Runs to the closing `/` or the line's end (an unclosed literal is a syntax error awk rejects).
+    A `\\`-escape covers the next char, so a `\\<newline>` continues the regex, as it does in awk.
+    """
+    n = i + 1
+    end = len(prog)
+    while n < end and prog[n] not in ("/", "\n"):
+        if prog[n] == "\\":
+            n = _awk_skip_escape(prog, n)
+        elif prog[n] == "[":  # only a simple class is safe to parse; anything else is ambiguous
+            m = _AWK_SIMPLE_CLASS.match(prog, n)
+            if m is None:
+                return None
+            n = m.end()
+        else:
+            n += 1
+    return n + 1
+
+
+def _awk_skip_escape(prog: str, n: int) -> int:
+    """Return the index past a `\\`-escape at prog[n], skipping a `\\<newline>` line continuation
+    whole (so a literal continues across it) and otherwise covering the one escaped char."""
+    m = _AWK_LINE_CONT.match(prog, n)
+    return m.end() if m else n + 2
+
+
+def _awk_skip_string(prog: str, i: int) -> int:
+    """Return the index just past a `"string"` literal that opens at prog[i] == '"'.
+
+    Runs to the next unescaped `"` or the line's end. A `\\`-escape covers the next char, so a
+    `\\<newline>` continues the string onto the next line, as it does in awk.
+    """
+    n = i + 1
+    end = len(prog)
+    while n < end and prog[n] not in ('"', "\n"):
+        n = _awk_skip_escape(prog, n) if prog[n] == "\\" else n + 1
+    return n + 1
+
+
+def _awk_scan_word(prog: str, i: int, after_dollar: bool) -> tuple[int, str]:
+    """Return the end of the name or number at prog[i] and what a `/` right after it does.
+
+    A number glued to letters splits differently per awk: all four read `1in` as `1 in`, busybox
+    reads `0x1in` as hex `0x1` then `in` where mawk and nawk read `0` then `x1in`. So a `/` after
+    one is ambiguous. A plain number is a non-lvalue value (_AWK_NONVAR) — unless it is a field
+    (`$1`), which is an lvalue, so a `/=` after it divides.
+    """
+    m = _AWK_NUMBER.match(prog, i)
+    num_end = m.end() if m else i
+    end = num_end
+    while end < len(prog) and (prog[end].isalnum() or prog[end] == "_"):
+        end += 1
+    if num_end == i:  # a name
+        return end, _AWK_WORD_STATE.get(prog[i:end], _AWK_DIVIDE)
+    if end > num_end:  # a number glued to letters
+        return end, _AWK_EITHER
+    return end, _AWK_DIVIDE if after_dollar else _AWK_NONVAR
+
+
+def _awk_slash(prog: str, i: int, slash: str) -> tuple[str, int, str] | None:
+    """Handle a `/` at prog[i]. Return (chunk to emit, next index, next slash-state), or None when
+    the awks read this `/` differently and the caller must keep the rest of the program raw.
+    """
+    if slash == _AWK_EITHER or (slash == _AWK_NONVAR and prog[i + 1 : i + 2] == "="):
+        return None
+    if slash in (_AWK_DIVIDE, _AWK_NONVAR):  # division
+        return "/", i + 1, _AWK_REGEX
+    end = _awk_skip_regex(prog, i)  # regex literal
+    return None if end is None else ("//", end, _AWK_DIVIDE)
+
+
+def _awk_after_punct(c: str, slash: str, headers: list[bool]) -> str:
+    """Return what a `/` after punctuation `c` does. `headers` holds one entry per open `(`: does
+    it open an if/while/for condition? That condition's `)` ends no value, so a regex follows it.
+    """
+    if c == "(":
+        headers.append(slash == _AWK_HEADER)
+        return _AWK_REGEX
+    if c == ")":  # a grouped/call value: not an lvalue, so `/=` after it is ambiguous (see _AWK_NONVAR)
+        return _AWK_REGEX if headers and headers.pop() else _AWK_NONVAR
+    return _AWK_DIVIDE if c == "]" else _AWK_REGEX  # `]` ends an array/field lvalue: `/` divides
+
+
+def _awk_strip_literals(prog: str) -> str:
+    """Replace awk string, regex, and comment content with inert placeholders, leaving code.
+
+    A single regex cannot do this: a `"` inside `/re/` is not a string and a `/` inside `"str"` is
+    not a regex, so the two forms must be tracked left to right with the same state awk's lexer
+    keeps. Where awks disagree on a `/`, the rest of the program is kept as written: a real pipe
+    can then be over-read, never hidden. Each char consumed once -> linear, no backtracking.
+    """
+    out: list[str] = []
+    i, n = 0, len(prog)
+    slash = _AWK_REGEX  # what a `/` at this point does, per what the last token left
+    headers: list[bool] = []  # see _awk_after_punct
+    while i < n:
+        c = prog[i]
+        if c == '"':  # string literal
+            i = _awk_skip_string(prog, i)
+            out.append('""')
+            slash = _AWK_NONVAR
+        elif c == "#":  # comment — to end of line; a trailing `\` does not continue it
+            eol = prog.find("\n", i)
+            i = eol if eol >= 0 else n
+        elif c == "/":  # division, a regex literal, or a `/` the awks read differently (-> raw)
+            act = _awk_slash(prog, i, slash)
+            if act is None:
+                out.append(prog[i:])
+                break
+            chunk, i, slash = act
+            out.append(chunk)
+        elif c.isalnum() or c == "_":  # name or number
+            j, slash = _awk_scan_word(prog, i, bool(out) and out[-1] == "$")
+            out.append(prog[i:j])
+            i = j
+        elif c == "\n":  # ends the statement: a `/` opening the next line starts a regex
+            out.append(c)
+            slash = _AWK_REGEX
+            i += 1
+        elif m := _AWK_LINE_CONT.match(prog, i):  # `\`+blanks+newline continuation: not a token
+            out.append(" ")
+            i = m.end()
+        elif c.isspace():  # a blank: not a token
+            out.append(" ")
+            i += 1
+        elif prog.startswith(("++", "--"), i):
+            out.append(prog[i : i + 2])
+            slash = _AWK_EITHER
+            i += 2
+        else:
+            out.append(c)
+            slash = _awk_after_punct(c, slash, headers)
+            i += 1
+    return "".join(out)
+
+
+def awk_command_pipe(args: list[str]) -> str | None:
+    """Return a reason if an awk program pipes output to, or reads from, a command, else None.
+
+    Target-agnostic, so `print | c` with `c` from ARGV is caught where the literal-anchored
+    _AWK_DANGEROUS_TEXT misses it. Used by dangerous_awk (substitution) and by the top-level
+    validator (BLOCKED), where the payload sits in a quoted arg no YAML rule can see. LAB-4832.
+    """
+    for arg in args:
+        code = _awk_strip_literals(arg)
+        if _AWK_PIPE_KEYWORD.search(code) and _AWK_LONE_PIPE.search(code):
+            return "awk program pipes to or from a command (print | cmd, cmd | getline)"
+    return None
 
 
 def dangerous_awk(args: list[str]) -> str | None:
@@ -622,8 +814,8 @@ def dangerous_awk(args: list[str]) -> str | None:
         if arg != "awk" and arg.startswith(_AWK_DANGEROUS_FLAG_PREFIXES):
             return f"awk {arg} loads external program code or enables writes"
         if _AWK_DANGEROUS_TEXT.search(arg):
-            return "awk program executes commands or writes files (system/getline/pipe/redirect)"
-    return None
+            return "awk program executes commands or writes files (system/getline/redirect)"
+    return awk_command_pipe(args)
 
 
 # sed is allowed inside substitution only in a conservative read-only form: clusterable boolean
@@ -1672,8 +1864,8 @@ class SubstitutionValidator:
                     return True, kubectl_reason
 
             # awk/sed are whitelisted as read-only pipeline stages but carry exec/write escape
-            # hatches (awk system()/getline/pipes, sed -i/-f/e/w commands) — same contextual
-            # pattern as find above. See #104.
+            # hatches (awk system()/getline/pipes to a literal or variable command, sed -i/-f/e/w
+            # commands) — same contextual pattern as find above. See #104, LAB-4832.
             if base_command == "awk" and args:
                 awk_reason = dangerous_awk(args)
                 if awk_reason:

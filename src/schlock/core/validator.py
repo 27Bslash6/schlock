@@ -445,6 +445,30 @@ def _check_dangerous_command_flags(
                     matched_rules=["ast_dangerous_combo:git"],
                 )
 
+        # awk piping to/from a command (`print | c`, `c | getline`) is an exec primitive; the
+        # payload rides in a quoted arg the YAML rules treat as data. BLOCKED like git -c, not
+        # HIGH like kubectl — this does deny the legitimate `print | "sort"` idiom, but the shell
+        # pipe (`awk '...' | sort`) is the plain alternative, and an arbitrary command from an awk
+        # arg has no defensible top-level use. system() stays a HIGH YAML rule, and -f /
+        # `print > file` stay allowed here. LAB-4832 (BLOCKED vs HIGH settled on the ticket).
+        if base_name in ("awk", "gawk", "mawk", "nawk"):
+            from schlock.core.substitution import awk_command_pipe  # noqa: PLC0415
+
+            awk_reason = awk_command_pipe(args)
+            if awk_reason:
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: {awk_reason}",
+                    alternatives=[
+                        "Pipe awk's output to the command in the shell: awk '...' | cmd",
+                        "Run the command directly instead of from inside awk",
+                    ],
+                    exit_code=1,
+                    error=None,
+                    matched_rules=["ast_dangerous_combo:awk"],
+                )
+
     return None
 
 
