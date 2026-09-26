@@ -524,11 +524,19 @@ class TestHeredocSuppressionCoversTheBodyNotTheWord:
     def test_only_the_body_range_is_suppressed(self):
         """The suppression range must cover the body, not the word that carries it."""
         parser = BashCommandParser()
-        command = "$(cat <<EOF\n\nEOF\n)mk''fs /dev/sda"
+        command = "echo $(cat <<EOF\n\nEOF\n)mk''fs /dev/sda"
         reconstructed, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
         assert "mkfs" in reconstructed
         # every range is strictly shorter than the word that contains the heredoc
         assert ranges and all(end - start <= len("\nEOF") for start, end in ranges)
+
+    def test_a_command_position_body_is_not_suppressed(self):
+        """A substitution in command position runs its output, so its heredoc body is code."""
+        parser = BashCommandParser()
+        command = "$(cat <<EOF\n\nEOF\n)mk''fs /dev/sda"
+        reconstructed, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
+        assert "mkfs" in reconstructed
+        assert ranges == []
 
 
 class TestHeredocSuppressionRequiresProvenance:

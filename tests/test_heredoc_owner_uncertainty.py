@@ -865,6 +865,11 @@ class TestParallelPerlReplacement:
             # Getopt::Long auto_abbrev: `--rp` is the only `--rp*` option, so it is `--rpl`
             "parallel --rp '{X} system\"id\"' 'echo {X}' ::: a",
             "parallel --rp='{X} system\"id\"' 'echo {X}' ::: a",
+            # A `/` in the Perl must not cut the marker off: the guard reads raw words, not basenames
+            "parallel 'echo {= s/a/b/; system(\"id\") =}' ::: a",
+            "parallel echo '{= s:x:y:; system(\"id\") =}/' ::: a",  # trailing `/`: empty basename
+            "parallel --rpl='{X} s/a/b/; system(\"id\")' 'echo {X}' ::: a",
+            "parallel --rp='{X} s/a/b/; system(\"id\")' 'echo {X}' ::: a",
         ],
     )
     def test_perl_replacement_blocks(self, command, no_shellcheck):
@@ -875,6 +880,7 @@ class TestParallelPerlReplacement:
         [
             "parallel echo {} ::: '{=a=}'",  # `:::` input is data, never a replacement string
             "parallel echo ::: '{=x}'",
+            "parallel echo {} ::: 's/{=a=}/x'",
         ],
     )
     def test_perl_replacement_in_input_is_safe(self, command, no_shellcheck):

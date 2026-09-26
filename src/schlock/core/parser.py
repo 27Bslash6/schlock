@@ -2459,8 +2459,9 @@ class BashCommandParser:
                     # GNU parallel's `{= perl =}` / `--rpl` run Perl in parallel itself, so they
                     # are code with no heredoc and no template head to classify (LAB-5180).
                     # `:::` input is data parallel never evaluates, so only the words before it count.
+                    # Raw words, not basenames: a `/` in the Perl (`{= s/a/b/ =}`) would cut the marker.
                     if cmd_name in ("parallel", "env_parallel") and _parallel_executes_perl(
-                        list(itertools.takewhile(lambda w: not w.startswith(":::"), _get_all_words(node)))
+                        list(itertools.takewhile(lambda w: not w.startswith(":::"), _command_words(node)))
                     ):
                         dangers.append("parallel replacement string executes Perl code")
 
