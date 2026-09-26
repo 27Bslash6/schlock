@@ -76,6 +76,52 @@ class TestStringLiteralBypassFix:
         )
 
 
+class TestEverySuppressionRangeIsConsulted:
+    """Pin that `_is_in_string_literal` consults EVERY suppression range.
+
+    The function folds its ranges with `any(...)`. Truncating that fold to the
+    first range (`string_literals[:1]`) survived the whole suite: no test had a
+    rule match sitting entirely inside a *second* literal. Dropping ranges can
+    only over-block, but the next person to batch, sort or bisect that lookup
+    gets no signal from the suite if they get the multi-range case wrong - and
+    bounds taken from the wrong pair of ranges (min start, max end) widen the
+    suppressed span and under-block. Found by the LAB-4321 expert panel
+    (LAB-4325); every row below is the sole kill for at least one mutation.
+    """
+
+    @pytest.mark.parametrize(
+        "command,expected_allowed,expected_risk",
+        [
+            # Dangerous text entirely inside the SECOND literal. Under the
+            # `[:1]` mutation only the first range is consulted, so the match
+            # escapes suppression and this scores BLOCKED.
+            ('echo "hello there" "rm -rf /"', True, RiskLevel.SAFE),
+            # Dangerous literal FIRST. Sole kill for the mirror mutation
+            # `[-1:]` (last range only), which survives the rest of the suite;
+            # the row above passes it.
+            ('echo "rm -rf /" "hello there"', True, RiskLevel.SAFE),
+            # Unquoted payload BETWEEN two literals, with the match STARTING
+            # inside the first. Sole kill for the under-block shapes: an
+            # envelope over all ranges (min start, max end), a bisect that
+            # checks start and end against different ranges, and a start-only
+            # containment check - the Bug #1 rows above stopped pinning that
+            # last one once LAB-1732 gave bare quoted tokens like "safe" no
+            # range at all.
+            ('echo "x rm" -rf / "y z"', False, RiskLevel.BLOCKED),
+        ],
+    )
+    def test_suppression_consults_every_range(self, safety_rules_path, command, expected_allowed, expected_risk):
+        """Each row asserts its own absolute verdict - never attack == control."""
+        with patch("schlock.core.validator.is_shellcheck_available", return_value=False):
+            clear_caches()
+            result = validate_command(command, config_path=safety_rules_path)
+
+        assert (result.allowed, result.risk_level) == (expected_allowed, expected_risk), (
+            f"{command!r} scored {result.risk_level} (allowed={result.allowed}, rules={result.matched_rules}), "
+            f"expected {expected_risk}"
+        )
+
+
 class TestEmptyQuotedStringRangeFix:
     """Test FIX 2: Empty quoted string range bug.
 
