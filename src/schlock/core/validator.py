@@ -6,6 +6,7 @@ handles configuration layering (plugin defaults → user → project).
 """
 
 import logging
+import posixpath
 import re
 import subprocess
 import threading
@@ -821,6 +822,179 @@ _SELF_PROTECTION_REDIRECT_PATTERNS = [re.compile(r">>?\s*\S*" + re.escape(path))
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
 
 
+# SELF-PROTECTION: Directories that hold schlock configuration files. Extracting an archive
+# into one overwrites the config without the config file name ever appearing in the command,
+# so the file-name fast path above cannot see it (LAB-4830).
+SELF_PROTECTION_DIRS = (".claude/hooks", ".config/schlock")
+_CONFIG_DIR_RE = re.compile(r"(?:^|/)(?:" + "|".join(map(re.escape, SELF_PROTECTION_DIRS)) + r")(?:/|$)")
+# Leading option name, so "-C.claude/hooks", "-o.claude/hooks", "--directory=x" yield the path.
+_OPTION_PREFIX_RE = re.compile(r"^--?[A-Za-z][A-Za-z-]*=?")
+# Split a command into shell command-position pieces: real separators, plus the OPENERS of a
+# subshell / process substitution, so `echo $(tar … -C .claude/hooks)` exposes tar as a leading
+# word. Newline and a lone `&` are separators too, so a config dir named in a *later*, unrelated
+# statement never binds to an extractor in an earlier one.
+_ARCHIVE_SEGMENT_SPLIT_RE = re.compile(r"\$\(|[`;\n]|\|\|?|&&?|[<>]\(")
+# Env assignments prefixing a command ("TAR_OPTIONS=-x tar …") — the command is what follows.
+_ARCHIVE_ENV_ASSIGN_RE = re.compile(r'^([A-Za-z_]\w*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+)+')
+# A leading redirection token (`>`, `>>`, `2>`, `<`): its target is not an extraction argument.
+_REDIRECT_RE = re.compile(r"^\d*(?:>>?|<)")
+# Command prefixes that hand off to the next word without changing what it does.
+_EXTRACT_WRAPPERS = frozenset({"sudo", "doas", "command", "busybox", "nice", "stdbuf"})
+_TAR_NAMES = frozenset({"tar", "gtar", "bsdtar"})
+_7Z_NAMES = frozenset({"7z", "7za", "7zr", "7zz"})
+# tar short options that consume the NEXT word as their value.
+_TAR_ARG_OPTS = frozenset("bCfFgHIKLNTVX")
+# tar long options that consume the next word as their value, so "--exclude -t" does not read
+# `-t` as list mode. Over-listing only ever skips a filename (harmless); under-listing a
+# read-mode value can only fail closed, since an extract mode is checked first.
+_TAR_LONG_WITH_ARG = frozenset(
+    {
+        "file", "directory", "exclude", "exclude-from", "exclude-tag", "transform", "xform",
+        "files-from", "label", "owner", "group", "mode", "blocking-factor", "record-size",
+        "use-compress-program", "newer", "after-date", "one-top-level",
+    }
+)  # fmt: skip
+# tar modes that never write into the -C directory (list / create / compare / append / update / concat).
+_TAR_READ_MODES = frozenset("tcdruA")
+_TAR_READ_LONG = frozenset({"list", "create", "diff", "compare", "append", "update", "catenate", "concatenate", "delete"})
+_UNZIP_ARG_OPTS = frozenset("dPxO")
+_UNZIP_READ_OPTS = frozenset("cltpvzZ")  # list, test, stdout, comment, zipinfo
+
+
+def _short_flags(args: list[str], arg_opts: frozenset[str]) -> set[str]:
+    """Letters of the short-option clusters in args, skipping each option's argument.
+
+    A cluster ends at an option that takes an argument ("-Cdir"); when that option ends the
+    cluster ("-C dir", "-P pw"), the next word is its value and is skipped, so a value such as
+    the `-l` in "-P -l" is never mistaken for a mode letter.
+    """
+    flags: set[str] = set()
+    i = 0
+    while i < len(args):
+        word = args[i]
+        if word.startswith("-") and not word.startswith("--") and len(word) > 1:
+            j = 1
+            while j < len(word):
+                ch = word[j]
+                flags.add(ch)
+                if ch in arg_opts:
+                    if j == len(word) - 1:
+                        i += 1  # value is the next word
+                    break
+                j += 1
+        i += 1
+    return flags
+
+
+def _tar_modes(args: list[str]) -> set[str]:
+    """Mode tokens that are real options — short letters and `--long` names, values skipped.
+
+    Skipping option values (short and long) is what stops an option's argument (`--exclude -t`,
+    `-f -t`) from being read as a mode.
+    """
+    modes: set[str] = set()
+    i = 0
+    first = True
+    while i < len(args):
+        word = args[i]
+        if word.startswith("--"):
+            name = word[2:].split("=", 1)[0]
+            modes.add("--" + name)
+            if "=" not in word and name in _TAR_LONG_WITH_ARG:
+                i += 1  # value is the next word
+        elif word.startswith("-") and len(word) > 1:
+            j = 1
+            while j < len(word):
+                ch = word[j]
+                modes.add(ch)
+                if ch in _TAR_ARG_OPTS:
+                    if j == len(word) - 1:
+                        i += 1
+                    break
+                j += 1
+        elif first and word and word[0].isalpha():
+            modes.update(word)  # old-style key letters: "tar xf a.tar"
+        first = False
+        i += 1
+    return modes
+
+
+def _tar_extracts(args: list[str]) -> bool:
+    """True unless tar visibly runs a mode that cannot write into its -C directory.
+
+    Inverted on purpose: an invocation with no visible mode (supplied via TAR_OPTIONS, or an
+    abbreviated long option) counts as an extraction. A valid tar always names a mode, so this
+    only costs verdicts on commands that would fail anyway. A visible extract mode outranks a
+    read-mode letter, because a read letter can appear as an unskipped option value.
+    """
+    modes = _tar_modes(args)
+    longs = {m[2:] for m in modes if m.startswith("--")}
+    if "x" in modes or any(name.startswith(("ext", "ge")) for name in longs):  # -x / --extract / --get
+        return True
+    if longs & _TAR_READ_LONG:
+        return False
+    return not ({m for m in modes if not m.startswith("--")} & _TAR_READ_MODES)
+
+
+def _names_config_dir(arg: str) -> bool:
+    """True if a single argument resolves to a path inside a config directory.
+
+    Normalises before matching so that a quoted, escaped, or dot/double-slash spelling of the
+    same runtime path ("-C'.claude'/hooks", ".claude//hooks", ".claude/./hooks") cannot slip the
+    literal match. normpath does no filesystem access; `~`/`$VAR` are left as text, which the
+    (?:^|/) boundary still anchors.
+    """
+    arg = _OPTION_PREFIX_RE.sub("", arg, count=1)
+    arg = arg.replace('"', "").replace("'", "").replace("`", "").replace("\\", "").strip("(){}")
+    if not arg:
+        return False
+    return bool(_CONFIG_DIR_RE.search(posixpath.normpath(arg)))
+
+
+def _extracts_into_config_dir(command: str) -> bool:
+    """Detect an archive extraction (tar/bsdtar, unzip, 7z) that names a config directory.
+
+    The extractor must be the command word of a segment (after env assignments and pass-through
+    wrappers such as sudo), so a config dir named as an *argument* to some other command
+    (`grep tar .claude/hooks`) is not mistaken for an extraction. Any of the extractor's own
+    arguments naming the dir counts — the target option ("-C dir", "--directory=dir", "-d dir",
+    "-odir") and a member filter alike ("tar -xf a.tar .claude/hooks" recreates the dir under
+    the cwd) — but redirection targets do not.
+    """
+    if ".claude" not in command and "schlock" not in command:
+        return False
+    for raw in _ARCHIVE_SEGMENT_SPLIT_RE.split(command):
+        words = _ARCHIVE_ENV_ASSIGN_RE.sub("", raw.strip()).split()
+        k = 0
+        while k < len(words) and words[k].rsplit("/", 1)[-1] in _EXTRACT_WRAPPERS:
+            k += 1
+        if k >= len(words):
+            continue
+        name = words[k].strip("\"'`(){}").rsplit("/", 1)[-1]
+        args: list[str] = []
+        skip = False
+        for word in words[k + 1 :]:
+            if skip:
+                skip = False
+                continue
+            if _REDIRECT_RE.match(word):
+                skip = word[-1] in "<>"  # bare operator: its target is the next word
+                continue
+            args.append(word)
+        if name in _TAR_NAMES:
+            extracts = _tar_extracts(args)
+        elif name == "unzip":
+            extracts = not (_short_flags(args, _UNZIP_ARG_OPTS) & _UNZIP_READ_OPTS)
+        elif name in _7Z_NAMES:
+            command_word = next((arg for arg in args if not arg.startswith("-")), "")
+            extracts = command_word.lower() in ("x", "e")
+        else:
+            continue
+        if extracts and any(_names_config_dir(arg) for arg in args):
+            return True
+    return False
+
+
 def _check_self_protection(command: str) -> Optional[ValidationResult]:
     """Allowlist-based check preventing modification of schlock configuration files.
 
@@ -843,6 +1017,11 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
     Returns:
         ValidationResult blocking the command if it targets schlock config, None otherwise
     """
+    # Check 0: archive extraction into a config directory. Runs before the fast path because
+    # the command names only the directory, never the config file.
+    if _extracts_into_config_dir(command):
+        return _make_self_protection_result(command)
+
     # Fast path: skip if command doesn't reference any config path
     if not _matches_protected_path(command):
         return None
