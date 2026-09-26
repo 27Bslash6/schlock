@@ -664,8 +664,9 @@ _AWK_LINE_CONT = re.compile(r"\\[ \t\r]*\n")
 # plain members (not `[`, `]`, `\`), `\x` escapes (not `\]`), and POSIX `[:class:]`/`[.coll.]`/`[=eq=]`
 # sub-brackets, then `]`. A `\]` (busybox closes the class, others escape it), a leading `]` (even
 # after `^`), or a bare nested `[` is parsed differently, so a regex containing one is kept raw rather
-# than guessed. The `^` is possessive so `[^]...]` cannot backtrack into reading `^` as a member.
-_AWK_SIMPLE_CLASS = re.compile(r"\[\^?+(?:\[[:.=][^\]\n]*[:.=]\]|\\[^\]\n]|[^\[\]\\\n])+\]")
+# than guessed. The `(?!\^?\])` lookahead rejects a leading `]` (with or without `^`) so it is kept
+# raw rather than read as `^`-member-then-close (a possessive `^` would too, but needs Python 3.11).
+_AWK_SIMPLE_CLASS = re.compile(r"\[(?!\^?\])\^?(?:\[[:.=][^\]\n]*[:.=]\]|\\[^\]\n]|[^\[\]\\\n])+\]")
 
 
 def _awk_skip_regex(prog: str, i: int) -> int | None:
