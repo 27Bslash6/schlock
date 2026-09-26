@@ -910,10 +910,7 @@ def _make_self_protection_result(command: str) -> ValidationResult:
 
 
 def _check_special_cases(command: str) -> Optional[ValidationResult]:
-    """Check special cases that require dynamic state inspection.
-
-    Special cases are commands that can't be validated by static rules alone
-    and require checking system state (e.g., git status for uncommitted changes).
+    """Check special cases that must run before the command is parsed.
 
     Returns None if no special case applies (continue normal validation).
     Returns ValidationResult if special case is triggered.
@@ -927,61 +924,75 @@ def _check_special_cases(command: str) -> Optional[ValidationResult]:
     # SELF-PROTECTION: Prevent LLM from modifying schlock's own configuration
     # This is a hardcoded backstop that runs BEFORE YAML rule matching and
     # cannot be bypassed via rule_overrides or category_overrides.
-    self_protection = _check_self_protection(command)
-    if self_protection is not None:
-        return self_protection
+    return _check_self_protection(command)
 
-    # Git reset --hard protection: check for uncommitted changes
-    if "git reset" in command and "--hard" in command:
-        try:
-            # Run git status --porcelain to check for uncommitted changes
-            result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
 
-            # If git status succeeded and has output, there are uncommitted changes
-            if result.returncode == 0 and result.stdout.strip():
-                logger.warning("Blocked git reset --hard due to uncommitted changes")
-                return ValidationResult(
-                    allowed=False,
-                    risk_level=RiskLevel.BLOCKED,
-                    message="BLOCKED: Uncommitted changes detected! git reset --hard will destroy them.",
-                    alternatives=[
-                        "Save changes first with 'git stash'",
-                        "Commit changes before resetting",
-                        "Use 'git reset --soft' to keep changes in working directory",
-                    ],
-                    exit_code=1,
-                    error=None,
-                )
+def _runs_hard_reset(command: str, result: ValidationResult) -> bool:
+    """Whether ``command`` may be a `git reset --hard`, so the uncommitted-changes probe is owed.
 
-        except subprocess.TimeoutExpired:
-            logger.warning("git status timeout during reset --hard check")
-            # Fail-safe: block if we can't verify safety
+    Two legs, and neither subsumes the other. The rule match sees the command bash runs: any git
+    global option between `git` and `reset` (`-C .`, `--no-pager`, `-c k=v`, ...) displaces the
+    subcommand, and the rule already skips them, so keying on it closes the class instead of
+    listing options that go stale as git grows (LAB-5493). The substring is the only leg that
+    sees `reset -q --hard` and `reset HEAD~1 --hard`: the rule requires `reset\\s+--hard`.
+    """
+    return "git_hard_reset" in result.matched_rules or ("git reset" in command and "--hard" in command)
+
+
+def _check_uncommitted_changes() -> Optional[ValidationResult]:
+    """Deny a hard reset that would destroy uncommitted changes in cwd's work tree.
+
+    Returns None when the tree is clean or its state cannot be read for a reason that says it
+    is not a repository (normal validation stands), a BLOCKED verdict otherwise.
+    """
+    try:
+        # Run git status --porcelain to check for uncommitted changes
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
+        # If git status succeeded and has output, there are uncommitted changes
+        if result.returncode == 0 and result.stdout.strip():
+            logger.warning("Blocked git reset --hard due to uncommitted changes")
             return ValidationResult(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
-                message="BLOCKED: Unable to verify git status (timeout). Reset --hard blocked for safety.",
-                alternatives=["Verify git repository state manually"],
+                message="BLOCKED: Uncommitted changes detected! git reset --hard will destroy them.",
+                alternatives=[
+                    "Save changes first with 'git stash'",
+                    "Commit changes before resetting",
+                    "Use 'git reset --soft' to keep changes in working directory",
+                ],
                 exit_code=1,
-                error="git status timeout",
+                error=None,
             )
 
-        except FileNotFoundError:
-            # Git not installed or not in PATH - not a git repo
-            # Let normal validation handle this
-            pass
+    except subprocess.TimeoutExpired:
+        logger.warning("git status timeout during reset --hard check")
+        # Fail-safe: block if we can't verify safety
+        return ValidationResult(
+            allowed=False,
+            risk_level=RiskLevel.BLOCKED,
+            message="BLOCKED: Unable to verify git status (timeout). Reset --hard blocked for safety.",
+            alternatives=["Verify git repository state manually"],
+            exit_code=1,
+            error="git status timeout",
+        )
 
-        except Exception as e:
-            logger.debug(f"git status check failed (not a git repo?): {e}")
-            # Not a git repo or other error - let normal validation handle it
-            pass
+    except FileNotFoundError:
+        # Git not installed or not in PATH - not a git repo
+        # Let normal validation handle this
+        pass
 
-    # No special case triggered
+    except Exception as e:
+        logger.debug(f"git status check failed (not a git repo?): {e}")
+        # Not a git repo or other error - let normal validation handle it
+        pass
+
     return None
 
 
@@ -2596,14 +2607,26 @@ def validate_command(
     result = _validate_command(
         command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
     )
-    if not deferred:
-        return result
-    sub = _substitution_verdict(deferred[0])
+    if deferred:
+        result = _join_substitution(result, _substitution_verdict(deferred[0]))
+    # The hard-reset probe keys on the finished verdict, so it runs after every pass rather than
+    # before the parse, and after the cache lookup, so a verdict cached while the tree was clean
+    # cannot answer for it once it is dirty. Its BLOCKED verdict is never cached: tree state
+    # changes. Top-level only, so `git status` runs at most once per call: a re-entry (a shell
+    # payload, a heredoc candidate) hands its matched rules up to this one. A verdict that is
+    # already BLOCKED needs no probe, which can only deny.
+    if _depth == 0 and not _derived and result.risk_level != RiskLevel.BLOCKED and _runs_hard_reset(command, result):
+        return _check_uncommitted_changes() or result
+    return result
+
+
+def _join_substitution(result: ValidationResult, sub: ValidationResult) -> ValidationResult:
+    """Join a completed verdict with a substitution verdict too weak to have short-circuited it."""
     # The higher level wins, on level alone: a HIGH rule match arrives with allowed=True, so
     # deciding on `allowed` sent every HIGH tie to the substitution and `rm -r d $(base64 -d f)`
     # lost `recursive_delete`. A tie is denied if either half is, and reports both halves, so a
-    # cheap HIGH rule up front cannot hide the refused substitution from the prompt. Only
-    # `deferred[0]`, the first worst substitution, is named. An allowed substitution verdict (a
+    # cheap HIGH rule up front cannot hide the refused substitution from the prompt. The caller
+    # passes only the first worst substitution, so only it is named. An allowed substitution verdict (a
     # rule match below HIGH, LAB-4223) joins the same way and denies nothing.
     if sub.risk_level > result.risk_level:
         return sub
@@ -2644,7 +2667,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
        for what the caller submitted, MAX_DERIVED_COMMAND_SIZE for text schlock derived from it
     1. Check cache for previous result
     2. Validate input (empty check)
-    3. Special case checks (git reset --hard, etc.)
+    3. Special case checks (self-protection; the hard-reset probe runs in validate_command)
     4. Parse command with BashCommandParser
     5. Match against rules with RuleEngine
     6. Build ValidationResult

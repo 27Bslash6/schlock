@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,6 +19,21 @@ def no_shellcheck(monkeypatch):
     clear_caches()
     yield
     clear_caches()
+
+
+@pytest.fixture
+def clean_worktree():
+    """Report a clean tree to the hard-reset guard.
+
+    That guard (validator.py) shells out to `git status --porcelain` and escalates
+    to BLOCKED on a dirty tree, which would mask the rule-driven verdict a test is
+    about. It is keyed on cwd, so without this the verdict depends on the checkout.
+    """
+    result = MagicMock()
+    result.returncode = 0
+    result.stdout = ""
+    with patch("subprocess.run", return_value=result):
+        yield
 
 
 @pytest.fixture
