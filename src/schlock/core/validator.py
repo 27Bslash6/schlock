@@ -640,7 +640,7 @@ def _shell_delegated_payloads(
     `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
     shell on every later git command in that repo or for that user, not at this command.
 
-    Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
+    Here-strings (`bash <<< "..."`) are a redirect word, not an argument, so they
     are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
     Step 5c re-entry as these payloads (LAB-2768).
 

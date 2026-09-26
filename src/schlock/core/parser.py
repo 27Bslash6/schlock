@@ -337,6 +337,12 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
+# Child attributes a walker descends to find commands in argument words AND redirection targets:
+# "redirects"/"output" reach `wc <<< "$(cat x | sh)"` and `( : ) < "$(…)"` (LAB-4838).
+# Deliberately NOT used by the string-literal, heredoc-range and segment walkers: their ranges
+# suppress rule matches, so widening them can lower a verdict.
+EXEC_CHILD_ATTRS = ("parts", "command", "list", "pipe", "compound", "redirects", "output")
+
 
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     """Resolve a multicall binary to its effective applet and that applet's args.
@@ -1011,7 +1017,7 @@ class BashCommandParser:
                         results.append((words[0], words[1:]))
 
                 # Recursively visit child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                for attr in EXEC_CHILD_ATTRS:
                     if hasattr(node, attr):
                         child = getattr(node, attr)
                         if isinstance(child, list):
@@ -1030,8 +1036,8 @@ class BashCommandParser:
 
         SECURITY CRITICAL (LAB-2768): `bash <<< "rm -rf /"` feeds the here-string to bash's
         stdin, and a bare shell runs its stdin as a program - the same "argument is code, not
-        data" sink as `bash -c PROG`, but the here-string hangs off a *redirect* node that
-        `extract_commands_with_args` skips. So `_shell_delegated_payloads` sees `('bash', [])`,
+        data" sink as `bash -c PROG`, but the here-string is a *redirect* word that
+        `extract_commands_with_args` never reads as a payload. So `_shell_delegated_payloads` sees `('bash', [])`,
         no payload, no recursion, and the delegated `rm -rf /` degrades to HIGH (allowed by the
         permissive preset).
 
@@ -1054,7 +1060,7 @@ class BashCommandParser:
                 found = _here_string_program(node)
                 if found is not None:
                     results.append(found)
-            for attr in ["parts", "command", "list", "pipe", "compound"]:
+            for attr in EXEC_CHILD_ATTRS:
                 child = getattr(node, attr, None)
                 if isinstance(child, list):
                     for item in child:
@@ -1808,7 +1814,7 @@ class BashCommandParser:
 
         def visit_children(node, visitor):
             """Recursively visit child nodes of an AST node."""
-            for attr in ("parts", "command", "list", "pipe", "compound"):
+            for attr in EXEC_CHILD_ATTRS:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -1977,7 +1983,7 @@ class BashCommandParser:
                     check_pipeline(node)
 
                 # Recurse into child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                for attr in EXEC_CHILD_ATTRS:
                     if hasattr(node, attr):
                         child = getattr(node, attr)
                         if isinstance(child, list):
