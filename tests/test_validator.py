@@ -1223,14 +1223,16 @@ class TestHeredocSurroundings:
     ):
         """One ShellCheck spawn still elevates, behind a whitelisted head too.
 
-        `rm -r$''f /` matches `recursive_delete` at HIGH; only ShellCheck reads
-        the `$''` splice and raises it to BLOCKED. Behind `ls` no pass would
+        `rm -rf ./build` matches `recursive_delete` at HIGH; only the (stubbed)
+        ShellCheck finding raises it to BLOCKED. Behind `ls` no pass would
         spawn ShellCheck on its own, so this pins the escalation's own spawn.
+        (The tail was `rm -r$''f /` until LAB-3005 taught the parser to read
+        `$''` splices, which now blocks it without ShellCheck.)
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
 
-        result = validate_command(f"{head} <<{opener}\nx\n{terminator}\nrm -r$''f /", config_path=safety_rules_path)
+        result = validate_command(f"{head} <<{opener}\nx\n{terminator}\nrm -rf ./build", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         prefix = "Alongside heredoc: " if path == "fallback" else ""
@@ -1325,9 +1327,9 @@ class TestHeredocSurroundings:
         `_shellcheck` through that re-entry would drop this to HIGH.
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
-        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -r$''f /" else [])
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -rf ./build" else [])
 
-        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -r$''f /\"", config_path=safety_rules_path)
+        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -rf ./build\"", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ShellCheck: deletes a system directory" in result.message
@@ -1336,17 +1338,17 @@ class TestHeredocSurroundings:
         """A ShellCheck-less verdict must not answer for the same string later.
 
         The cache is keyed on the command string alone. Behind a whitelisted head
-        the per-segment pass is the only one that sees `rm -r$''f /`, and it
+        the per-segment pass is the only one that sees `rm -rf ./build`, and it
         sees it without ShellCheck; caching that HIGH would hand it to the next
         top-level call, which ShellCheck should raise to BLOCKED.
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
 
-        validate_command("ls <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
-        assert val_module._global_cache.get("rm -r$''f /") is None
+        validate_command("ls <<'EOF'\nx\nEOF\nrm -rf ./build", config_path=safety_rules_path)
+        assert val_module._global_cache.get("rm -rf ./build") is None
 
-        result = validate_command("rm -r$''f /", config_path=safety_rules_path)
+        result = validate_command("rm -rf ./build", config_path=safety_rules_path)
         assert result.risk_level == RiskLevel.BLOCKED
 
         # The Step 5 whitelist return has a cache write of its own. Pin it with a

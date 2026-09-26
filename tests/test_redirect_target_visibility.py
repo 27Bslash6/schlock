@@ -377,6 +377,8 @@ class TestDollarPrefixedQuoteForms:
             ('echo a > "\\"$\'x\'"', "echo a > \"$'x'"),
             # A span shlex splits is not rebuilt from its first fragment.
             ("echo a > $'/dev/sda'$(echo a b)", "echo a > /dev/sda$(echo a b)"),
+            # Unrebuilt (a backslash), the decoded word keeps the expansion's `$`.
+            ('echo a >> $"$HOME"/.bash\\rc', "echo a >> $HOME/.bashrc"),
         ],
     )
     def test_only_markers_are_dropped(self, command, expected):
@@ -385,8 +387,8 @@ class TestDollarPrefixedQuoteForms:
     @pytest.mark.parametrize(
         ("command", "rule"),
         [
-            # A backslash or a multi-word span skips the rebuild; bashlex's parts still
-            # locate the leading markers, even behind an empty fragment.
+            # A backslash or a multi-word span skips the rebuild; the word parse() decoded
+            # has no markers left, even behind an empty fragment.
             ("echo a > $'/etc/passwd\\x00'", "protect_system_files"),
             ("echo a > $'/dev/sda'$(echo a b)", "disk_destruction_dd"),
             ("echo a > ''$'/dev/'\\sda", "disk_destruction_dd"),

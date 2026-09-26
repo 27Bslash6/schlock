@@ -58,8 +58,8 @@
      `src/schlock/core/parser.py` re-reads the target's own source span with a quote-run regex
      and `shlex`. It holds only while: bashlex has already fixed the word's boundaries; it
      decides no structure and no verdict (the word still goes through every rule); and any span
-     it cannot read exactly (a backslash, or not one `shlex` word) keeps bashlex's word, less
-     its leading markers.
+     it cannot read exactly (a backslash, or not one `shlex` word) keeps the word as `parse()`
+     left it, which `_DollarQuoteDecoder` has already read the way bash does.
    - **Approved exception — recognising a `{varname}` redirect prefix.** bashlex splits
      `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
      argument, so `_mark_fd_variables` in `src/schlock/core/parser.py` tags that one word at

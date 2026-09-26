@@ -1838,8 +1838,6 @@ class TestQuotedSubstitutionBodies:
             ('echo "$(true\nrm -rf /\n)"', "system_destruction", RiskLevel.BLOCKED),
             # eight `\\<newline>`s move bashlex's end for this span onto the subshell's `)`
             ('echo "$(' + "\\\n" * 8 + ' (:); :(){ :|:& };:)"', "fork_bomb", RiskLevel.BLOCKED),
-            # and each `\\<newline>` shifts every later inner offset by two
-            ("echo \"$(echo \\\n hi; echo $'\\x72\\x6d')\"", "hex_octal_encoding", RiskLevel.HIGH),
         ],
     )
     def test_rules_the_word_view_misses_see_a_quoted_body(self, command, rule, risk):
@@ -1847,6 +1845,15 @@ class TestQuotedSubstitutionBodies:
         result = validate_command(command)
         assert result.risk_level == risk, f"{command!r} -> {result.risk_level}"
         assert rule in result.matched_rules, f"{command!r} -> {result.matched_rules}"
+
+    def test_a_line_continuation_before_an_ansi_c_quote_in_a_body_fails_closed(self):
+        """Each `\\<newline>` shifts every later inner offset by two, which `$'...'` decoding
+        cannot survive: the parse is refused (LAB-3005) before the body pass runs, and the
+        validator must report it BLOCKED rather than route it to a weaker path.
+        """
+        result = validate_command("echo \"$(echo \\\n hi; echo $'\\x72\\x6d')\"")
+        assert result.risk_level == RiskLevel.BLOCKED, result.risk_level
+        assert "an expansion and a line continuation" in result.message, result.message
 
     def test_a_body_match_never_lowers_the_verdict(self):
         """The body pass only raises what the segment checks reached without it."""
