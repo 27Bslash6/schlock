@@ -456,6 +456,21 @@ _DANGEROUS_GIT_CONFIGS = frozenset(
 )
 
 
+def _is_git_exec_key(key: str, entry: str) -> bool:
+    """True if git config `key` names the `_DANGEROUS_GIT_CONFIGS` `entry`.
+
+    git's key grammar is `<section>[.<subsection>].<name>`: section and name are case-insensitive,
+    and the subsection is free text that may itself hold dots (`credential.https://github.com.helper`,
+    `gpg.ssh.program`). So an entry matches on its section and final segment, whatever sits
+    between; a literal prefix test sees neither. `alias.` is a prefix entry (every `alias.<name>`).
+    """
+    key = key.lower()
+    if key.startswith(entry):
+        return True
+    section, _, name = entry.partition(".")
+    return bool(name) and key.startswith(f"{section}.") and key.rsplit(".", 1)[-1] == name
+
+
 def dangerous_git_config(args: list[str]) -> str | None:
     """Return a reason string if `args` (a git command's word-args) sets a -c config that
     executes arbitrary commands, else None. Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
@@ -471,9 +486,9 @@ def dangerous_git_config(args: list[str]) -> str | None:
             config_val = arg[2:]
         if not config_val:
             continue
-        config_lower = config_val.lower()
+        key, _, _ = config_val.partition("=")
         for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
-            if config_lower.startswith(dangerous_prefix):
+            if _is_git_exec_key(key, dangerous_prefix):
                 if dangerous_prefix == "alias.":
                     # git runs an alias as a shell command only when its VALUE starts with '!'
                     # (alias.<name>=!cmd). A '!' elsewhere is a normal git-subcommand alias.
@@ -558,17 +573,21 @@ def git_config_exec_payload(args: list[str]) -> str | None:
     for i, (key, reads_before_key) in enumerate(positionals[:-1]):
         if reads_before_key:
             continue  # a read's <name> <value-pattern> pair, not a write
-        key_lower = key.lower()
         for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
-            if not key_lower.startswith(dangerous_prefix):
+            if not _is_git_exec_key(key, dangerous_prefix):
                 continue
             value = positionals[i + 1][0]
+            stripped = value.lstrip()
             if dangerous_prefix == "alias.":
                 # Same refinement as the -c form: git runs an alias as a shell command only when
                 # its value starts with '!'. `alias.st status` is an ordinary git-subcommand alias.
-                stripped = value.lstrip()
                 if not stripped.startswith("!"):
                     return None
+                return stripped[1:].strip() or None
+            if dangerous_prefix == "credential.helper" and stripped.startswith("!"):
+                # gitcredentials(7): a `!` helper is a shell command, as for an alias. Without the
+                # `!` it still runs a program (the path, or `git credential-<value>`), so it falls
+                # through to the raw value below rather than to None.
                 return stripped[1:].strip() or None
             # A boolean value selects a built-in and names no executable (core.fsmonitor=true).
             return None if _is_git_boolean(value) else value

