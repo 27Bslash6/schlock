@@ -366,8 +366,9 @@ def _first_command_node(node: Any) -> Optional[Any]:
     handled separately by the recursive walk, so first-command is the right target here (#97) -
     unlike a here-string's shared fd, which any command in the group may read (`_command_nodes`).
 
-    Expressed via `_command_nodes` so the two security-critical traversals share ONE walk skeleton:
-    a future bashlex child-attr change cannot leave one of them silently under-scanning (LAB-2768).
+    Expressed via `_command_nodes`, as is `BashCommandParser._segment_nodes`, so every
+    security-critical command-node traversal shares ONE walk skeleton: a bashlex child-attr
+    change is one edit there and cannot leave one of them silently under-scanning (LAB-2768, LAB-4687).
     """
     return next(iter(_command_nodes(node)), None)
 
@@ -967,51 +968,11 @@ class BashCommandParser:
         return segment
 
     def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
-        """Collect the AST nodes that each form one independently-validated segment."""
-        nodes: list[Any] = []
+        """Collect the AST nodes that each form one independently-validated segment.
 
-        def visit(node):  # noqa: PLR0912 - AST traversal requires multiple branches
-            """Recursively visit AST nodes to collect command nodes."""
-            if hasattr(node, "kind"):
-                # Command nodes contain individual commands
-                if node.kind == "command" and hasattr(node, "pos"):
-                    nodes.append(node)
-                    return  # Don't recurse into command parts
-
-                # Pipeline nodes - visit each command in the pipeline
-                if node.kind == "pipeline" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind != "pipe":
-                            visit(part)
-                    return
-
-                # List nodes (;, &&, ||) - visit each command
-                if node.kind == "list" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind not in ("operator",):
-                            visit(part)
-                    return
-
-                # Compound commands (if, for, while, etc.) - recurse into body
-                if node.kind == "compound" and hasattr(node, "list"):
-                    for item in node.list if isinstance(node.list, list) else [node.list]:
-                        visit(item)
-                    return
-
-                # Recursively visit other child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
-
-        for node in ast_nodes or []:
-            visit(node)
-
-        return nodes
+        Delegates to `_command_nodes` so segment extraction shares the one walk skeleton (LAB-4687).
+        """
+        return [n for node in ast_nodes or [] for n in _command_nodes(node)]
 
     @staticmethod
     def _rebase(ranges: list[tuple], base: int, end: int) -> list[tuple]:
