@@ -652,7 +652,7 @@ def _trap_action(args: list[str]) -> Optional[str]:
     return args[0]
 
 
-def _shell_delegated_payloads(
+def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator shape
     commands_with_args: list[tuple[str, list[str]]],
     *,
     trap_handlers: Optional[list[str]] = None,
