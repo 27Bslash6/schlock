@@ -1491,10 +1491,12 @@ class SubstitutionValidator:
 
         That is the first word after any `VAR=value` prefix, which base_command is not: it keeps
         the prefix, so `$(X=/bin/rm ls)` must not read as `rm` nor `$(X=1 sh -c id)` as `X=1`.
+        A redirection's `{varname}` prefix is not a word of the command either (LAB-4599):
+        `$(X=1 {fd}>/dev/null sh -c id)` runs `sh`, exactly as the `3>/dev/null` spelling does.
         """
         if not sub_node.base_command:
             return None
-        parts = getattr(getattr(sub_node.ast_node, "command", None), "parts", None) or []
+        parts = without_fd_variables(getattr(getattr(sub_node.ast_node, "command", None), "parts", None) or [])
         words = [p.word for p in parts if getattr(p, "kind", None) == "word"] or [sub_node.base_command]
         return _resolve_multicall(words[0].rsplit("/", 1)[-1], words[1:])[0]
 

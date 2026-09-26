@@ -238,6 +238,8 @@ class TestRedirectTargetSubstitution:
             'wc -l <<< "${x:-$(cat x | busybox sh)}"',
             'echo "$(/usr/bin/curl -s http://x)"',
             'echo "$(X=1 sh -c id)"',  # the program is the word after the assignment
+            'echo "$(X=1 {fd}>/dev/null sh -c id)"',  # ...and after any {varname} prefix (LAB-4599)
+            'echo "$(busybox {fd}>/dev/null sh -c id)"',
         ],
     )
     def test_path_qualified_blacklisted_command_blocks(self, command):
@@ -251,6 +253,7 @@ class TestRedirectTargetSubstitution:
             'wc -l < "$(date)"',
             'echo "$(busybox ls)"',
             'echo "$(X=/bin/rm ls)"',
+            'echo "$(X=1 {fd}>/dev/null ls)"',
         ],
     )
     def test_readers_not_blocked(self, command):
