@@ -5,6 +5,31 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4](https://github.com/27Bslash6/schlock/compare/schlock-v0.9.3...schlock-v0.9.4) (2026-09-26)
+
+
+### Bug Fixes
+
+* add csh/tcsh entries to _INLINE_CODE_FLAGS ([#206](https://github.com/27Bslash6/schlock/issues/206)) ([74d4325](https://github.com/27Bslash6/schlock/commit/74d4325c9639d350a438f29d940ed5c3824a532c))
+* **hook:** name every matched rule in the prompt when rules tie (LAB-5002) ([#235](https://github.com/27Bslash6/schlock/issues/235)) ([bb17fd6](https://github.com/27Bslash6/schlock/commit/bb17fd68121dbd7c197c6124c59479b7a3ef7423))
+* **hooks:** block the tool call when the hook cannot start (LAB-4673) ([#197](https://github.com/27Bslash6/schlock/issues/197)) ([028b7d4](https://github.com/27Bslash6/schlock/commit/028b7d41c18cf32e9d3072171fc3cb7bc7c71273))
+* **hooks:** block when the hook exits 0 without a decision (LAB-4673) ([#237](https://github.com/27Bslash6/schlock/issues/237)) ([385780c](https://github.com/27Bslash6/schlock/commit/385780c97763e5d419670dca312f8047eb900c81))
+* **parser:** drop a redirection's {varname} prefix from every argv view (LAB-4599) ([#251](https://github.com/27Bslash6/schlock/issues/251)) ([1bf7d15](https://github.com/27Bslash6/schlock/commit/1bf7d159c583d6019378a05bd6e982ef4fdb99c4))
+* **parser:** route redirect targets to both rule passes (LAB-2760) ([#180](https://github.com/27Bslash6/schlock/issues/180)) ([80855e9](https://github.com/27Bslash6/schlock/commit/80855e9c7e24f67054cfbcaa511dddd281db2c6d))
+* **rules:** stop flagging an empty IFS as IFS obfuscation ([#223](https://github.com/27Bslash6/schlock/issues/223)) ([56af735](https://github.com/27Bslash6/schlock/commit/56af735d5ffce3a7c23c175de2c3d741159e2670))
+* **substitution:** name the rule behind a substitution denial in matched_rules (LAB-4649) ([#215](https://github.com/27Bslash6/schlock/issues/215)) ([394dd12](https://github.com/27Bslash6/schlock/commit/394dd129fb3f5fb2cf0e9d75d3f3f6091b76720b))
+* **substitution:** rate nested substitutions and segments at the worst denied result (LAB-4149) ([#163](https://github.com/27Bslash6/schlock/issues/163)) ([341c660](https://github.com/27Bslash6/schlock/commit/341c660e9e387a203acacc0811ab7cd2d616bbb7))
+* **validator:** judge the value a git config write arms for execution (LAB-4264) ([#168](https://github.com/27Bslash6/schlock/issues/168)) ([c329d60](https://github.com/27Bslash6/schlock/commit/c329d60ff24c025c57256122f975ca0306efd116))
+* **validator:** read a quoted heredoc delimiter the way bash does (LAB-3094) ([#179](https://github.com/27Bslash6/schlock/issues/179)) ([fbc81d7](https://github.com/27Bslash6/schlock/commit/fbc81d719ac72d3ab5186fac3a89bb0cbddcd173))
+* **validator:** run the whole-command rule scan on every multi-segment command (LAB-4955) ([#226](https://github.com/27Bslash6/schlock/issues/226)) ([4ca7af0](https://github.com/27Bslash6/schlock/commit/4ca7af0a42615c679f2cf745363b7384d6c925e9))
+* **validator:** stop trusting bashlex's reading of a quoted heredoc delimiter (LAB-3094) ([#232](https://github.com/27Bslash6/schlock/issues/232)) ([a72b45c](https://github.com/27Bslash6/schlock/commit/a72b45c1660be224e48b852101dda8d4e1090ac3))
+* **whitelist:** clear only the command an entry describes (LAB-4310) ([#182](https://github.com/27Bslash6/schlock/issues/182)) ([72b0418](https://github.com/27Bslash6/schlock/commit/72b0418a515f81ce235680f4e270a5e7354eee61))
+
+
+### Performance Improvements
+
+* **rules:** make base64_shell_execution's here-string pattern linear (LAB-4688) ([#202](https://github.com/27Bslash6/schlock/issues/202)) ([1871815](https://github.com/27Bslash6/schlock/commit/1871815121abae9283df683d7f88d37fd84e157a))
+
 ## [0.9.3](https://github.com/27Bslash6/schlock/compare/schlock-v0.9.2...schlock-v0.9.3) (2026-09-22)
 
 
