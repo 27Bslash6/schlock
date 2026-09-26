@@ -489,6 +489,90 @@ def dangerous_git_config(args: list[str]) -> str | None:
     return None
 
 
+# `git config` READ modes that take a trailing value-PATTERN, so the word after the key is a
+# search argument rather than a value being persisted: `git config --get core.pager 'rm -rf /'`
+# looks for a pager matching that pattern. Modes with no trailing pair (--list, --edit,
+# --remove-section) are absent — they cannot reach the key/value scan at all. Write spellings
+# (--add, --replace-all, `set`) are absent because they ARE writes.
+#
+# Exact tokens, and only ahead of the key. git ACCEPTS and IGNORES a read flag on a write — both
+# `git config core.pager CMD --get` and `--get=x` exit 0 and persist CMD (verified, git 2.43) — so
+# matching one anywhere, or by prefix, hands an attacker a one-token bypass of this whole guard.
+_GIT_CONFIG_READ_FLAGS = frozenset(
+    {
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--get-color",
+        "--get-colorbool",
+        "--unset",
+        "--unset-all",
+    }
+)
+
+
+def git_config_exec_payload(args: list[str]) -> str | None:
+    """Return the command string a `git config` WRITE arms for later execution, else None.
+
+    `git -c core.pager=CMD log` runs CMD once; `git config core.pager CMD` PERSISTS it and runs it
+    on every later git invocation in that repo or for that user, outliving the session that wrote
+    it. `dangerous_git_config` above guards the injected form; this is its persisted twin, over the
+    same `_DANGEROUS_GIT_CONFIGS` key set.
+
+    Returns the payload rather than a verdict, so each caller judges it with the machinery it
+    already has. That is what keeps `git config --global core.editor vim` SAFE — the payload `vim`
+    is a safe command — while `core.pager 'rm -rf /'` inherits `rm -rf /`'s verdict. The key alone
+    cannot decide it: setting an editor or a pager is an everyday command, and only the VALUE says
+    whether this one is an attack.
+
+    Pure; the shared extractor, with each tier applying its own judgement. `args` may or may not
+    include the leading "git" token.
+
+    Known ceilings. A value that is not a command gets whatever verdict that text has AS a command,
+    so `core.hooksPath hooks-dir` (a directory) reads SAFE, as the bare word does. `git config
+    --edit` is not flagged either: it spawns the editor ALREADY configured and names no program,
+    exactly like `git commit`.
+    """
+    if "config" not in args:
+        return None
+    # Scan from the `config` token rather than assuming a position: git's own global options
+    # (`git -C dir`, `git -c k=v`, `git --no-pager`) displace the subcommand. A stray `config`
+    # elsewhere costs nothing — a payload is only returned when a dangerous KEY and a VALUE follow.
+    rest = args[args.index("config") + 1 :]
+
+    # Positionals only, each carrying how many read flags preceded it. The KEY is found by prefix
+    # match rather than by position, so an unknown value-taking option (`--file F`, `--type T`)
+    # cannot shift the key out from under the scan.
+    reads_seen = 0
+    positionals: list[tuple[str, int]] = []
+    for arg in rest:
+        if arg.startswith("-"):
+            if arg in _GIT_CONFIG_READ_FLAGS:
+                reads_seen += 1
+            continue
+        positionals.append((arg, reads_seen))
+
+    for i, (key, reads_before_key) in enumerate(positionals[:-1]):
+        if reads_before_key:
+            continue  # a read's <name> <value-pattern> pair, not a write
+        key_lower = key.lower()
+        for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
+            if not key_lower.startswith(dangerous_prefix):
+                continue
+            value = positionals[i + 1][0]
+            if dangerous_prefix == "alias.":
+                # Same refinement as the -c form: git runs an alias as a shell command only when
+                # its value starts with '!'. `alias.st status` is an ordinary git-subcommand alias.
+                stripped = value.lstrip()
+                if not stripped.startswith("!"):
+                    return None
+                return stripped[1:].strip() or None
+            # A boolean value selects a built-in and names no executable (core.fsmonitor=true).
+            return None if _is_git_boolean(value) else value
+    return None
+
+
 # find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir) or delete files (-delete).
 _DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
 
@@ -1031,10 +1115,16 @@ class SubstitutionValidator:
                 substitutions.extend(self._substitutions_in_parameter(node, current_depth))
                 return
 
-            # Recurse into child nodes. "redirects"/"output" reach process substitutions used as
-            # redirection targets — `cat < <(git push)`, `echo x > >(cmd)` — which hang off
-            # RedirectNode.output and were otherwise never extracted, so no tier ever saw them.
-            for attr in ["parts", "command", "list", "pipe", "compound", "redirects", "output"]:
+            # Recurse into child nodes. `output` and `redirects` reach substitutions used
+            # as redirection TARGETS - `cat < <(git push)`, `echo x > >(cmd)`,
+            # `echo a > "$(r''m -rf /)"` - which were otherwise never extracted, so no
+            # tier ever saw them (LAB-2760/LAB-4114). bashlex parks a simple command's
+            # target under `redirect.output.parts`; a COMPOUND (`{ …; } > "$(…)"`) hangs
+            # its redirections off `redirects` and never `parts`, so `output` alone
+            # reaches the simple form and misses every compound one. An fd-duplication target is an
+            # int with no `kind` and falls straight back out of visit(). `heredoc` stays
+            # off the list: its body has its own mechanism.
+            for attr in ["parts", "command", "list", "pipe", "compound", "output", "redirects"]:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -1491,6 +1581,28 @@ class SubstitutionValidator:
 
         return check_node(cmd_node)
 
+    def _git_config_payload_reason(self, args: list[str]) -> str | None:
+        """Return a reason if an inner `git config` write arms an executable value, else None.
+
+        `git config <exec-key> <value>` persists what `-c <exec-key>=<value>` only injects, so the
+        value gets the same YAML rules this tier runs on every other inner command. The payload's
+        OWN quoting is honoured, or the tier would deny things the top level allows: the payload of
+        `alias.x '!echo "git push --force"'` prints a string, it does not push.
+        """
+        from .rules import RiskLevel  # noqa: PLC0415
+
+        payload = git_config_exec_payload(args)
+        if not payload or self.rule_engine is None:
+            return None
+        try:
+            literals = self.parser.extract_string_literals(payload, self.parser.parse(payload))
+        except Exception:  # noqa: BLE001 - unparseable payload: judge it with nothing suppressed
+            literals = []
+        match = self.rule_engine.match_command(payload, string_literals=literals)
+        if match and match.matched and self._amplify_risk(match.risk_level) in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+            return f"git config persists an executable value: {match.message}"
+        return None
+
     def _has_dangerous_inner_structure(  # noqa: PLR0911, PLR0912, PLR0915
         self, node: Any, base_command: str | None = None
     ) -> tuple[bool, str]:
@@ -1543,7 +1655,8 @@ class SubstitutionValidator:
                     args.append(part.word)
 
             if base_command == "git" and args:
-                git_reason = dangerous_git_config(args)
+                # The persisted twin of the -c check: judge the VALUE, not the key.
+                git_reason = dangerous_git_config(args) or self._git_config_payload_reason(args)
                 if git_reason:
                     return True, git_reason
 

@@ -536,8 +536,9 @@ class TestParseOnce:
             # is real arithmetic rather than an identity.
             "echo lead && diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n)",
             "echo ok; x=$(cat <<EOF\nrm -rf /\nEOF\n)",
-            # A nested SHELL body must keep is_shell through the rebase, or it
-            # would start suppressing code.
+            # The only is_shell=False range here is the `$( … )` one above; a body
+            # inside `<( … )` is is_shell whatever runs it. A nested SHELL body must
+            # keep is_shell through the rebase too, or it would start suppressing code.
             "echo ok; diff /dev/null <(bash <<EOF\nrm -rf /\nEOF\n)",
         ],
     )
@@ -546,9 +547,9 @@ class TestParseOnce:
 
                 _segment_nodes stops at the outer command, whose span already covers
                 `<(cat <<EOF ... EOF)`, and _close_heredocs only ever reaches a command's
-                OWN redirects - so nothing else takes that body out, and `cat` merely
-                emits it while `diff` merely reads it. Assuming no segment could hold an
-                inert body is what hard-denied
+                OWN redirects - so nothing else takes that body out. (Inside `<( … )`
+                the range is is_shell, since the reader may run it; inside `$( … )` it
+                is inert.) Assuming no segment could hold an inert body is what hard-denied
                 `diff /dev/null <(cat <<EOF
         rm -rf /
         EOF)`: an over-block on a
