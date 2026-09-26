@@ -578,10 +578,9 @@ class TestP0FileTruncation:
             "true 2> /dev/null.bak",
             "foo | tee /dev/null.bak",
             # A quoted operand can start with a blank: `"true" 2> ' ;'` reconstructs to
-            # `true 2>  ;`, and only a target that may be a blank reaches it. That is why
-            # `true 2>  /dev/null` stays a false positive.
+            # `true 2>  ;`, and only a target that may be a blank reaches it.
             "\"true\" 2> ' ;'",
-            "'true' > ' /dev/null'",
+            "'true' > ' |'",
         ],
     )
     def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
@@ -602,6 +601,12 @@ class TestP0FileTruncation:
             "(true 2> /dev/null)",
             "echo `true 2> /dev/null`",
             "true 2> /dev/null; ls",
+            # Repeated blanks before `/dev/null` are still a discard.
+            ">  /dev/null",
+            ": 2>  /dev/null",
+            "true 2>  /dev/null",
+            "echo -n 2>  /dev/null",
+            "printf '' 2>\t /dev/null",
             # Appending is not truncating.
             "true >> ~/.aws/credentials",
             "true 2>> ~/.aws/credentials",
