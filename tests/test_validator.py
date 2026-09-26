@@ -896,7 +896,7 @@ class TestMultiSegmentWhitelistBypass:
     def test_end_anchored_full_command_entry_still_whitelisted(self):
         """AC-3: the deliberate multi-command carve-out (00_whitelist.yaml) survives.
 
-        This is the entry the is_fully_whitelisted() call site exists for: no
+        This is the entry the is_whitelisted_whole() call site exists for: no
         per-segment pass can approve it, because "docker login" in isolation is
         not whitelisted.
         """
@@ -927,7 +927,11 @@ class TestMultiSegmentWhitelistBypass:
         ],
     )
     def test_greedy_whitelist_pattern_cannot_span_a_chain(self, command):
-        """A full-span match only means "vetted" if the pattern excludes separators."""
+        """A whole-line match only means "vetted" if the pattern excludes separators.
+
+        Each row is refused twice over: the shipped slots exclude separators, and none of these
+        entries declares the separators the line holds (`is_whitelisted_whole` counts them).
+        """
         result = validate_command(command)
         assert not result.allowed
         assert result.risk_level == RiskLevel.BLOCKED
@@ -1346,8 +1350,9 @@ class TestHeredocSurroundings:
         assert result.risk_level == RiskLevel.BLOCKED
 
         # The Step 5 whitelist return has a cache write of its own. Pin it with a
-        # whole-command whitelist entry, which reaches Step 5 only by full-span match
-        # (is_fully_whitelisted, #146) - a prefix no longer gets there.
+        # whole-command whitelist entry, which reaches Step 5 only by declaring every
+        # command in the line (is_whitelisted_whole, #146 / LAB-4290) - a prefix no
+        # longer gets there.
         whitelisted = "gh auth token | docker login ghcr.io -u me --password-stdin"
         validate_command(whitelisted, config_path=safety_rules_path, _shellcheck=False)
         assert val_module._global_cache.get(whitelisted) is None
@@ -2770,8 +2775,8 @@ class TestSiblingSubstitutionsRateTheWorst:
         "command",
         [
             'echo "$(x=1) $(echo b)"',
-            # Multi-segment. The full-command whitelist check is span-anchored, so
-            # this row never reaches that short-circuit; it pins the join of the
+            # Multi-segment. `^ls\b` declares no separator, so this row never
+            # reaches the whole-line short-circuit; it pins the join of the
             # deferred denial with the segment verdict instead. The short-circuit is
             # pinned by test_full_span_whitelist_does_not_clear_a_deferred_denial.
             "ls $(x=1); echo hi",
@@ -2793,12 +2798,12 @@ class TestSiblingSubstitutionsRateTheWorst:
     def test_full_span_whitelist_does_not_clear_a_deferred_denial(self, tmp_path, monkeypatch):
         """A whitelist entry spanning the WHOLE chain must not turn a substitution denial SAFE.
 
-        The multi-segment `is_fully_whitelisted` short-circuit returns SAFE without
+        The multi-segment `is_whitelisted_whole` short-circuit returns SAFE without
         checking a single segment. Only the join in `validate_command` puts the
         deferred `$(x=1)` denial back, and only its `not _deferred` guard keeps the
         pre-join SAFE out of the cache, hence the second call. Reaching the
-        short-circuit needs several segments and a whitelist match that reaches the
-        end of the command - in practice a "$"-anchored user entry - which is why
+        short-circuit needs several segments and a whitelist entry that writes their
+        separators and matches the whole command - in practice a user entry - which is why
         `ls $(x=1); echo hi` above no longer lands here. Let a whitelisted verdict
         skip the join, or be cached, and this test returns SAFE / allowed=True.
         """
