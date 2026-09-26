@@ -903,8 +903,9 @@ class RuleEngine:
         insurance and is not: reporting anything other than "first executable match,
         or none" on exhaustion is wrong in one direction or the other. Reporting the
         last suppressed match denies benign text (a quoted doc listing 32 `sudo`
-        lines). Returning None instead lets padding silence the rule. Measured, the
-        bound bought ~1%; the superlinearity lives elsewhere.
+        lines) under a rule that never matched, which the ask prompt and the audit
+        log then repeat. Returning None instead lets padding silence the rule.
+        Measured, the bound bought ~1%; the superlinearity lives elsewhere.
         Termination is structural: `pos` strictly increases every iteration.
         """
         pos = 0

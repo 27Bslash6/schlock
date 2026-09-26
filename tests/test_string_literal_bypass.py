@@ -368,9 +368,10 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
         [
             # Everyday heredoc pipe: must not trip the fail-closed segment branch.
             ("cat <<EOF | grep x\nhello\nEOF", True, RiskLevel.SAFE),
-            # The segment suppresses its body; the whole-command scan does not, and
-            # it now runs whatever the segments matched. Same verdict as the command
-            # without `&& chmod`.
+            # The body is text, so BLOCKED is not the intended verdict: the segment
+            # suppresses its body, but the whole-command scan does not, and it runs
+            # whenever no segment is BLOCKED. A known fail-closed side effect, tracked
+            # on LAB-4979. Same verdict as the command without `&& chmod`.
             ("cat <<EOF | grep x && chmod 777 f\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
             # A shell's heredoc body is code. Was HIGH (body never reached the
             # segment); now matches the single-segment `bash <<EOF` verdict.
