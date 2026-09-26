@@ -2,7 +2,10 @@
 
 import pytest
 
+from schlock.core.rules import RiskLevel
+from schlock.core.validator import clear_caches, validate_command
 from schlock.integrations.shellcheck import (
+    _SHELLCHECK_DIRECTIVE,
     SECURITY_RELEVANT_CODES,
     ShellCheckFinding,
     ShellCheckSeverity,
@@ -94,6 +97,95 @@ class TestShellCheckExecution:
             # Very short timeout should still work for simple command
             findings = run_shellcheck("echo test", timeout=10.0)
             assert isinstance(findings, list)
+
+
+# A recursive delete of a system directory. schlock's own rules rate this HIGH;
+# only ShellCheck's SC2114 elevates it to BLOCKED. An attacker-supplied
+# `# shellcheck disable` directive in the command text used to switch that
+# elevation off (CWE-693, LAB-4587). `$''` is an empty ANSI-C expansion, so bash
+# executes `rm -rf /usr` regardless of any comment line.
+_DANGEROUS = "rm -r$''f /usr"
+_DANGEROUS_HEREDOC = f"ls <<'ZZ'\nbody\nZZ\n{_DANGEROUS}"
+
+# Every ShellCheck directive placement an attacker can write. Each must be
+# neutralised so the command is still BLOCKED via shellcheck:SC2114. The list is
+# the differential sweep against the real binary: line-start, mid-line, trailing,
+# after separators, malformed keywords that make ShellCheck parse-error (itself a
+# suppression), and the disable=all / code-list / key= variants.
+_DIRECTIVE_PLACEMENTS = [
+    ("file_disable_code", f"# shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("file_disable_all", f"# shellcheck disable=all\n{_DANGEROUS}"),
+    ("leading_whitespace", f"   # shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("no_space_after_hash", f"#shellcheck disable=SC2114\n{_DANGEROUS}"),
+    # Non-ASCII directive gaps ShellCheck honours (found by the differential sweep):
+    # a Unicode space and a zero-width space that ASCII [ \t] would miss.
+    ("nbsp_gap", f"#\u00a0shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("zwsp_gap", f"#\u200bshellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("code_list", f"# shellcheck disable=SC2114,SC2034\n{_DANGEROUS}"),
+    ("trailing_note_on_directive", f"# shellcheck disable=SC2114 # why\n{_DANGEROUS}"),
+    ("crlf_line_ending", f"# shellcheck disable=SC2114\r\n{_DANGEROUS}"),
+    ("shell_key_then_disable", f"# shellcheck shell=bash\n# shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("source_key_then_disable", f"# shellcheck source=/dev/null\n# shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("enable_key_then_disable", f"# shellcheck enable=require-variable-braces\n# shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("trailing_same_line", f"{_DANGEROUS} # shellcheck disable=SC2114"),
+    ("after_semicolon_space", f"true ; # shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("after_semicolon_nospace", f"true;# shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("prev_line_trailing", f"true # shellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("bare_keyword", f"# shellcheck\n{_DANGEROUS}"),
+    ("concatenated_keyword", f"# shellcheckshellcheck disable=SC2114\n{_DANGEROUS}"),
+    ("prefix_word_shellchecker", f"# shellchecker is great\n{_DANGEROUS}"),
+    ("directive_inside_string", f"echo '# shellcheck disable=SC2114'; {_DANGEROUS}"),
+    ("directive_in_heredoc_shape", f"# shellcheck disable=SC2114\n{_DANGEROUS_HEREDOC}"),
+]
+
+
+class TestShellCheckDirectiveNeutralisation:
+    """An embedded ShellCheck directive must not disable the ShellCheck control.
+
+    Regression coverage for LAB-4587 (CWE-693). These cases are UN-STUBBED — they
+    exercise the real ShellCheck binary through the full validation pipeline, so
+    they assert the rule that actually fired (`shellcheck:SC2114`), not merely the
+    verdict, per the LAB-4270 lesson.
+    """
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize(("label", "command"), _DIRECTIVE_PLACEMENTS, ids=[p[0] for p in _DIRECTIVE_PLACEMENTS])
+    def test_directive_cannot_suppress_shellcheck(self, label, command):
+        clear_caches()
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{label}: risk {result.risk_level}"
+        assert result.allowed is False, f"{label}: allowed"
+        assert "shellcheck:SC2114" in result.matched_rules, f"{label}: rules {result.matched_rules}"
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize("command", [_DANGEROUS, _DANGEROUS_HEREDOC], ids=["plain", "heredoc"])
+    def test_control_without_directive_still_blocked(self, command):
+        """Commands with no directive are unaffected: still BLOCKED via SC2114."""
+        clear_caches()
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert "shellcheck:SC2114" in result.matched_rules
+
+    def test_disarm_neutralises_directive_keyword(self):
+        """The disarm rewrites the `shellcheck` token so it is no longer a directive."""
+        original = "# shellcheck disable=SC2114\ncmd"
+        out = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shellchecK", original)
+        assert "shellcheck" not in out
+        assert out == "# shellchecK disable=SC2114\ncmd"
+        assert len(out) == len(original)  # equal width -> ShellCheck columns still match `command`
+
+    def test_disarm_leaves_non_directive_comment_byte_identical(self):
+        """A comment that is not a shellcheck directive is passed through unchanged."""
+        original = "# not a directive\ncmd"
+        assert _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shellchecK", original) == original
+
+    def test_disarm_preserves_quote_balance(self):
+        """Rewriting in place (not deleting to EOL) keeps a quoted string balanced."""
+        original = "echo '# shellcheck disable=SC2114'; cmd"
+        out = _SHELLCHECK_DIRECTIVE.sub(r"\g<1>shellchecK", original)
+        assert out.count("'") == original.count("'")  # quotes intact -> no parse-error fail-open
+        assert out == "echo '# shellchecK disable=SC2114'; cmd"
 
 
 class TestShellCheckFinding:
