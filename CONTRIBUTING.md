@@ -4,7 +4,7 @@
 
 ```bash
 # Clone repository
-git clone https://github.com/27Bslash6/schlock.git
+git clone https://github.com/27b-io/schlock.git
 cd schlock
 
 # Install development dependencies (uv recommended)
