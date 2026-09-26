@@ -5,6 +5,7 @@ rule engine, and cache. It provides the main validate_command() API and
 handles configuration layering (plugin defaults → user → project).
 """
 
+import bisect
 import logging
 import re
 import subprocess
@@ -1297,10 +1298,11 @@ class _DoubleParen:
         - `# ((\n1<<b\n))` - the opener is on the comment line, the `))` is not,
           and bash runs the arithmetic.
 
-        Over-firing costs nothing measurable in the other direction: across 6307
-        commands the verdicts are identical either way, and across 336 generated
-        quote/comment/heredoc combinations every command this offers extra is
-        one bash runs nothing dangerous in (canary-checked, `rm` shimmed).
+        Over-firing is NOT free on its own. An extra `((` that pairs up can
+        rewrite a real heredoc opener, and a later heredoc then swallows lines
+        bash runs (`: # ((` ... `# ))` straddling `cat <<'X'`). It is safe because
+        Step 3b joins the rewrite's verdict with the unrewritten one, so an
+        over-fire can only deny more.
 
         A `$((` is excluded because it is an expansion, not an arithmetic
         command, and its over-block is tracked separately (27Bslash6/schlock#112).
@@ -1492,16 +1494,20 @@ def _neuter_arithmetic_shifts(command: str) -> str:
     context that could hold a real heredoc - a `$(…)` - is one `_DoubleParen`
     refuses to vouch for. A BACKTICK is not: it re-lexes as shell and can hold a
     real heredoc, but `_paren` skips it opaquely rather than refusing, so
-    `(( 1 + `cat <<Z … Z` ))` has its opener rewritten to `cat ==Z`. That is
-    deny-side - an inert body becomes a visible command - so it is a
-    false-positive risk rather than a bypass, and it is recorded here instead of
-    being claimed away.
+    `(( 1 + `cat <<Z … Z` ))` has its opener rewritten to `cat ==Z`. Removing a
+    real opener is not deny-side by itself - a later heredoc can then swallow
+    what followed the body - which is why the caller never trusts this rewrite
+    over the unrewritten text (Step 3b's join).
     """
-    # Bash removes `\<newline>` before it tokenizes anything, so `(\<newline>(`
-    # is the same opener as `((`. Scan what bash scans - but hand the splice-free
-    # text back only when a shift is actually rewritten, so a command this guard
-    # has no business touching is returned exactly as it arrived.
-    spliced = command.replace("\\\n", "") if "\\\n" in command else command
+    # Bash removes `\<newline>` before it tokenizes the shell, so `(\<newline>(`
+    # is the same opener as `((`, and the scan reads the splice-free text. The
+    # rewrite does NOT: bash leaves a splice alone inside a quoted heredoc body,
+    # so handing the spliced text on joined `body \` to its terminator line and
+    # filed the commands after it as body (`SAFE` while bash ran them). Each
+    # shift is written back where it sits in ``command``, found through
+    # ``splices`` - where each removed splice sits in the scanned text.
+    splices = [match.start() - 2 * k for k, match in enumerate(re.finditer(r"\\\n", command))]
+    spliced = command.replace("\\\n", "") if splices else command
     if "((" not in spliced or "<<" not in spliced:
         return command
 
@@ -1520,8 +1526,9 @@ def _neuter_arithmetic_shifts(command: str) -> str:
                 pos += 1  # `<<<` is a here-string, not a shift
                 continue
             if rewritten is None:
-                rewritten = list(spliced)
-            rewritten[shift : shift + 2] = _ARITH_SHIFT
+                rewritten = list(command)
+            for at, placeholder in zip((shift, shift + 1), _ARITH_SHIFT):
+                rewritten[at + 2 * bisect.bisect_right(splices, at)] = placeholder
 
     return command if rewritten is None else "".join(rewritten)
 
@@ -2738,6 +2745,7 @@ def validate_command(
     _depth: int = 0,
     _shellcheck: bool = True,
     _derived: bool = False,
+    _as_written: bool = False,
 ) -> ValidationResult:
     """Validate a command for safety — the main validation API.
 
@@ -2748,12 +2756,18 @@ def validate_command(
     back down to HIGH merely by having a substitution appended. Whatever returns first, the
     worse verdict wins.
 
-    ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
+    ``_depth``, ``_shellcheck``, ``_derived`` and ``_as_written`` are internal, keyword-only; see
     :func:`_validate_command`.
     """
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
-        command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
+        command,
+        config_path,
+        _depth=_depth,
+        _deferred=deferred,
+        _shellcheck=_shellcheck,
+        _derived=_derived,
+        _as_written=_as_written,
     )
     if not deferred:
         return result
@@ -2787,6 +2801,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
     _deferred: Optional[list[SubstitutionValidationResult]] = None,
     _shellcheck: bool = True,
     _derived: bool = False,
+    _as_written: bool = False,
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
@@ -2825,6 +2840,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         _derived: Internal, keyword-only. True when ``command`` is text schlock produced from an
             admitted command (a heredoc rewrite or one of its segments), so the derived-text
             ceiling applies, not the caller's. Callers leave it False.
+        _as_written: Internal, keyword-only. True skips the Step 3b shift rewrite and judges
+            ``command`` as bashlex reads it - the other half of Step 3b's join - and leaves the
+            verdict out of the cache, since a fresh call would join it. Callers leave it False.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -2881,12 +2899,19 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # opener to bashlex, and the phantom body hides every line after it from
         # the rules while bash runs them (LAB-4317). Rewriting the shift hands
         # those lines back to the flow below, which validates them on their
-        # merits - so the verdict comes from the rule the payload matches.
+        # merits - so the verdict comes from the rule the payload matches. Only
+        # the arithmetic command is handled here; `$(( … ))` is an expansion and
+        # is tracked separately (27Bslash6/schlock#112).
         #
-        # This is one instance of a class, not the whole class: bashlex and bash
-        # also disagree about `a[1<<b ]=1` (still a live fail-open) and about
-        # `$(( … ))` (denied only because bashlex crashes on it, 27Bslash6/schlock#112).
-        # Neither is fixed here.
+        # The rewrite is judged ALONGSIDE the command as written, never instead
+        # of it, and the worse verdict wins. `command_level_openers` offers every
+        # `((` in the text, and one bash reads as a comment, a quote or a heredoc
+        # body can still pair up and rewrite a REAL opener - which re-parents the
+        # body after it: `: # ((` over `cat <<'X'` ... `# ))` let a later heredoc
+        # swallow the lines bash ran, and the rewrite alone said SAFE. Joined, an
+        # over-fired rewrite can deny more than the unrewritten reading, never less.
+        # The price is measured and pinned: a benign shift keeps the deny bashlex's
+        # own reading gives it.
         #
         # Rewriting a shift creates no parens and no new `<<`, so the regions are
         # the same on a second pass and this recurses exactly once. That is the
@@ -2894,33 +2919,42 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # something, so a shift missed on the first pass gets no second pass and
         # stays hidden. Under-firing here is a live bypass, which is why
         # `command_level_openers` over-approximates rather than lexes.
-        try:
-            neutered = _neuter_arithmetic_shifts(command)
-        except _UnfollowableParenError as unfollowable:
-            # The `((` reading could not be followed, so whether the lines after
-            # it are a heredoc body or commands bash runs is unknown - and the
-            # bashlex reading below, which would decide it, is the one that is
-            # wrong about `((`. Deny, naming the construct: this is the one exit
-            # here that is a schlock decision rather than a rule match, and it
-            # says so.
-            return ValidationResult(
-                allowed=False,
-                risk_level=RiskLevel.BLOCKED,
-                message=f"BLOCKED: {unfollowable}",
-                alternatives=[
-                    "Simplify the arithmetic command so its `))` can be located",
-                    "Run the commands after the arithmetic separately",
-                ],
-                exit_code=1,
-                error=str(unfollowable),
-            )
+        neutered = command
+        if not _as_written:
+            try:
+                neutered = _neuter_arithmetic_shifts(command)
+            except _UnfollowableParenError as unfollowable:
+                # The `((` reading could not be followed, so whether the lines after
+                # it are a heredoc body or commands bash runs is unknown - and the
+                # bashlex reading below, which would decide it, is the one that is
+                # wrong about `((`. Deny, naming the construct: this is the one exit
+                # here that is a schlock decision rather than a rule match, and it
+                # says so.
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: {unfollowable}",
+                    alternatives=[
+                        "Simplify the arithmetic command so its `))` can be located",
+                        "Run the commands after the arithmetic separately",
+                    ],
+                    exit_code=1,
+                    error=str(unfollowable),
+                )
         if neutered != command:
-            arithmetic_result = validate_command(
-                neutered, config_path, _depth=_depth, _shellcheck=_shellcheck, _derived=_derived
+            # ShellCheck runs once, on the half that is the text the user typed.
+            rewritten = validate_command(neutered, config_path, _depth=_depth, _shellcheck=False, _derived=_derived)
+            as_written = validate_command(
+                command, config_path, _depth=_depth, _shellcheck=_shellcheck, _derived=_derived, _as_written=True
             )
+
+            # A tie goes to the half that names a rule, then to the rewrite: a deny should say why.
+            def rank(result: ValidationResult) -> tuple[RiskLevel, bool, bool]:
+                return result.risk_level, not result.allowed, bool(result.matched_rules)
+
+            arithmetic_result = as_written if rank(as_written) > rank(rewritten) else rewritten
             if _depth == 0 and _shellcheck:
-                # Cached under what the user typed; the recursion cached the
-                # rewrite, which nobody will ever issue.
+                # Cached under what the user typed; neither half cached itself.
                 _global_cache.set(command, arithmetic_result)
             return arithmetic_result
 
@@ -3095,7 +3129,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         error=None,
                         matched_rules=[],
                     )
-                    if _depth == 0 and _shellcheck and not _deferred:
+                    if _depth == 0 and _shellcheck and not _deferred and not _as_written:
                         _global_cache.set(command, result)
                     return result
 
@@ -3365,8 +3399,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
         # Nor when a substitution verdict is still owed a join: the cached entry would be the
-        # pre-join verdict, and the next identical command would hit it and skip the join.
-        if _depth == 0 and _shellcheck and not _deferred:
+        # pre-join verdict, and the next identical command would hit it and skip the join. Nor
+        # the as-written half of Step 3b's join, for the same reason.
+        if _depth == 0 and _shellcheck and not _deferred and not _as_written:
             _global_cache.set(command, result)
 
         # Step 8: Return
