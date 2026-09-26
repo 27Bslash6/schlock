@@ -3671,12 +3671,14 @@ class TestMultilineSubstitution:
         assert result.risk_level == RiskLevel.BLOCKED, description
         assert result.allowed is False, description
         assert result.exit_code == 1, description
+        assert "Dangerous command in substitution: rm" in result.message, f"{description}: {result.message}"
 
     @pytest.mark.parametrize(
         "command,risk_level,description",
         [
             # AC-2: inert spellings. Escalation only raises, so a false positive here has no
-            # downstream fix.
+            # downstream fix. One inert spelling is denied on purpose: see
+            # test_quoted_text_after_the_substitution_is_denied_on_purpose.
             ("echo '$(echo a\nrm -rf /)'", RiskLevel.SAFE, "single quotes: bash prints it, never runs it"),
             ('echo "a\nb"', RiskLevel.SAFE, "plain multi-line string"),
             # Benign multi-line bodies keep the verdict of their single-line spelling.
@@ -3714,6 +3716,7 @@ class TestMultilineSubstitution:
         result = validate_command('echo "$(echo a)\nrm -rf /"', config_path=safety_rules_path)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
+        assert "system_destruction" in result.matched_rules, result.matched_rules
 
     def test_multiline_body_gets_the_single_line_verdict(self, safety_rules_path):
         """A non-whitelisted second line is escalated exactly as it is after a `;`."""

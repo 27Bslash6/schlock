@@ -1369,15 +1369,15 @@ class BashCommandParser:
 
         Offsets come from the substitution's own span, never its inner command:
         inside a word each `\\<newline>` moves every later inner offset two places
-        early. The word's own span is exact, so a word holding a newline, or a
-        substitution whose closer is not where _body_end looks, gets ONE body,
-        from its first substitution to its closing quote. The newline arm stays
-        although substitution spans are now real across newlines, because it is
-        the fail-closed side: it judges the quoted text after the `)` as code
-        too. That body keeps its heredoc
-        ranges only while no `\\<newline>` has moved them, and never its literal
-        ranges, which is a false positive on quoted text in a multi-line word
-        and never a missed payload.
+        early, and can move the substitution's own end too. The word's own span
+        is exact, so a word holding a newline, or a substitution whose closer is
+        not where _body_end looks, gets ONE body, from its first substitution (or
+        its opening quote, when a `\\<newline>` comes first) to its closing quote.
+        For a plain newline that is also the fail-closed read on purpose: the
+        quoted text after the `)` is judged as code too. That body keeps its
+        heredoc ranges only while no `\\<newline>` has moved them, and never its
+        literal ranges, which is a false positive on quoted text in a multi-line
+        word and never a missed payload.
 
         Raises:
             ValueError: past _MAX_BODY_TEXT_FACTOR times the command's length in
