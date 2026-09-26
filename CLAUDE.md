@@ -74,6 +74,15 @@
      widen the allowlist by modelling bash's subscript grammar: four review rounds of that
      never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
      must raise, never fall back to "argument". Every spelling is decided by real bash first.
+   - **Approved exception — refusing a split subscript.** bash reads an element assignment
+     before the command name (`a[ ; ]=1 bash`) as one word to its matching `]`, while bashlex
+     ends the word at the first blank or operator, so its tree names the wrong command.
+     `_PrefixSubscriptCheck` in `src/schlock/core/parser.py` scans each prefix word's raw
+     span with `_subscript_closes` (`_SUBSCRIPT_TOKEN`). It holds only while it can **only
+     refuse**: a subscript that closes inside bashlex's word changes nothing, and every other
+     reading - an unclosed subscript, a quote or expansion it does not model, a substitution
+     span it cannot trust - raises `ParseError`. It never supplies a word boundary of its
+     own: its only output is that refusal, which fails the command closed.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.

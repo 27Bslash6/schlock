@@ -4,10 +4,11 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks. Two readers
-here work on single words whose boundaries bashlex has already fixed, _redirect_words
-and _mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE); CLAUDE.md lists
-both as approved exceptions and the constraints each must keep.
+Regex-based parsing is explicitly NOT supported due to security risks. Three readers
+here work on single words whose boundaries bashlex has already fixed: _redirect_words,
+_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE) and _subscript_closes,
+which only ever refuses. CLAUDE.md lists each as an approved exception and the
+constraints it must keep.
 """
 
 import bisect
@@ -794,28 +795,35 @@ class _PrefixSubscriptCheck(bashlex.ast.nodevisitor):
     """Raise ParseError when bash reads a subscript before the command name past bashlex's word.
 
     `a[ ; ]=1 bash` is one assignment followed by `bash` to bash, but to bashlex it is two commands.
-    Once the word boundaries disagree, no reading of bashlex's tree can be trusted. A `{varname}`
-    prefix is part of its redirection, so the check reads past it (`{fd}>out a[ ; ]=1 bash`), which
-    needs _mark_fd_variables to have run first.
+    Once the word boundaries disagree, no reading of bashlex's tree can be trusted. It walks the
+    same word parts as _command_words, so it reads past a `{varname}` prefix too
+    (`{fd}>out a[ ; ]=1 bash`), which needs _mark_fd_variables to have run first.
     """
 
     def __init__(self, command: str) -> None:
         self._command = command
 
     def visitcommand(self, n: Any, parts: "list[Any]") -> None:
-        for part in parts:
-            if part.kind != "word" or _is_fd_variable(part):
-                continue
+        for part in _word_parts(parts):
             if _SUBSCRIPT_START.match(self._command, part.pos[0], part.pos[1]) and not _subscript_closes(self._command, part):
                 raise ParseError("Failed to parse bash command: a subscript before the command name is not closed")
             if not _ASSIGNMENT_WORD.match(part.word):
                 return
 
 
-def _refuse_split_subscripts(command: str, nodes: "list[Any]") -> None:
+def _refuse_split_subscripts(command: str, ast_nodes: "list[Any]") -> None:
     checker = _PrefixSubscriptCheck(command)
-    for node in nodes:
+    for node in ast_nodes:
         checker.visit(node)
+
+
+def _word_parts(parts: "list[Any]") -> "list[Any]":
+    """A command node's word parts: no assignment, no redirection, no `{varname}` prefix."""
+    return [
+        part
+        for part in without_fd_variables(parts)
+        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
+    ]
 
 
 def _command_words(node: Any) -> "list[str]":
@@ -825,11 +833,7 @@ def _command_words(node: Any) -> "list[str]":
     view in this module reads a command through here. A word shaped like an assignment
     is skipped only before the command name: `echo a[0]=1` names `echo`.
     """
-    words = [
-        part.word
-        for part in without_fd_variables(getattr(node, "parts", None) or [])
-        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
-    ]
+    words = [part.word for part in _word_parts(getattr(node, "parts", None) or [])]
     return words[next((i for i, word in enumerate(words) if not _ASSIGNMENT_WORD.match(word)), len(words)) :]
 
 
@@ -969,7 +973,7 @@ class BashCommandParser:
         """Extract the command name from a command node.
 
         SECURITY: Correctly handles prefixes that appear before the command:
-        - Assignment nodes: VAR=value exec bash → returns 'exec'
+        - Assignments: VAR=value exec bash, a[0]=1 exec bash → returns 'exec'
         - Redirect nodes: 2>&1 exec bash → returns 'exec'
         - Path handling: /usr/bin/exec → returns 'exec'
 
@@ -999,9 +1003,10 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax, or a
+            ParseError: If bashlex fails to parse the command syntax, a
                 `{varname}` redirect prefix cannot be read with certainty
-                (see _mark_fd_variables)
+                (see _mark_fd_variables), or a subscript before the command
+                name runs past bashlex's word (see _PrefixSubscriptCheck)
 
         Example:
             >>> parser = BashCommandParser()

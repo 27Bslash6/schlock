@@ -710,6 +710,11 @@ class TestSubscriptedAssignmentPrefix:
             (f"{_DOWNLOAD} | a[0]=1 2>/dev/null bash", f"{_DOWNLOAD} | FOO=1 2>/dev/null bash"),
             (f"{_DOWNLOAD} | FOO=1 >/dev/null b=2 bash", f"{_DOWNLOAD} | FOO=1 b=2 bash"),
             ("a[0]=1 b=2 bash <<< 'rm -rf /'", "FOO=1 b=2 bash <<< 'rm -rf /'"),
+            (f"{_DOWNLOAD} | {{fd}}>out a[0]=1 bash", f"{_DOWNLOAD} | {{fd}}>out FOO=1 bash"),
+            # Both sides blocked, not merely equal: parity also passes when both are wrongly SAFE.
+            ("a[0]=1 bash <<'EOF'\nrm -rf /\nEOF", "FOO=1 bash <<'EOF'\nrm -rf /\nEOF"),
+            ("a[0]=1 bash <<EOF\nrm -rf /\nEOF", "FOO=1 bash <<EOF\nrm -rf /\nEOF"),
+            ("a[0]=1 bash <<'A;B'\nrm -rf /\nA;B", "FOO=1 bash <<'A;B'\nrm -rf /\nA;B"),
         ],
     )
     def test_prefixed_shell_is_blocked_like_its_plain_twin(self, command, twin):
@@ -729,19 +734,6 @@ class TestSubscriptedAssignmentPrefix:
     )
     def test_benign_prefixed_command_scores_as_its_plain_twin(self, command, twin):
         assert validate_command(command).risk_level == validate_command(twin).risk_level
-
-    _HEREDOC_TWINS = [
-        ("a[0]=1 bash <<'EOF'\nrm -rf /\nEOF", "FOO=1 bash <<'EOF'\nrm -rf /\nEOF"),
-        ("a[0]=1 bash <<EOF\nrm -rf /\nEOF", "FOO=1 bash <<EOF\nrm -rf /\nEOF"),
-        ("a[0]=1 bash <<'A;B'\nrm -rf /\nA;B", "FOO=1 bash <<'A;B'\nrm -rf /\nA;B"),
-    ]
-
-    # Blocked, not merely equal: parity alone passed while both sides scored SAFE, because the heredoc
-    # consumer lookup named the prefix (`FOO=1`, `a[0]=1`) instead of `bash`.
-    @pytest.mark.parametrize(("command", "twin"), _HEREDOC_TWINS)
-    def test_prefixed_heredoc_shell_is_blocked_like_its_plain_twin(self, command, twin):
-        assert validate_command(twin).risk_level == RiskLevel.BLOCKED
-        assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         "command",
@@ -883,6 +875,9 @@ class TestSubscriptedAssignmentPrefix:
             ("bash a[0]=1", ["bash", "a[0]=1"]),
             # `a[0]` carries no `=`, so bash runs it as the command (a glob).
             ("a[0] bash", ["a[0]", "bash"]),
+            # A `{varname}` prefix belongs to its redirection, so the assignment prefix runs on past it.
+            ("{fd}>out a[0]=1 bash", ["bash"]),
+            ("{fd}>out FOO=1 bash", ["bash"]),
         ],
     )
     def test_command_words_skip_the_assignment_prefix(self, command, words):
