@@ -71,6 +71,16 @@ _SOURCE_TOKEN = re.compile(r"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|.", re.DOTALL)
 # line -- the fail-closed direction, costing a false positive on an exotic spelling, never a
 # denial.
 _SEPARATOR_TOKENS = frozenset({"\\|", "[|]", ";", "\\;", "[;]", "&", "\\&", "[&]"})
+# Separator tokens bash does not read as a separator, by what sits next to them. An `&` beside `<`
+# or `>` is part of a redirection (`2>&1`, `<&3`, `&>log`); a separator after a literal backslash
+# is escaped (`\;`, find's terminator, is an argument). Counting either declares a command the
+# entry never describes, and the line gets to add one.
+_AMPERSAND_TOKENS = frozenset({"&", "\\&", "[&]"})
+_REDIRECTION_TOKENS = frozenset({"<", "\\<", "[<]", ">", "\\>", "[>]"})
+_BACKSLASH_TOKENS = frozenset({"\\\\", "[\\\\]"})
+# A verbose flag, global or scoped, or an inline comment: text in the source that is never matched,
+# so a separator written there is no separator at all. The count does not try to read past one.
+_COMMENT_SYNTAX = re.compile(r"\(\?(?:[aiLmsux]*x|#)")
 # Whitespace that `\s` and `str.strip` accept but bash does not treat as blank: \r, \v, \f,
 # \x1c-\x1f and the Unicode spaces are WORD characters to bash. Only space, tab and newline aren't.
 _NON_BASH_BLANK = re.compile(r"[^\S \t\n]")
@@ -80,10 +90,18 @@ def _declared_separators(source: str) -> int:
     """Count the command separators a whitelist pattern's source writes.
 
     Adjacent separator tokens are one separator: `&&`, `\\|\\|` and `\\|&` each join two commands.
+    A pattern using comment syntax counts as writing none, so it clears no line.
     """
+    if _COMMENT_SYNTAX.search(source):
+        return 0
+    tokens = _SOURCE_TOKEN.findall(source)
     count, previous = 0, False
-    for token in _SOURCE_TOKEN.findall(source):
-        current = token in _SEPARATOR_TOKENS
+    for before, token, after in zip(["", *tokens], tokens, [*tokens[1:], ""]):
+        current = (
+            token in _SEPARATOR_TOKENS
+            and before not in _BACKSLASH_TOKENS
+            and not (token in _AMPERSAND_TOKENS and _REDIRECTION_TOKENS & {before, after})
+        )
         if current and not previous:
             count += 1
         previous = current
@@ -787,6 +805,12 @@ class RuleEngine:
         # unseats the anchored entry and lands the pipeline on BLOCKED. After the guard above,
         # only space, tab and newline are left for this to strip.
         command = command.strip()
+        # A final backslash escapes nothing, so bash keeps it: as the line's last word (alone, or
+        # straight after `;` or `&`) it is a command named `\`. The parser drops that word without
+        # counting it, so the count would miss a command bash runs. An even run is escaped
+        # backslashes, an ordinary argument.
+        if (len(command) - len(command.rstrip("\\"))) % 2:
+            return False
         for pattern in self.whitelist_patterns:
             declared = _declared_separators(pattern.pattern)
             if declared and declared + 1 == segment_count and pattern.fullmatch(command):

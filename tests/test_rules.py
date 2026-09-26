@@ -1,12 +1,14 @@
 """Tests for RuleEngine."""
 
 import re
+import shutil
 
 import pytest
 import yaml
 
+from schlock.core import validator
 from schlock.core.parser import BashCommandParser
-from schlock.core.rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
+from schlock.core.rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule, _declared_separators
 from schlock.exceptions import ConfigurationError
 
 
@@ -1237,3 +1239,179 @@ class TestWhitelistRefusesCommandSeparators:
             engine = RuleEngine(rules)
         assert "may never match" in caplog.text
         assert not engine.is_whitelisted("psql mydb < schema.sql")
+
+
+class TestDeclaredCountIsWhatBashRuns:
+    """LAB-5377: an entry must not declare more commands than bash finds in the text it matches.
+
+    `is_whitelisted_whole` clears a line when the parser finds one more command than the entry
+    writes separators. A separator character bash does not read as one -- a redirection's `&`, an
+    escaped `;`, a `;` in a regex comment -- declares a command the author never described, and
+    that is a slot for one more. Likewise a command the parser never counts. The mutation-bearing
+    tests call `_declared_separators` and `is_whitelisted_whole` directly: through
+    `validate_command`, `_WHOLE_LINE_DISQUALIFIER` or a tighter shipped entry can refuse the same
+    line and hide a reverted rule.
+    """
+
+    @staticmethod
+    def _engine(tmp_path, pattern: str) -> RuleEngine:
+        rules = tmp_path / "user_whitelist.yaml"
+        rules.write_text(yaml.safe_dump({"whitelist": [pattern], "rules": []}))
+        return RuleEngine(rules)
+
+    @pytest.mark.parametrize(
+        ("source", "declared"),
+        [
+            # A redirection's `&` sits beside `>` or `<`, before or after, in any spelling.
+            (r"^a\s+2>&1$", 0),
+            (r"^a\s+>&2$", 0),
+            (r"^a\s+<&3$", 0),
+            (r"^a\s+&>\S+$", 0),
+            (r"^a\s+&>>\S+$", 0),
+            (r"^a\s+2\>&1$", 0),
+            (r"^a\s+2[>]&1$", 0),
+            (r"^a\s+&\>\S+$", 0),
+            (r"^a\s+\<&3$", 0),
+            (r"^a\s+[<]&3$", 0),
+            (r"^a\s+2>\&1$", 0),
+            (r"^a\s+2>[&]1$", 0),
+            # ...so a pipeline entry keeps its one pipe, whether the redirection is required or not.
+            (r"^npm\s+run\s+\S+\s+2>&1\s*\|\s*tee\s+\S+$", 1),
+            (r"^npm\s+run\s+\S+(\s+2>&1)?\s*\|\s*tee\s+\S+$", 1),
+            (r"^npm\s+test\s+&>\s*\S+$", 0),
+            # `|&` pipes stderr too and `&&` is AND: both still join two commands.
+            (r"^a\s*\|&\s*b$", 1),
+            (r"^a\s*&&\s*b$", 1),
+            # After a literal backslash a separator is escaped: bash reads `\;` as an argument.
+            (r"^find\s+\S+\s+-name\s+\S+\s+-exec\s+rm\s+\{\}\s+\\;$", 0),
+            (r"^find\s+\S+\s+-exec\s+rm\s+\{\}\s+[\\];$", 0),
+            (r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$", 1),
+            (r"^echo\s+a\\&\s+\S+$", 0),
+            (r"^echo\s+a\\\|\s+\S+$", 0),
+            (r"^echo\s+a\\\;\s+\S+$", 0),
+            # A verbose flag, global or scoped, or an inline comment carries text that is never
+            # matched. Such an entry is read as declaring nothing: it clears no line.
+            (r"(?x) ^make \s+ \S+ $  # build; nothing else", 0),
+            (r"^make\s+\S+(?#one; command)$", 0),
+            (r"(?ix) ^make \s+ \S+ $  # build; nothing else", 0),
+            (r"(?sx) ^make \s+ \S+ $  # a; b", 0),
+            ("(?x:^make \\s+ \\S+ # a; b\n)$", 0),
+            # A flag group that is not verbose, or that turns verbose off, changes nothing.
+            (r"(?i:^a\s*;\s*b)$", 1),
+            (r"(?-x:^a\s*;\s*b)$", 1),
+        ],
+    )
+    def test_only_what_bash_reads_as_a_separator_is_declared(self, source, declared):
+        re.compile(source)  # every row is an entry a user could write
+        assert _declared_separators(source) == declared
+
+    def test_shipped_entries_keep_their_declared_counts(self, data_dir):
+        """Only the gh/docker pipeline declares a separator; every other shipped entry speaks for one command."""
+        shipped = yaml.safe_load((data_dir / "rules" / "00_whitelist.yaml").read_text())["whitelist"]
+        assert any("docker" in pattern for pattern in shipped)
+        for pattern in shipped:
+            assert _declared_separators(pattern) == (1 if "docker" in pattern else 0), pattern
+
+    @pytest.mark.parametrize("tail", ["\n\\", "\n \\", "\n\t\\", ";\\", "&\\"])
+    def test_a_lone_trailing_backslash_is_a_command_the_parser_does_not_count(self, tmp_path, tail):
+        """A backslash with nothing after it escapes nothing, so bash keeps it as a literal.
+
+        As the last word of a line -- alone, or straight after `;` or `&` -- that word is a command
+        named `\\`: bash 5.3 exits 127 ("\\: command not found") when none exists, and runs one
+        planted on PATH. The parser drops the word without counting it, so the count sees two
+        commands where bash runs three.
+        """
+        engine = self._engine(tmp_path, r"^foo\s*\|\s*bar[\s\S]*$")
+        (entry,) = engine.whitelist_patterns
+        command = "foo | bar x" + tail
+
+        assert entry.fullmatch(command.strip())
+        assert _segment_count(command) == 2, "the parser counts the `\\` now; the guard may be redundant"
+        assert not engine.is_whitelisted_whole(command, 2)
+
+    def test_an_escaped_trailing_backslash_is_an_argument_and_still_clears(self, tmp_path):
+        r"""An even run is escaped backslashes: `bar x\\` hands `bar` the argument `x\`."""
+        engine = self._engine(tmp_path, r"^foo\s*\|\s*bar[\s\S]*$")
+        for command in ("foo | bar x", "foo | bar x\\\\"):
+            assert _segment_count(command) == 2, command
+            assert engine.is_whitelisted_whole(command, 2), command
+
+    # (user entry, line, risk level with the entry, a rule that must fire). Each line clears the
+    # gate on the count alone before this fix; the risk level is the one it gets with no entry.
+    ROWS = [
+        (
+            r"^npm\s+run\s+\S+(\s+2>&1)?\s*\|\s*tee\s+\S+$",
+            "npm run build;rm${IFS}-rf${IFS}~ | tee log",
+            RiskLevel.BLOCKED,
+            "ifs_obfuscation",
+        ),
+        (
+            r"^find\s+\S+\s+-name\s+\S+\s+-exec\s+rm\s+\{\}\s+\\;$",
+            r"find x;rm${IFS}-rf${IFS}~ -name y -exec rm {} \;",
+            RiskLevel.BLOCKED,
+            "ifs_obfuscation",
+        ),
+        (
+            r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$",
+            "find src -exec wc {} \\; | tee\nreboot",
+            RiskLevel.HIGH,
+            "file_truncation",
+        ),
+        (r"^echo\s+a\\&\s+\S+$", r"echo a\& x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
+        (r"^echo\s+a\\\|\s+\S+$", r"echo a\| x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
+        (r"(?x) ^make \s+ \S+ $  # build; nothing else", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
+        (r"^make\s+\S+(?#one; command)$", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
+        (r"(?ix) ^make \s+ \S+ $  # build; nothing else", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
+        (r"(?sx) ^make \s+ \S+ $  # a; b", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
+        ("(?x:^make \\s+ \\S+ # a; b\n)$", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
+        (r"^foo\s*\|\s*bar[\s\S]*$", "foo | bar x\n\\", RiskLevel.SAFE, None),
+        (r"^foo\s*\|\s*bar[\s\S]*$", "foo | bar x\n \\", RiskLevel.SAFE, None),
+        (r"^foo\s*\|\s*bar[\s\S]*$", "foo | bar x\n\t\\", RiskLevel.SAFE, None),
+    ]
+
+    @pytest.mark.parametrize(("pattern", "command", "risk", "rule"), ROWS)
+    def test_the_whole_line_check_refuses_a_line_with_an_undeclared_command(self, tmp_path, pattern, command, risk, rule):
+        engine = self._engine(tmp_path, pattern)
+        (entry,) = engine.whitelist_patterns
+
+        assert entry.fullmatch(command.strip())
+        assert not engine.is_whitelisted_whole(command, _segment_count(command))
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize(("pattern", "command", "risk", "rule"), ROWS)
+    def test_the_line_gets_the_verdict_it_gets_with_no_entry(self, tmp_path, data_dir, pattern, command, risk, rule):
+        """Refusing the whitelist is not refusing the command: the line is judged one command at a time.
+
+        Matched rules are compared by inclusion. For the `make` rows the segment loop's prefix
+        test still clears `make x` on its own, so `make_build` is absent with the entry and
+        present without it.
+        """
+        rules_dir = tmp_path / "rules"
+        shutil.copytree(data_dir / "rules", rules_dir)
+        whitelist = rules_dir / "00_whitelist.yaml"
+        data = yaml.safe_load(whitelist.read_text())
+        data["whitelist"].append(pattern)
+        whitelist.write_text(yaml.safe_dump(data))
+
+        result = validator.validate_command(command, config_path=str(rules_dir))
+
+        assert result.message != "Command is whitelisted"
+        assert result.risk_level == risk
+        if rule is None:
+            assert result.message == "No security rules matched"
+            assert result.matched_rules == []
+        else:
+            assert rule in result.matched_rules
+
+    @pytest.mark.parametrize(
+        ("pattern", "command"),
+        [
+            (r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$", r"find src -exec wc {} \; | tee log"),
+            (r"^npm\s+run\s+\S+(\s+2>&1)?\s*\|\s*tee\s+\S+$", "npm run build | tee log"),
+        ],
+    )
+    def test_the_line_an_entry_was_written_for_now_clears(self, tmp_path, pattern, command):
+        """The over-count also cost the author their own line: declared three commands, found two."""
+        engine = self._engine(tmp_path, pattern)
+        assert _segment_count(command) == 2
+        assert engine.is_whitelisted_whole(command, 2)
