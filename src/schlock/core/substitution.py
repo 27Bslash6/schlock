@@ -618,33 +618,32 @@ _AWK_LONE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # pipe to a command (`-F|`, `OFS=|`, a bare `a|b` in data).
 _AWK_PIPE_KEYWORD = re.compile(r"\b(?:printf?|getline)\b")
 # awk's lexer rule for `/`: after a value (name, number, string, regex, `)`, `]`) it divides;
-# anywhere else it opens a regex literal. _awk_strip_literals tracks which the last token left.
-# _AWK_EITHER marks a `/` the awks disagree on: after postfix `x++`/`x--` gawk and busybox divide
-# while mawk and nawk open a regex; after `case` gawk opens one (switch) while the others take
-# `case` for a variable. LAB-4832.
-_AWK_VALUE, _AWK_OPERAND, _AWK_HEADER, _AWK_EITHER = "value", "operand", "header", "either"
-# What a word leaves; any other name or number is a value. A word marked OPERAND that some awk takes
-# for a variable strips real code, so only words that are keywords in gawk, mawk, nawk and busybox
-# alike (`and`, `or`, `not`, `func` are variables in some). The `)` closing an if/while/for
-# condition (HEADER) ends no value, so a `/` after it opens a regex.
+# anywhere else it opens a regex literal. _awk_strip_literals tracks what a `/` at the current
+# point would do. _AWK_EITHER marks a `/` the awks disagree on: after postfix `x++`/`x--` gawk and
+# busybox divide while mawk and nawk open a regex; after `case` gawk opens one (switch) while the
+# others take `case` for a variable. _AWK_HEADER: an `if`/`while`/`for` whose `(...)` follows.
+_AWK_DIVIDE, _AWK_REGEX, _AWK_HEADER, _AWK_EITHER = "divide", "regex", "header", "either"
+# What a `/` right after a word does; after any other name or number it divides. Either wrong
+# reading hides a pipe (stripped division text, or a regex's `"` pairing with a later quote), so
+# each entry is what every awk accepting a `/` there does: gawk, mawk, nawk and busybox checked.
+# `getline`, `and`, `or`, `not`, `func` are values, or variables in some awks. LAB-4832.
 _AWK_WORD_STATE = {
     **dict.fromkeys(
-        (
-            "print", "printf", "getline", "return", "else", "do", "delete", "next", "nextfile",
-            "exit", "in", "function", "BEGIN", "END",
-        ),
-        _AWK_OPERAND,
+        ("print", "printf", "return", "exit", "else", "do", "in", "delete", "break", "continue"),
+        _AWK_REGEX,
     ),
     **dict.fromkeys(("if", "while", "for"), _AWK_HEADER),
     "case": _AWK_EITHER,
-}  # fmt: skip
+}
+_AWK_NUMBER = re.compile(r"\d+\.?\d*(?:[eE][+-]?\d+)?")
 
 
 def _awk_skip_regex(prog: str, i: int) -> int:
     """Return the index just past a `/regex/` literal that opens at prog[i] == '/'.
 
     Runs to the closing `/` or the line's end (an unclosed literal is a syntax error awk rejects).
-    A `\\`-escape covers the next char; inside a `[...]` bracket expression `/` is literal.
+    A `\\`-escape covers the next char, so a `\\<newline>` continues the regex, as it does in awk;
+    inside a `[...]` bracket expression `/` is literal.
     """
     n = i + 1
     end = len(prog)
@@ -674,6 +673,35 @@ def _awk_skip_string(prog: str, i: int) -> int:
     return n + 1
 
 
+def _awk_scan_word(prog: str, i: int) -> tuple[int, str]:
+    """Return the end of the name or number at prog[i] and what a `/` right after it does.
+
+    A number glued to letters splits differently per awk: all four read `1in` as `1 in`, busybox
+    reads `0x1in` as hex `0x1` then `in` where mawk and nawk read `0` then `x1in`. So a `/` after
+    one is ambiguous.
+    """
+    m = _AWK_NUMBER.match(prog, i)
+    num_end = m.end() if m else i
+    end = num_end
+    while end < len(prog) and (prog[end].isalnum() or prog[end] == "_"):
+        end += 1
+    if num_end == i:  # a name
+        return end, _AWK_WORD_STATE.get(prog[i:end], _AWK_DIVIDE)
+    return end, _AWK_EITHER if end > num_end else _AWK_DIVIDE
+
+
+def _awk_after_punct(c: str, slash: str, headers: list[bool]) -> str:
+    """Return what a `/` after punctuation `c` does. `headers` holds one entry per open `(`: does
+    it open an if/while/for condition? That condition's `)` ends no value, so a regex follows it.
+    """
+    if c == "(":
+        headers.append(slash == _AWK_HEADER)
+        return _AWK_REGEX
+    if c == ")":
+        return _AWK_REGEX if headers and headers.pop() else _AWK_DIVIDE
+    return _AWK_DIVIDE if c == "]" else _AWK_REGEX
+
+
 def _awk_strip_literals(prog: str) -> str:
     """Replace awk string, regex, and comment content with inert placeholders, leaving code.
 
@@ -684,48 +712,42 @@ def _awk_strip_literals(prog: str) -> str:
     """
     out: list[str] = []
     i, n = 0, len(prog)
-    prev = _AWK_OPERAND  # what the last significant token left: decides `/` = divide vs regex
-    headers: list[bool] = []  # one per open `(`: does it hold an if/while/for condition?
+    slash = _AWK_REGEX  # what a `/` at this point does, per what the last token left
+    headers: list[bool] = []  # see _awk_after_punct
     while i < n:
         c = prog[i]
         if c == '"':  # string literal
             i = _awk_skip_string(prog, i)
             out.append('""')
-            prev = _AWK_VALUE
+            slash = _AWK_DIVIDE
         elif c == "#":  # comment — to end of line; a trailing `\` does not continue it
             eol = prog.find("\n", i)
             i = eol if eol >= 0 else n
-        elif c == "/" and prev == _AWK_EITHER:
+        elif c == "/" and slash == _AWK_EITHER:
             out.append(prog[i:])
             break
-        elif c == "/" and prev != _AWK_VALUE:  # regex literal (operand position)
+        elif c == "/" and slash != _AWK_DIVIDE:  # regex literal
             i = _awk_skip_regex(prog, i)
             out.append("//")
-            prev = _AWK_VALUE
+            slash = _AWK_DIVIDE
         elif c.isalnum() or c == "_":  # name or number
-            j = i
-            while i < n and (prog[i].isalnum() or prog[i] == "_"):
-                i += 1
-            word = prog[j:i]
-            out.append(word)
-            prev = _AWK_WORD_STATE.get(word, _AWK_VALUE)
+            j, slash = _awk_scan_word(prog, i)
+            out.append(prog[i:j])
+            i = j
         elif c == "\n":  # ends the statement: a `/` opening the next line starts a regex
             out.append(c)
-            prev = _AWK_OPERAND
+            slash = _AWK_REGEX
             i += 1
         elif c.isspace() or prog.startswith("\\\n", i):  # a blank or `\<newline>`: not a token
             out.append(" ")
             i += 2 if c == "\\" else 1
         elif prog.startswith(("++", "--"), i):
             out.append(prog[i : i + 2])
-            prev = _AWK_EITHER
+            slash = _AWK_EITHER
             i += 2
         else:
-            if c == "(":
-                headers.append(prev == _AWK_HEADER)
-            closes_header = c == ")" and bool(headers) and headers.pop()
             out.append(c)
-            prev = _AWK_VALUE if c in ")]" and not closes_header else _AWK_OPERAND
+            slash = _awk_after_punct(c, slash, headers)
             i += 1
     return "".join(out)
 

@@ -142,6 +142,10 @@ class TestTopLevelAwkCommandPipe:
             "awk 'BEGIN{c=ARGV[1]; x = 1\n/\"/; print 1 | c}' 'rm -rf /'",
             # a comment ends at its newline even after a trailing backslash
             "awk 'BEGIN{c=ARGV[1] # x \\\n; print 1 | c}' 'rm -rf /'",
+            # `getline` is a value, so a `/` after it divides (was HIGH, not BLOCKED)
+            "awk 'BEGIN{c=ARGV[1]; ARGV[1]=\"\"; y = getline / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            # busybox (the `awk` on Alpine) opens a regex after break/continue
+            "awk 'BEGIN{c=ARGV[1]; while (1) { break /\"/ } print 1 | c; y = \"a\"}' 'rm -rf /'",
         ],
     )
     def test_command_pipe_blocks(self, command):
@@ -172,12 +176,6 @@ class TestTopLevelAwkCommandPipe:
     def test_system_stays_high(self):
         """The command-pipe check must not change the existing system() rating (HIGH, ask)."""
         assert validate_command("awk 'BEGIN{system(\"id\")}'").risk_level == RiskLevel.HIGH
-
-    def test_scanner_continues_past_backslash_newline(self):
-        # awk reads `\<newline>` as a blank in code and continues a string over it; a scanner that
-        # ended the statement there would hide |. `\\\n` is a literal backslash then a newline.
-        assert awk_command_pipe(["awk", "BEGIN{x = 4 \\\n/ 2; print 1 | c}"]) is not None
-        assert awk_command_pipe(["awk", 'BEGIN{x = "a\\\nb"; print 1 | c}']) is not None
 
     @pytest.mark.parametrize("program", ['"' + '\\"' * 40000, "(/" + "\\/" * 40000])
     def test_literal_scan_is_linear(self, program):

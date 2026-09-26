@@ -2971,6 +2971,24 @@ class TestDangerousAwkHelper:
             ["awk", 'BEGIN{c=ARGV[1]; for (k in a) /"/; print 1 | c}'],
             ["awk", 'BEGIN{c=ARGV[1]; x = 1\n/"/; print 1 | c}'],
             ["awk", "BEGIN{c=ARGV[1] # x \\\n; print 1 | c}"],
+            ["awk", 'BEGIN{c=ARGV[1]; x = /a\\\n"/; print 1 | c; y = "b"}'],  # regex continues
+            # one row per word after which a `/` opens a regex (busybox alone for in/break/continue)
+            ["awk", 'BEGIN{c=ARGV[1]; print /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; printf /"/; print 1 | c; y = "a"}'],
+            ["awk", 'function f() { return /"/; } BEGIN{c=ARGV[1]; f(); print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN { exit /"/ } END { c=ARGV[1]; print 1 | c; y = "a" }'],
+            ["awk", 'BEGIN{c=ARGV[1]; if (0) x=1; else /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; do /"/; while (0); print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; x = 1 in /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; while (1) { break /"/ } print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; for (i=0;i<1;i++) { continue /"/ } print 1 | c; y = "a"}'],
+            # values: a `/` after them divides (getline's row is top-level: any getline denies here)
+            ["awk", "BEGIN{c=ARGV[1]; or=4; y = or / 2; print 1 | c; z = 4 / 1}"],
+            ["awk", "BEGIN{c=ARGV[1]; x = 1. / 2; print 1 | c; z = 4 / 1}"],
+            # a number glued to letters: busybox reads `0x1in` as `0x1 in`, mawk and nawk as `0 x1in`
+            ["awk", 'BEGIN{c=ARGV[1]; x = 1in /"/; print 1 | c; y = "a"}'],
+            ["awk", 'BEGIN{c=ARGV[1]; x = 0x1in /"/; print 1 | c; y = "a"}'],
+            ["awk", "BEGIN{c=ARGV[1]; x = 0x1in / 2; print 1 | c; z = 4 / 1}"],
         ],
     )
     def test_dangerous_awk(self, args):
