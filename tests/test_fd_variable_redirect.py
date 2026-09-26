@@ -82,23 +82,37 @@ class TestEverySpellingBashConsumes:
             "{fd}<<<x",
             "{fd[0]}>out",  # an array element is a variable too
             "{_x1}>out",
-            # bash decides on the RAW token: quotes inside a subscript do not stop it
+            "{fd[ab_1]}>out",
+        ],
+    )
+    def test_consumed_spelling(self, redirect, safety_rules_path):
+        assert _verdict(f"chmod {redirect} 777 ./x", safety_rules_path) == (RiskLevel.HIGH, ("chmod_777",))
+
+    @pytest.mark.parametrize(
+        "redirect",
+        [
+            # bash consumes each of these too, but reading bash's subscript grammar did not
+            # converge, so any spelling outside the allowlist fails closed instead
             '{fd["0"]}<in',
-            "{fd[a[0]]}<in",  # brackets nest
-            '{fd["]"]}<in',  # a quoted `]` does not close it
-            "{fd[\\]]}<in",  # nor an escaped one
+            "{fd[a[0]]}<in",
+            '{fd["]"]}<in',
+            "{fd[\\]]}<in",
             "{fd[}]}<in",
-            # an expansion is skipped whole, as bash skips it: its `]` closes nothing
             "{fd[$(echo ])]}<in",
             "{fd[`echo ]`]}<in",
             "{fd[${x:-]}]}<in",
             "{fd[']']}<in",
             '{fd["\\""]}<in',
-            "{fd[$'\\'']}<in",  # `$'…'` honours backslash escapes
+            "{fd[$'\\'']}<in",
+            "{fd[$i]}<in",
+            # the panel's round-4 repros: each an untagged prefix before the allowlist
+            "{fd[\\$'\\']}>o",
+            "{fd['${']}>o",
+            "{fd[$${]}]}>o",
         ],
     )
-    def test_consumed_spelling(self, redirect, safety_rules_path):
-        assert _verdict(f"chmod {redirect} 777 ./x", safety_rules_path) == (RiskLevel.HIGH, ("chmod_777",))
+    def test_spelling_outside_the_allowlist_fails_closed(self, redirect, safety_rules_path):
+        assert _verdict(f"chmod {redirect} 777 ./x", safety_rules_path) == (RiskLevel.BLOCKED, ())
 
     @pytest.mark.parametrize(
         "command",
@@ -126,11 +140,6 @@ class TestLookalikesStayArguments:
             "a{fd}>out",  # not the whole word
             "{fd}&>out",  # `&>` takes no fd variable
             "{fd}&>>out",
-            '{f"d"}<in',  # a quote in the NAME makes an argument
-            '{"fd"}<in',
-            "{fd[]}<in",  # an empty subscript
-            "{fd[0][1]}<in",  # two subscripts
-            "{fd[0]]}<in",  # a stray `]`
             "{fd[0]]<in",  # no closing brace
             "{a\u00e9}<in",  # a non-ASCII name
             "{f$(echo)d}<in",  # an expansion in the NAME
@@ -142,6 +151,22 @@ class TestLookalikesStayArguments:
     def test_unclosed_quote_fails_closed(self, safety_rules_path):
         # bash rejects the whole line (the quote never closes); so does the parse
         assert _verdict('chmod {fd["0]}<in 777 ./x', safety_rules_path) == (RiskLevel.BLOCKED, ())
+
+    @pytest.mark.parametrize(
+        "redirect",
+        [
+            '{f"d"}<in',  # a quote in the NAME
+            '{"fd"}<in',
+            "{fd[]}<in",  # an empty subscript
+            "{fd[0][1]}<in",  # two subscripts
+            "{fd[0]]}<in",  # a stray `]`
+        ],
+    )
+    def test_brace_shaped_lookalike_fails_closed(self, redirect, safety_rules_path):
+        # bash passes these as arguments, but they start with `{` and sit against a
+        # redirect: outside the allowlist, so blocked rather than read. Over-blocking a
+        # malformed word is the safe direction.
+        assert _verdict(f"chmod {redirect} 777 ./x", safety_rules_path) == (RiskLevel.BLOCKED, ())
 
     @pytest.mark.parametrize(
         ("command", "expected"),
@@ -202,6 +227,8 @@ class TestEveryArgvViewSkipsThePrefix:
             ("x=$(git {fd}<in push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
             # $(…) base command: `{fd}` is not the command being run
             ("x=$({fd}<in git push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            # an apostrophe in a comment inside $(…) opens no quote
+            ("echo $(# don't\ngit {fd}<x push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
             # $(…) structure check: `kubectl get` is read-only, not "kubectl {fd}"
             ("x=$(kubectl {fd}<x get pods)", (RiskLevel.SAFE, ())),
             # pipe-to-shell stages (_get_command_name, _stage_args, _get_all_words)
@@ -240,7 +267,6 @@ class TestLineContinuationsFailClosed:
             "git {fd}\\\n<i push --force origin main",
             "x=$(git {f\\\nd}</dev/null push --force origin main)",
             "echo x\\\ny\\\n$(git {fd}<i push --force origin main)",
-            "echo x\\\ny\\\nz\\\n$(git {fd}<i push --force origin main)",
             "echo x\\\ny\\\n`git {fd}<i push --force origin main`",
             "echo x\\\ny\\\n$(y=$(git {fd}<i push --force origin main))",
             "echo 'a\\\nb'$(git {fd}<i push --force origin main)",
@@ -254,6 +280,9 @@ class TestLineContinuationsFailClosed:
             "git {fd}>\\\no push --force origin main",
             "chmod {fd}>\\\n/dev/null 777 /etc/passwd",
             "x=$(git {fd}>\\\no push --force origin main)",
+            "git {f\\\nd}>\\\n/dev/null push --force origin main",  # a continuation inside the folded word too
+            "git {fd}\\\n>\\\no push --force origin main",
+            "echo {a,b}>\\\no",  # bash brace-expands this one; failing closed over-blocks it
         ],
     )
     def test_blocked(self, command, safety_rules_path):
@@ -265,12 +294,9 @@ class TestLineContinuationsFailClosed:
             # continuations between words, and around a word with none, leave offsets raw
             ("echo \\\n\\\n$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
             ("x=1\\\ny\\\n git {fd}<i push --force origin main", (RiskLevel.HIGH, ("git_force_push",))),
-            ("echo $(# don't\ngit {fd}<x push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
             # a brace word that cannot be a prefix is never read, so it cannot fail closed
             ("n=$(# don't count\\\n awk '{n++} END {print n}'<&0)", (RiskLevel.SAFE, ())),
             ("x=$(awk \\\n '{print}' f)", (RiskLevel.SAFE, ())),
-            # a brace word folded with its operator is only suspect when it could be a prefix
-            ("echo {a,b}>\\\no", (RiskLevel.SAFE, ())),
         ],
     )
     def test_unaffected(self, command, expected, safety_rules_path):

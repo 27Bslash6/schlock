@@ -63,16 +63,16 @@
    - **Approved exception — recognising a `{varname}` redirect prefix.** bashlex splits
      `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
      argument, so `_mark_fd_variables` in `src/schlock/core/parser.py` tags that one word at
-     parse time and every argv view drops it (LAB-4599). It reads the word's RAW source span,
-     because bashlex's word has lost the quotes bash decides on: an unquoted ASCII name, then
-     an optional subscript read by `_subscript_closes_at_end` the way bash's
-     `valid_array_reference` reads it (nested brackets, quoted runs incl. `$'…'`, escapes),
-     with every `$(…)`/`${…}`/backquote bashlex located in the word blanked first. It holds
-     only while: the word ends where the redirect starts; every spelling it accepts or
-     rejects was decided by running real bash first; and **any backslash-newline in the
-     candidate's enclosing top-level word raises `ParseError`**, because bashlex's offsets
-     there follow neither bash nor themselves. Leaving a real prefix untagged is the bypass,
-     so an uncertain reading must raise, never fall back to "argument".
+     parse time and every argv view drops it (LAB-4599). It decides only what it can know for
+     certain, from the word's RAW source span (bashlex's word has lost its quotes): a word glued
+     to a redirect is **tagged** only if the raw span fully matches `_FD_VARIABLE_ALLOWED_RE`
+     (`{name}` or `{name[sub]}`, `sub` only name/digit characters) and no backslash-newline
+     sits in its enclosing top-level word; it stays an **argument** if the raw span starts with
+     anything but `{`; **every other brace-shaped spelling raises `ParseError`**, as does a
+     top-level `{`-word with `}` then `<`/`>` in it (bashlex folded the operator in). Do not
+     widen the allowlist by modelling bash's subscript grammar: four review rounds of that
+     never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
+     must raise, never fall back to "argument". Every spelling is decided by real bash first.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.

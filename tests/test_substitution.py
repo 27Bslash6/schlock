@@ -1407,8 +1407,8 @@ class TestCommandNameSkipsFdVariablePrefix:
     @pytest.mark.parametrize(
         ("command", "brace", "variable"),
         [
-            ("{fd[1,2]}<x date", False, False),
-            ("{fd[$i]}<x date", False, False),
+            ("{fd[0]}<x date", False, False),
+            ("{fd[ab_1]}<x date", False, False),
             ("3<x date", False, False),
             ("{r,}m {fd}<x -rf /", True, False),
             ("$CMD {fd}<x", False, True),
@@ -1427,14 +1427,21 @@ class TestCommandNameSkipsFdVariablePrefix:
         assert validator._find_outer_command(parser.parse(command), None) == expected
 
     @pytest.mark.usefixtures("no_shellcheck")
-    @pytest.mark.parametrize("prefix", ["{fd[1,2]}<x", "{fd[$i]}<x", "3<x"])
+    @pytest.mark.parametrize("prefix", ["{fd}<x", "{fd[0]}<x", "3<x"])
     def test_denial_names_no_phantom_pattern(self, prefix):
-        """The subscript's `,` and `$i` read as brace expansion / a variable command name."""
         result = validate_command(f"echo $({prefix} date)")
         assert (result.risk_level, result.message) == (
             RiskLevel.BLOCKED,
             "BLOCKED: Cannot determine command in substitution",
         )
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize("prefix", ["{fd[1,2]}<x", "{fd[$i]}<x"])
+    def test_exotic_subscript_fails_closed(self, prefix):
+        """A subscript outside the allowlist is never read (LAB-4599): the parse refuses it."""
+        result = validate_command(f"echo $({prefix} date)")
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "Cannot read the `{varname}` redirect prefix" in result.message
 
 
 class TestNestedSubstitutionValidation:
