@@ -2019,6 +2019,32 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     return bodies
 
 
+# A backslash-newline inside a heredoc or here-string operator, or in front of or inside its
+# delimiter word. bash deletes an unquoted backslash-newline before it tokenizes, so every
+# one of these is joined first: `cat <\` then `<EOF` is `cat <<EOF`, `cat q <\` then
+# `<<'B' r` is the here-string `<<<'B' r`, `cat <<\` then `-EOF` is `<<-EOF`, and
+# `cat <<E\` then `OF`, or `cat << \` then `X`, open a heredoc ended by `EOF` or `X`. The
+# opener scan, and the `<<` test in front of it, read the text as written, one physical line
+# at a time: they find no opener in the first spelling, misread the second as a quoted
+# heredoc that blanks the command after it, and read the others with the wrong operator
+# or delimiter.
+# ShellCheck cannot parse the join at all. bashlex alone reads it as bash does, and one
+# reader is not enough to vouch.
+#
+# The second branch starts only at a `<<` that no `<` precedes, so a here-string continued
+# before its word (`cat <<<\` then `-x`) is not taken for a heredoc. Its delimiter run stops
+# at whitespace and operators, so an opener whose line continues after the word stays with
+# the normaliser's own continued-line refusal.
+#
+# Matched on raw text on purpose: the join is made before tokenizing, so this is the level
+# bash itself acts at. Where bash would NOT join - single quotes, a comment, a quoted
+# heredoc body - this refuses anyway, and a benign heredoc refused this way stays refused:
+# `cat <\` then `<EOF` then `hello` then `EOF`, and `cat <<X\` then `Y` then `hello` then
+# `XY`. That is a false positive, never a miss, and it matches the refusal of a continued
+# opener. Neither is pinned, so a later change that reads the join can allow them.
+_HEREDOC_OPERATOR_CONTINUATION_RE = re.compile(r"<(?:\\\n)+<|(?<!<)<<-?[ \t]*[^\s;&|()<>]*\\\n")
+
+
 class _Normalised(NamedTuple):
     """What `_normalise_heredoc_delimiters` hands back, beyond the rewritten text."""
 
@@ -2719,6 +2745,19 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             return special_check
 
         # Step 4: Parse command and extract AST context
+        if _HEREDOC_OPERATOR_CONTINUATION_RE.search(command):
+            # Before the normaliser, whose `<<` test cannot see this join (see the pattern).
+            error = "a backslash-newline inside a heredoc or here-string operator or its delimiter is joined by bash"
+            return ValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"BLOCKED: Cannot determine what this redirection reads: {error}",
+                alternatives=["Write the `<<`, `<<-` or `<<<` operator and its delimiter on one line"],
+                exit_code=1,
+                error=error,
+            )
+            # Not cached: a parse-level refusal, like the parse errors below.
+
         parser = _get_parser()
         # bashlex ends a heredoc at the delimiter as written, bash at the delimiter with
         # its quotes removed. Reconciling the two before parsing is what keeps a quoted

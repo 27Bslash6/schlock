@@ -3423,6 +3423,125 @@ class TestADelimiterBashlexWouldMisread:
         assert "ANSI-C escape" in (result.error or "")
 
 
+class TestARedirectionOperatorSplitByAContinuation:
+    """A backslash-newline inside a heredoc or here-string operator, or its delimiter word.
+
+    bash deletes an unquoted backslash-newline before it tokenizes, so `cat <\\` followed by
+    `<EOF` is `cat <<EOF`, `cat q <\\` followed by `<<'B' r` is the here-string
+    `cat q <<<'B' r`, `cat <<\\` followed by `-EOF` is `cat <<-EOF`, and `cat <<E\\` or
+    `cat << \\` followed by `OF` or `X` opens a heredoc ended by `EOF` or `X`. Neither the
+    `<<` presence test nor the opener scan sees that join: they read the text as written,
+    line by line. ShellCheck cannot read it either (SC1073, a parse error, which carries no
+    security verdict).
+
+    What bash does with each row was established under bash 5.3 in a temp dir, with
+    `touch` standing in for `rm -rf /` and an existence check on the file afterwards:
+
+    - every heredoc row: the body is expanded, so the substitution runs;
+    - command-after-terminator: the line after `EOF` runs;
+    - here-string, here-string-from-a-heredoc-operator: the join makes `<<<`, so the line
+      after the opener runs as a command.
+
+    command-after-terminator and here-string-from-a-heredoc-operator are regression pins:
+    they are denied with this check removed too, so they guard the verdict, not the check.
+
+    Rows pin the verdict, not a message, so a later change that reads the joined operator
+    instead of refusing it keeps them.
+    """
+
+    @pytest.fixture(
+        params=[
+            "off",
+            pytest.param("on", marks=pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")),
+        ]
+    )
+    def shellcheck(self, request, monkeypatch):
+        if request.param == "off":
+            monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        clear_caches()
+        yield
+        clear_caches()
+
+    HERE_STRING = "cat q <\\\n<<'B' r\nrm -rf /\nB"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <\\\n<EOF\n$(rm -rf /)\nEOF",
+            "cat <\\\n\\\n<EOF\n$(rm -rf /)\nEOF",
+            "cat <\\\n<-EOF\n$(rm -rf /)\n\tEOF",
+            "cat <\\\n<EOF\nx\nEOF\nrm -rf /",
+            HERE_STRING,
+            "cat <<\\\n<EOF\n$(rm -rf /)\nEOF",
+            "cat <<\\\n-EOF\n$(rm -rf /)\n\tEOF",
+            "cat <<E\\\nOF\n$(rm -rf /)\nEOF",
+            "cat << \\\nX\n$(rm -rf /)\nX",
+            "cat <<\t\\\nX\n$(rm -rf /)\nX",
+            "cat <<- \\\nX\n$(rm -rf /)\n\tX",
+            "cat <<A <<B\\\nC\nx\nA\n$(rm -rf /)\nBC",
+        ],
+        ids=[
+            "heredoc",
+            "two-continuations",
+            "tab-stripping",
+            "command-after-terminator",
+            "here-string",
+            "here-string-from-a-heredoc-operator",
+            "dash-split-from-its-operator",
+            "delimiter-split",
+            "space-before-a-continued-delimiter",
+            "tab-before-a-continued-delimiter",
+            "space-after-dash-before-a-continued-delimiter",
+            "second-heredoc-on-the-line",
+        ],
+    )
+    @pytest.mark.usefixtures("shellcheck")
+    def test_a_split_operator_is_denied(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.usefixtures("shellcheck")
+    def test_the_here_string_is_denied_without_the_body_that_denied_it_by_accident(self, safety_rules_path, monkeypatch):
+        """The here-string row was BLOCKED before this check existed, for the wrong reason.
+
+        The opener scan reads `<<'B'` on the second line as a quoted heredoc and blanks the
+        `rm` line as its body. It is then refused only because `_shell_heredoc_bodies` hands
+        that ownerless body back to be validated as a program ("Shell-delegated payload").
+        With that path emptied the command is SAFE unless something reads the join.
+        """
+        monkeypatch.setattr(val_module, "_shell_heredoc_bodies", lambda *_: [])
+
+        result = validate_command(self.HERE_STRING, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        ["cat <\\\nfile", "cat <\\\\\n<file", "cat <<<\\\n-x", "cat <<< \\\nx"],
+        ids=[
+            "continued-onto-a-word",
+            "escaped-backslash-is-no-continuation",
+            "here-string-continued-before-its-word",
+            "here-string-continued-after-a-space",
+        ],
+    )
+    @pytest.mark.usefixtures("shellcheck")
+    def test_a_continuation_that_forms_no_heredoc_operator_keeps_its_verdict(self, safety_rules_path, command):
+        """None of these joins into a heredoc operator, so each keeps main's SAFE verdict.
+
+        Real bash reads them as `cat <file`, as `cat <\\` followed by `<file`, and as the
+        here-strings `cat <<<-x` and `cat <<< x`. No `<` may precede the `<<` the pattern
+        starts at, which is what keeps the here-strings from reading as a heredoc.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+        assert result.risk_level == RiskLevel.SAFE
+
+
 @pytest.mark.usefixtures("no_shellcheck")
 class TestBashlexHeredocsAreLocatedByTheirOpener:
     """One walk of bashlex's heredocs, located by where each `<<` sits."""
