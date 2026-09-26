@@ -49,9 +49,14 @@ needs_binary = pytest.mark.skipif(
 
 
 def _fake_binary(tmp_path, body):
-    """Write an executable stand-in for schlock-parse that runs `body`."""
+    """Write an executable stand-in for schlock-parse that runs `body`.
+
+    Like the real CLI, the stand-in reads stdin to EOF before anything else, and
+    `body` sees it as `data`. A stand-in that exits without reading would let the
+    bridge's stdin write hit a closed pipe whenever the test process is slow.
+    """
     script = tmp_path / "fake-schlock-parse"
-    script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+    script.write_text("#!/usr/bin/env python3\nimport sys\ndata = sys.stdin.read()\n" + body, encoding="utf-8")
     script.chmod(0o755)
     return script
 
@@ -136,7 +141,7 @@ class TestExitContract:
             NativeBridge(binary_path=binary).parse_json("if; then")
 
     def test_command_reaches_the_binary_on_stdin(self, tmp_path):
-        binary = _fake_binary(tmp_path, "sys.stdout.write(sys.stdin.read())\n")
+        binary = _fake_binary(tmp_path, "sys.stdout.write(data)\n")
         assert NativeBridge(binary_path=binary).parse_json("echo unique-marker") == "echo unique-marker"
 
 
