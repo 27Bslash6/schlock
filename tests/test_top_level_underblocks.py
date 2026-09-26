@@ -125,6 +125,23 @@ class TestTopLevelAwkCommandPipe:
             "/usr/bin/awk '{print | c}' f",
             'awk \'/"/ {print 1 | c; x = "a"}\' f',  # quote in a regex must not pair with a later one
             "awk '{print ($1+$2)/2 | c}' f",  # division, not a regex literal hiding the pipe
+            # awks disagree on `/` after postfix ++/--: gawk and busybox divide, mawk and nawk read
+            # a regex. Each spelling hides the pipe from one reading, so neither may be assumed.
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = x++ / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = x-- / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = x++ /\"/; print 1 | c}' 'rm -rf /'",
+            # `case` is gawk's switch keyword (a regex follows) and a plain variable elsewhere
+            "awk 'BEGIN{c=ARGV[1]; case=4; y = case / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            "gawk 'BEGIN{c=ARGV[1]; switch (\"\\\"\") { case /\"/: print 1 | c }}' 'rm -rf /'",
+            # `and` is a plain variable in mawk and nawk, so a `/` after it divides
+            "awk 'BEGIN{c=ARGV[1]; and=4; y = and / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            # the `)` closing an if/while/for condition ends no value: the `/` opens a regex
+            "awk 'BEGIN{c=ARGV[1]; if (1) /\"/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; while (0) /\"/; print 1 | c}' 'rm -rf /'",
+            # a newline ends the statement, so a `/` starting the next line opens a regex
+            "awk 'BEGIN{c=ARGV[1]; x = 1\n/\"/; print 1 | c}' 'rm -rf /'",
+            # a comment ends at its newline even after a trailing backslash
+            "awk 'BEGIN{c=ARGV[1] # x \\\n; print 1 | c}' 'rm -rf /'",
         ],
     )
     def test_command_pipe_blocks(self, command):
@@ -145,6 +162,8 @@ class TestTopLevelAwkCommandPipe:
             "awk '{while ((getline l < \"f\") > 0) print l}' f",  # getline from a file
             "awk '{print $1} # x|y' f",  # a pipe inside a comment, not code (panel FP)
             "awk '{print $1 \"|\" $2}' f",  # a pipe inside a string literal
+            "awk '{n++} /a|b/ {print}' f",  # only a `/` directly after ++ is ambiguous
+            "awk 'NR == 1\n/a|b/ {print}' f",  # a regex pattern opening the second line
         ],
     )
     def test_non_exec_awk_not_blocked(self, command):
@@ -154,9 +173,9 @@ class TestTopLevelAwkCommandPipe:
         """The command-pipe check must not change the existing system() rating (HIGH, ask)."""
         assert validate_command("awk 'BEGIN{system(\"id\")}'").risk_level == RiskLevel.HIGH
 
-    def test_scanner_folds_line_continuation(self):
-        # awk joins `\<newline>`; the scanner must too, or a continued division/string hides |.
-        # The `\\\n` here is a literal backslash then a newline, matching the shell payload.
+    def test_scanner_continues_past_backslash_newline(self):
+        # awk reads `\<newline>` as a blank in code and continues a string over it; a scanner that
+        # ended the statement there would hide |. `\\\n` is a literal backslash then a newline.
         assert awk_command_pipe(["awk", "BEGIN{x = 4 \\\n/ 2; print 1 | c}"]) is not None
         assert awk_command_pipe(["awk", 'BEGIN{x = "a\\\nb"; print 1 | c}']) is not None
 

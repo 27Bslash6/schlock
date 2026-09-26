@@ -617,17 +617,27 @@ _AWK_LONE_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # Every awk command pipe touches one of these keywords, so a stripped program without one is not a
 # pipe to a command (`-F|`, `OFS=|`, a bare `a|b` in data).
 _AWK_PIPE_KEYWORD = re.compile(r"\b(?:printf?|getline)\b")
-# Words after which `/` is division, not the start of a regex literal. awk's own lexer rule: a `/`
-# following a value (name, number, string, `)`, `]`) divides; anywhere else it opens a regex. Only
-# the statement keywords need listing — an unlisted name is treated as a value, which at worst
-# leaves a regex `|` in place and over-blocks, never strips real code. See LAB-4832.
-_AWK_STMT_KEYWORDS = frozenset(
-    {
-        "print", "printf", "getline", "return", "if", "else", "while", "for", "do",
-        "delete", "next", "nextfile", "exit", "in", "case", "function", "func",
-        "BEGIN", "END", "and", "or", "not",
-    }
-)  # fmt: skip
+# awk's lexer rule for `/`: after a value (name, number, string, regex, `)`, `]`) it divides;
+# anywhere else it opens a regex literal. _awk_strip_literals tracks which the last token left.
+# _AWK_EITHER marks a `/` the awks disagree on: after postfix `x++`/`x--` gawk and busybox divide
+# while mawk and nawk open a regex; after `case` gawk opens one (switch) while the others take
+# `case` for a variable. LAB-4832.
+_AWK_VALUE, _AWK_OPERAND, _AWK_HEADER, _AWK_EITHER = "value", "operand", "header", "either"
+# What a word leaves; any other name or number is a value. A word marked OPERAND that some awk takes
+# for a variable strips real code, so only words that are keywords in gawk, mawk, nawk and busybox
+# alike (`and`, `or`, `not`, `func` are variables in some). The `)` closing an if/while/for
+# condition (HEADER) ends no value, so a `/` after it opens a regex.
+_AWK_WORD_STATE = {
+    **dict.fromkeys(
+        (
+            "print", "printf", "getline", "return", "else", "do", "delete", "next", "nextfile",
+            "exit", "in", "function", "BEGIN", "END",
+        ),
+        _AWK_OPERAND,
+    ),
+    **dict.fromkeys(("if", "while", "for"), _AWK_HEADER),
+    "case": _AWK_EITHER,
+}  # fmt: skip
 
 
 def _awk_skip_regex(prog: str, i: int) -> int:
@@ -651,47 +661,71 @@ def _awk_skip_regex(prog: str, i: int) -> int:
     return n + 1
 
 
+def _awk_skip_string(prog: str, i: int) -> int:
+    """Return the index just past a `"string"` literal that opens at prog[i] == '"'.
+
+    Runs to the next unescaped `"` or the line's end. A `\\`-escape covers the next char, so a
+    `\\<newline>` continues the string onto the next line, as it does in awk.
+    """
+    n = i + 1
+    end = len(prog)
+    while n < end and prog[n] not in ('"', "\n"):
+        n += 2 if prog[n] == "\\" else 1
+    return n + 1
+
+
 def _awk_strip_literals(prog: str) -> str:
     """Replace awk string, regex, and comment content with inert placeholders, leaving code.
 
     A single regex cannot do this: a `"` inside `/re/` is not a string and a `/` inside `"str"` is
     not a regex, so the two forms must be tracked left to right with the same state awk's lexer
-    keeps. Line continuations are folded first (awk joins `\\<newline>` in both code and strings).
-    One pass, each char consumed once -> linear, no catastrophic backtracking.
+    keeps. Where awks disagree on a `/`, the rest of the program is kept as written: a real pipe
+    can then be over-read, never hidden. Each char consumed once -> linear, no backtracking.
     """
-    prog = prog.replace("\\\n", "")
     out: list[str] = []
     i, n = 0, len(prog)
-    prev_is_value = False  # was the last significant token a value? decides `/` = divide vs regex
+    prev = _AWK_OPERAND  # what the last significant token left: decides `/` = divide vs regex
+    headers: list[bool] = []  # one per open `(`: does it hold an if/while/for condition?
     while i < n:
         c = prog[i]
-        if c == '"':  # string literal — runs to the next unescaped quote or newline
-            i += 1
-            while i < n and prog[i] not in ('"', "\n"):
-                i += 2 if prog[i] == "\\" else 1
-            i += 1
+        if c == '"':  # string literal
+            i = _awk_skip_string(prog, i)
             out.append('""')
-            prev_is_value = True
-        elif c == "#":  # comment — to end of line
-            while i < n and prog[i] != "\n":
-                i += 1
-        elif c == "/" and not prev_is_value:  # regex literal (operand position)
+            prev = _AWK_VALUE
+        elif c == "#":  # comment — to end of line; a trailing `\` does not continue it
+            eol = prog.find("\n", i)
+            i = eol if eol >= 0 else n
+        elif c == "/" and prev == _AWK_EITHER:
+            out.append(prog[i:])
+            break
+        elif c == "/" and prev != _AWK_VALUE:  # regex literal (operand position)
             i = _awk_skip_regex(prog, i)
             out.append("//")
-            prev_is_value = True
+            prev = _AWK_VALUE
         elif c.isalnum() or c == "_":  # name or number
             j = i
             while i < n and (prog[i].isalnum() or prog[i] == "_"):
                 i += 1
             word = prog[j:i]
             out.append(word)
-            prev_is_value = word not in _AWK_STMT_KEYWORDS
-        elif c.isspace():  # whitespace is not a token: leave prev_is_value as it was
+            prev = _AWK_WORD_STATE.get(word, _AWK_VALUE)
+        elif c == "\n":  # ends the statement: a `/` opening the next line starts a regex
             out.append(c)
+            prev = _AWK_OPERAND
             i += 1
+        elif c.isspace() or prog.startswith("\\\n", i):  # a blank or `\<newline>`: not a token
+            out.append(" ")
+            i += 2 if c == "\\" else 1
+        elif prog.startswith(("++", "--"), i):
+            out.append(prog[i : i + 2])
+            prev = _AWK_EITHER
+            i += 2
         else:
+            if c == "(":
+                headers.append(prev == _AWK_HEADER)
+            closes_header = c == ")" and bool(headers) and headers.pop()
             out.append(c)
-            prev_is_value = c in ")]"  # a value follows `)`/`]`; any other punctuation resets
+            prev = _AWK_VALUE if c in ")]" and not closes_header else _AWK_OPERAND
             i += 1
     return "".join(out)
 
