@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner
+from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner, reset_parse_budget
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -2592,6 +2592,10 @@ def validate_command(
     ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
     :func:`_validate_command`.
     """
+    if _depth == 0 and not _derived:
+        # A new command gets a fresh parse budget; re-entries for its payloads and heredoc
+        # rewrites share the one it is spending (LAB-5659).
+        reset_parse_budget()
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
         command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
@@ -2786,7 +2790,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # Validate command/process substitution using AST-based analysis
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
-            sub_results = sub_validator.validate_all_substitutions(ast)
+            # `parse_target`, not `command`: the heredoc walk slices bodies by positions from
+            # `ast`, and a quoted body is blanked only in `parse_target`. Handed `command`, it
+            # read back the literal body bash never expands and denied it (LAB-2756).
+            sub_results = sub_validator.validate_all_substitutions(ast, command=parse_target)
 
             # Worst verdict wins, and the join is NOT made here. Returning a denial from this
             # point skips every pass below it — the AST dangerous-flag pass (the only thing that
