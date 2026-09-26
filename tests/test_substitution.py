@@ -1986,6 +1986,19 @@ class TestPeeledGroupReadRedirects:
             ('x=$(ls; ( cat ) < "$(bash)")', 'x=$(ls; cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # list segment
             ('x=$( ( cat ) < "$(bash)" | cat )', 'x=$(cat < "$(bash)" | cat)', RiskLevel.BLOCKED, "bash"),  # pipeline
             ('cat <( ( cat ) < "$(bash)" )', 'cat <(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # process subst
+            # A list or pipeline BODY is validated segment by segment, and the group's redirect
+            # belongs to no segment, so it is judged on its own.
+            ('x=$( ( cat | cat ) < "$(bash)" )', 'x=$(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( { cat; ls; } < "$(bash)" )', 'x=$(cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( cat && ls ) < "$(bash)" )', 'x=$(cat < "$(bash)" && ls)', RiskLevel.BLOCKED, "bash"),
+            (
+                'x=$( ( cat | cat ) <<< "$(./payload.sh)" )',
+                'x=$(cat | cat <<< "$(./payload.sh)")',
+                RiskLevel.HIGH,
+                "./payload.sh",
+            ),
+            ('x=$(ls; ( cat; ls ) < "$(bash)")', 'x=$(ls; cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('cat <( ( cat | cat ) < "$(bash)" )', 'cat <(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
         ],
     )
     def test_grouped_read_redirect_matches_ungrouped_twin(self, grouped, twin, level, target):
@@ -2003,7 +2016,10 @@ class TestPeeledGroupReadRedirects:
             "x=$( ( cat ) < file )",
             "x=$( { cat; } < file )",
             'x=$( ( cat ) < "$(echo hi)" )',
-            'x=$(cat < "$(echo hi)")',
+            'x=$(cat < "$(echo hi)")',  # ungrouped reference
+            'x=$( ( cat | cat ) < "$(echo hi)" )',
+            "x=$( ( cat; ls ) < file )",
+            'x=$( ( cat | wc -l ) < "$(date)" )',
         ],
     )
     def test_benign_grouped_reads_stay_safe(self, command):
