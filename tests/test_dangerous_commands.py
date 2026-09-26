@@ -581,6 +581,15 @@ class TestP0FileTruncation:
             # `true 2>  ;`, and only a target that may be a blank reaches it.
             "\"true\" 2> ' ;'",
             "'true' > ' |'",
+            # A quoted target of blanks then `/dev/null` names a file under a directory called
+            # " ", not the null device. Reconstructed it reads as the discard `true >  /dev/null`,
+            # so the raw text has to catch it: a quoted producer word, and `>|`, both count.
+            "\"true\" 2> ' /dev/null'",
+            "'true' > ' /dev/null'",
+            "':' > ' /dev/null'",
+            "'echo' -n > ' /dev/null'",
+            "true >| ' /dev/null'",
+            "printf '' >| f",
         ],
     )
     def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
@@ -607,6 +616,8 @@ class TestP0FileTruncation:
             "true 2>  /dev/null",
             "echo -n 2>  /dev/null",
             "printf '' 2>\t /dev/null",
+            "'true' > /dev/null",
+            "true >| /dev/null",
             # Appending is not truncating.
             "true >> ~/.aws/credentials",
             "true 2>> ~/.aws/credentials",
