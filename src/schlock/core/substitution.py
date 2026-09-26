@@ -456,6 +456,29 @@ _DANGEROUS_GIT_CONFIGS = frozenset(
 )
 
 
+def _git_exec_entry(key: str) -> str | None:
+    """Return the `_DANGEROUS_GIT_CONFIGS` entry git config `key` names, else None.
+
+    git's key grammar is `<section>[.<subsection>].<name>`: section and name are case-insensitive,
+    and the subsection is free text that may itself hold dots (`credential.https://github.com.helper`,
+    `gpg.ssh.program`). So an entry matches on its section and final segment, whatever sits
+    between. That deliberately over-approximates: git ignores a subsection on `core.pager`, and
+    matching it anyway costs a false positive on a key nobody writes, where a per-section list of
+    which keys take subsections would cost a bypass each time it fell behind git. `alias.` is a
+    prefix entry: every `alias.<name>`.
+    """
+    key = key.lower()
+    for entry in _DANGEROUS_GIT_CONFIGS:
+        if entry.endswith("."):
+            if key.startswith(entry):
+                return entry
+            continue
+        section, _, name = entry.partition(".")
+        if key.startswith(f"{section}.") and key.rsplit(".", 1)[-1] == name:
+            return entry
+    return None
+
+
 def dangerous_git_config(args: list[str]) -> str | None:
     """Return a reason string if `args` (a git command's word-args) sets a -c config that
     executes arbitrary commands, else None. Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
@@ -471,23 +494,22 @@ def dangerous_git_config(args: list[str]) -> str | None:
             config_val = arg[2:]
         if not config_val:
             continue
-        config_lower = config_val.lower()
-        for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
-            if config_lower.startswith(dangerous_prefix):
-                if dangerous_prefix == "alias.":
-                    # git runs an alias as a shell command only when its VALUE starts with '!'
-                    # (alias.<name>=!cmd). A '!' elsewhere is a normal git-subcommand alias.
-                    _, _, alias_value = config_val.partition("=")
-                    if not alias_value.lstrip().startswith("!"):
-                        continue
-                else:
-                    # A boolean value selects a built-in and names no executable
-                    # (e.g. core.fsmonitor=true); only a path/command value is RCE. A bare
-                    # `-c key` (no =VALUE) is key=true to git -> also benign. See #97.
-                    _, _, value = config_val.partition("=")
-                    if _is_git_boolean(value):
-                        continue
-                return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
+        # git splits `-c` at the FIRST `=`, so a subsection cannot hold one here.
+        key, _, value = config_val.partition("=")
+        entry = _git_exec_entry(key)
+        if entry is None:
+            continue
+        if entry == "alias.":
+            # git runs an alias as a shell command only when its VALUE starts with '!'
+            # (alias.<name>=!cmd). A '!' elsewhere is a normal git-subcommand alias.
+            if not value.lstrip().startswith("!"):
+                continue
+        elif _is_git_boolean(value):
+            # A boolean value selects a built-in and names no executable
+            # (e.g. core.fsmonitor=true); only a path/command value is RCE. A bare
+            # `-c key` (no =VALUE) is key=true to git -> also benign. See #97.
+            continue
+        return f"git config {entry.rstrip('.')} executes commands via -c flag"
     return None
 
 
@@ -514,15 +536,15 @@ _GIT_CONFIG_READ_FLAGS = frozenset(
 )
 
 
-def git_config_exec_payload(args: list[str]) -> str | None:
-    """Return the command string a `git config` WRITE arms for later execution, else None.
+def git_config_exec_payloads(args: list[str]) -> list[str]:
+    """Return every command string a `git config` WRITE arms for later execution.
 
     `git -c core.pager=CMD log` runs CMD once; `git config core.pager CMD` PERSISTS it and runs it
     on every later git invocation in that repo or for that user, outliving the session that wrote
     it. `dangerous_git_config` above guards the injected form; this is its persisted twin, over the
     same `_DANGEROUS_GIT_CONFIGS` key set.
 
-    Returns the payload rather than a verdict, so each caller judges it with the machinery it
+    Returns payloads rather than a verdict, so each caller judges them with the machinery it
     already has. That is what keeps `git config --global core.editor vim` SAFE — the payload `vim`
     is a safe command — while `core.pager 'rm -rf /'` inherits `rm -rf /`'s verdict. The key alone
     cannot decide it: setting an editor or a pager is an everyday command, and only the VALUE says
@@ -537,7 +559,7 @@ def git_config_exec_payload(args: list[str]) -> str | None:
     exactly like `git commit`.
     """
     if "config" not in args:
-        return None
+        return []
     # Scan from the `config` token rather than assuming a position: git's own global options
     # (`git -C dir`, `git -c k=v`, `git --no-pager`) displace the subcommand. A stray `config`
     # elsewhere costs nothing — a payload is only returned when a dangerous KEY and a VALUE follow.
@@ -555,24 +577,31 @@ def git_config_exec_payload(args: list[str]) -> str | None:
             continue
         positionals.append((arg, reads_seen))
 
+    # EVERY key-shaped positional is scanned, not just the first. An option operand can be spelled
+    # like an exec key (`--file core.x.editor`, `--comment alias.x`), and stopping at it would hand
+    # back the real key's NAME as the payload and never reach the real value. Judging a decoy's
+    # "payload" too is harmless over-approximation; stopping early is a bypass.
+    payloads = []
     for i, (key, reads_before_key) in enumerate(positionals[:-1]):
         if reads_before_key:
             continue  # a read's <name> <value-pattern> pair, not a write
-        key_lower = key.lower()
-        for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
-            if not key_lower.startswith(dangerous_prefix):
-                continue
-            value = positionals[i + 1][0]
-            if dangerous_prefix == "alias.":
-                # Same refinement as the -c form: git runs an alias as a shell command only when
-                # its value starts with '!'. `alias.st status` is an ordinary git-subcommand alias.
-                stripped = value.lstrip()
-                if not stripped.startswith("!"):
-                    return None
-                return stripped[1:].strip() or None
+        entry = _git_exec_entry(key)
+        if entry is None:
+            continue
+        value = positionals[i + 1][0]
+        stripped = value.lstrip()
+        if stripped.startswith("!") and entry in ("alias.", "credential.helper"):
+            # Both run a `!` value as a shell command (gitcredentials(7) for the helper).
+            payloads.append(stripped[1:].strip())
+        elif entry == "alias.":
+            # Same refinement as the -c form: `alias.st status` is a git-subcommand alias and
+            # arms nothing. A helper without `!` is not exempt: it still runs a program (the path,
+            # or `git credential-<value>`), so it falls through to the raw value.
+            continue
+        elif not _is_git_boolean(value):
             # A boolean value selects a built-in and names no executable (core.fsmonitor=true).
-            return None if _is_git_boolean(value) else value
-    return None
+            payloads.append(value)
+    return [p for p in payloads if p]
 
 
 # find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir) or delete files (-delete).
@@ -1589,16 +1618,16 @@ class SubstitutionValidator:
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
-        payload = git_config_exec_payload(args)
-        if not payload or self.rule_engine is None:
+        if self.rule_engine is None:
             return None
-        try:
-            literals = self.parser.extract_string_literals(payload, self.parser.parse(payload))
-        except Exception:  # noqa: BLE001 - unparseable payload: judge it with nothing suppressed
-            literals = []
-        match = self.rule_engine.match_command(payload, string_literals=literals)
-        if match and match.matched and self._amplify_risk(match.risk_level) in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-            return f"git config persists an executable value: {match.message}"
+        for payload in git_config_exec_payloads(args):
+            try:
+                literals = self.parser.extract_string_literals(payload, self.parser.parse(payload))
+            except Exception:  # noqa: BLE001 - unparseable payload: judge it with nothing suppressed
+                literals = []
+            match = self.rule_engine.match_command(payload, string_literals=literals)
+            if match and match.matched and self._amplify_risk(match.risk_level) in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+                return f"git config persists an executable value: {match.message}"
         return None
 
     def _has_dangerous_inner_structure(  # noqa: PLR0911, PLR0912, PLR0915
