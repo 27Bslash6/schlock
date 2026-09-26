@@ -22,7 +22,6 @@ are pinned here so the idea cannot come back unmeasured.
 """
 
 import time
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -42,21 +41,6 @@ def _no_shellcheck(monkeypatch):
     clear_caches()
     yield
     clear_caches()
-
-
-@pytest.fixture
-def clean_worktree():
-    """Report a clean tree to the hard-reset guard.
-
-    That guard (validator.py) shells out to `git status --porcelain` and escalates
-    to BLOCKED on a dirty tree, which would mask the rule-driven verdict these
-    tests are about. It is unchanged by this ticket and keyed on cwd.
-    """
-    result = MagicMock()
-    result.returncode = 0
-    result.stdout = ""
-    with patch("subprocess.run", return_value=result):
-        yield
 
 
 def verdict(command, rules_dir_path):
