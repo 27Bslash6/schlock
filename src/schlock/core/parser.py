@@ -410,8 +410,9 @@ def has_compound_redirects(ast_nodes: list[Any]) -> bool:
     compound into its `.list`, so the redirection belongs to none of the resulting
     segments (LAB-2760). The multi-segment branch uses this to decide whether it
     needs a whole-command pass at all - running that pass unconditionally is an
-    over-block, because a process-substitution word carries its heredoc body
-    VERBATIM into the reconstruction where no heredoc range suppresses it.
+    over-block, because a command-substitution word carries its heredoc body
+    VERBATIM into the reconstruction, where only `_reconstruct`'s own suppression
+    keeps an inert body away from the rules.
     """
 
     def visit(node) -> bool:
@@ -1272,12 +1273,13 @@ class BashCommandParser:
     def _reconstruct(self, command: str, ast_nodes: list[Any], *, include_redirects: bool) -> tuple[str, list[tuple]]:
         """Shared body of the two reconstruction passes."""
         words = self._collect_words(ast_nodes, include_redirects=include_redirects, command=command)
-        # A process-substitution word carries its heredoc body VERBATIM (`<(cat <<EOF
+        # A command-substitution word carries its heredoc body VERBATIM (`$(cat <<EOF
         # … EOF)` is one word spanning the body), so the body reaches the
         # reconstruction where no heredoc range suppresses it - the original-form pass
-        # gets `heredoc_ranges`, this one never did. Suppress it here, or a compound
-        # redirect such as `{ diff /dev/null <(cat <<EOF … EOF); } > out.txt` scores
-        # text that `cat` merely prints as an executed command.
+        # gets `heredoc_ranges`, this one never did. Suppress an inert one here, or the
+        # whole-command pass scores text that `cat` merely prints as an executed
+        # command. A body inside `<( … )` is never inert (`extract_heredoc_ranges`):
+        # whatever reads the substitution may run it.
         #
         # SECURITY: suppress the BODY, never the word that carries it, and only in the
         # word that actually OWNS it. Two separate mistakes were made here, each found
@@ -1398,9 +1400,13 @@ class BashCommandParser:
         """
         heredoc_ranges = []
 
-        def visit(node, parent_cmd=None):
+        def visit(node, parent_cmd=None, in_process=False):
             """Recursively visit AST nodes to find heredocs."""
             if hasattr(node, "kind"):
+                # A heredoc inside `<( … )` is code whatever runs it: the reader of the
+                # substitution may execute what it prints (`bash <(cat <<EOF … )`), and
+                # nothing here knows the reader. Same rule as `_bashlex_heredocs`.
+                in_process = in_process or node.kind == "processsubstitution"
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
@@ -1411,7 +1417,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
+                        is_shell = in_process or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -1420,9 +1426,9 @@ class BashCommandParser:
                         child = getattr(node, attr)
                         if isinstance(child, list):
                             for item in child:
-                                visit(item, cmd_name or parent_cmd)
+                                visit(item, cmd_name or parent_cmd, in_process)
                         elif child:
-                            visit(child, cmd_name or parent_cmd)
+                            visit(child, cmd_name or parent_cmd, in_process)
 
         for node in ast_nodes or []:
             visit(node)

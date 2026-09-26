@@ -430,23 +430,41 @@ class TestNormalisedDescriptorDoesNotInventAGap:
         assert reconstructed == "cmd x 2> /dev/null"
 
 
-class TestInertHeredocIsNotPromotedByAnUnrelatedRedirect:
-    """A process-substitution word carries its heredoc body verbatim into the reconstruction.
+class TestProcessSubstitutionHeredocIsCode:
+    """A heredoc inside `<( … )` is code, whatever command inside it takes the body.
 
-    The original-form pass suppresses it via `heredoc_ranges`; the reconstruction never
-    did. Harmless until a compound redirect could switch the whole-command pass on —
-    then an unrelated `> out.txt` rescored text that `cat` merely prints.
-
-    The case is single-segment on purpose. A multi-segment command also runs an
-    unconditional whole-command rule scan over the unreconstructed text, with no heredoc
-    ranges, and that scan rates the body the same with or without this suppression, so a
-    test built on it cannot fail.
+    What reads the substitution may run what it prints - `bash <(cat <<EOF … )` executes
+    the body - and nothing at the heredoc knows the reader. The quoted-delimiter path
+    already treated such a body as code, but `extract_heredoc_ranges` judged it by the
+    command inside (`cat`) and marked it inert, so the rule passes suppressed it and a
+    shell running `rm -rf /` came out SAFE. Pinned per spelling: plain, redirected,
+    compound and loop forms reach the rules by different routes.
     """
 
-    def test_unrelated_compound_redirect_does_not_promote_heredoc_text(self, safety_rules_path):
-        base = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n)"
-        with_redirect = "{ diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); } > out.txt"
-        assert _verdict(with_redirect, safety_rules_path) == _verdict(base, safety_rules_path) == (RiskLevel.SAFE, ())
+    BODY = "cat <<EOF\nrm -rf /\nEOF\n"
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "bash <({b})",
+            "bash <({b}) > out.txt",
+            "{{ bash <({b}); }}",
+            "{{ bash <({b}); }} > out.txt",
+            "for i in 1; do source <({b}); done",
+            "source <({b}) > out.txt",
+        ],
+    )
+    def test_a_shell_reading_the_substitution_is_blocked(self, template, safety_rules_path):
+        assert _risk(template.format(b=self.BODY), safety_rules_path) is RiskLevel.BLOCKED
+
+    def test_an_unrelated_compound_redirect_does_not_change_the_verdict(self, safety_rules_path):
+        """Fail closed for any reader, and consistently: the redirect is not what decides."""
+        base = f"diff /dev/null <({self.BODY})"
+        with_redirect = f"{{ diff /dev/null <({self.BODY}); }} > out.txt"
+        assert _risk(with_redirect, safety_rules_path) is _risk(base, safety_rules_path) is RiskLevel.BLOCKED
+
+    def test_a_benign_body_stays_safe(self, safety_rules_path):
+        assert _risk("diff <(cat <<EOF\nhello\nEOF\n) b.txt", safety_rules_path) is RiskLevel.SAFE
 
     def test_a_shell_heredoc_is_still_executable_text(self, safety_rules_path):
         """Suppression follows is_shell: `bash <<EOF` runs its body, so it is not inert."""
@@ -563,6 +581,6 @@ class TestSuppressionRangeProvenanceIsPinned:
     def test_an_unambiguous_body_is_still_suppressed(self):
         """Declining on ambiguity must not disable the mechanism in the ordinary case."""
         parser = BashCommandParser()
-        command = "diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
+        command = "x=$(cat <<EOF\nrm -rf /\nEOF\n); { chmod +x x; } > out.txt"
         _, ranges = parser.reconstruct_command_with_suppression_ranges(command, parser.parse(command))
         assert len(ranges) == 1
