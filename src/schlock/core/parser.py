@@ -869,6 +869,20 @@ def _is_env_assignment(word: str) -> bool:
     return bool(eq) and name.isidentifier()
 
 
+def _skips_as_assignment(word: str) -> bool:
+    """True for an assignment word the command-position scan may step over.
+
+    Not one whose subscript holds a substitution: bash evaluates a subscript as arithmetic when
+    no command follows, so that word is read like a command word, decode and all. Reading it when
+    a command does follow costs a BLOCKED only on a word bash rejects (`not a valid identifier`).
+    """
+    assignment = _ASSIGNMENT_WORD.match(word)
+    if assignment is None:
+        return False
+    subscript = assignment.group().partition("[")[2]
+    return "$(" not in subscript and "`" not in subscript
+
+
 def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     """True if a command node executes the output of a base-N decode as a command.
 
@@ -890,13 +904,15 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     Nor is a leading assignment bashlex typed as a word: after a redirect it types `TOKEN=…` so,
     and reading that as the command both BLOCKED `2>/dev/null TOKEN=$(… | base64 -d) ./run`,
     which only assigns the decode, and ended the scan before `>o X=1 $(base64 -d x)` ran it.
+    One is read anyway (_skips_as_assignment): with no command after it, `a[$(base64 -d x)]=1`
+    evaluates its subscript as arithmetic, and that runs any `$(…)` the decode prints.
     ponytail: a wrapper's literal operand ends the scan, so `flock /tmp/l $(base64 -d x)` and
     `timeout -s KILL 5 $(…)` stay at the substitution floor (HIGH). Per-wrapper operand arity
     would close that; nothing here models it yet.
     """
     in_wrapper = False
     words = _word_parts(getattr(node, "parts", None) or [])
-    start = next((i for i, w in enumerate(words) if not _ASSIGNMENT_WORD.match(w.word)), len(words))
+    start = next((i for i, w in enumerate(words) if not _skips_as_assignment(w.word)), len(words))
     for word in words[start:]:
         text = word.word
         if in_wrapper and (text.startswith("-") or text[:1].isdigit() or _is_env_assignment(text)):

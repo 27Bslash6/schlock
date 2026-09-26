@@ -907,6 +907,9 @@ class TestBase64DecodeAtCommandPosition:
             "2>/dev/null X+=1 $(base64 -d x)",
             "{fd}>out a[0]=1 $(base64 -d x)",
             "a[0]=1 $(base64 -d x)",
+            # With no command after it, a subscript is arithmetic: bash runs a `b[$(…)]` it decodes.
+            "a[$(base64 -d x)]=1",
+            "2>/dev/null a[`base64 -d x`]=1",
         ],
     )
     def test_decode_run_as_a_command_is_blocked(self, command):
@@ -946,6 +949,8 @@ class TestBase64DecodeAtCommandPosition:
             '{fd}>/dev/null TOKEN=$(echo "$S" | base64 -d) ./run',
             # Only BEFORE the command name: here bash runs a command named `X=1`, not the decode.
             "$(true) X=1 $(base64 -d x)",
+            # A subscript without a substitution is still skipped: this assigns the decode.
+            "a[0]=$(base64 -d x)",
         ],
     )
     def test_decode_as_data_is_not_escalated(self, command):
