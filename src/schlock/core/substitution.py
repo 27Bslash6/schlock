@@ -1444,14 +1444,32 @@ class SubstitutionValidator:
 
         base_command = self._extract_base_command(node)
 
-        # Find nested substitutions
+        # Find nested substitutions. The walk goes ONE level past the cap, and no further: the
+        # nodes at MAX_SUBSTITUTION_DEPTH + 1 are extracted but do not recurse, so they exist
+        # only to trip validate_substitution's depth guard. Stopping AT the cap (`<`) left the
+        # deepest level unextracted, so the guard had nothing to fire on and a 12-deep
+        # `$(echo $(… $(bash)))` rated SAFE. One extra level costs one node per capped node,
+        # not a scan of the subtree below it.
         nested: list[SubstitutionNode] = []
-        if depth < MAX_SUBSTITUTION_DEPTH and hasattr(node, "command"):
+        if depth <= MAX_SUBSTITUTION_DEPTH and hasattr(node, "command"):
             try:
                 inner_ast = [node.command] if node.command else []
                 nested = self.extract_substitutions(inner_ast, depth + 1, command, budget)
-            except Exception:  # noqa: S110 - Parse errors treated as suspicious AST
-                nested = []  # Failed to parse nested - treat as no nested subs
+            except Exception as exc:  # noqa: BLE001 - a failed walk denies, it never drops
+                # Dropping what the walk was reading is an allow: `echo $(echo $(bash))` read
+                # SAFE once the inner walk raised. A node with no base command is denied by
+                # every tier, so it stands in for whatever the walk could not see.
+                logger.debug("Nested substitution walk failed in %r: %s", inner_command, exc)
+                nested = [
+                    SubstitutionNode(
+                        substitution_type=sub_type,
+                        inner_command=inner_command,
+                        base_command=None,
+                        ast_node=node,
+                        nested_substitutions=[],
+                        depth=depth + 1,
+                    )
+                ]
 
         return SubstitutionNode(
             substitution_type=sub_type,
@@ -2110,8 +2128,12 @@ class SubstitutionValidator:
         # Import here to avoid circular dependency
         from .rules import RiskLevel  # noqa: PLC0415
 
-        # Check depth limit
-        if depth > MAX_SUBSTITUTION_DEPTH:
+        # Check depth limit, on the deeper of the two counters. `depth` counts validation
+        # recursion; sub_node.depth counts extraction. They drift on a re-parse: the nodes
+        # decoded from a `${…}` or heredoc body are extracted one level deeper than the
+        # expansion that holds them, but validated at its level. Reading only the recursion
+        # count let those routes nest one level past the horizon unseen.
+        if max(depth, sub_node.depth) > MAX_SUBSTITUTION_DEPTH:
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
