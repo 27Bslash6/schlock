@@ -604,12 +604,13 @@ def git_config_exec_payloads(args: list[str]) -> list[str]:
     return [p for p in payloads if p]
 
 
-def _renamed_section(args: list[str]) -> str | None:
-    """Return the NEW name `git config --rename-section OLD NEW` gives a section, else None.
+def _renamed_section(args: list[str]) -> tuple[str, str] | None:
+    """Return the (OLD, NEW) names of `git config --rename-section OLD NEW`, else None.
 
     git accepts any unambiguous abbreviation of a long option, so `--ren` already means
     --rename-section (`--re` is ambiguous: --remove-section, --replace-all). `rename-section` is
-    the subcommand spelling of newer git.
+    the subcommand spelling of newer git. The last two positionals are OLD and NEW: git stops
+    parsing options at the first positional and rejects a rename with any other count.
     """
     if "config" not in args:
         return None
@@ -618,7 +619,7 @@ def _renamed_section(args: list[str]) -> str | None:
     flagged = any(len(arg) >= len("--ren") and "--rename-section".startswith(arg) for arg in rest)
     if not (flagged or positionals[:1] == ["rename-section"]) or len(positionals) < 2:
         return None
-    return positionals[-1]
+    return positionals[-2], positionals[-1]
 
 
 def key_rated_git_config_write(args: list[str]) -> str | None:
@@ -633,16 +634,18 @@ def key_rated_git_config_write(args: list[str]) -> str | None:
     (`-f man.cfg`) rates too, and so does renaming the `man` section away.
     """
     prefixes = tuple(_KEY_RATED_GIT_CONFIGS)
-    new_section = _renamed_section(args)
-    if new_section is not None:
+    renamed = _renamed_section(args)
+    if renamed is not None:
         # A rename writes every key of the section under its NEW name, so `foo.viewer custom`
         # renamed into `man` arms the viewer without ever naming man.viewer. `help` holds
-        # help.format, `man.custom` holds man.custom.cmd.
-        section = new_section.lower() + "."
-        if any(prefix.startswith(section) or section.startswith(prefix) for prefix in prefixes):
-            return f"git config renames a section to {new_section}, which chooses a program that git runs later"
-    # Every rename still falls through, so renaming `man` away rates too. Stopping at the rename
-    # would let a `--file` operand spelled `--ren` hide a real write behind it.
+        # help.format, `man.custom` holds man.custom.cmd. The OLD name counts too: `man` renamed
+        # to `alias` turns man.viewer '!cmd' into a shell alias (verified against git 2.43).
+        old_section, new_section = renamed
+        for section in (old_section.lower() + ".", new_section.lower() + "."):
+            if any(prefix.startswith(section) or section.startswith(prefix) for prefix in prefixes):
+                return f"git config renames section {old_section} to {new_section}, moving keys that choose a program git runs"
+    # Every rename still falls through: stopping at the rename would let a `--file` operand
+    # spelled `--ren` hide a real write behind it.
     for key, _ in _git_config_writes(args):
         if key.lower().startswith(prefixes):
             return f"git config {key} chooses a program that git runs later"
