@@ -3036,6 +3036,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     message=ctx_reason,
                     alternatives=ctx_alternatives,
                 )
+                if all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
 
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
@@ -3098,6 +3100,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     message=f"Shell-delegated payload {payload!r}: {inner.message}",
                     alternatives=inner.alternatives,
                 )
+                if all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
             if match.risk_level == RiskLevel.BLOCKED:
                 break
 
