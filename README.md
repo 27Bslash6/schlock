@@ -174,7 +174,7 @@ risk_tolerance:
     LOW: allow
     MEDIUM: allow
     HIGH: ask      # Prompt before allowing
-    BLOCKED: deny  # Always block
+    BLOCKED: deny  # Always block; the hook ignores any other value
 ```
 
 **Actions explained:**

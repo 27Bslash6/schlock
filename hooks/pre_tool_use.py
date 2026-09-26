@@ -67,6 +67,10 @@ def get_risk_tolerance() -> dict:
     Loads from config file or returns default preset.
     Caches result for performance.
 
+    SECURITY: the returned mapping always has ``BLOCKED: deny``. The setup wizard refuses to
+    write anything else, but a config that arrives by clone or a non-Bash tool never goes
+    through the wizard, so the floor is enforced here on the read path as well (LAB-4596).
+
     Returns:
         Dict mapping risk level names to actions (allow/ask/deny)
     """
@@ -90,7 +94,15 @@ def get_risk_tolerance() -> dict:
                 if config_data and "risk_tolerance" in config_data:
                     risk_tol = config_data["risk_tolerance"]
                     if "levels" in risk_tol:
-                        _risk_tolerance = risk_tol["levels"]
+                        levels = dict(risk_tol["levels"])
+                        # Security floor: BLOCKED is deny whatever the file says (the code default below already is).
+                        if levels.get("BLOCKED", "deny") != "deny":
+                            logger.warning(
+                                f"Ignoring risk_tolerance.levels.BLOCKED={levels['BLOCKED']!r} in {config_path} "
+                                "(BLOCKED is always deny)"
+                            )
+                        levels["BLOCKED"] = "deny"
+                        _risk_tolerance = levels
                         logger.info(f"Loaded risk tolerance from {config_path}")
                         return _risk_tolerance
             except Exception as e:
@@ -244,7 +256,7 @@ def map_risk_to_status(risk_level: RiskLevel) -> str:
         Default "balanced" preset:
         - SAFE, LOW, MEDIUM → allow (safe to execute)
         - HIGH → ask (prompt user for approval)
-        - BLOCKED → deny (always prevented)
+        - BLOCKED → deny (pinned by get_risk_tolerance; not configurable)
 
     Risk tolerance can be configured in:
         - .claude/hooks/schlock-config.yaml (project)

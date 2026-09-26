@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 # Add src and hooks to path BEFORE importing
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -78,6 +79,56 @@ class TestStatusMapping:
     def test_blocked_risk_blocked(self):
         """BLOCKED risk level maps to deny."""
         assert map_risk_to_status(RiskLevel.BLOCKED) == "deny"
+
+
+def _write_risk_tolerance(tmp_path: Path, where: str, levels: dict) -> None:
+    """Drop a risk_tolerance mapping into the project or user config under the isolated tmp_path."""
+    path = {
+        "project": tmp_path / ".claude" / "hooks" / "schlock-config.yaml",
+        "user": tmp_path / ".config" / "schlock" / "config.yaml",
+    }[where]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump({"risk_tolerance": {"levels": levels}}), encoding="utf-8")
+
+
+_HOSTILE_LEVELS = {"SAFE": "allow", "LOW": "allow", "MEDIUM": "allow", "HIGH": "ask", "BLOCKED": "allow"}
+
+
+class TestBlockedFloor:
+    """BLOCKED maps to deny whatever any config file says (LAB-4596)."""
+
+    @pytest.mark.parametrize("where", ["project", "user"])
+    def test_hostile_mapping_still_denies(self, tmp_path, where):
+        _write_risk_tolerance(tmp_path, where, _HOSTILE_LEVELS)
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "rm -rf / --no-preserve-root"}})
+
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize(
+        "levels",
+        [
+            {**_HOSTILE_LEVELS, "BLOCKED": "ask"},
+            {**_HOSTILE_LEVELS, "BLOCKED": 1},
+            {**_HOSTILE_LEVELS, "BLOCKED": None},
+            {"HIGH": "allow"},
+        ],
+        ids=["ask", "non-string", "null", "omitted"],
+    )
+    def test_returned_mapping_floors_blocked(self, tmp_path, caplog, levels):
+        _write_risk_tolerance(tmp_path, "user", levels)
+
+        assert pre_tool_use.get_risk_tolerance()["BLOCKED"] == "deny"
+        assert ("Ignoring risk_tolerance.levels.BLOCKED" in caplog.text) == ("BLOCKED" in levels)
+
+    def test_permissive_preset_still_applies(self, tmp_path):
+        """Rejected alternative: refusing project-level risk_tolerance the way whitelist is refused (issue #66).
+
+        The setup wizard writes the project file, so that would break every preset chosen through it.
+        Only BLOCKED is pinned; the rest of the mapping is honoured.
+        """
+        _write_risk_tolerance(tmp_path, "project", RISK_PRESETS["permissive"]["settings"])
+
+        assert map_risk_to_status(RiskLevel.HIGH) == "allow"
 
 
 class TestMessageFormatting:
