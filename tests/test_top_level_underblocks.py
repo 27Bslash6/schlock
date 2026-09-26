@@ -625,6 +625,14 @@ class TestKeyRatedGitConfigWriteHelper:
         # include.path=true includes a file NAMED true, which an attacker can write.
         assert key_rated_git_config_write(["config", "include.path", "true"]) is not None
 
+    def test_a_boolean_on_a_path_key_other_than_fsmonitor_is_a_path(self):
+        # git reads core.hooksPath=true as the directory ./true, which an attacker can create.
+        assert key_rated_git_config_write(["config", "core.hooksPath", "true"]) is not None
+
+    def test_an_empty_path_value_is_not_rated(self):
+        # An empty helper clears the helper list; it names nothing git runs.
+        assert key_rated_git_config_write(["config", "credential.helper", ""]) is None
+
     def test_keys_narrows_the_check(self):
         args = ["config", "core.hooksPath", ".githooks"]
         assert key_rated_git_config_write(args) is not None
@@ -661,6 +669,7 @@ class TestGitConfigPersistenceKeys:
         "git config core.askpass /usr/bin/ssh-askpass",
         "git config gpg.program gpg2",
         "git config core.fsmonitor rs-git-fsmonitor",
+        "git config core.hooksPath true",
     ]
     ORDINARY_WRITES = [
         "git config core.fsmonitor true",
@@ -682,6 +691,7 @@ class TestGitConfigPersistenceKeys:
         "git -c core.gitProxy=pwn fetch",
         "git -c core.alternateRefsCommand=pwn fetch",
         "git -c uploadpack.packObjectsHook=pwn fetch",
+        "git -c core.hooksPath=true commit",
     ]
 
     @pytest.mark.parametrize("command", ATTACKS)
@@ -709,6 +719,10 @@ class TestGitConfigPersistenceKeys:
 
     def test_injected_boolean_on_a_path_valued_key_stays_safe(self):
         assert validate_command("git -c core.fsmonitor=true status").risk_level == RiskLevel.SAFE
+
+    def test_injected_empty_helper_stays_safe(self):
+        # `-c credential.helper=` is the everyday way to switch helpers off for one command.
+        assert dangerous_git_config(["-c", "credential.helper=", "clone", "u"]) is None
 
     def test_wrapped_bootstrap_write_asks(self):
         # Ceiling, pinned: the BLOCKED check reads git's own args, like the `-c` check beside it,

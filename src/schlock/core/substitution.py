@@ -447,8 +447,7 @@ _VIEWER_GIT_CONFIGS = frozenset({"help.format", "man."})
 # Keys whose value is a PATH git runs, or runs files from: a hooks directory, an askpass or
 # fsmonitor program, a gpg binary, a credential helper. Judging that value as a command cannot
 # fire on the real attack, since `/tmp/evilhooks` is a harmless word bare. So these are rated on
-# the key too. Unlike the viewer keys, git reads a boolean here as a boolean
-# (`core.fsmonitor true` selects the built-in monitor), so a boolean value stays unrated.
+# the key too. See `_key_rated_value_is_inert` for the few values that name nothing.
 _PATH_VALUED_GIT_CONFIGS = frozenset({"core.askpass", "core.fsmonitor", "core.hookspath", "credential.helper", "gpg.program"})
 
 # Keys that load MORE config or hooks from a path: include.path / includeIf.<cond>.path read
@@ -459,9 +458,21 @@ _BOOTSTRAP_GIT_CONFIGS = frozenset({"include.path", "includeif.", "init.template
 
 # Every key rated on the KEY, whatever the value (a worse value still gets its own verdict).
 _KEY_RATED_GIT_CONFIGS = _VIEWER_GIT_CONFIGS | _PATH_VALUED_GIT_CONFIGS | _BOOTSTRAP_GIT_CONFIGS
-# The key-rated keys that read a boolean-looking value as a NAME: a viewer called `true`, a
-# config file called `true`. Only these are rated even when the value is a boolean.
-_BOOLEAN_IS_A_NAME_GIT_CONFIGS = _VIEWER_GIT_CONFIGS | _BOOTSTRAP_GIT_CONFIGS
+
+
+def _key_rated_value_is_inert(prefix: str, value: str) -> bool:
+    """True if the key-rated key `prefix` set to `value` names nothing git runs or loads.
+
+    Most key-rated keys read a boolean-looking word as a NAME: a viewer called `true`, a config
+    file called `true`, a hooks directory `./true` an attacker can create. So a boolean rates like
+    any other value. Two exceptions, both path-valued: an empty value, which names nothing
+    (`credential.helper=` clears the helper list), and a boolean for core.fsmonitor, the one key
+    here git reads as a boolean (`true` selects the built-in monitor).
+    """
+    if prefix not in _PATH_VALUED_GIT_CONFIGS:
+        return False
+    return not value.strip() or (prefix == "core.fsmonitor" and _is_git_boolean(value))
+
 
 # git -c config keys that execute arbitrary commands when set via -c (top-level under-block fix).
 # Lowercased for case-insensitive match against the config key. Includes the key-rated keys:
@@ -513,10 +524,13 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     # A boolean value selects a built-in and names no executable
                     # (e.g. core.fsmonitor=true); only a path/command value is RCE. A bare
                     # `-c key` (no =VALUE) is key=true to git -> also benign. See #97.
-                    # Not for a key that reads a boolean as a name: git reads man.viewer=true as
-                    # a viewer NAMED `true`, so the key decides there, not the value.
+                    # Not for a key-rated key: git reads man.viewer=true as a viewer NAMED
+                    # `true`, so the key decides there, not the value.
                     _, _, value = config_val.partition("=")
-                    if _is_git_boolean(value) and dangerous_prefix not in _BOOLEAN_IS_A_NAME_GIT_CONFIGS:
+                    if dangerous_prefix in _KEY_RATED_GIT_CONFIGS:
+                        if _key_rated_value_is_inert(dangerous_prefix, value):
+                            continue
+                    elif _is_git_boolean(value):
                         continue
                 return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
     return None
@@ -646,8 +660,8 @@ def _rename_section_candidates(args: list[str]) -> list[str]:
 def key_rated_git_config_write(args: list[str], keys: frozenset[str] = _KEY_RATED_GIT_CONFIGS) -> str | None:
     """Return a reason if a `git config` command WRITES a key in `keys`, else None.
 
-    The key decides, whatever the value: see `_KEY_RATED_GIT_CONFIGS`. The one value that does not
-    rate is a boolean written to a path-valued key, which git reads as a boolean. Reads
+    The key decides, bar the values `_key_rated_value_is_inert` lets through: see
+    `_KEY_RATED_GIT_CONFIGS`. Reads
     (`--get man.viewer`, `--list`) write nothing and stay unrated. Pure; `args` may or may not
     include the leading "git" token. A value that is itself a dangerous command still gets that
     command's own, worse verdict through `git_config_exec_payloads`, which covers the same keys.
@@ -659,7 +673,7 @@ def key_rated_git_config_write(args: list[str], keys: frozenset[str] = _KEY_RATE
     prefixes = tuple(keys)
     for key, value in _git_config_writes(args):
         prefix = next((p for p in prefixes if key.lower().startswith(p)), None)
-        if prefix is None or (_is_git_boolean(value) and prefix not in _BOOLEAN_IS_A_NAME_GIT_CONFIGS):
+        if prefix is None or _key_rated_value_is_inert(prefix, value):
             continue
         return f"git config {key} names a program or file that git runs or loads later"
     for word in _rename_section_candidates(args):
