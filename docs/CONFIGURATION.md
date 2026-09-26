@@ -121,6 +121,8 @@ whitelist:
 
 - Patterns are regex, matched against the start of a **single command** (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
+- A command carrying `..` or a redirection (`<`, `>`, including `2>&1`) is never whitelisted, as one
+  command or as a pipeline; it is judged by the rules instead
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
