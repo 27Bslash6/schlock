@@ -469,6 +469,14 @@ class CommitMessageFilter:
     # real on-disk file.
     _STDIN_TARGETS = ("-", "/dev/stdin")
 
+    # Whole-token quoted spans whose CONTENT — not the token itself — is a bare stdin target
+    # (LAB-3904 shape 2: `'-'`, `'/dev/stdin'`) or a short/long attached flag+target quoted as one
+    # word (`"-F-"`, `"--file=-"`). `_consume_command_line` blanks only the quote characters
+    # around one of these, not the content, so the content survives into `scan_text` as a token
+    # for `_first_stdin_flag_end` to find — otherwise the ordinary quote pass blanks the whole
+    # span and the flag looks fileless (unscannable) even though its stdin target is right there.
+    _QUOTED_STDIN_SPANS = frozenset({"-", "/dev/stdin", "-F-", "--file=-"})
+
     @classmethod
     def _short_cluster_stdin_attached(cls, word: str) -> Optional[str]:
         """For a single-dash short-flag cluster, the text attached after its ``F`` letter
@@ -477,6 +485,23 @@ class CommitMessageFilter:
         """
         idx = cls._short_cluster_f_index(word)
         return None if idx is None else word[idx + 1 :]
+
+    @staticmethod
+    def _dequote_word(word: str) -> str:
+        """Strip one pair of matching quotes wrapping the WHOLE token (``'-'`` -> ``-``,
+        ``"-F-"`` -> ``-F-``); any other word is returned unchanged.
+
+        Minimal, not full bash quote removal (no partial-quote joining, no escapes) — just enough
+        for ``_stdin_flag_value_indices`` to recognize a stdin target or an attached flag+target
+        hidden inside one whole-token quote. Needed because two of its callers hand it words that
+        were never quote-processed: ``_git_commit_arg_lists``'s naive ``command.split()`` fallback
+        (only reached when bashlex can't parse — a quoted heredoc delimiter, LAB-3904 shape 2) and
+        raw command-line splits in general. bashlex's own ``.word`` is already quote-removed, so
+        this is a no-op there.
+        """
+        if len(word) >= 2 and word[0] == word[-1] and word[0] in "'\"":
+            return word[1:-1]
+        return word
 
     @classmethod
     def _stdin_flag_value_indices(cls, words: list[str]):
@@ -490,11 +515,11 @@ class CommitMessageFilter:
         """
         i = 0
         while i < len(words):
-            word = words[i]
+            word = cls._dequote_word(words[i])
             if word == "--":
                 break  # pathspec terminator
             if word == "--file":
-                if i + 1 < len(words) and words[i + 1] in cls._STDIN_TARGETS:
+                if i + 1 < len(words) and cls._dequote_word(words[i + 1]) in cls._STDIN_TARGETS:
                     yield i + 1
             elif word.startswith("--file="):
                 if word[len("--file=") :] in cls._STDIN_TARGETS:
@@ -504,7 +529,9 @@ class CommitMessageFilter:
                 if attached:
                     if attached in cls._STDIN_TARGETS:  # -F-, -F/dev/stdin, -aF-
                         yield i
-                elif attached is not None and i + 1 < len(words) and words[i + 1] in cls._STDIN_TARGETS:  # -F -
+                elif (
+                    attached is not None and i + 1 < len(words) and cls._dequote_word(words[i + 1]) in cls._STDIN_TARGETS
+                ):  # -F -
                     yield i + 1
             i += 1
 
@@ -679,8 +706,22 @@ class CommitMessageFilter:
             else:
                 close = command.find("'", i + 1)
                 i = n if close == -1 else close + 1
-            scan_chars[start:i] = " " * (i - start)
+            cls._blank_quoted_span(command, scan_chars, start, i, ch)
         return n
+
+    @classmethod
+    def _blank_quoted_span(cls, command: str, scan_chars: list[str], start: int, end: int, quote_char: str) -> None:
+        """Blank the quoted span ``command[start:end]`` in ``scan_chars`` — normally the whole
+        span, but for a well-terminated span whose content is exactly a stdin target, only the
+        quote characters, so the content stays a token in ``scan_text`` (LAB-3904 shape 2).
+        """
+        terminated = end - start >= 2 and command[end - 1] == quote_char
+        content = command[start + 1 : end - 1] if terminated else None
+        if content in cls._QUOTED_STDIN_SPANS:
+            scan_chars[start] = " "
+            scan_chars[end - 1] = " "
+        else:
+            scan_chars[start:end] = " " * (end - start)
 
     def _scan_heredocs(self, command: str) -> Optional[tuple[list[tuple[int, str, int]], str]]:
         """Bind every heredoc body to its ``<<`` opener, single pass, left to right, and produce
@@ -694,7 +735,7 @@ class CommitMessageFilter:
         unblanked in ``scan_chars`` after the quote pass — an O(1) test, so a line packed with
         quoted decoys costs one regex pass, not openers × quoted-spans. Returns
         ``(bindings, scan_text)`` where ``bindings`` is ``[(opener_start_pos, body, fd), ...]`` in
-        source order — ``fd`` from ``_heredoc_target_fd`` (0 unless explicitly numbered, e.g.
+        source order — ``fd`` from ``_redirect_target_fd`` (0 unless explicitly numbered, e.g.
         ``3<<B``) — and ``scan_text`` is ``command`` with every heredoc body, quoted span,
         escaped char and comment blanked to same-length spaces (offsets still line up with
         ``command``): the only text safe to scan for a real ``-F``/``--file`` flag, and in which
@@ -737,20 +778,22 @@ class CommitMessageFilter:
                     body_lines.append(test_line)  # `<<-` strips each body line's leading tabs, as bash and bashlex do
                     cursor = next_nl + 1
                 scan_chars[body_start:cursor] = " " * (cursor - body_start)
-                results.append((opener_pos, "\n".join(body_lines), self._heredoc_target_fd(command, opener_pos)))
+                results.append((opener_pos, "\n".join(body_lines), self._redirect_target_fd(command, opener_pos)))
             pos = cursor
         return results, "".join(scan_chars)
 
     @staticmethod
-    def _heredoc_target_fd(command: str, opener_start: int) -> int:
-        """The fd a `<<`/`<<-` heredoc opener at ``opener_start`` targets — the digit run
-        immediately preceding it with no separating whitespace (bash's ``[n]<<word`` syntax,
-        e.g. ``3<<B``), or 0 (stdin, the default unnumbered form) if there is none.
+    def _redirect_target_fd(command: str, redirect_start: int) -> int:
+        """The fd a redirect operator starting at ``redirect_start`` targets — the digit run
+        immediately preceding it with no separating whitespace (bash's ``[n]<word`` / ``[n]<<word``
+        syntax, e.g. ``3<<B``, ``2<&1``), or 0 (the default unnumbered form) if there is none.
+        Generic across redirect operators, not just heredoc openers: bash's digit-prefix rule
+        doesn't care which operator follows.
         """
-        j = opener_start
+        j = redirect_start
         while j > 0 and command[j - 1].isdigit():
             j -= 1
-        return int(command[j:opener_start]) if j < opener_start else 0
+        return int(command[j:redirect_start]) if j < redirect_start else 0
 
     @staticmethod
     def _strip_heredoc_terminator(value: str, delim: str) -> str:
@@ -782,10 +825,20 @@ class CommitMessageFilter:
         (``cmd <<A <<B``) — redirects apply left to right, so a LATER one silently overrides an
         earlier one for the same fd (verified: ``bash -c 'cat <<A <<B\\n...A\\n...B'`` prints B's
         body, not A's). That is unambiguous, not ammunition for the ambiguity refusal above, so
-        this walk keeps overwriting rather than stopping at the first match.
+        this walk keeps overwriting rather than stopping at the first match. The same left-to-right
+        rule applies across redirect TYPES, not just repeated heredocs: a later plain fd-0 redirect
+        (``< /dev/null``, ``<&3``, a here-string ``<<< str``) silently discards an earlier heredoc's
+        body too (verified: ``bash -c "cat <<X < /dev/null\\n...\\nX"`` prints nothing), so any such
+        redirect clears the winner instead of leaving the heredoc it followed as the answer.
         """
         parts = self._parse(command)
         matches: list[str] = []
+
+        def targets_fd0(p: Any) -> bool:
+            # Explicit fd number (`0<<EOF`, `3<<other`) decides outright; otherwise the redirect
+            # TYPE's own default applies — `<`-family (`<`, `<<`, `<<-`, `<<<`, `<&`, `<>`) default
+            # to fd 0, `>`-family to fd 1.
+            return p.input == 0 if p.input is not None else p.type.startswith("<")
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
@@ -794,13 +847,11 @@ class CommitMessageFilter:
                 if idx != -1 and self._arg_targets_stdin(words[idx + 1 :]):
                     winner = None
                     for p in getattr(node, "parts", []):
+                        if getattr(p, "kind", None) != "redirect" or not targets_fd0(p):
+                            continue
                         heredoc = getattr(p, "heredoc", None)
-                        # bashlex: implicit stdin is input None; an explicit `0<<EOF` is input 0.
-                        is_stdin_heredoc = (
-                            getattr(p, "kind", None) == "redirect" and p.type in ("<<", "<<-") and p.input in (None, 0)
-                        )
-                        if is_stdin_heredoc and heredoc is not None:
-                            winner = p  # later redirect to the same (implicit) fd 0 wins
+                        # later redirect to the same (implicit) fd 0 wins; a non-heredoc one clears it
+                        winner = p if p.type in ("<<", "<<-") and heredoc is not None else None
                     if winner is not None:
                         delim = getattr(winner.output, "word", "")
                         matches.append(self._strip_heredoc_terminator(winner.heredoc.value, delim))
@@ -820,6 +871,12 @@ class CommitMessageFilter:
     # `|&`), `&&`, and a background `&` — but not the `&` of an fd dup (`2>&1`, `<&0`) or of
     # `&>file`, which are redirects on the same command.
     _COMMAND_SEPARATOR_RE = re.compile(r"[;|\n]|(?<![<>])&(?!>)")
+
+    # A run of `<` characters, used AFTER a winning heredoc opener's own `<<`/`<<-` to spot a
+    # later fd-0 redirect that overrides it: a run of length 1 (`<`, `<&N`) or 3 (a here-string
+    # `<<< word`) is some OTHER redirect operator; length 2 is just another `<<`/`<<-` heredoc
+    # opener (not an override — same-fd double heredocs are handled by "last one wins" above).
+    _REDIRECT_RUN_RE = re.compile(r"<+")
 
     def _extract_heredoc_stdin_message(self, command: str) -> Optional[str]:
         """Commit message of a ``git commit -F-`` / ``--file -`` fed by an in-command heredoc.
@@ -865,7 +922,33 @@ class CommitMessageFilter:
             for h in heredocs
             if h[2] == 0 and target_pos <= h[0] and not self._COMMAND_SEPARATOR_RE.search(scan_text, target_pos, h[0])
         ]
-        return own[-1][1] if own else None
+        if not own or self._stdin_overridden_after(scan_text, own[-1][0]):
+            return None
+        return own[-1][1]
+
+    def _stdin_overridden_after(self, scan_text: str, opener_pos: int) -> bool:
+        """True if a later fd-0 redirect on ``opener_pos``'s logical COMMAND overrides its heredoc.
+
+        bash applies ALL fd-0 redirects left to right, not just repeated heredocs: a later plain
+        redirect (``< /dev/null``, ``<&3``, a here-string ``<<< str``) silently discards this
+        heredoc's body too (verified: ``bash -c "cat <<X < /dev/null\\n...\\nX"`` prints nothing).
+        Searches after the opener's own ``<<``/``<<-``, up to the first command separator or the
+        end of the logical line (whichever comes first — a sibling command chained with ``;``/
+        ``|``/``&&`` on the SAME physical line owns its own redirects, not this heredoc's). A run
+        of ``<`` of length other than 2 is some other redirect operator (length 2 is just another
+        ``<<``/``<<-`` heredoc opener); it only overrides when it explicitly or implicitly targets
+        fd 0 — an unrelated ``2<&1``/``2<file`` on the same line must not be mistaken for one.
+        """
+        line_end = scan_text.find("\n", opener_pos)
+        if line_end == -1:
+            line_end = len(scan_text)
+        sep = self._COMMAND_SEPARATOR_RE.search(scan_text, opener_pos + 2, line_end)
+        if sep is not None:
+            line_end = sep.start()
+        return any(
+            len(m.group()) != 2 and self._redirect_target_fd(scan_text, m.start()) == 0
+            for m in self._REDIRECT_RUN_RE.finditer(scan_text, opener_pos + 2, line_end)
+        )
 
     # Explanation surfaced when an unscannable commit is warned/blocked. Unscannable always
     # means file/stdin delivery (-F/--file), so a single static message suffices.

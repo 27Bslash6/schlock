@@ -1861,6 +1861,83 @@ class TestHeredocStdinExtraction:
         assert len(scan_text) == len(cmd)
         assert duration < 0.5, f"_scan_heredocs took {duration:.3f}s on large legitimate input"
 
+    def test_shape1_ast_later_stdin_redirect_overrides_heredoc(self):
+        # LAB-3904 shape 1, AST tier: bash applies fd-0 redirects left to right, so a later plain
+        # redirect after the heredoc opener discards its body entirely (verified against real
+        # bash: `bash -c "cat <<X < /dev/null\nbody\nX"` prints nothing). Same for an fd dup
+        # (`<&N`) and a here-string (`<<< str`) — all unscannable, not the heredoc's body.
+        for suffix in ("< /dev/null", "<&3", "<<< str"):
+            cmd = f"git commit -F- <<X {suffix}\nGenerated with Claude Code\nX\n"
+            assert self._filter().classify_message_delivery(cmd) == "unscannable", suffix
+
+    def test_shape1_ast_no_trailing_redirect_still_binds(self):
+        # Benign twin: without a later stdin redirect the heredoc is untouched as before — a
+        # dirty body is blocked, a clean one passes through unflagged.
+        dirty = self._filter(self._ad_rules()).filter_commit_message("git commit -F- <<X\nGenerated with Claude Code\nX\n")
+        assert dirty.message_delivery == "scannable"
+        assert dirty.patterns_removed
+        clean = self._filter(self._ad_rules()).filter_commit_message("git commit -F- <<X\nclean\nX\n")
+        assert clean.message_delivery == "scannable"
+        assert not clean.patterns_removed
+
+    def test_shape1_fallback_later_stdin_redirect_overrides_heredoc(self):
+        # Same shape, fallback tier: a quoted delimiter defeats bashlex, so _scan_heredocs' naive
+        # scanner must apply the same left-to-right override rule bash does.
+        for suffix in ("< /dev/null", "<&3", "<<< str"):
+            cmd = f"git commit -F- <<'X' {suffix}\nGenerated with Claude Code\nX\n"
+            assert self._filter().classify_message_delivery(cmd) == "unscannable", suffix
+
+    def test_shape1_fallback_no_trailing_redirect_still_binds(self):
+        # Benign twin on the fallback tier.
+        dirty = self._filter(self._ad_rules()).filter_commit_message("git commit -F- <<'X'\nGenerated with Claude Code\nX\n")
+        assert dirty.message_delivery == "scannable"
+        assert dirty.patterns_removed
+        clean = self._filter(self._ad_rules()).filter_commit_message("git commit -F- <<'X'\nclean\nX\n")
+        assert clean.message_delivery == "scannable"
+        assert not clean.patterns_removed
+
+    def test_shape1_unrelated_fd_redirect_does_not_falsely_override(self):
+        # Panel-found (expert-panel-review, LAB-3904): the override check must be fd-0-aware, not
+        # "any non-`<<` run of `<`". A redirect on a DIFFERENT explicit fd (`2<&1`, `2<file`) never
+        # touches stdin, so it must not be mistaken for an override of the commit's own heredoc.
+        for suffix in ("2<&1", "2<file"):
+            cmd = f"git commit -F- <<'X' {suffix}\nGenerated with Claude Code\nX\n"
+            result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+            assert result.message_delivery == "scannable", suffix
+            assert result.patterns_removed, suffix
+
+    def test_shape1_sibling_command_redirect_does_not_falsely_override(self):
+        # Panel-found (expert-panel-review, LAB-3904): the override search must stop at a command
+        # separator on the same physical line — a sibling command chained with `;` owns its own
+        # redirects, they are not a later redirect on the heredoc opener's own command.
+        cmd = "git commit -F- <<'X'; echo hi < /dev/null\nGenerated with Claude Code\nX\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
+
+    def test_shape2_quoted_stdin_target_binds_heredoc(self):
+        # LAB-3904 shape 2: a quoted stdin target still reads stdin in real bash (verified:
+        # `cat '-' <<'X'` prints the heredoc body) — the quote pass used to blank the whole span,
+        # hiding the target from the flag scan and reporting unscannable even though the message
+        # bytes are right there in the command. Covers a separate quoted value (`-F '-'`), a
+        # quoted attached short form (`"-F-"`), a quoted attached long form (`"--file=-"`), and a
+        # quoted `--file` value (`'/dev/stdin'`).
+        for flag in ("-F '-'", '"-F-"', '"--file=-"', "--file '/dev/stdin'"):
+            dirty = self._filter(self._ad_rules()).filter_commit_message(
+                f"git commit {flag} <<'X'\nGenerated with Claude Code\nX\n"
+            )
+            assert dirty.message_delivery == "scannable", flag
+            assert dirty.patterns_removed, flag
+            clean = self._filter(self._ad_rules()).filter_commit_message(f"git commit {flag} <<'X'\nclean\nX\n")
+            assert clean.message_delivery == "scannable", flag
+            assert not clean.patterns_removed, flag
+
+    def test_shape2_quoted_non_stdin_target_stays_unscannable(self):
+        # Benign twin: a quoted target that is NOT `-`/`/dev/stdin` is a real file, not the
+        # heredoc — must not be reported as scannable.
+        cmd = "git commit -F 'msg.txt' <<'X'\nGenerated with Claude Code\nX\n"
+        assert self._filter().classify_message_delivery(cmd) == "unscannable"
+
 
 class TestPatternCaseWhitespace:
     """Issue #85: shipped advertising patterns must match case-insensitively and tolerate
