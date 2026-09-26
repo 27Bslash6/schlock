@@ -5,8 +5,9 @@ It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
 Regex-based parsing is explicitly NOT supported due to security risks. Two readers
-here work on single words whose boundaries bashlex has already fixed: _redirect_words
-and _mark_fd_variables; CLAUDE.md lists them as approved exceptions.
+here work on single words whose boundaries bashlex has already fixed, _redirect_words
+and _mark_fd_variables (its subscript scanner is _subscript_closes_at_end); CLAUDE.md
+lists both as approved exceptions and the constraints each must keep.
 """
 
 import bisect
@@ -177,6 +178,9 @@ FD_VARIABLE = r"\{[A-Za-z_][A-Za-z0-9_]*\}"
 # The name part of the prefix as _is_fd_variable_spelling reads it; an optional array
 # subscript may follow the name (`{fd[0]}>out`). See that function for what bash accepts.
 _FD_VARIABLE_HEAD_RE = re.compile(FD_VARIABLE.removesuffix(r"\}"))
+# The same prefix as bashlex's word spells it, quotes removed: a name, then optionally
+# one `[…]`. Only a word of this shape is read from the source at all.
+_FD_VARIABLE_WORD_SHAPE_RE = re.compile(FD_VARIABLE.removesuffix(r"\}") + r"(\[.*\])?\}", re.DOTALL)
 _NO_FD_VARIABLE_OPERATORS = frozenset({"&>", "&>>"})
 # Set on a word node by _mark_fd_variables. A boolean set only when true, so every other
 # node keeps its bashlex attributes (node equality and repr read the whole __dict__).
@@ -562,8 +566,9 @@ def _subscript_closes_at_end(text: str) -> bool:
     """True when ``text`` is one non-empty `[…]` subscript whose `]` is its last character.
 
     bash's valid_array_reference: brackets nest (`[a[0]]`), and quoted runs and
-    backslash-escaped characters are skipped (`["]"]`, `[\\]]`), so a bracket inside
-    them does not count.
+    backslash-escaped characters are skipped (`["]"]`, `[\\]]`, `[$'\\'']`), so a
+    bracket inside them does not count. Expansions are skipped too; _word_source has
+    already blanked them.
     """
     if not text.startswith("["):
         return False
@@ -574,9 +579,10 @@ def _subscript_closes_at_end(text: str) -> bool:
             i += 2
             continue
         if char in "'\"":
+            escapes = char == '"' or text[i - 1 : i] == "$"  # `$'…'` honours backslash escapes
             i += 1
             while i < len(text) and text[i] != char:
-                i += 2 if char == '"' and text[i] == "\\" else 1
+                i += 2 if escapes and text[i] == "\\" else 1
             if i >= len(text):
                 return False
         elif char == "[":
@@ -589,42 +595,8 @@ def _subscript_closes_at_end(text: str) -> bool:
     return False
 
 
-def _join_continuations(text: str) -> str:
-    """``text`` with its line continuations removed, as bash reads a token.
-
-    Not inside `'…'` or `$'…'`: bash keeps a backslash-newline there, and so does
-    bashlex's coordinate system (verified on both). A `$(…)` or backquote nested in
-    double quotes quotes afresh, so a `'` inside it opens a single-quoted run again.
-    """
-    out: list[str] = []
-    contexts = [""]  # "" (unquoted), `"`, `(` (inside `$(…)`), "`"
-    i = 0
-    while i < len(text):
-        char, top = text[i], contexts[-1]
-        if char == "\\":
-            if text[i + 1 : i + 2] != "\n":
-                out.append(text[i : i + 2])
-            i += 2
-            continue
-        if char == "'" and top != '"':
-            close = i + 1
-            ansi = bool(out) and out[-1] == "$"
-            while close < len(text) and text[close] != "'":
-                close += 2 if ansi and text[close] == "\\" else 1
-            out.append(text[i : close + 1])
-            i = close + 1
-            continue
-        if char in ('"', "`") and top == char or char == ")" and top == "(":
-            contexts.pop()
-        elif char in ('"', "`") or char == "(" and (top == "(" or (out and out[-1] == "$")):
-            contexts.append(char)
-        out.append(char)
-        i += 1
-    return "".join(out)
-
-
 def _is_fd_variable_spelling(text: str) -> bool:
-    """True when ``text`` (see _word_source) is spelled as bash's `{varname}` redirect prefix.
+    """True when ``text``, a word's source (see _word_source), is spelled as bash's `{varname}` prefix.
 
     Read from the SOURCE, never bashlex's word: bashlex has already removed the quotes,
     and bash decides on the raw token. A quote in the name makes an argument (`{f"d"}`,
@@ -639,17 +611,16 @@ def _is_fd_variable_spelling(text: str) -> bool:
 
 
 def _fd_variable_candidate(word: Any, redirect: Any) -> bool:
-    """True when bashlex's own reading could make ``word`` the `{varname}` prefix of ``redirect``.
+    """True when ``word`` is glued to ``redirect`` and bashlex's word is shaped as a `{varname}` prefix.
 
-    Cheap, source-free and deliberately loose: it only decides which words get read
-    from the source at all. The prefix must end where the redirect starts (`{fd} >out`
-    is an argument), and `&>`/`&>>` take none.
+    Source-free: it decides which words get read from the source at all. Quote removal
+    only ever drops characters, so a real prefix always has this shape in bashlex's
+    word. The prefix must end where the redirect starts (`{fd} >out` is an argument),
+    and `&>`/`&>>` take none.
     """
     pos, next_pos = getattr(word, "pos", None), getattr(redirect, "pos", None)
-    text = getattr(word, "word", "")
     return bool(
-        text.startswith("{")
-        and text.endswith("}")
+        _FD_VARIABLE_WORD_SHAPE_RE.fullmatch(getattr(word, "word", ""))
         and getattr(redirect, "kind", None) == "redirect"
         and pos
         and next_pos
@@ -658,19 +629,25 @@ def _fd_variable_candidate(word: Any, redirect: Any) -> bool:
     )
 
 
-def _word_source(word: Any, view: str, raw: bool) -> str:
-    """``word``'s source as bash tokenizes it, every expansion bashlex located inside it blanked.
+def _word_source(word: Any, source: str) -> str:
+    """``word``'s raw source, every expansion bashlex located inside it blanked.
 
     Blanking keeps a `]` inside `$(…)`, `${…}` or backquotes from closing the subscript,
     as bash's valid_array_reference skips them too. The filler is no name character,
-    so an expansion in the NAME (`{f$(x)d}`) still makes an argument.
+    so an expansion in the NAME (`{f$(x)d}`) still makes an argument. A one-character
+    parameter is the `$` of `$'…'`/`$"…"`, a quote marker the scanner needs to see.
     """
     start, end = word.pos
-    text = list(_join_continuations(view[start:end]) if raw else view[start:end])
+    text = list(source[start:end])
     for part in getattr(word, "parts", None) or []:
         part_start, part_end = part.pos
-        text[part_start - start : part_end - start] = "~" * (part_end - part_start)
+        if part_end - part_start > 1:
+            text[part_start - start : part_end - start] = "~" * (part_end - part_start)
     return "".join(text)
+
+
+def _unreadable(source: str, word: Any, cause: str) -> ParseError:
+    return ParseError(f"Cannot read the `{{varname}}` redirect prefix {word.word!r} in {source!r}: {cause}")
 
 
 def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
@@ -682,38 +659,44 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
     `git {fd}>out push --force origin main` and `chmod {fd}>out 777 f` were SAFE, and
     `{fd}>out git …` ran a command named `{fd}`.
 
-    Decided once, here, because only the parse still has the source. A false match
-    hides a real argument from every rule, so it accepts only spellings real bash was
-    seen to consume.
+    Decided once, here, because only the parse still has the source. Leaving a real
+    prefix untagged is the bypass, so a reading this cannot make with certainty raises
+    ParseError, which fails the command closed; it never guesses "argument".
 
-    bashlex's coordinates are the raw source's for everything outside a word. Inside
-    one - a `$(…)` body, a `${…}` - they index that top-level word with its line
-    continuations joined (_join_continuations), so each word's descendants are read
-    against that view. Where the view and bashlex disagree about a candidate (its
-    redirect does not start with an operator there), the reading is uncertain, and an
-    uncertain reading of a prefix is a ParseError, which fails the command closed.
+    bashlex's coordinates index the raw source, except inside a top-level word that
+    holds a line continuation: there they index the word with its continuations joined,
+    in ways that track neither bash's quoting nor bashlex's own consistently. So a
+    backslash-newline anywhere in the candidate's enclosing top-level word raises. Even
+    the joining is unreliable, so this does not attempt it.
     """
-    stack = [(node, source, True) for node in ast_nodes or []]
+    stack: list[tuple[Any, Optional[tuple]]] = [(node, None) for node in ast_nodes or []]
     while stack:
-        node, view, raw = stack.pop()
+        node, enclosing = stack.pop()
         parts = getattr(node, "parts", None)
         if getattr(node, "kind", None) == "command" and parts:
-            for word, redirect in zip(parts, parts[1:]):
-                if not _fd_variable_candidate(word, redirect):
+            for word, redirect in zip(parts, [*parts[1:], None]):
+                if not (hasattr(word, "word") and _FD_VARIABLE_WORD_SHAPE_RE.fullmatch(word.word)):
                     continue
-                if view[redirect.pos[0] : redirect.pos[0] + 1] not in ("<", ">", "&"):
-                    raise ParseError(f"Cannot place the `{{varname}}` redirect prefix {word.word!r} in the source")
-                if _is_fd_variable_spelling(_word_source(word, view, raw)):
-                    setattr(word, _FD_VARIABLE_TAG, True)
-        child_view, child_raw = view, raw
-        if raw and hasattr(node, "word") and getattr(node, "pos", None):
-            start, end = node.pos
-            child_view, child_raw = view[:start] + _join_continuations(view[start:end]), False
+                start, end = enclosing or word.pos
+                continued = "\\\n" in source[start:end]
+                raw = source[word.pos[0] : word.pos[1]]
+                if redirect is not None and _fd_variable_candidate(word, redirect):
+                    if continued:
+                        raise _unreadable(source, word, "a line continuation in or around it")
+                    if source[redirect.pos[0] : redirect.pos[0] + 1] not in ("<", ">"):
+                        raise _unreadable(source, word, "its redirection is not where bashlex places it")
+                    if _is_fd_variable_spelling(_word_source(word, source)):
+                        setattr(word, _FD_VARIABLE_TAG, True)
+                elif not continued and raw.startswith("{") and re.search(r"\}[<>]", raw):
+                    # `{fd}>\<newline>o`: bashlex folds the operator into the word and
+                    # splits the command there, while bash allocates and runs it whole.
+                    raise _unreadable(source, word, "a redirection operator bashlex folded into the word")
+        child_enclosing = enclosing
+        if enclosing is None and hasattr(node, "word") and getattr(node, "pos", None):
+            child_enclosing = node.pos
         for value in vars(node).values():
             stack.extend(
-                (child, child_view, child_raw)
-                for child in (value if isinstance(value, list) else (value,))
-                if hasattr(child, "kind")
+                (child, child_enclosing) for child in (value if isinstance(value, list) else (value,)) if hasattr(child, "kind")
             )
 
 

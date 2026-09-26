@@ -902,7 +902,10 @@ class CommitMessageFilter:
         # double-miss on the same command just parses twice harmlessly (idempotent, last write wins).
         try:
             # The parser's own entry point, so words carry its `{varname}` redirect tag
-            # (LAB-4599). Its ParseError is unwrapped: callers catch bashlex's own types.
+            # (LAB-4599). A ParseError wrapping a bashlex error is unwrapped, so callers'
+            # `except bashlex.errors.ParsingError` behaves as before. One with no bashlex
+            # cause (an unreadable prefix) re-raises as ParseError: callers' broad except
+            # takes it to the regex fallback, and the validation hook denies the command.
             try:
                 parsed = list(_PARSER.parse(command))
             except ParseError as exc:

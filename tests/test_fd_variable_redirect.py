@@ -88,14 +88,13 @@ class TestEverySpellingBashConsumes:
             '{fd["]"]}<in',  # a quoted `]` does not close it
             "{fd[\\]]}<in",  # nor an escaped one
             "{fd[}]}<in",
-            "{f\\\nd}<in",  # a line continuation vanishes before bash reads the word
-            "{fd}\\\n<in",
             # an expansion is skipped whole, as bash skips it: its `]` closes nothing
             "{fd[$(echo ])]}<in",
             "{fd[`echo ]`]}<in",
             "{fd[${x:-]}]}<in",
             "{fd[']']}<in",
             '{fd["\\""]}<in',
+            "{fd[$'\\'']}<in",  # `$'…'` honours backslash escapes
         ],
     )
     def test_consumed_spelling(self, redirect, safety_rules_path):
@@ -203,23 +202,6 @@ class TestEveryArgvViewSkipsThePrefix:
             ("x=$(git {fd}<in push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
             # $(…) base command: `{fd}` is not the command being run
             ("x=$({fd}<in git push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            # inside a word bashlex positions skip line continuations; the reader must follow
-            ("x=$(git {f\\\nd}</dev/null push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            ("echo x\\\ny\\\n$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            ("echo x\\\ny\\\nz\\\n$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            ("echo x\\\ny\\\n`git {fd}<i push --force origin main`", (RiskLevel.BLOCKED, ("git_force_push",))),
-            ("echo x\\\ny\\\n$(y=$(git {fd}<i push --force origin main))", (RiskLevel.BLOCKED, ("git_force_push",))),
-            # …but not inside '…' or $'…', where bash and bashlex both keep them
-            ("echo 'a\\\nb'$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            ("echo $'a\\\nb'$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            ('echo "a\\\nb"$(git {fd}<i push --force origin main)', (RiskLevel.BLOCKED, ("git_force_push",))),
-            ("echo $'a\\'b\\\nc'$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            # a `'` inside `"$(…)"` quotes afresh
-            ("echo \"$(echo 'a\\\nb')\"$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            (
-                "echo \"$(echo 'a\\\nb')\"'c\\\nd'$(git {fd}<i push --force origin main)",
-                (RiskLevel.BLOCKED, ("git_force_push",)),
-            ),
             # $(…) structure check: `kubectl get` is read-only, not "kubectl {fd}"
             ("x=$(kubectl {fd}<x get pods)", (RiskLevel.SAFE, ())),
             # pipe-to-shell stages (_get_command_name, _stage_args, _get_all_words)
@@ -242,6 +224,59 @@ class TestEveryArgvViewSkipsThePrefix:
         assert _verdict("x=$({fd}<in ls)", safety_rules_path) == (RiskLevel.BLOCKED, ())
 
 
+class TestLineContinuationsFailClosed:
+    """A continuation inside the prefix's enclosing word makes bashlex's offsets untrustworthy.
+
+    bash consumes the prefix in every row below. Rather than model how bashlex joins
+    continuations (its own coordinates track neither bash's quoting nor themselves), the
+    parse refuses, so the command is BLOCKED. Continuations outside that word are harmless:
+    bashlex's coordinates stay raw there.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git {f\\\nd}<i push --force origin main",
+            "git {fd}\\\n<i push --force origin main",
+            "x=$(git {f\\\nd}</dev/null push --force origin main)",
+            "echo x\\\ny\\\n$(git {fd}<i push --force origin main)",
+            "echo x\\\ny\\\nz\\\n$(git {fd}<i push --force origin main)",
+            "echo x\\\ny\\\n`git {fd}<i push --force origin main`",
+            "echo x\\\ny\\\n$(y=$(git {fd}<i push --force origin main))",
+            "echo 'a\\\nb'$(git {fd}<i push --force origin main)",
+            "echo $'a\\\nb'$(git {fd}<i push --force origin main)",
+            'echo "a\\\nb"$(git {fd}<i push --force origin main)',
+            "echo $(# note \\\ngit {fd}<x<y push --force origin main)",  # a comment's continuation
+            "echo `echo 'a\\\nb'; git {fd}<x push --force origin main`",
+            "echo ${x:-'a\\\nb'}$(git {fd}<x push --force origin main)",
+            # the operator after a continuation: bashlex folds `>\` into the word and splits
+            # the command there, while bash allocates the fd and runs the push
+            "git {fd}>\\\no push --force origin main",
+            "chmod {fd}>\\\n/dev/null 777 /etc/passwd",
+            "x=$(git {fd}>\\\no push --force origin main)",
+        ],
+    )
+    def test_blocked(self, command, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, ())
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            # continuations between words, and around a word with none, leave offsets raw
+            ("echo \\\n\\\n$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            ("x=1\\\ny\\\n git {fd}<i push --force origin main", (RiskLevel.HIGH, ("git_force_push",))),
+            ("echo $(# don't\ngit {fd}<x push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            # a brace word that cannot be a prefix is never read, so it cannot fail closed
+            ("n=$(# don't count\\\n awk '{n++} END {print n}'<&0)", (RiskLevel.SAFE, ())),
+            ("x=$(awk \\\n '{print}' f)", (RiskLevel.SAFE, ())),
+            # a brace word folded with its operator is only suspect when it could be a prefix
+            ("echo {a,b}>\\\no", (RiskLevel.SAFE, ())),
+        ],
+    )
+    def test_unaffected(self, command, expected, safety_rules_path):
+        assert _verdict(command, safety_rules_path) == expected
+
+
 class TestEveryConsumerParsesThroughTheTag:
     """A bashlex AST built anywhere but BashCommandParser.parse carries no prefix tag."""
 
@@ -251,27 +286,49 @@ class TestEveryConsumerParsesThroughTheTag:
         assert commit_filter.is_git_commit_command('git "{fd}">out commit -m "msg"') is False  # `{fd}` is git's argument
 
     def test_an_unplaceable_prefix_fails_closed(self):
-        # The view and bashlex disagree: the redirect bashlex puts at offset 8 is not there.
+        # The source and bashlex disagree: the redirect bashlex puts at offset 8 is not there.
         ast = bashlex.parse("git {fd}<i push")
         with pytest.raises(ParseError):
             _mark_fd_variables("git {fd}xi push", ast)
 
     def test_no_other_bashlex_parse_call(self):
         # BashCommandParser.parse tags; _parse_succeeds only asks whether a synthetic probe parses.
-        allowed = {("parser.py", "parse"), ("parser.py", "_parse_succeeds")}
-        found = set()
-        for path in (pathlib.Path(__file__).parent.parent / "src").rglob("*.py"):
-            tree = ast.parse(path.read_text())
-            for func in ast.walk(tree):
-                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                for call in ast.walk(func):
-                    if (
-                        isinstance(call, ast.Call)
-                        and isinstance(call.func, ast.Attribute)
-                        and call.func.attr == "parse"
-                        and isinstance(call.func.value, ast.Name)
-                        and call.func.value.id == "bashlex"
-                    ):
-                        found.add((path.name, func.name))
-        assert found == allowed
+        src = pathlib.Path(__file__).parent.parent / "src"
+        found = {(path.relative_to(src).as_posix(), owner) for path in src.rglob("*.py") for owner in _bashlex_parse_calls(path)}
+        assert found == {("schlock/core/parser.py", "parse"), ("schlock/core/parser.py", "_parse_succeeds")}
+
+
+def _import_aliases(tree):
+    """Local name -> the dotted name it stands for, for every import in ``tree``."""
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[alias.asname or alias.name.split(".")[0]] = alias.name if alias.asname else alias.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return aliases
+
+
+def _bashlex_parse_calls(path):
+    """The enclosing function ("<module>" at top level) of every bashlex parse call in ``path``."""
+    tree = ast.parse(path.read_text())
+    aliases = _import_aliases(tree)
+    owners = {}
+    for func in ast.walk(tree):
+        if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(func):
+                owners.setdefault(node, func.name)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        chain, func = [], node.func
+        while isinstance(func, ast.Attribute):
+            chain.insert(0, func.attr)
+            func = func.value
+        if isinstance(func, ast.Name) and ".".join([aliases.get(func.id, func.id), *chain]) in (
+            "bashlex.parse",
+            "bashlex.parser.parse",
+        ):
+            yield owners.get(node, "<module>")
