@@ -12,6 +12,7 @@ from schlock.core import validator as validator_module
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
+    _VETTED_LAUNCHERS,
     DANGEROUS_SUBSTITUTION_COMMANDS,
     MAX_SUBSTITUTION_DEPTH,
     SAFE_SUBSTITUTION_COMMANDS,
@@ -19,6 +20,7 @@ from schlock.core.substitution import (
     SubstitutionType,
     SubstitutionValidationResult,
     SubstitutionValidator,
+    _hides_a_glued_git_payload,
     dangerous_awk,
     dangerous_sed,
 )
@@ -58,6 +60,23 @@ class TestSubstitutionConstants:
         """No command should be in both lists."""
         overlap = SAFE_SUBSTITUTION_COMMANDS & DANGEROUS_SUBSTITUTION_COMMANDS
         assert len(overlap) == 0, f"Commands in both lists: {overlap}"
+
+    def test_whitelisted_wrapper_or_delegator_is_a_launcher(self):
+        """The glued-git-option guard exempts vetted readers, so a whitelisted delegator must be a launcher.
+
+        git, op, awk and sed are hand-vetted launchers outside the delegator table; the parametrised
+        guard test below pins each of them.
+        """
+        delegators = SAFE_SUBSTITUTION_COMMANDS & validator_module._DELEGATOR_COMMANDS
+        assert delegators <= _VETTED_LAUNCHERS, delegators - _VETTED_LAUNCHERS
+
+    @pytest.mark.parametrize("launcher", ["git", "op", "find", "awk", "sed"])
+    def test_glued_git_guard_scans_every_launcher(self, launcher):
+        """Called directly, below the structural checks, so dropping any launcher fails here."""
+        assert _hides_a_glued_git_payload([launcher, "git", "difftool", "-xa b"])
+
+    def test_glued_git_guard_skips_a_vetted_reader(self):
+        assert not _hides_a_glued_git_payload(["printf", "%s", "git", "-xa b"])
 
 
 class TestSubstitutionDataClasses:
@@ -1774,6 +1793,68 @@ class TestWhitelistedSubstitutionYamlRules:
             bare = validate_command(inner)
             wrapped = validate_command(f'echo "$({inner})"')
             assert order.index(wrapped.risk_level) >= order.index(bare.risk_level), inner
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Dequoted, the payload's first word fuses with the flag (`-xrm`), so no `\brm` rule
+            # can see it; the `/bin/rm` row was also suppressed as opaque data (LAB-4265).
+            "echo \"$(git difftool -x'rm -rf /')\"",
+            "echo \"$(git difftool -x'/bin/rm -rf /')\"",
+            "echo \"$(git rebase -x'rm -rf /' main)\"",
+            "echo \"$(git submodule foreach -q'rm -rf /')\"",
+            # a cluster hides the split point, a backslash leaves no quote to split at, and a
+            # quoted dash is the same argv
+            "echo \"$(git difftool -yx'rm -rf /')\"",
+            'echo "$(git difftool -xrm\\ -rf\\ /)"',
+            "echo \"$(git difftool '-xrm -rf /')\"",
+            # --namespace takes `--` as its value, so git still parses the -x after it
+            "echo \"$(git --namespace -- difftool -x'rm -rf /')\"",
+            # an unknown wrapper must not carry it to Layer 4 still fused
+            "echo \"$(timeout 5 git difftool -x'rm -rf /')\"",
+            "echo \"$(/usr/bin/git difftool -x'rm -rf /')\"",
+            # through the pipeline and list renderers
+            "echo \"$(git log | git difftool -x'rm -rf /')\"",
+            "echo \"$(cd x && git difftool -x'rm -rf /')\"",
+            # a vetted launcher runs git, and the reader exemption keys on the command word
+            "echo \"$(op run -- git difftool -x'rm -rf /')\"",
+            "echo \"$(awk 'BEGIN{c=ARGV[1] FS ARGV[2] FS ARGV[3]; print 1 | c}' git difftool '-xrm -rf /')\"",
+            "echo \"$(git difftool -x'rm -rf /' HEAD cat)\"",
+            # Accepted over-block: whether -S's value is data is git's option table to know.
+            # The message names the fix, `-S 'foo bar'`.
+            "echo \"$(git log -S'foo bar')\"",
+        ],
+    )
+    def test_multi_word_value_glued_to_a_git_short_option_is_denied(self, command):
+        """A glued multi-word value is unreadable, so it is denied rather than guessed at."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(git log -n5)"',
+            "echo \"$(grep -rn'pattern' src/)\"",
+            'echo "$(sort -k2 f)"',
+            'echo "$(head -n20 f)"',
+            "echo \"$(cut -d' ' -f1 f)\"",
+            # on a reader the same shape is data: only git runs a glued short-option value
+            "echo \"$(date -d'1 day ago' +%F)\"",
+            "echo \"$(date -d '-1 day' +%F)\"",
+            "echo \"$(sed -e's/ /_/g' f)\"",
+            # git as data before the glued word: git parses nothing that precedes it
+            "echo \"$(grep -rn -e'-o json' vendor/git)\"",
+            # git as a reader's argument is data: printf is the command, not git
+            "echo \"$(printf '%s' git '-xhello world')\"",
+            # the two spellings the denial message points at
+            "echo \"$(git log -S 'foo bar')\"",
+            "echo \"$(git log --format='%h %s')\"",
+        ],
+    )
+    def test_ordinary_glued_short_options_stay_safe(self, command):
+        """A glued datum, a glued separator, or any glued value off git is not a payload."""
+        assert validate_command(command).allowed is True
 
     @pytest.mark.parametrize(
         "command",
