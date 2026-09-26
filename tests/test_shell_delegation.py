@@ -899,10 +899,14 @@ class TestBase64DecodeAtCommandPosition:
             "${v:-flock #$(base64 -d x)}",
             # A `{varname}` redirect prefix is never argv, so the decode is the command: bash ran each.
             "{fd}>out $(base64 -d x)",
-            "{fd[1]}>out $(base64 -d x)",
             "{fd}>out {g}>o2 $(base64 -d x)",
             "$(true) {fd}>out $(base64 -d x)",
             "env {fd}>out $(base64 -d x)",
+            # bashlex types these assignments as words, but bash still assigns them first.
+            "{fd}>out X=1 $(base64 -d x)",
+            "2>/dev/null X+=1 $(base64 -d x)",
+            "{fd}>out a[0]=1 $(base64 -d x)",
+            "a[0]=1 $(base64 -d x)",
         ],
     )
     def test_decode_run_as_a_command_is_blocked(self, command):
@@ -937,6 +941,11 @@ class TestBase64DecodeAtCommandPosition:
             "X=${v:-$(base64 -d x)}",
             # Dropping a `{varname}` prefix does not promote the next word's argument.
             "{fd}>out echo $(base64 -d x)",
+            # An assignment after a redirect only assigns, as it does anywhere before the command.
+            '2>/dev/null TOKEN=$(echo "$S" | base64 -d) ./run',
+            '{fd}>/dev/null TOKEN=$(echo "$S" | base64 -d) ./run',
+            # Only BEFORE the command name: here bash runs a command named `X=1`, not the decode.
+            "$(true) X=1 $(base64 -d x)",
         ],
     )
     def test_decode_as_data_is_not_escalated(self, command):

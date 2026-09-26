@@ -659,7 +659,7 @@ def without_fd_variables(parts: "list[Any]") -> "list[Any]":
     """A command node's parts less every redirection's `{varname}` prefix.
 
     For each word view that walks `.parts` itself: this module's argv views
-    (_command_words) and substitution.py's inner-command views.
+    (_word_parts) and substitution.py's inner-command views.
     """
     return [part for part in parts if not _is_fd_variable(part)]
 
@@ -721,17 +721,30 @@ def _stdin_here_string(parts: "list[Any]") -> Optional[str]:
     return by_fd.get(0)
 
 
+# A word bash takes as an assignment when it comes before the command name. bashlex types a plain
+# `FOO=1` as an assignment node only when no redirect precedes it, and a subscripted `a[0]=1` never.
+# The subscript match runs to the LAST `]=` because bashlex has already dropped the quotes that can
+# hide a `]` (`a["]"]=1`).
+_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=", re.DOTALL)
+
+
+def _word_parts(parts: "list[Any]") -> "list[Any]":
+    """A command node's word parts: no assignment, no redirection, no `{varname}` prefix."""
+    return [
+        part
+        for part in without_fd_variables(parts)
+        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
+    ]
+
+
 def _command_words(node: Any) -> "list[str]":
     """Word tokens (command name + args) of a command node.
 
     Skips assignments, redirections and a redirection's `{varname}` prefix. Every argv
-    view in this module reads a command through here.
+    view in this module reads a command through here, or through _word_parts when it
+    needs the nodes.
     """
-    return [
-        part.word
-        for part in without_fd_variables(getattr(node, "parts", None) or [])
-        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
-    ]
+    return [part.word for part in _word_parts(getattr(node, "parts", None) or [])]
 
 
 def heredoc_owner(node: Any) -> Optional[str]:
@@ -868,21 +881,24 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     "The command" is every word bash may execute, not just the first: a leading bare expansion
     can vanish, and a wrapper (`env`, `nohup`, `timeout 5`, `builtin`) executes an operand. So the
     scan walks words until the first literal one, the command that actually runs; past a wrapper
-    it also steps over flags, `NAME=value` and numeric operands. A `{fd}` redirect prefix is no
-    word at all (see without_fd_variables): read as one, it ended the scan before `{fd}>o $(…)`.
-    It deliberately does NOT scan every wrapper operand the way `_classify_sink` does: there a
-    false hit only re-validates a payload, here it is an un-promptable BLOCKED, and
-    `timeout 30 curl -H "$(… | base64 -d)"` or `sudo mysql -p"$(base64 -d pw)"` pass the decode
-    as DATA to the command the wrapper runs.
+    it also steps over flags, `NAME=value` and numeric operands. It deliberately does NOT scan
+    every wrapper operand the way `_classify_sink` does: there a false hit only re-validates a
+    payload, here it is an un-promptable BLOCKED, and `timeout 30 curl -H "$(… | base64 -d)"`
+    or `sudo mysql -p"$(base64 -d pw)"` pass the decode as DATA to the command the wrapper runs.
+
+    Words come from _word_parts, as argv does, so a `{fd}` redirect prefix is never the command.
+    Nor is a leading assignment bashlex typed as a word: after a redirect it types `TOKEN=…` so,
+    and reading that as the command both BLOCKED `2>/dev/null TOKEN=$(… | base64 -d) ./run`,
+    which only assigns the decode, and ended the scan before `>o X=1 $(base64 -d x)` ran it.
     ponytail: a wrapper's literal operand ends the scan, so `flock /tmp/l $(base64 -d x)` and
     `timeout -s KILL 5 $(…)` stay at the substitution floor (HIGH). Per-wrapper operand arity
     would close that; nothing here models it yet.
     """
     in_wrapper = False
-    for word in without_fd_variables(getattr(node, "parts", None) or []):
-        if getattr(word, "kind", None) in ("assignment", "redirect"):
-            continue
-        text = getattr(word, "word", "")
+    words = _word_parts(getattr(node, "parts", None) or [])
+    start = next((i for i, w in enumerate(words) if not _ASSIGNMENT_WORD.match(w.word)), len(words))
+    for word in words[start:]:
+        text = word.word
         if in_wrapper and (text.startswith("-") or text[:1].isdigit() or _is_env_assignment(text)):
             continue
         if _runs_decode(word, seen):
