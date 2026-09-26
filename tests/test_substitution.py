@@ -4,6 +4,7 @@ Targeted tests to improve coverage on uncovered code paths.
 """
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -1363,6 +1364,77 @@ class TestCheckProcessSubstitutionContext:
         """_find_outer_command with None returns None."""
         result = validator._find_outer_command(None, None)
         assert result is None
+
+
+class TestCommandNameSkipsFdVariablePrefix:
+    """A redirection's `{varname}` prefix is never the command name.
+
+    bash consumes `{fd}` with its redirect, so `{fd}<x date` names its command exactly as
+    `3<x date` does. These lookups read `parts[0]` raw and named `{fd}` instead. Each row
+    pins a `{varname}` spelling and its numeric-fd twin to the same absolute value; a
+    trailing prefix shows the lookup still finds the command. The prefix itself is decided
+    in tests/test_fd_variable_redirect.py.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("{fd}<x date", None),
+            ("3<x date", None),
+            ("date {fd}<x", "date"),
+            ("{fd}<x date | cat", None),
+            ("3<x date | cat", None),
+            ("date {fd}<x | cat", "date"),
+        ],
+    )
+    def test_list_segment_base_command(self, validator, parser, command, expected):
+        assert validator._segment_base_command(parser.parse(command)[0]) == expected
+
+    @pytest.mark.parametrize(
+        ("inner", "expected"),
+        [("{fd}<x date | cat", None), ("3<x date | cat", None), ("date {fd}<x | cat", "date")],
+    )
+    def test_pipeline_base_command(self, validator, parser, inner, expected):
+        (sub,) = validator.extract_substitutions(parser.parse(f"echo $({inner})"))
+        assert sub.base_command == expected
+
+    @pytest.mark.parametrize(("command", "expected"), [("{fd}<x date", None), ("3<x date", None), ("date {fd}<x", "date")])
+    def test_compound_base_command(self, validator, parser, command, expected):
+        """bashlex leads every compound that reaches this branch with a reserved word, so pin it directly."""
+        node = SimpleNamespace(command=SimpleNamespace(kind="compound", list=parser.parse(command)))
+        assert validator._extract_base_command(node) == expected
+
+    @pytest.mark.parametrize(
+        ("command", "brace", "variable"),
+        [
+            ("{fd[1,2]}<x date", False, False),
+            ("{fd[$i]}<x date", False, False),
+            ("3<x date", False, False),
+            ("{r,}m {fd}<x -rf /", True, False),
+            ("$CMD {fd}<x", False, True),
+        ],
+    )
+    def test_ast_pattern_checks(self, validator, parser, command, brace, variable):
+        node = parser.parse(command)[0]
+        assert validator._has_brace_expansion_in_command(node) is brace
+        assert validator._has_variable_as_command(node) is variable
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [("{fd}>f bash <(ls)", None), ("3>f bash <(ls)", None), ("bash {fd}>f <(ls)", "bash")],
+    )
+    def test_find_outer_command(self, validator, parser, command, expected):
+        assert validator._find_outer_command(parser.parse(command), None) == expected
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize("prefix", ["{fd[1,2]}<x", "{fd[$i]}<x", "3<x"])
+    def test_denial_names_no_phantom_pattern(self, prefix):
+        """The subscript's `,` and `$i` read as brace expansion / a variable command name."""
+        result = validate_command(f"echo $({prefix} date)")
+        assert (result.risk_level, result.message) == (
+            RiskLevel.BLOCKED,
+            "BLOCKED: Cannot determine command in substitution",
+        )
 
 
 class TestNestedSubstitutionValidation:
