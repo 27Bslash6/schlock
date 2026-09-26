@@ -1765,8 +1765,6 @@ class TestQuotedSubstitutionBodies:
             # a `for` word list belongs to no command segment
             ('for f in "$(:(){ :|:& };:)"; do :; done', "fork_bomb", RiskLevel.BLOCKED),
             ("echo \"$(cat 'ordinary\nfile' ~/.ssh/id_rsa)\"", "ssh_key_exfiltration", RiskLevel.BLOCKED),
-            # bashlex ends the inner command at the first newline
-            ('echo "$(true\nrm -rf /\n)"', "system_destruction", RiskLevel.BLOCKED),
             # eight `\\<newline>`s move bashlex's end for this span onto the subshell's `)`
             ('echo "$(' + "\\\n" * 8 + ' (:); :(){ :|:& };:)"', "fork_bomb", RiskLevel.BLOCKED),
             # and each `\\<newline>` shifts every later inner offset by two

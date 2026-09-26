@@ -371,8 +371,8 @@ class TestEvalExecDetection:
         )
 
 
-def _inner_subst_command(nodes):
-    """Return the `command` node inside the first command-substitution reachable from `nodes`.
+def _first_substitution(nodes):
+    """Return the first command- or process-substitution node reachable from ``nodes``.
 
     Accepts either a single node or the list returned by ``parser.parse``.
     """
@@ -381,8 +381,8 @@ def _inner_subst_command(nodes):
     def walk(n):
         if found:
             return
-        if getattr(n, "kind", None) == "commandsubstitution":
-            found.append(n.command)
+        if getattr(n, "kind", None) in ("commandsubstitution", "processsubstitution"):
+            found.append(n)
             return
         for attr in ("parts", "command", "list"):
             child = getattr(n, attr, None)
@@ -398,6 +398,12 @@ def _inner_subst_command(nodes):
     else:
         walk(nodes)
     return found[0] if found else None
+
+
+def _inner_subst_command(nodes):
+    """Return the ``command`` node inside the first substitution reachable from ``nodes``."""
+    sub = _first_substitution(nodes)
+    return sub.command if sub is not None else None
 
 
 def _op_signature(node):
@@ -619,6 +625,150 @@ class TestAndOrSubstitutionCorrection:
         finally:
             bashlex.parser.yaccparser = real_yacc
             parser_mod._apply_andor_substitution_correction()  # restore the real correction
+
+
+class TestMultilineSubstitutionCorrection:
+    """LAB-4114: bashlex 0.18 read only the first line of a substitution body.
+
+    ``$(echo a\\nrm -rf /)`` produced an AST holding ``echo a`` alone; the second line was re-read
+    as inert word text, so the validator rated the command SAFE while bash ran ``rm -rf /``.
+    ``_parse_all_substitution_units`` replaces bashlex's one-unit parse of the body.
+    """
+
+    @pytest.mark.parametrize(
+        "command,semicolon_spelling",
+        [
+            ('echo "$(echo a\nrm -rf /)"', "echo a; rm -rf /"),
+            ("echo $(echo a\nrm -rf /)", "echo a; rm -rf /"),
+            ("echo `echo a\nrm -rf /`", "echo a; rm -rf /"),
+            ("cat <(echo a\nrm -rf /)", "echo a; rm -rf /"),
+            ('echo "$(echo a # trailing comment\nrm -rf /)"', "echo a; rm -rf /"),
+            ('echo "$(echo a\n\n\nrm -rf /)"', "echo a; rm -rf /"),
+            ('echo "$(echo a\nrm -rf /\n)"', "echo a; rm -rf /"),
+            ('echo "$(\n  echo a\n  rm -rf /\n)"', "echo a; rm -rf /"),
+            ('echo "$(echo a;\nrm -rf /)"', "echo a; rm -rf /"),
+            ('echo "$(echo a &\nrm -rf /)"', "echo a & rm -rf /"),
+            ('echo "$(echo a\nrm -rf /\necho c)"', "echo a; rm -rf /; echo c"),
+            ('echo "$(echo a | tr a b\nrm -rf /)"', "echo a | tr a b; rm -rf /"),
+            ('echo "$(echo a &&\n  echo b\nrm -rf /)"', "echo a && echo b; rm -rf /"),
+            ('echo "$(cat <<EOF\nbody\nEOF\nrm -rf /)"', "cat <<EOF; rm -rf /\nbody\nEOF"),
+            ('echo "$(echo "$(echo a\nrm -rf /)")"', 'echo "$(echo a; rm -rf /)"'),
+        ],
+    )
+    def test_every_line_reaches_the_ast(self, parser, command, semicolon_spelling):
+        """The multi-line body parses to the same words and separators as its ``;`` spelling."""
+        body = _inner_subst_command(parser.parse(command))
+        assert body is not None
+        got = [("op", ";") if item == ("op", "\n") else item for item in _op_signature(body)]
+        assert got == _op_signature(parser.parse(semicolon_spelling)[0])
+
+    def test_body_ends_at_the_first_closing_paren(self, parser):
+        """Text after the ``)`` inside the same quoted word is data, never a second unit."""
+        body = _inner_subst_command(parser.parse('echo "$(echo a)\nrm -rf /"'))
+        assert _op_signature(body) == [("word", "echo"), ("word", "a")]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(a\n&& b)",
+            "echo $(a\n| b)",
+            "echo $()",
+            "echo $(\n)",
+            "echo $(\n# only a comment\n)",
+            # Unterminated bodies: the tokenizer refuses the word before the unit loop ever runs.
+            "echo $(echo ok\n",
+            "echo <(echo ok\n",
+            "echo `echo ok\n",
+            # A backtick body ends only at EOF: a stray ``)`` is bash's syntax error, not an end.
+            "echo `echo a\n)echo b`",
+            "echo `echo a)`",
+        ],
+    )
+    def test_malformed_bodies_still_rejected(self, parser, command):
+        """Reading more lines must not make bashlex accept what bash rejects, nor swallow an empty body."""
+        with pytest.raises(ParseError):
+            parser.parse(command)
+
+    def test_empty_body_is_a_deliberate_parse_error(self, parser):
+        """A body with nothing to parse raises ``ParsingError``, not the ``AttributeError`` stock bashlex hit.
+
+        ``$()`` is rejected by the grammar inside the first unit's parse; a blank backtick body is
+        the one spelling where ``parse()`` hands back a bare string instead of a node or raising.
+        """
+        with pytest.raises(ParseError) as excinfo:
+            parser.parse("echo ` `")
+        assert isinstance(excinfo.value.original_error, bashlex.errors.ParsingError)
+
+    def test_a_paren_body_that_runs_out_is_rejected(self):
+        """A ``$( )`` body handed over without its ``)`` must deny, never return the units it could parse.
+
+        Unreachable from ``parse()``: the word delimiter refuses an unterminated ``$(`` before the
+        unit loop runs (pinned above). The same text is a complete two-unit body for backticks,
+        which have no closer.
+        """
+        outer = bashlex.parser._parser("echo x")
+        closer = bashlex.tokenizer.token(bashlex.tokenizer.tokentype.RIGHT_PAREN, ")")
+        with pytest.raises(bashlex.errors.ParsingError, match=r"matching '\)'"):
+            parser_mod._parse_all_substitution_units(
+                outer, "echo a\necho b\n", 0, {"eoftoken": closer, "parserstate": outer.parserstate}
+            )
+        node, end = parser_mod._parse_all_substitution_units(outer, "echo a\necho b\n", 0)
+        assert node.kind == "list"
+        assert end == len("echo a\necho b")
+
+    def test_a_unit_ending_on_an_unexpected_token_is_rejected(self, monkeypatch):
+        """The guard on a unit terminator that is neither NEWLINE nor the closer denies, never breaks.
+
+        Unreachable from ``parse()`` with bashlex 0.18: ``inputunit`` only ever terminates on a
+        newline or ``$end``, and a stray ``;;``/``fi``/``}`` is a yacc syntax error inside the
+        unit's own parse (Mark S swept 200 seeded commands on LAB-4640: NEWLINE and RIGHT_PAREN
+        were the only terminators observed). Pinned directly, like its EOF sibling above, because
+        it is the docstring's advertised fail-closed property and a ``break`` in its place would
+        hand back the prefix - the LAB-4114 failure - the day the grammar moves.
+        """
+        outer = bashlex.parser._parser("echo x")
+
+        class FakeTok:
+            _current_token = bashlex.tokenizer.token(bashlex.tokenizer.tokentype.SEMI_SEMI, ";;", pos=(6, 8))
+            _shell_input_line_index = 8
+
+        class FakeUnit:
+            tok = FakeTok()
+
+            @staticmethod
+            def parse():
+                return bashlex.ast.node(kind="command", parts=[], pos=(0, 6))
+
+        monkeypatch.setattr(bashlex.parser, "_parser", lambda *_args, **_kwargs: FakeUnit())
+        closer = bashlex.tokenizer.token(bashlex.tokenizer.tokentype.RIGHT_PAREN, ")")
+        with pytest.raises(bashlex.errors.ParsingError, match=r"unexpected ';;' after substitution unit"):
+            parser_mod._parse_all_substitution_units(
+                outer, "echo a;; echo b)", 0, {"eoftoken": closer, "parserstate": outer.parserstate}
+            )
+
+    @pytest.mark.parametrize(
+        "command,span,body_kind,body_span",
+        [
+            # Stock bashlex 0.18 values, recorded before the correction: a one-unit body must be
+            # byte-identical, including the sloppy end offset bashlex gives ``$(echo a )``.
+            ('echo "$(rm -rf /)"', (6, 17), "command", (8, 16)),
+            ("echo $(a; b)", (5, 12), "list", (7, 11)),
+            ("echo `a`", (5, 8), "command", (6, 7)),
+            ('echo "$(a)$(b)"', (6, 10), "command", (8, 9)),
+            ('echo "$(echo a )"', (6, 15), "command", (8, 14)),
+            ("echo $(a\n)", (5, 9), "command", (7, 8)),
+            # A heredoc body lies outside the node span, so stock bashlex reads the ``)`` as the
+            # byte after ``cat <<EOF``. Pre-existing and span-only: the tree still holds the redirect.
+            ("echo $(cat <<EOF\nx\nEOF\n)", (5, 17), "command", (7, 16)),
+        ],
+    )
+    def test_one_unit_bodies_are_untouched(self, parser, command, span, body_kind, body_span):
+        """A one-unit body takes the same path and yields the same spans as stock bashlex."""
+        sub = _first_substitution(parser.parse(command))
+        assert sub is not None
+        assert tuple(sub.pos) == span
+        assert sub.command.kind == body_kind
+        assert tuple(sub.command.pos) == body_span
 
 
 def test_extract_command_segments_keeps_an_escaped_trailing_blank():

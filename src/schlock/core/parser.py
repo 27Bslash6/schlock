@@ -8,11 +8,16 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import bisect
+import copy
 import logging
 from typing import Any, NamedTuple, Optional
 
 import bashlex
+import bashlex.ast
 import bashlex.errors
+import bashlex.parser
+import bashlex.subst
+import bashlex.tokenizer
 
 from schlock.exceptions import ParseError
 
@@ -119,6 +124,118 @@ def _apply_andor_substitution_correction() -> None:
 
 
 _apply_andor_substitution_correction()
+
+
+def _parse_all_substitution_units(
+    parserobj: Any, base: str, sindex: int, tokenizerargs: Optional[dict[str, Any]] = None
+) -> tuple[Any, int]:
+    r"""Drop-in for ``bashlex.subst._recursiveparse`` that reads EVERY line of a substitution body.
+
+    bashlex 0.18 parses the body of ``$( … )``, ``<( … )`` and `` ` … ` `` with a single call to
+    its top-level ``inputunit`` production, and a bare newline ends an input unit. So for
+    ``$(echo a\nrm -rf /)`` only ``echo a`` reached the AST: the tokenizer had already delimited
+    the whole word, so nothing raised, and ``rm -rf /)`` was re-read as inert word text. The
+    validator was handed a truncated tree and rated the command SAFE while bash ran the second
+    line (LAB-4114). ``;``, ``|``, ``&&`` and ``||`` joins were never affected — they are
+    intra-unit — which is why the single-line spelling was always caught.
+
+    This parses unit after unit until the tokenizer stops at the closing ``)`` (or the end of a
+    backtick body) and joins the units into the ``list`` / ``operator('\n')`` shape bashlex's
+    own grammar produces for ``(a\nb)``, so the validator's list-segment path sees each line as
+    a segment exactly as it does for ``$(a; b)``. A one-unit body yields the same node and end
+    offset as before. Comment lines, blank lines and heredoc bodies are skipped by the tokenizer
+    itself — its post-parse index is the only resume signal, never a hand-rolled scan.
+
+    Fail closed by construction: a unit that does not parse raises exactly as it does today; a
+    body with nothing to parse (stock bashlex handed back the bare ``'\n'`` string for ``` ` ` ```
+    and crashed on ``.pos``), a unit ending on a token that is neither a newline nor the body's own
+    closer (``)`` for ``$( )`` and ``<( )``, EOF for backticks), and a ``$( )`` or ``<( )`` body that
+    runs out before its ``)`` all raise ``ParsingError``, so they take the normal deny path.
+    """
+    tok = parserobj.tok
+    if tokenizerargs is None:
+        tokenizerargs = {
+            "parserstate": copy.copy(tok._parserstate),
+            "lastreadtoken": tok._last_read_token,
+            "tokenbeforethat": tok._token_before_that,
+            "twotokensago": tok._two_tokens_ago,
+        }
+    limit = parserobj._expansionlimit
+    if limit is not None:
+        limit -= 1
+
+    newline_type = bashlex.tokenizer.tokentype.NEWLINE
+    eof_type = bashlex.tokenizer.tokentype.EOF
+    # ``_parsedolparen`` passes ``)`` as ``eoftoken`` for a ``$( )`` / ``<( )`` body; the backtick branch passes none.
+    closer: Any = tokenizerargs.get("eoftoken")
+    body_end_type = closer.ttype if closer is not None else eof_type
+    string = base[sindex:]
+    parts: list[Any] = []
+    offset = 0
+
+    def body_ended(token: Any) -> bool:
+        """A body ends only at its own closer. EOF inside a ``$( )`` body means the word delimiter and
+        the unit tokenizer disagreed about where it ends: deny rather than rate the prefix (LAB-4114)."""
+        if closer is not None and token.ttype is eof_type:
+            raise bashlex.errors.ParsingError(f"unexpected EOF while looking for matching {closer.value!r}", string, len(string))
+        return token.ttype is body_end_type
+
+    while True:
+        # ``_parser`` pops ``parserstate`` out of the dict it is given and the tokenizer mutates
+        # the state as it runs, so every unit gets its own copy of both.
+        args = dict(tokenizerargs)
+        args["parserstate"] = copy.copy(tokenizerargs["parserstate"])
+        unit = bashlex.parser._parser(string[offset:], tokenizerargs=args, expansionlimit=limit)
+        parsed = unit.parse()
+        if not isinstance(parsed, bashlex.ast.node):
+            # ``None`` for an empty body, a bare str for a whitespace-only one: neither is a unit.
+            raise bashlex.errors.ParsingError("empty command substitution", string, offset)
+        node: Any = parsed  # bashlex is untyped; every attribute below is dynamic
+        end = offset + node.pos[1]
+        bashlex.subst._adjustpositions(node, sindex + offset, len(base))
+        parts.extend(node.parts if node.kind == "list" else [node])
+
+        terminator: Any = unit.tok._current_token
+        if body_ended(terminator):
+            # The unit ended at its ``)``. EOF never lands here: the tokenizer appends a trailing
+            # newline, so a unit ends on NEWLINE or the closer, and EOF is only seen at the peek below.
+            break
+        if terminator.ttype is not newline_type:
+            # Only a newline, ``)`` or EOF can end an ``inputunit``. Anything else means the grammar
+            # moved under us; handing back the prefix would silently drop the rest of the body.
+            raise bashlex.errors.ParsingError(
+                f"unexpected {terminator.value!r} after substitution unit", string, offset + terminator.lexpos
+            )
+        # The tokenizer has consumed the terminator - and any heredoc body it opened - so its
+        # index is where the next unit starts. Capture it before peeking moves it on.
+        resume = unit.tok._shell_input_line_index
+        # Blank and comment lines yield further NEWLINE tokens, which the parser absorbs. What
+        # follows them decides: another unit, or nothing but the terminator, which bashlex's
+        # ``$( )`` grammar cannot parse on a line of its own.
+        following: Any = unit.tok.token()
+        while following.ttype is newline_type:
+            following = unit.tok.token()
+        if body_ended(following):
+            break
+        # ``a;\nb`` already carries its separator; mirror ``p_list1`` and never emit two in a row.
+        if parts[-1].kind != "operator":
+            pos = (sindex + offset + terminator.lexpos, sindex + offset + terminator.endlexpos)
+            parts.append(bashlex.ast.node(kind="operator", op="\n", pos=pos))
+        offset += resume
+
+    if len(parts) == 1:
+        return parts[0], end
+    return bashlex.ast.node(kind="list", parts=parts, pos=(parts[0].pos[0], parts[-1].pos[1])), end
+
+
+# ``_parsedolparen`` (``$( )``, ``<( )``) and the backtick branch of ``_expandwordinternal`` both
+# reach ``_recursiveparse`` by module-global lookup, so one rebind covers all three spellings.
+# Assigning to a name bashlex no longer reads would install nothing and leave the truncating
+# parse live, so a bashlex that renamed it must fail this import rather than run. What an
+# import failure means for the tool call is the hook's decision, made where it imports this module.
+if not hasattr(bashlex.subst, "_recursiveparse"):
+    raise ImportError("bashlex.subst._recursiveparse is missing; the multi-line substitution correction cannot install")
+bashlex.subst._recursiveparse = _parse_all_substitution_units
 
 # Interpreters that EXECUTE their standard input as a program when given no program source.
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
@@ -1251,14 +1368,16 @@ class BashCommandParser:
         `"$(grep -rn 'rm -rf' src/)"` as the command it searches for.
 
         Offsets come from the substitution's own span, never its inner command:
-        bashlex ends the inner command at the first newline, and inside a word
-        each `\\<newline>` moves every later inner offset two places early. The
-        word's own span is exact, so a word holding a newline, or a substitution
-        whose closer is not where _body_end looks, gets ONE body, from its first
-        substitution to its closing quote. That body keeps its heredoc
-        ranges only while no `\\<newline>` has moved them, and never its literal
-        ranges, which is a false positive on a quoted argument in a multi-line
-        body and never a missed payload.
+        inside a word each `\\<newline>` moves every later inner offset two places
+        early, and can move the substitution's own end too. The word's own span
+        is exact, so a word holding a newline, or a substitution whose closer is
+        not where _body_end looks, gets ONE body, from its first substitution (or
+        its opening quote, when a `\\<newline>` comes first) to its closing quote.
+        For a plain newline that is also the fail-closed read on purpose: the
+        quoted text after the `)` is judged as code too. That body keeps its
+        heredoc ranges only while no `\\<newline>` has moved them, and never its
+        literal ranges, which is a false positive on quoted text in a multi-line
+        word and never a missed payload.
 
         Raises:
             ValueError: past _MAX_BODY_TEXT_FACTOR times the command's length in
