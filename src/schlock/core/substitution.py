@@ -1458,8 +1458,12 @@ class SubstitutionValidator:
             except Exception as exc:  # noqa: BLE001 - a failed walk denies, it never drops
                 # Dropping what the walk was reading is an allow: `echo $(echo $(bash))` read
                 # SAFE once the inner walk raised. A node with no base command is denied by
-                # every tier, so it stands in for whatever the walk could not see.
-                logger.debug("Nested substitution walk failed in %r: %s", inner_command, exc)
+                # every tier, so it stands in for whatever the walk could not see. Reusing this
+                # node's ast_node is safe because a list or pipeline parent is re-walked per
+                # segment by _validate_segments (which raises into its own sentinel), never
+                # through nested_substitutions. The AST already parsed, so a raise here is a
+                # schlock bug, not hostile input: log it where it will be seen.
+                logger.warning("Nested substitution walk failed in %r: %s", inner_command, exc, exc_info=True)
                 nested = [
                     SubstitutionNode(
                         substitution_type=sub_type,
