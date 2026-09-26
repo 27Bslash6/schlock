@@ -468,10 +468,14 @@ def _key_rated_value_is_inert(prefix: str, value: str) -> bool:
     any other value. Two exceptions, both path-valued: an empty value, which names nothing
     (`credential.helper=` clears the helper list), and a boolean for core.fsmonitor, the one key
     here git reads as a boolean (`true` selects the built-in monitor).
+
+    Both compare the value exactly, never stripped: git trims neither a `-c` value nor a quoted
+    persisted one, so `core.hooksPath ' '` is the directory named one space, and
+    `core.fsmonitor ' on'` runs a program called `on` (both verified, git 2.43).
     """
     if prefix not in _PATH_VALUED_GIT_CONFIGS:
         return False
-    return not value.strip() or (prefix == "core.fsmonitor" and _is_git_boolean(value))
+    return value == "" or (prefix == "core.fsmonitor" and value.lower() in _GIT_BOOLEAN_VALUES)
 
 
 # git -c config keys that execute arbitrary commands when set via -c (top-level under-block fix).

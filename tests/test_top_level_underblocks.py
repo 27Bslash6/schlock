@@ -633,6 +633,13 @@ class TestKeyRatedGitConfigWriteHelper:
         # An empty helper clears the helper list; it names nothing git runs.
         assert key_rated_git_config_write(["config", "credential.helper", ""]) is None
 
+    def test_a_whitespace_path_value_is_a_path(self):
+        # git trims neither a -c value nor a quoted persisted one: ' ' is the directory named one
+        # space, and core.fsmonitor=' on' runs a program named `on` (verified, git 2.43).
+        assert key_rated_git_config_write(["config", "core.hooksPath", " "]) is not None
+        assert key_rated_git_config_write(["config", "core.fsmonitor", " on"]) is not None
+        assert dangerous_git_config(["-c", "core.hooksPath= ", "commit"]) is not None
+
     def test_keys_narrows_the_check(self):
         args = ["config", "core.hooksPath", ".githooks"]
         assert key_rated_git_config_write(args) is not None
@@ -670,6 +677,9 @@ class TestGitConfigPersistenceKeys:
         "git config gpg.program gpg2",
         "git config core.fsmonitor rs-git-fsmonitor",
         "git config core.hooksPath true",
+        # git trims neither value: a directory named one space, a program named `on`.
+        "git config --global core.hooksPath ' '",
+        "git config core.fsmonitor ' on'",
     ]
     ORDINARY_WRITES = [
         "git config core.fsmonitor true",
@@ -692,6 +702,8 @@ class TestGitConfigPersistenceKeys:
         "git -c core.alternateRefsCommand=pwn fetch",
         "git -c uploadpack.packObjectsHook=pwn fetch",
         "git -c core.hooksPath=true commit",
+        "git -c core.hooksPath=' ' commit",
+        "git -c core.fsmonitor=' on' status",
     ]
 
     @pytest.mark.parametrize("command", ATTACKS)
@@ -723,6 +735,7 @@ class TestGitConfigPersistenceKeys:
     def test_injected_empty_helper_stays_safe(self):
         # `-c credential.helper=` is the everyday way to switch helpers off for one command.
         assert dangerous_git_config(["-c", "credential.helper=", "clone", "u"]) is None
+        assert validate_command("git -c credential.helper= clone u").risk_level == RiskLevel.SAFE
 
     def test_wrapped_bootstrap_write_asks(self):
         # Ceiling, pinned: the BLOCKED check reads git's own args, like the `-c` check beside it,
