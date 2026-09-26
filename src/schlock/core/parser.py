@@ -4,10 +4,11 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks. Two readers
-here work on single words whose boundaries bashlex has already fixed, _redirect_words
-and _mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE); CLAUDE.md lists
-both as approved exceptions and the constraints each must keep.
+Regex-based parsing is explicitly NOT supported due to security risks. Three readers
+here work on single words whose boundaries bashlex has already fixed: _redirect_words,
+_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE) and _subscript_closes,
+which only ever refuses. CLAUDE.md lists each as an approved exception and the
+constraints it must keep.
 """
 
 import bisect
@@ -18,6 +19,7 @@ import shlex
 from typing import Any, NamedTuple, Optional
 
 import bashlex
+import bashlex.ast
 import bashlex.errors
 
 from schlock.exceptions import ParseError
@@ -720,17 +722,119 @@ def _stdin_here_string(parts: "list[Any]") -> Optional[str]:
     return by_fd.get(0)
 
 
+# bashlex reads a plain `FOO=1` in front of a command as an assignment node. It reads a subscripted
+# `a[0]=1` as a plain word, and the same goes for every assignment after that word or after a
+# redirect. Bash takes each of them as an assignment, rejects the subscripted ones
+# (``a[0]': not a valid identifier``) and runs the command anyway. The subscript match runs to the
+# LAST `]=` because bashlex has already dropped the quotes that can hide a `]` (`a["]"]=1`).
+_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=", re.DOTALL)
+_SUBSCRIPT_START = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\[")
+# One unit of a subscript's source text, read as bash reads it: a backslash escape, a quoted string
+# or a plain `${...}` is opaque. `stop` is what this does not model: a backtick, `$'`, `$"`, a `$(`
+# bashlex did not parse as a substitution, any other `${`, or a quote that does not close.
+_SUBSCRIPT_TOKEN = re.compile(
+    r"""\\.|'[^']*'|"(?:[^"\\`$]|\\.|\$(?![({]))*"|\$\{[^{}'"`\\$]*\}|(?P<stop>[`'"]|\$[({'"])|.""",
+    re.DOTALL,
+)
+
+
+def _subscript_span_is_trustworthy(command: str, word: Any) -> "Optional[dict[int, int]]":
+    """The command-substitution spans inside ``word`` to skip, or None when they cannot be trusted.
+
+    The scan skips a `$(...)` / backtick / `<(...)` using bashlex's own span so a `]` inside one is
+    not read as the subscript's close. Two things make that span wrong, and bash still runs the
+    command, so both must fail closed:
+    - A backslash-newline: bashlex removes it and shifts every later offset, so no child span lines
+      up with ``command`` any more.
+    - A `#` comment or a `<<` heredoc inside the substitution: bashlex ends the span before the real
+      closer, and the scan would resume inside the substitution and read a `]` bash never reaches.
+    """
+    start, end = word.pos
+    if "\\\n" in command[start:end]:
+        return None
+    skip: dict[int, int] = {}
+    for part in word.parts:
+        if part.kind not in ("commandsubstitution", "processsubstitution"):
+            continue
+        src = command[part.pos[0] : part.pos[1]]
+        brackets = (src[:2] in ("$(", "<(", ">(") and src.endswith(")")) or (src[:1] == "`" and src.endswith("`"))
+        if not brackets or "#" in src or "<<" in src:
+            return None
+        skip[part.pos[0]] = part.pos[1]
+    return skip
+
+
+def _subscript_closes(command: str, word: Any) -> bool:
+    """Whether the subscript opened by the first `[` of ``word`` also closes inside it.
+
+    Bash reads a subscript as one matched `[`...`]` pair, and blanks, `;`, `|`, `#` and newlines
+    inside it are ordinary characters. bashlex ends the word at the first of them. Anything this
+    does not model, and any substitution span it cannot trust, counts as not closing - so a
+    quoted key holding a substitution (`m["$(basename x)"]=1`) is a deliberate over-block.
+    """
+    skip = _subscript_span_is_trustworthy(command, word)
+    if skip is None:
+        return False
+    start, end = word.pos
+    depth, i = 0, command.index("[", start)
+    while i < end:
+        if i in skip:
+            i = skip[i]
+            continue
+        token = _SUBSCRIPT_TOKEN.match(command, i, end)
+        if token is None or token.group("stop"):
+            return False
+        depth += {"[": 1, "]": -1}.get(token.group(), 0)
+        if depth == 0:
+            return True
+        i = token.end()
+    return False
+
+
+class _PrefixSubscriptCheck(bashlex.ast.nodevisitor):
+    """Raise ParseError when bash reads a subscript before the command name past bashlex's word.
+
+    `a[ ; ]=1 bash` is one assignment followed by `bash` to bash, but to bashlex it is two commands.
+    Once the word boundaries disagree, no reading of bashlex's tree can be trusted. It walks the
+    same word parts as _command_words, so it reads past a `{varname}` prefix too
+    (`{fd}>out a[ ; ]=1 bash`), which needs _mark_fd_variables to have run first.
+    """
+
+    def __init__(self, command: str) -> None:
+        self._command = command
+
+    def visitcommand(self, n: Any, parts: "list[Any]") -> None:
+        for part in _word_parts(parts):
+            if _SUBSCRIPT_START.match(self._command, part.pos[0], part.pos[1]) and not _subscript_closes(self._command, part):
+                raise ParseError("Failed to parse bash command: a subscript before the command name is not closed")
+            if not _ASSIGNMENT_WORD.match(part.word):
+                return
+
+
+def _refuse_split_subscripts(command: str, ast_nodes: "list[Any]") -> None:
+    checker = _PrefixSubscriptCheck(command)
+    for node in ast_nodes:
+        checker.visit(node)
+
+
+def _word_parts(parts: "list[Any]") -> "list[Any]":
+    """A command node's word parts: no assignment, no redirection, no `{varname}` prefix."""
+    return [
+        part
+        for part in without_fd_variables(parts)
+        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
+    ]
+
+
 def _command_words(node: Any) -> "list[str]":
     """Word tokens (command name + args) of a command node.
 
     Skips assignments, redirections and a redirection's `{varname}` prefix. Every argv
-    view in this module reads a command through here.
+    view in this module reads a command through here. A word shaped like an assignment
+    is skipped only before the command name: `echo a[0]=1` names `echo`.
     """
-    return [
-        part.word
-        for part in without_fd_variables(getattr(node, "parts", None) or [])
-        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
-    ]
+    words = [part.word for part in _word_parts(getattr(node, "parts", None) or [])]
+    return words[next((i for i, word in enumerate(words) if not _ASSIGNMENT_WORD.match(word)), len(words)) :]
 
 
 def heredoc_owner(node: Any) -> Optional[str]:
@@ -869,7 +973,7 @@ class BashCommandParser:
         """Extract the command name from a command node.
 
         SECURITY: Correctly handles prefixes that appear before the command:
-        - Assignment nodes: VAR=value exec bash → returns 'exec'
+        - Assignments: VAR=value exec bash, a[0]=1 exec bash → returns 'exec'
         - Redirect nodes: 2>&1 exec bash → returns 'exec'
         - Path handling: /usr/bin/exec → returns 'exec'
 
@@ -885,12 +989,8 @@ class BashCommandParser:
         """
         if not hasattr(node, "kind") or node.kind != "command":
             return None
-        if not hasattr(node, "parts"):
-            return None
-
         words = _command_words(node)
-        cmd = words[0].split("/")[-1] if words else ""
-        return cmd if cmd else None
+        return (words[0].split("/")[-1] or None) if words else None
 
     def parse(self, command: str) -> list[Any]:
         """Parse command into bashlex AST.
@@ -903,9 +1003,10 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax, or a
+            ParseError: If bashlex fails to parse the command syntax, a
                 `{varname}` redirect prefix cannot be read with certainty
-                (see _mark_fd_variables)
+                (see _mark_fd_variables), or a subscript before the command
+                name runs past bashlex's word (see _PrefixSubscriptCheck)
 
         Example:
             >>> parser = BashCommandParser()
@@ -934,6 +1035,7 @@ class BashCommandParser:
                 original_error=e,
             )
         _mark_fd_variables(command, ast)
+        _refuse_split_subscripts(command, ast)
         return ast
 
     def extract_commands(self, ast_nodes: list[Any]) -> list[str]:
@@ -1803,8 +1905,8 @@ class BashCommandParser:
         dangers.extend(pipeline_dangers)
 
         def _get_all_words(node) -> list[str]:
-            """Get ALL words from a command node, skipping assignments/redirects."""
-            return [cmd for word in _command_words(node) if (cmd := word.split("/")[-1])]
+            """Basenames of a command node's words from its name on, skipping empty ones."""
+            return [name for word in _command_words(node) if (name := word.split("/")[-1])]
 
         def visit_children(node, visitor):
             """Recursively visit child nodes of an AST node."""
@@ -1926,10 +2028,6 @@ class BashCommandParser:
         # locally for THAT check only.
         shell_interpreters = STDIN_EXEC_INTERPRETERS | {"env", "xargs"}
 
-        def _stage_args(part) -> list[str]:
-            """Word-args AFTER the command name for a pipeline stage command node."""
-            return _command_words(part)[1:]  # the first word is the command name
-
         def check_pipeline(node):
             """Check a pipeline node for dangerous patterns."""
             if not hasattr(node, "parts"):
@@ -1948,7 +2046,7 @@ class BashCommandParser:
                     if cmd_name:
                         # Resolve multicall wrappers (busybox/toybox) to their applet so the
                         # stage is classified by what actually runs (`busybox sh` -> `sh`).
-                        stages.append(_resolve_multicall(cmd_name, _stage_args(stage_node)))
+                        stages.append(_resolve_multicall(cmd_name, _command_words(stage_node)[1:]))
 
             if len(stages) < 2:
                 return
