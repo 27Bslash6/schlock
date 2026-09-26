@@ -1648,7 +1648,7 @@ class SubstitutionValidator:
         # Check for output redirections and dangerous arguments
         if hasattr(cmd_node, "parts"):
             args: list[str] = []
-            for part in cmd_node.parts:
+            for part in without_fd_variables(cmd_node.parts):
                 # Any write redirection: $(echo x > file), $(… >| file), $(… &> file), $(… <> file)
                 if _is_write_redirect(part):
                     return True, "output redirection in substitution"
