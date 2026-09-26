@@ -13,13 +13,18 @@ pinned absolutely as (risk_level, matched_rules), never as "same as the control"
 it reads the raw command, which this defect never touched.
 """
 
+import ast
+import pathlib
 from unittest.mock import patch
 
+import bashlex
 import pytest
 
-from schlock.core.parser import BashCommandParser
+from schlock.core.parser import BashCommandParser, _mark_fd_variables
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import clear_caches, validate_command
+from schlock.exceptions import ParseError
+from schlock.integrations.commit_filter import CommitMessageFilter
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +90,12 @@ class TestEverySpellingBashConsumes:
             "{fd[}]}<in",
             "{f\\\nd}<in",  # a line continuation vanishes before bash reads the word
             "{fd}\\\n<in",
+            # an expansion is skipped whole, as bash skips it: its `]` closes nothing
+            "{fd[$(echo ])]}<in",
+            "{fd[`echo ]`]}<in",
+            "{fd[${x:-]}]}<in",
+            "{fd[']']}<in",
+            '{fd["\\""]}<in',
         ],
     )
     def test_consumed_spelling(self, redirect, safety_rules_path):
@@ -123,10 +134,15 @@ class TestLookalikesStayArguments:
             "{fd[0]]}<in",  # a stray `]`
             "{fd[0]]<in",  # no closing brace
             "{a\u00e9}<in",  # a non-ASCII name
+            "{f$(echo)d}<in",  # an expansion in the NAME
         ],
     )
     def test_lookalike_is_an_argument(self, redirect, safety_rules_path):
         assert _verdict(f"chmod {redirect} 777 ./x", safety_rules_path) == (RiskLevel.SAFE, ())
+
+    def test_unclosed_quote_fails_closed(self, safety_rules_path):
+        # bash rejects the whole line (the quote never closes); so does the parse
+        assert _verdict('chmod {fd["0]}<in 777 ./x', safety_rules_path) == (RiskLevel.BLOCKED, ())
 
     @pytest.mark.parametrize(
         ("command", "expected"),
@@ -187,8 +203,23 @@ class TestEveryArgvViewSkipsThePrefix:
             ("x=$(git {fd}<in push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
             # $(…) base command: `{fd}` is not the command being run
             ("x=$({fd}<in git push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
-            # inside $(…) bashlex positions skip line continuations; the reader must follow
+            # inside a word bashlex positions skip line continuations; the reader must follow
             ("x=$(git {f\\\nd}</dev/null push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            ("echo x\\\ny\\\n$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            ("echo x\\\ny\\\nz\\\n$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            ("echo x\\\ny\\\n`git {fd}<i push --force origin main`", (RiskLevel.BLOCKED, ("git_force_push",))),
+            ("echo x\\\ny\\\n$(y=$(git {fd}<i push --force origin main))", (RiskLevel.BLOCKED, ("git_force_push",))),
+            # …but not inside '…' or $'…', where bash and bashlex both keep them
+            ("echo 'a\\\nb'$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            ("echo $'a\\\nb'$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            ('echo "a\\\nb"$(git {fd}<i push --force origin main)', (RiskLevel.BLOCKED, ("git_force_push",))),
+            ("echo $'a\\'b\\\nc'$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            # a `'` inside `"$(…)"` quotes afresh
+            ("echo \"$(echo 'a\\\nb')\"$(git {fd}<i push --force origin main)", (RiskLevel.BLOCKED, ("git_force_push",))),
+            (
+                "echo \"$(echo 'a\\\nb')\"'c\\\nd'$(git {fd}<i push --force origin main)",
+                (RiskLevel.BLOCKED, ("git_force_push",)),
+            ),
             # $(…) structure check: `kubectl get` is read-only, not "kubectl {fd}"
             ("x=$(kubectl {fd}<x get pods)", (RiskLevel.SAFE, ())),
             # pipe-to-shell stages (_get_command_name, _stage_args, _get_all_words)
@@ -209,3 +240,38 @@ class TestEveryArgvViewSkipsThePrefix:
         # A leading redirection leaves no determinable command, which fails closed - as
         # `$(3<in ls)` always did. Reading `{fd}` as the command ranked it merely unknown.
         assert _verdict("x=$({fd}<in ls)", safety_rules_path) == (RiskLevel.BLOCKED, ())
+
+
+class TestEveryConsumerParsesThroughTheTag:
+    """A bashlex AST built anywhere but BashCommandParser.parse carries no prefix tag."""
+
+    def test_commit_filter_sees_the_commit(self):
+        commit_filter = CommitMessageFilter({"enabled": True, "rules": {}})
+        assert commit_filter.is_git_commit_command('git {fd}>out commit -m "msg"') is True
+        assert commit_filter.is_git_commit_command('git "{fd}">out commit -m "msg"') is False  # `{fd}` is git's argument
+
+    def test_an_unplaceable_prefix_fails_closed(self):
+        # The view and bashlex disagree: the redirect bashlex puts at offset 8 is not there.
+        ast = bashlex.parse("git {fd}<i push")
+        with pytest.raises(ParseError):
+            _mark_fd_variables("git {fd}xi push", ast)
+
+    def test_no_other_bashlex_parse_call(self):
+        # BashCommandParser.parse tags; _parse_succeeds only asks whether a synthetic probe parses.
+        allowed = {("parser.py", "parse"), ("parser.py", "_parse_succeeds")}
+        found = set()
+        for path in (pathlib.Path(__file__).parent.parent / "src").rglob("*.py"):
+            tree = ast.parse(path.read_text())
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for call in ast.walk(func):
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "parse"
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "bashlex"
+                    ):
+                        found.add((path.name, func.name))
+        assert found == allowed

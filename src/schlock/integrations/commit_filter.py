@@ -36,8 +36,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import bashlex
 import bashlex.errors
+
+from schlock.core.parser import BashCommandParser, without_fd_variables
+from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,7 @@ _MSG_FLAG = r"(?:-m\s+|--message(?:\s+|=))"
 # parses within a single filter_commit_message call (the actual win). Small: a process rarely sees
 # this many distinct git-commit commands.
 _PARSE_CACHE_MAX = 64
+_PARSER = BashCommandParser()
 
 
 @dataclass(frozen=True)
@@ -281,7 +284,7 @@ class CommitMessageFilter:
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
-                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p.word for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
                 idx = self._commit_subcommand_index(words)
                 if idx != -1:
                     globals_before = words[1:idx]
@@ -786,7 +789,7 @@ class CommitMessageFilter:
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
-                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p.word for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
                 idx = self._commit_subcommand_index(words)
                 if idx != -1 and self._arg_targets_stdin(words[idx + 1 :]):
                     winner = None
@@ -898,7 +901,12 @@ class CommitMessageFilter:
         # Parse OUTSIDE the lock: never hold the lock across a ~300ms parse. A concurrent
         # double-miss on the same command just parses twice harmlessly (idempotent, last write wins).
         try:
-            parsed = list(bashlex.parse(command))
+            # The parser's own entry point, so words carry its `{varname}` redirect tag
+            # (LAB-4599). Its ParseError is unwrapped: callers catch bashlex's own types.
+            try:
+                parsed = list(_PARSER.parse(command))
+            except ParseError as exc:
+                raise exc.original_error or exc from None
         except Exception as exc:  # noqa: BLE001 - memoize the failure, then re-raise verbatim
             with self._parse_lock:
                 self._store(command, (False, exc))
@@ -929,7 +937,7 @@ class CommitMessageFilter:
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
-                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p.word for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
                 idx = self._commit_subcommand_index(words)
                 if idx != -1:
                     results.append(words[idx + 1 :])
@@ -1015,7 +1023,7 @@ class CommitMessageFilter:
         def visit(node: Any) -> None:
             """Recursively visit AST nodes to find git commit messages."""
             if hasattr(node, "kind") and node.kind == "command":
-                words = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
 
                 # Check if this is 'git [global-opts] commit' (issue #82: tolerate -C/-c/etc.)
                 idx = self._commit_subcommand_index([w.word for w in words])
