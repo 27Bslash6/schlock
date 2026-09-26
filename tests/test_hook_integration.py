@@ -126,6 +126,64 @@ class TestMessageFormatting:
             message = format_message(result)
             assert f"Risk Level: {risk_level.name}" in message
 
+    @pytest.mark.parametrize("matched_rules", [["x"], [], ["x", "x"]])
+    def test_single_or_no_rule_output_unchanged(self, matched_rules):
+        """One distinct rule or none: no `Rules matched` line, output as before LAB-5002."""
+        result = ValidationResult(
+            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
+        )
+        assert format_message(result, decision="ask") == "CAUTION: Reason\nRisk Level: HIGH\n\nAlternatives:\n  - Alt"
+
+    @pytest.mark.parametrize(("decision", "status"), [("ask", "CAUTION"), ("deny", "BLOCKED")])
+    @pytest.mark.parametrize("matched_rules", [["a", "b"], ["a", "b", "a"]])
+    def test_every_matched_rule_is_named(self, decision, status, matched_rules):
+        """Every distinct matched rule is named, not only the one whose message is shown (LAB-5002)."""
+        result = ValidationResult(
+            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
+        )
+        assert format_message(result, decision=decision) == (
+            f"{status}: Reason\nRisk Level: HIGH\nRules matched: a, b\n\nAlternatives:\n  - Alt"
+        )
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_segment_tie_prompt_names_both_rules(self, tmp_path, monkeypatch):
+        """Two HIGH segments on different rules: the ask text names both; the audit line is unchanged."""
+        log_file = tmp_path / "audit.jsonl"
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS["balanced"]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+
+        command = "git push --force origin main && rm -r ./build"
+        output = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})["hookSpecificOutput"]
+
+        assert output["permissionDecision"] == "ask"
+        assert output["permissionDecisionReason"] == (
+            "CAUTION: Force push overwrites remote history\n"
+            "Risk Level: HIGH\n"
+            "Rules matched: git_force_push, recursive_delete\n"
+            "\n"
+            "Alternatives:\n"
+            "  - Use --force-with-lease"
+        )
+        (line,) = log_file.read_text().splitlines()
+        assert json.loads(line)["violations"] == ["git_force_push", "recursive_delete"]
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_shellcheck_audit_entries_stay_out_of_the_prompt_and_the_cache(self, tmp_path, monkeypatch):
+        """The hook appends ShellCheck findings to the audit list; that must not reach `matched_rules`."""
+        log_file = tmp_path / "audit.jsonl"
+        finding = SimpleNamespace(sc_code="SC2086", message="Double quote")
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS["balanced"]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([finding], "ShellCheck says"))
+
+        for _ in range(2):
+            output = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}})
+            assert "Rules matched" not in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        violations = [json.loads(line)["violations"] for line in log_file.read_text().splitlines()]
+        assert violations == [["git_commit", "ShellCheck SC2086: Double quote"]] * 2
+
 
 class TestHookHandler:
     """Test hook handler integration with validation engine."""

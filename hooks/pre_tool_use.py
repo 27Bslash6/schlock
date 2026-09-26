@@ -331,15 +331,11 @@ def format_message(result: ValidationResult, decision: str = "deny") -> str:
     Returns:
         Formatted message string
 
-    Format for "ask" (prompt):
-        CAUTION: <reason>
+    Format ("CAUTION" for "ask", "BLOCKED" for "deny"):
+        CAUTION|BLOCKED: <reason>
         Risk Level: <risk_level>
-        Alternatives:
-          - <alternative 1>
+        Rules matched: <rule>, <rule>   (only when two or more distinct rules matched)
 
-    Format for "deny" (block):
-        BLOCKED: <reason>
-        Risk Level: <risk_level>
         Alternatives:
           - <alternative 1>
     """
@@ -353,6 +349,12 @@ def format_message(result: ValidationResult, decision: str = "deny") -> str:
 
     # Risk level line
     lines.append(f"Risk Level: {result.risk_level.name}")
+
+    # `message` comes from one rule; name every distinct matched rule so none hides behind it (LAB-5002)
+    # Segments repeat rules (`rm -r a && rm -r b`), so dedupe in order before counting
+    rules = list(dict.fromkeys(result.matched_rules))
+    if len(rules) > 1:
+        lines.append("Rules matched: " + ", ".join(rules))
 
     # Alternatives (if any)
     if result.alternatives:
@@ -551,8 +553,8 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         # Calculate execution time
         execution_time_ms = (time.perf_counter() - start_time) * 1000
 
-        # Extract violations from result
-        violations = result.matched_rules if hasattr(result, "matched_rules") and result.matched_rules else []
+        # Copy: the appends below are audit-only and must not leak into the (cached) result or the prompt
+        violations = list(result.matched_rules) if hasattr(result, "matched_rules") and result.matched_rules else []
 
         # Add shellcheck findings to violations for audit
         if shellcheck_findings:
