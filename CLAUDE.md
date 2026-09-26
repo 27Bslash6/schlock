@@ -60,6 +60,12 @@
      decides no structure and no verdict (the word still goes through every rule); and any span
      it cannot read exactly (a backslash, or not one `shlex` word) keeps bashlex's word, less
      its leading markers.
+   - **Approved exception — recognising a `{varname}` redirect prefix.** bashlex splits
+     `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
+     argument, so `_is_fd_variable` in `src/schlock/core/parser.py` matches that one word with
+     `_FD_VARIABLE_WORD_RE` and every argv view drops it (LAB-4599). It holds only while: the
+     word is unquoted (its span is exactly as wide as the word), it ends where the redirect
+     starts, and every spelling it accepts or rejects was decided by running real bash first.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.

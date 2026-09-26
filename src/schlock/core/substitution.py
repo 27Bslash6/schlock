@@ -26,6 +26,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+from .parser import without_fd_variables
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -877,7 +879,7 @@ def _command_tokens(node: Any) -> list[tuple[str, bool]]:
     The first word is exempt whatever its shape: a quoted command name is still the command
     being run, so ``$('rm -rf /' foo)`` must keep matching the rule it names.
     """
-    parts = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
+    parts = [p for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
     return [(part.word, index > 0 and _is_opaque_argument(part)) for index, part in enumerate(parts)]
 
 
@@ -1434,8 +1436,9 @@ class SubstitutionValidator:
             return None
 
         # Handle simple command
-        if hasattr(cmd_node, "parts") and cmd_node.parts:
-            first_part = cmd_node.parts[0]
+        simple_parts = without_fd_variables(getattr(cmd_node, "parts", None) or [])
+        if simple_parts:
+            first_part = simple_parts[0]
             if hasattr(first_part, "word"):
                 return first_part.word
 

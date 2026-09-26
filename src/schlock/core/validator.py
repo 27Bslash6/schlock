@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner
+from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -1185,13 +1185,13 @@ _FRESH, _TIME, _TIMEP, _REDIR, _ASSIGNED, _COPROC, _NAMED, _LOST = (
 )
 _RESERVED_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{"))
 _ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
-_REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
+_REDIRECT_WORD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
 # What a word may hold and still absorb a following `<` or `>`: an fd prefix,
 # or the first character of a two-character operator (`>>`, `<>`, `&>>`).
-_FD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\}|&)[<>]?")
+_FD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE}|&)[<>]?")
 # `2>&-` closes the descriptor: the `-` is the whole target even glued, so
 # `2>&-a[0]=1` is a redirection and then an assignment (verified).
-_FD_CLOSE_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]&")
+_FD_CLOSE_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]&")
 _ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=(…)` opens a compound assignment
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 # Blanks and control-operator characters end a word at the top level. `<` and
