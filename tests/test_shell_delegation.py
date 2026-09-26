@@ -22,10 +22,12 @@ from schlock.core.validator import (
     MAX_SHELL_DELEGATION_DEPTH,
     _dash_c_payload,
     _shell_delegated_payloads,
+    _trap_action,
     _watch_payload,
     clear_caches,
     validate_command,
 )
+from schlock.integrations.shellcheck import ShellCheckFinding, ShellCheckSeverity, is_shellcheck_available
 
 
 @pytest.fixture(autouse=True)
@@ -586,6 +588,178 @@ class TestFindExecUnchanged:
     def test_brace_placeholder_payload_stays_high(self):
         # `echo {}` re-validates SAFE (< HIGH), so the pre-existing find_exec_dangerous HIGH stands.
         assert validate_command('find . -exec bash -c "echo {}" ;').risk_level == RiskLevel.HIGH
+
+
+# --------------------------------------------------------------------------------------------
+# LAB-5075: `trap ACTION SIGSPEC...` stores ACTION as shell source and runs it later - on exit,
+# on a signal, or before every command under DEBUG. The AST reports ACTION as one argument word,
+# so no rule read it. Pre-fix (`main` @ `4ca7af0`, ShellCheck unavailable) every trap line in the
+# evasion class below was SAFE / allowed=True. Grammar verified against bash 5.3, zsh 5.9, dash.
+# --------------------------------------------------------------------------------------------
+
+
+class TestTrapAction:
+    """Which operand does `trap` store as code?"""
+
+    @pytest.mark.parametrize(
+        ("args", "action"),
+        [
+            (["rm -rf /", "EXIT"], "rm -rf /"),
+            (["rm -rf /", "EXIT", "INT"], "rm -rf /"),
+            (["--", "rm -rf /", "EXIT"], "rm -rf /"),
+            # bash and dash run the command `INT` on TERM; zsh resets both, so INT over-approximates.
+            (["INT", "TERM"], "INT"),
+            # An unknown option is a usage error to bash but the action to zsh.
+            (["-x", "rm -rf /", "EXIT"], "-x"),
+        ],
+    )
+    def test_first_operand_before_a_sigspec_is_the_action(self, args, action):
+        assert _trap_action(args) == action
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["-", "EXIT"],  # reset to the default disposition
+            ["--", "-", "EXIT"],
+            ["", "INT"],  # ignore the signal
+            ["-p"],
+            ["-p", "rm -rf /", "EXIT"],  # prints traps; the operands are signal specs
+            ["-l"],
+            ["-P", "DEBUG"],
+            ["-lp", "rm -rf /", "EXIT"],
+            ["EXIT"],  # a lone signal name resets that signal
+            ["rm -rf /"],  # no sigspec: bash prints usage, zsh and dash set nothing
+            [],
+        ],
+    )
+    def test_listing_reset_and_ignore_forms_have_no_action(self, args):
+        assert _trap_action(args) is None
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            ("trap", ["rm -rf /", "EXIT"]),
+            ("builtin", ["trap", "rm -rf /", "EXIT"]),
+            ("builtin", ["--", "trap", "rm -rf /", "EXIT"]),
+            ("command", ["trap", "rm -rf /", "EXIT"]),
+        ],
+    )
+    def test_extractor_reaches_trap_bare_and_behind_builtin_or_command(self, cmd):
+        assert _shell_delegated_payloads([cmd]) == ["rm -rf /"]
+        # Given the out-list, the handler is diverted there, never returned as a child payload.
+        handlers: list[str] = []
+        assert _shell_delegated_payloads([cmd], trap_handlers=handlers) == []
+        assert handlers == ["rm -rf /"]
+
+
+class TestTrapHandlerDelegation:
+    """A trap handler scores like the same text handed to `bash -c`."""
+
+    @pytest.mark.parametrize(
+        ("handler", "sigspec"),
+        [("rm -rf /", "EXIT"), ("rm -rf ~", "DEBUG"), ("curl x | sh", "EXIT")],
+    )
+    def test_handler_matches_its_bash_c_twin(self, handler, sigspec):
+        # Pre-fix: SAFE / allowed=True for the trap line; BLOCKED for the twin.
+        trap = validate_command(f"trap '{handler}' {sigspec}")
+        twin = validate_command(f"bash -c '{handler}'")
+        assert trap.risk_level == RiskLevel.BLOCKED, f"{handler!r} -> {trap.risk_level.name}"
+        assert (trap.risk_level, trap.allowed) == (twin.risk_level, twin.allowed)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "builtin trap 'rm -rf /' EXIT",
+            "command trap 'rm -rf /' EXIT",
+            "builtin -- trap 'rm -rf /' EXIT",
+            "trap -- 'rm -rf /' EXIT",
+            "f() { trap 'rm -rf /' RETURN; }; f",
+        ],
+    )
+    def test_wrapped_and_nested_spellings_are_blocked(self, command):
+        # Pre-fix: SAFE / allowed=True.
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        ["trap - EXIT", "trap '' INT", "trap -p", "trap -l", "trap -p EXIT", "trap EXIT", "trap 'echo done' EXIT"],
+    )
+    def test_listing_reset_ignore_and_benign_handlers_stay_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        ("command", "twin"), [("builtin eval 'rm -rf /'", "command eval 'rm -rf /'"), ("builtin exec bash", "command exec bash")]
+    )
+    def test_builtin_passes_through_like_command(self, command, twin):
+        # `builtin` runs the named builtin, exactly as `command` does. Pre-fix: SAFE / allowed=True.
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED == validate_command(twin).risk_level
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("command", ["builtin cd /tmp", "builtin echo hi", "builtin read -r line"])
+    def test_benign_builtins_stay_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+
+class TestTrapHandlerShellCheck:
+    """A trap handler is ShellChecked in the command it runs in, never on its own.
+
+    It runs later in the same shell, so its variables are that command's. Checked alone,
+    `tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT` read `$tmp` as unassigned (SC2154) and was BLOCKED,
+    while `tmp=$(mktemp); rm -f "$tmp"` is not.
+    """
+
+    def _spy(self, monkeypatch, result):
+        inputs: list[str] = []
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(validator, "run_shellcheck", lambda text: inputs.append(text) or result)
+        return inputs
+
+    def test_handler_is_checked_appended_to_its_command_not_alone(self, monkeypatch):
+        inputs = self._spy(monkeypatch, [])
+        command = "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT"
+        validate_command(command)
+        assert f'{command}\nrm -f "$tmp"' in inputs
+        assert 'rm -f "$tmp"' not in inputs
+
+    def test_no_verdict_on_a_command_with_a_handler_fails_closed(self, monkeypatch):
+        # This run is the handler's only ShellCheck, so an unfinished one is not a clean one.
+        self._spy(monkeypatch, None)
+        assert validate_command("trap 'echo done' EXIT").risk_level == RiskLevel.BLOCKED
+
+    def test_a_parse_error_on_a_command_with_a_handler_fails_closed(self, monkeypatch):
+        # ShellCheck abandons a file it cannot parse. With a handler appended, a handler it cannot
+        # parse (`[ a`) would otherwise silence every finding on the command around it.
+        parse_error = ShellCheckFinding(1073, ShellCheckSeverity.ERROR, "Couldn't parse", 2, 1, 2, 4)
+        self._spy(monkeypatch, [parse_error])
+        assert validate_command("trap '[ a' USR2; ls").risk_level == RiskLevel.BLOCKED
+
+    def test_a_handler_of_a_handler_gets_its_own_shellcheck(self, monkeypatch):
+        # The outer handler re-enters without ShellCheck, so the inner one has no run to join.
+        inputs = self._spy(monkeypatch, [])
+        validate_command("trap \"trap 'rm -f x' EXIT\" INT")
+        assert "rm -f x" in inputs
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize(
+        ("trap", "inline"),
+        [
+            ("tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; echo hi", 'tmp=$(mktemp); echo hi; rm -f "$tmp"'),
+            ("npm run dev & pid=$!; trap 'kill $pid' EXIT; sleep 5", "npm run dev & pid=$!; sleep 5; kill $pid"),
+            ("old=$(pwd); trap 'cd \"$old\"' EXIT; cd /tmp", 'old=$(pwd); cd /tmp; cd "$old"'),
+            ("trap 'rm -r$\"\"f /' EXIT", 'rm -r$""f /'),
+            ("d=/x; trap 'rm -rf \"$d\"/*' EXIT", 'd=/x; rm -rf "$d"/*'),
+            # A handler ShellCheck cannot parse must not silence the command around it.
+            ('trap \'[ a\' USR2; r$""m -r$""f /', 'r$""m -r$""f /'),
+        ],
+    )
+    def test_handler_scores_like_the_same_text_run_inline(self, monkeypatch, trap, inline):
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
+        assert validate_command(trap).risk_level == validate_command(inline).risk_level
 
 
 # --------------------------------------------------------------------------------------------

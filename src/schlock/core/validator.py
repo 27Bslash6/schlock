@@ -18,6 +18,7 @@ import yaml
 from schlock.exceptions import ConfigurationError, ParseError
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 from schlock.integrations.shellcheck import (
+    ShellCheckSeverity,
     get_security_findings,
     is_shellcheck_available,
     run_shellcheck,
@@ -538,10 +539,13 @@ _FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
 # extractor on each arg that names one of these (LAB-3004), so runner operand semantics,
 # `watch`, `find -exec`, and nested wrappers thread identically to the bare spelling instead of
 # being re-implemented in the wrapper branch. The union of all four recognized-command sets is
-# deliberate: WRAPPER_COMMANDS lets a nested wrapper be skipped past, the program/watch/find
+# deliberate: WRAPPER_COMMANDS lets a nested wrapper be skipped past, the program/watch/find/trap
 # members let the wrapped target be found; a member matched sooner only recurses earlier, it
 # can never make the scan miss. su/sg/runuser happen to sit in both unioned sets.
-_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find"})
+_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find", "trap"})
+
+# bash's `trap` listing options: any of them prints traps or signal names instead of setting one.
+_TRAP_LISTING_FLAGS: frozenset[str] = frozenset("lpP")
 
 
 def _find_exec_clauses(args: list[str]) -> list[list[str]]:
@@ -627,18 +631,46 @@ def _watch_payload(args: list[str]) -> Optional[str]:
     return " ".join(args[i:]) or None
 
 
-def _shell_delegated_payloads(
+def _trap_action(args: list[str]) -> Optional[str]:
+    """Return the handler `trap` stores to run later as shell source, or None.
+
+    bash 5.3: `trap [-lpP] [[ACTION] SIGSPEC ...]`. ACTION is the first operand, and only when a
+    SIGSPEC follows it: a lone operand is a signal to reset (or a usage error), `-` resets, the
+    empty string ignores, a listing option prints instead of setting, and an unknown option
+    rejects the whole call. zsh 5.9 has no trap options, so it reads any leading `-word` as the
+    ACTION; dash rejects them. So an unknown option is returned as the action, the reading that
+    runs code, while a listing cluster is not: to zsh its action is that one flag word, a
+    command name that runs nothing else. Reading a leading signal name as ACTION (`trap INT
+    TERM`, which zsh treats as two resets) only re-validates a harmless word.
+    """
+    if args[:1] == ["--"]:
+        args = args[1:]
+    elif args and len(args[0]) > 1 and args[0][0] == "-" and set(args[0][1:]) <= _TRAP_LISTING_FLAGS:
+        return None
+    if len(args) < 2 or args[0].strip() in ("", "-"):
+        return None
+    return args[0]
+
+
+def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator shape
     commands_with_args: list[tuple[str, list[str]]],
     *,
+    trap_handlers: Optional[list[str]] = None,
     _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
 ) -> list[str]:
     """Extract every argument the command will hand to a shell as source code.
 
     Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
-    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, `find -exec/-execdir/-ok/-okdir
-    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction, and
-    `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
-    shell on every later git command in that repo or for that user, not at this command.
+    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, the handler of `trap PROG SIGSPEC`
+    (LAB-5075), `find -exec/-execdir/-ok/-okdir <shell> -c PROG ;` (LAB-2767), whose clause
+    re-enters this same extraction, and `git config <exec-key> PROG` (LAB-4264), whose hand-off
+    is DEFERRED — git runs PROG through a shell on every later git command in that repo or for
+    that user, not at this command.
+
+    A trap handler runs later in THIS shell, not a child, so its variables are the enclosing
+    command's. Given ``trap_handlers``, handlers go there instead of the returned list, for
+    Step 5c to judge in that context; without it they are returned with the rest, the stricter
+    reading.
 
     Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
     are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
@@ -684,11 +716,14 @@ def _shell_delegated_payloads(
 
         if base == "watch":
             found.append(_watch_payload(args))
+        elif base == "trap":
+            action = _trap_action(args)
+            (found if trap_handlers is None else trap_handlers).extend([action] if action else [])
         elif base == "find":
             # Each exec clause is a command in its own right; re-run the FULL extractor on it,
             # so a wrapped or nested delegator inside `-exec` is caught for free.
             for clause in _find_exec_clauses(args):
-                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
+                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], trap_handlers=trap_handlers, _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
@@ -707,7 +742,9 @@ def _shell_delegated_payloads(
                 words = [a.rsplit("/", 1)[-1] for a in args]
                 for i, word in enumerate(words):
                     if word in _DELEGATOR_COMMANDS:
-                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])], _seen=seen))
+                        found.extend(
+                            _shell_delegated_payloads([(args[i], args[i + 1 :])], trap_handlers=trap_handlers, _seen=seen)
+                        )
 
         payloads.extend(p for p in found if p and p.strip())
     # The same program can still surface from more than one delegator (`su su bash -c PROG`:
@@ -3060,7 +3097,16 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # program on stdin - and it is blanked in `parse_target` so the outer parse cannot
         # misread it, so this is where its real text is validated (LAB-3094). It re-enters
         # exactly as a here-string does, so it counts against the same ceiling.
+        #
+        # A trap handler (LAB-5075) runs later in THIS shell, so its variables are this
+        # command's. ShellChecked alone it reads every one as unassigned and unknown (SC2154,
+        # SC2086), hard-blocking `tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT`. So it re-enters
+        # without ShellCheck and Step 6 ShellChecks it appended to this command instead, which
+        # is where it runs; ShellCheck's own look inside a trap string checks variable use only.
+        # A call that skips Step 6 (a nested handler, a heredoc-fallback segment) has no run to
+        # append to, so there a handler gets its own ShellCheck, the stricter reading.
         payloads: list[str] = []
+        trap_handlers: list[str] = []
         if match.risk_level < RiskLevel.BLOCKED:
             # Distinct payloads, as the here-string count already is: 257 copies of one body
             # are one program to validate, not 257.
@@ -3069,8 +3115,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             )
             if len(stdin_payloads) > MAX_DELEGATOR_TOKENS:
                 raise ValueError(f"Stdin program re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
-            payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
-        for payload in payloads:
+            delegated = _shell_delegated_payloads(commands_with_args, trap_handlers=trap_handlers)
+            payloads = list(dict.fromkeys(delegated + stdin_payloads))
+            trap_handlers = list(dict.fromkeys(trap_handlers))
+        for payload, own_shellcheck in [(p, True) for p in payloads] + [(h, not _shellcheck) for h in trap_handlers]:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
                 # shell quoting collapses before the payload can nest this far.
@@ -3083,7 +3131,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     error=None,
                 )
             else:
-                inner = validate_command(payload, config_path, _depth=_depth + 1)
+                inner = validate_command(payload, config_path, _depth=_depth + 1, _shellcheck=own_shellcheck)
             if inner.risk_level > match.risk_level:
                 match = RuleMatch(
                     matched=True,
@@ -3111,16 +3159,26 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # delimiter (`<<'E'OF`) any more than bashlex can, and answers with SC1044
             # parse noise instead of findings - silently emptying this whole tier for
             # the commands normalisation exists to rescue (LAB-3094).
-            findings = run_shellcheck(parse_target)
-            # A run with no verdict is refused in two cases, and read as clean otherwise:
+            findings = run_shellcheck("\n".join([parse_target, *trap_handlers]))
+            # ShellCheck gives up on a file it cannot parse and reports only SC1xxx parse errors,
+            # none of them security codes. A handler bashlex accepts but ShellCheck cannot parse
+            # (`trap '[ a' USR2`) would so silence the whole command, so that is no verdict.
+            if (
+                trap_handlers
+                and findings
+                and any(1000 <= f.code < 2000 and f.level is ShellCheckSeverity.ERROR for f in findings)
+            ):
+                findings = None
+            # A run with no verdict is refused in three cases, and read as clean otherwise:
             # - a payload re-entered from Step 5c (`bash -c "…"`): this is its only
             #   ShellCheck, since no outer spawn reads inside a `-c` string (LAB-4586);
             # - a command whose quoted delimiter was normalised: it took the heredoc
             #   fallback before LAB-3094, which refuses the same None, and moving it here
-            #   must not quietly hand it this path's reading instead.
+            #   must not quietly hand it this path's reading instead;
+            # - a command carrying a trap handler: this run is the handler's only ShellCheck.
             # For every other depth-0 command, whether None should fail closed is LAB-4362's
             # open question, not decided here.
-            if findings is None and (_depth > 0 or rewrote_quoted):
+            if findings is None and (_depth > 0 or rewrote_quoted or trap_handlers):
                 shellcheck_elevated = True
                 subject = "payload" if _depth > 0 else "command"
                 alternatives = [f"Shorten the {subject} or run its parts as separate Bash calls"]

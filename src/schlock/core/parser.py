@@ -291,6 +291,7 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
         # Execution context
         "env",  # Modifies environment then executes
         "command",  # Bypasses shell functions/aliases
+        "builtin",  # Runs the named shell builtin (`builtin eval`, `builtin trap`)
         "xargs",  # Executes command with piped input
         "parallel",  # GNU parallel execution
         "setsid",  # New session execution
