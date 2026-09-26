@@ -559,6 +559,48 @@ class TestP0FileTruncation:
         assert result.risk_level == RiskLevel.HIGH, f"Expected HIGH risk for: {command}, got {result.risk_level}"
         assert "file_truncation" in result.matched_rules
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "true > ~/.aws/credentials",
+            "true 3> ~/.aws/credentials",
+            "true 2> ~/.aws/credentials",
+            "true {fd}> ~/.aws/credentials",
+            "true 1> ~/.aws/credentials",
+            "true &> ~/.aws/credentials",
+            "true 2>| ~/.aws/credentials",
+            ": 2> important.db",
+            "echo -n 2> important.db",
+        ],
+    )
+    def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
+        """A write redirection truncates its target whatever descriptor it names."""
+        result = validate_command(command, config_path=safety_rules_path, _shellcheck=False)
+
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.HIGH, ["file_truncation"])
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "true 2>/dev/null",
+            "true 2> /dev/null",
+            "true 2>&1",
+            "true >&2",
+            ": 2> /dev/null",
+            # Appending is not truncating.
+            "true >> ~/.aws/credentials",
+            "true 2>> ~/.aws/credentials",
+            # `30` belongs to the argument `10:30`; it is not a descriptor on `:`.
+            "echo 10:30> out.txt",
+            "cmd 2> err.log",
+        ],
+    )
+    def test_fd_prefixed_non_truncation_allowed(self, safety_rules_path, command):
+        """Discards, fd duplications, appends and ordinary stderr capture stay SAFE."""
+        result = validate_command(command, config_path=safety_rules_path, _shellcheck=False)
+
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.SAFE, [])
+
     def test_dev_null_truncation_allowed(self, safety_rules_path):
         """/dev/null truncation should be allowed."""
         result = validate_command("> /dev/null", config_path=safety_rules_path)
