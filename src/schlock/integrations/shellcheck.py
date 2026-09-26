@@ -20,6 +20,7 @@ Usage:
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -269,11 +270,29 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
     if not path:
         return []
 
+    # Neither the checkout nor ShellCheck's own environment variables may choose which
+    # codes it reports, or how long it takes (LAB-5084). Without --norc it reads
+    # .shellcheckrc or shellcheckrc from the cwd and each parent, then ~ and the XDG config
+    # dir, so `disable=SC2086` in an ordinary repo switches a security code off, and a
+    # .shellcheckrc symlinked to /dev/zero runs every call into the timeout.
+    # SHELLCHECK_OPTS is prepended to argv, so it could --exclude the same codes. GHCRTS
+    # goes to the GHC runtime; ShellCheck is built without -rtsopts, so most values make it
+    # exit 1 with nothing on stdout, and a stray GHCRTS=-N turned every run into "no
+    # verdict". Everything else passes through: shim-installed binaries need PATH and HOME.
+    #
+    # Minimum supported ShellCheck is 0.7.0: it added --norc along with .shellcheckrc
+    # itself. An older binary rejects the flag (exit 3), which is "no verdict" below, so a
+    # quoted heredoc or a `bash -c` payload is BLOCKED and nothing gets findings. We do
+    # not gate the flag on get_shellcheck_version(), which would cost a second spawn per
+    # hook call, just to support releases from before 2019.
+    child_env = {k: v for k, v in os.environ.items() if k not in ("SHELLCHECK_OPTS", "GHCRTS")}
+
     try:
         # Run shellcheck with JSON output, reading from stdin
         result = subprocess.run(
             [
                 path,
+                "--norc",
                 f"--shell={shell}",
                 "--format=json",
                 f"--severity={severity}",
@@ -284,6 +303,7 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=child_env,
         )
 
         # Exit 0 or 1 is a verdict (1 = findings). Anything else - exit 2+, or a negative
