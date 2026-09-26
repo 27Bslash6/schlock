@@ -21,8 +21,8 @@
      heredoc delimiter (`<< 'EOF'`) outright, so for those commands there is no AST to walk
      and the shell *around* the heredoc would otherwise never be validated (LAB-2765).
      `_neuter_heredocs` / `_rewrite_openers` in `src/schlock/core/validator.py` recover it
-     with a hand-written lexer. This is the only sanctioned non-AST parsing path, and it holds
-     only while all four constraints do:
+     with a hand-written lexer. This is the only sanctioned non-AST path that decides command
+     structure, and it holds only while all four constraints do:
      1. **Bounded reach** — two call sites. The fallback (`_neuter_heredocs`) runs only from
         `_validate_heredoc_command`, after bashlex has already raised a heredoc-shaped error.
         `_normalise_heredoc_delimiters` runs the same lexer *before* bashlex on any command
@@ -53,6 +53,13 @@
         verdict.
      Bash's tokenization is what it must match, so every behavioural change here is decided by
      running real bash first and pinned by a test that names what bash did.
+   - **Approved exception — re-reading one redirect target.** bashlex mis-dequotes some
+     targets (`/dev/$'sda'`, `""'/dev/sda'`), so `_redirect_words` in
+     `src/schlock/core/parser.py` re-reads the target's own source span with a quote-run regex
+     and `shlex`. It holds only while: bashlex has already fixed the word's boundaries; it
+     decides no structure and no verdict (the word still goes through every rule); and any span
+     it cannot read exactly (a backslash, or not one `shlex` word) keeps bashlex's word, less
+     its leading markers.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.

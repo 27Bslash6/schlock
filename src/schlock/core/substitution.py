@@ -1115,10 +1115,16 @@ class SubstitutionValidator:
                 substitutions.extend(self._substitutions_in_parameter(node, current_depth))
                 return
 
-            # Recurse into child nodes. "redirects"/"output" reach process substitutions used as
-            # redirection targets — `cat < <(git push)`, `echo x > >(cmd)` — which hang off
-            # RedirectNode.output and were otherwise never extracted, so no tier ever saw them.
-            for attr in ["parts", "command", "list", "pipe", "compound", "redirects", "output"]:
+            # Recurse into child nodes. `output` and `redirects` reach substitutions used
+            # as redirection TARGETS - `cat < <(git push)`, `echo x > >(cmd)`,
+            # `echo a > "$(r''m -rf /)"` - which were otherwise never extracted, so no
+            # tier ever saw them (LAB-2760/LAB-4114). bashlex parks a simple command's
+            # target under `redirect.output.parts`; a COMPOUND (`{ …; } > "$(…)"`) hangs
+            # its redirections off `redirects` and never `parts`, so `output` alone
+            # reaches the simple form and misses every compound one. An fd-duplication target is an
+            # int with no `kind` and falls straight back out of visit(). `heredoc` stays
+            # off the list: its body has its own mechanism.
+            for attr in ["parts", "command", "list", "pipe", "compound", "output", "redirects"]:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
