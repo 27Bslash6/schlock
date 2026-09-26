@@ -223,6 +223,55 @@ def _extract_whitelist_patterns(data: dict, config_path: Path, is_user_level: bo
     return patterns
 
 
+def _strip_project_blocked_downgrades(file_rule_overrides: dict, merged: dict, config_path: Path, is_user_level: bool) -> None:
+    """Drop a project config's means of downgrading a BLOCKED rule, in place. No-op for user config.
+
+    SECURITY: Only user-level config may open the BLOCKED escape hatch (issue #56).
+    The hatch rewrites a rule's risk level *before* matching, so the BLOCKED floor in
+    ``apply_overrides()`` never engages — a cloned repo could otherwise turn any BLOCKED
+    rule off entirely. Because the merge is property-level, two shapes have to go:
+
+    * the project file opening the hatch itself; and
+    * the project file setting ``risk_level`` on a rule the *user* hatched. It carries no
+      hatch key of its own, so there is nothing to strip, yet the user's consent would
+      license whatever level the project picked. A bare ``allow_blocked_override: true``
+      with no user ``risk_level`` is enough to arm this — the user need not have chosen,
+      or wanted, any downgrade at all.
+
+    ``merged`` is what the user-level file has contributed so far; project files are read
+    second, so it is the user's consent and nothing else. Same threat model, and same
+    answer, as the whitelist restriction above.
+    """
+    if is_user_level:
+        return
+
+    hatched: list[str] = []
+    relevelled: list[str] = []
+    for rule_name, props in file_rule_overrides.items():
+        if not isinstance(props, dict):
+            continue
+        # `is True` mirrors the consumer in rules.py exactly. Any other value is already
+        # inert there, and a project-level `false` must SURVIVE so it can still close a
+        # hatch the user opened — stripping it would convert a refusal into an allow.
+        if props.get("allow_blocked_override") is True:
+            del props["allow_blocked_override"]
+            hatched.append(rule_name)
+        if "risk_level" in props and merged.get(rule_name, {}).get("allow_blocked_override") is True:
+            del props["risk_level"]
+            relevelled.append(rule_name)
+
+    if hatched:
+        logger.warning(
+            f"Ignoring allow_blocked_override in project config {config_path} "
+            "(allow_blocked_override is only supported in user-level config ~/.config/schlock/config.yaml)"
+        )
+    if relevelled:
+        logger.warning(
+            f"Ignoring risk_level for {sorted(relevelled)} in project config {config_path} "
+            "(these rules were unlocked by user-level allow_blocked_override, so only that file may set their level)"
+        )
+
+
 def _load_rule_overrides() -> tuple[dict, dict, list[str]]:
     """Load rule/category overrides and whitelist patterns from config files.
 
@@ -232,6 +281,7 @@ def _load_rule_overrides() -> tuple[dict, dict, list[str]]:
     SECURITY: Whitelist patterns are loaded from user-level config ONLY.
     Project-level config cannot define whitelist patterns because whitelist
     bypasses ALL rules including BLOCKED — a malicious repo could exploit this.
+    It cannot downgrade a BLOCKED rule either; see _strip_project_blocked_downgrades.
 
     Returns:
         Tuple of (rule_overrides, category_overrides, whitelist_patterns).
@@ -268,6 +318,9 @@ def _load_rule_overrides() -> tuple[dict, dict, list[str]]:
             # Merge rule_overrides (property-level: per-rule keys merge, per-property overwrites)
             file_rule_overrides = data.get("rule_overrides", {})
             if isinstance(file_rule_overrides, dict):
+                # No-ops for user config; neuters a project file's BLOCKED downgrades.
+                # Must run BEFORE the merge below — it reads the user's contribution.
+                _strip_project_blocked_downgrades(file_rule_overrides, rule_overrides, config_path, is_user_level)
                 for rule_name, props in file_rule_overrides.items():
                     if isinstance(props, dict):
                         rule_overrides.setdefault(rule_name, {}).update(props)
