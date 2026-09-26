@@ -438,7 +438,8 @@ def _check_dangerous_command_flags(
                     message=f"BLOCKED: {git_reason}",
                     alternatives=[
                         "Remove the -c config override",
-                        "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, etc.)",
+                        "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, "
+                        "man.*, help.format, etc.)",
                     ],
                     exit_code=1,
                     error=None,
@@ -627,7 +628,7 @@ def _watch_payload(args: list[str]) -> Optional[str]:
     return " ".join(args[i:]) or None
 
 
-def _shell_delegated_payloads(
+def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator shape, plus two ceilings
     commands_with_args: list[tuple[str, list[str]]],
     *,
     _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
@@ -652,7 +653,8 @@ def _shell_delegated_payloads(
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
 
-    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there).
+    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes or distinct payloads (fail
+    closed, see there).
     """
     # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
     # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
@@ -678,9 +680,9 @@ def _shell_delegated_payloads(
         # command straight through (`timeout 5 git config core.pager PROG`) and this scan keys on
         # the `config` token rather than on the first word.
         if base == "git" or base in WRAPPER_COMMANDS:
-            from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
+            from schlock.core.substitution import git_config_exec_payloads  # noqa: PLC0415
 
-            found.append(git_config_exec_payload(args))
+            found.extend(git_config_exec_payloads(args))
 
         if base == "watch":
             found.append(_watch_payload(args))
@@ -712,34 +714,51 @@ def _shell_delegated_payloads(
         payloads.extend(p for p in found if p and p.strip())
     # The same program can still surface from more than one delegator (`su su bash -c PROG`:
     # each `su` owns a -c AND wraps the next). Validating it once is enough.
-    return list(dict.fromkeys(payloads))
+    payloads = list(dict.fromkeys(payloads))
+    # Every payload re-enters validation. The suffix ceiling above does not count them, and one
+    # `git config` command yields a payload per candidate pair, so cap the distinct total as well
+    # (fail closed, same reason). git config takes at most three positionals, so no real command
+    # comes near this.
+    if len(payloads) > MAX_DELEGATOR_TOKENS:
+        raise ValueError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
+    return payloads
 
 
 def _check_contextual_high_risk(
     commands_with_args: list[tuple[str, list[str]]],
 ) -> Optional[tuple[str, str]]:
     """Return (base_name, reason) for the first kubectl command that modifies cluster state or
-    executes code, else None.
+    executes code, or for the first `git config` write to a key-rated key, else None.
 
-    Top-level parity with the SubstitutionValidator kubectl check (which BLOCKs these inside
+    Top-level parity with the SubstitutionValidator kubectl and git checks (which BLOCK these inside
     `$()`/`<()`). At the top level `kubectl delete`/`apply`/`exec` are common legitimate ops, so the
     caller elevates to HIGH (ask) and lets the preset decide, rather than hard-blocking. Reuses the
-    same `dangerous_kubectl` helper as the substitution path.
+    same `dangerous_kubectl` / `key_rated_git_config_write` helpers as the substitution path.
 
-    NOTE: find is deliberately NOT handled here. The substitution path blocks *any* `find -exec`
-    (conservative), but at the top level read-only `find -exec grep/cat/...` is legitimate, so
-    top-level find stays command-aware via the `find_exec_dangerous` / `recursive_delete` YAML
-    rules (extended to cover -execdir/-ok/-okdir). See #97.
+    The git check also runs for wrappers (`timeout 5 git config man.viewer custom`) and for a
+    `find -exec` clause, which hand a git command through whole. There it scans only what follows a
+    `git` word, so `nice grep config man.1 README` is not read as a config write.
+
+    NOTE: find's own -exec is deliberately NOT rated here. The substitution path blocks *any*
+    `find -exec` (conservative), but at the top level read-only `find -exec grep/cat/...` is
+    legitimate, so top-level find stays command-aware via the `find_exec_dangerous` /
+    `recursive_delete` YAML rules (extended to cover -execdir/-ok/-okdir). See #97.
     """
-    from schlock.core.substitution import dangerous_kubectl  # noqa: PLC0415
+    from schlock.core.substitution import dangerous_kubectl, key_rated_git_config_write  # noqa: PLC0415
 
     for cmd_name, args in commands_with_args:
         base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
-        if base_name != "kubectl":
-            continue
-        reason = dangerous_kubectl(args)
+        if base_name == "kubectl":
+            reason = dangerous_kubectl(args)
+            if reason:
+                return base_name, reason
+        git_args = args if base_name == "git" else None
+        if base_name in WRAPPER_COMMANDS or base_name == "find":
+            git_at = next((i for i, arg in enumerate(args) if arg.rsplit("/", 1)[-1] == "git"), None)
+            git_args = None if git_at is None else args[git_at + 1 :]
+        reason = key_rated_git_config_write(git_args) if git_args else None
         if reason:
-            return base_name, reason
+            return "git", reason
     return None
 
 
@@ -2957,7 +2976,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             )
             # Don't cache config errors
 
-        # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing).
+        # Step 5b: Contextual HIGH-risk commands (kubectl state-changing, key-rated git config writes).
         # Top-level parity with SubstitutionValidator (which BLOCKs these in $()); at the top level
         # they are common legitimate ops, so elevate to HIGH (ask) and let the preset decide rather
         # than hard-blocking. Only elevate when nothing already matched at >= HIGH. See #97.
@@ -2967,7 +2986,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 ctx_name, ctx_reason = contextual
                 ctx_alternatives = [
                     "Review exactly what will run or be modified before executing",
-                    "Use a read-only form (e.g. find without -exec/-delete, kubectl get/describe)",
+                    "Use a read-only form (e.g. kubectl get/describe, git config --get)",
                 ]
                 match = RuleMatch(
                     matched=True,

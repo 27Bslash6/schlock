@@ -3,15 +3,17 @@
 import pytest
 
 from schlock.core import validator as val_module
-from schlock.core.parser import _reads_stdin_as_program
+from schlock.core.parser import BashCommandParser, _reads_stdin_as_program
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
+    SubstitutionValidator,
     dangerous_find,
     dangerous_git_config,
     dangerous_kubectl,
-    git_config_exec_payload,
+    git_config_exec_payloads,
+    key_rated_git_config_write,
 )
-from schlock.core.validator import validate_command
+from schlock.core.validator import load_rules, validate_command
 
 
 @pytest.fixture
@@ -75,6 +77,22 @@ class TestDangerousGitConfigHelper:
     def test_bare_exec_key_without_value_is_safe(self):
         # `git -c core.fsmonitor` (no =VALUE) means core.fsmonitor=true to git
         assert dangerous_git_config(["-c", "core.fsmonitor", "status"]) is None
+
+    # --- the man-viewer chain: `git help` runs the program these keys pick ---
+    @pytest.mark.parametrize(
+        "config",
+        ["man.viewer=custom", "man.custom.cmd=/tmp/x.sh", "man.custom.path=/tmp/x", "help.format=web", "Man.Viewer=custom"],
+    )
+    def test_man_viewer_keys_are_dangerous(self, config):
+        assert dangerous_git_config(["-c", config, "help", "add"]) is not None
+
+    def test_man_viewer_boolean_is_still_dangerous(self):
+        # git reads man.viewer=true as a viewer NAMED `true` and runs man.true.cmd for it
+        # (verified against git 2.43), so the boolean refinement above must not clear it.
+        assert dangerous_git_config(["-c", "man.viewer=true", "help", "add"]) is not None
+
+    def test_man_prefix_needs_its_dot(self):
+        assert dangerous_git_config(["-c", "manual.x=y", "status"]) is None
 
 
 class TestTopLevelGitC:
@@ -361,93 +379,99 @@ class TestGitConfigExecPayload:
     """`git config <exec-key> <value>` PERSISTS what `-c <exec-key>=<value>` only injects.
 
     The helper returns the payload git will later execute, so each tier judges it with the
-    machinery it already has. None means "nothing is armed here" (LAB-4264).
+    machinery it already has. [] means "nothing is armed here" (LAB-4264).
     """
 
     def test_pager_write_returns_payload(self):
-        assert git_config_exec_payload(["config", "core.pager", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "core.pager", "rm -rf /"]) == ["rm -rf /"]
 
     def test_leading_git_token_tolerated(self):
         # The SubstitutionValidator passes the command word too; the top level does not.
-        assert git_config_exec_payload(["git", "config", "core.pager", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["git", "config", "core.pager", "rm -rf /"]) == ["rm -rf /"]
 
     def test_scope_flags_do_not_hide_the_key(self):
-        assert git_config_exec_payload(["config", "--global", "core.sshCommand", "rm -rf /"]) == "rm -rf /"
-        assert git_config_exec_payload(["config", "--system", "core.askpass", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "--global", "core.sshCommand", "rm -rf /"]) == ["rm -rf /"]
+        assert git_config_exec_payloads(["config", "--system", "core.askpass", "rm -rf /"]) == ["rm -rf /"]
 
     def test_git_global_options_displace_the_subcommand(self):
         # `git -C dir config ...` / `git -c k=v config ...`: config is not args[0].
-        assert git_config_exec_payload(["-C", "repo", "config", "core.pager", "rm -rf /"]) == "rm -rf /"
-        assert git_config_exec_payload(["--no-pager", "config", "core.pager", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["-C", "repo", "config", "core.pager", "rm -rf /"]) == ["rm -rf /"]
+        assert git_config_exec_payloads(["--no-pager", "config", "core.pager", "rm -rf /"]) == ["rm -rf /"]
 
     def test_value_taking_option_cannot_shift_the_key(self):
         # The key is found by prefix match, not by position, so --file/--type consuming (or not
         # consuming) their value cannot move the key out from under the scan.
-        assert git_config_exec_payload(["config", "--file", "cfg", "core.pager", "rm -rf /"]) == "rm -rf /"
-        assert git_config_exec_payload(["config", "--type", "path", "core.pager", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "--file", "cfg", "core.pager", "rm -rf /"]) == ["rm -rf /"]
+        assert git_config_exec_payloads(["config", "--type", "path", "core.pager", "rm -rf /"]) == ["rm -rf /"]
 
     def test_add_and_replace_all_are_writes(self):
-        assert git_config_exec_payload(["config", "--add", "core.pager", "rm -rf /"]) == "rm -rf /"
-        assert git_config_exec_payload(["config", "--replace-all", "core.pager", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "--add", "core.pager", "rm -rf /"]) == ["rm -rf /"]
+        assert git_config_exec_payloads(["config", "--replace-all", "core.pager", "rm -rf /"]) == ["rm -rf /"]
 
     def test_modern_set_subcommand_is_a_write(self):
         # git 2.46+ spelling of the same write.
-        assert git_config_exec_payload(["config", "set", "core.pager", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "set", "core.pager", "rm -rf /"]) == ["rm -rf /"]
 
     def test_key_match_is_case_insensitive(self):
-        assert git_config_exec_payload(["config", "CORE.PAGER", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "CORE.PAGER", "rm -rf /"]) == ["rm -rf /"]
 
     def test_alias_payload_strips_the_bang(self):
-        assert git_config_exec_payload(["config", "alias.zz", "!rm -rf /"]) == "rm -rf /"
-        assert git_config_exec_payload(["config", "alias.zz", " ! rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "alias.zz", "!rm -rf /"]) == ["rm -rf /"]
+        assert git_config_exec_payloads(["config", "alias.zz", " ! rm -rf /"]) == ["rm -rf /"]
 
     def test_alias_without_bang_arms_nothing(self):
         # `alias.st status` runs `git status`, not a shell command.
-        assert git_config_exec_payload(["config", "alias.st", "status"]) is None
+        assert git_config_exec_payloads(["config", "alias.st", "status"]) == []
 
     def test_boolean_value_arms_nothing(self):
-        assert git_config_exec_payload(["config", "core.fsmonitor", "true"]) is None
-        assert git_config_exec_payload(["config", "core.pager", "false"]) is None
+        assert git_config_exec_payloads(["config", "core.fsmonitor", "true"]) == []
+        assert git_config_exec_payloads(["config", "core.pager", "false"]) == []
 
     def test_benign_key_arms_nothing(self):
-        assert git_config_exec_payload(["config", "user.email", "a@b.com"]) is None
-        assert git_config_exec_payload(["config", "--global", "init.defaultBranch", "main"]) is None
+        assert git_config_exec_payloads(["config", "user.email", "a@b.com"]) == []
+        assert git_config_exec_payloads(["config", "--global", "init.defaultBranch", "main"]) == []
 
     def test_reads_arm_nothing(self):
         for read_flag in ("--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"):
-            assert git_config_exec_payload(["config", read_flag, "core.pager"]) is None
-        assert git_config_exec_payload(["config", "--get", "rm -rf /"]) is None
+            assert git_config_exec_payloads(["config", read_flag, "core.pager"]) == []
+        assert git_config_exec_payloads(["config", "--get", "rm -rf /"]) == []
 
     def test_removals_arm_nothing(self):
         for flag in ("--unset", "--unset-all", "--remove-section", "--rename-section"):
-            assert git_config_exec_payload(["config", flag, "core.pager"]) is None
+            assert git_config_exec_payloads(["config", flag, "core.pager"]) == []
 
     def test_modern_read_subcommands_arm_nothing(self):
         # No dedicated subcommand list: a read subcommand simply leaves no key/value pair behind.
-        assert git_config_exec_payload(["config", "get", "core.pager"]) is None
-        assert git_config_exec_payload(["config", "list"]) is None
+        assert git_config_exec_payloads(["config", "get", "core.pager"]) == []
+        assert git_config_exec_payloads(["config", "list"]) == []
 
     def test_trailing_read_flag_does_not_disarm_a_write(self):
         # git accepts and ignores it, and still performs the write.
-        assert git_config_exec_payload(["config", "core.pager", "rm -rf /", "--get"]) == "rm -rf /"
-        assert git_config_exec_payload(["config", "--get=x", "core.pager", "rm -rf /"]) == "rm -rf /"
+        assert git_config_exec_payloads(["config", "core.pager", "rm -rf /", "--get"]) == ["rm -rf /"]
+        assert git_config_exec_payloads(["config", "--get=x", "core.pager", "rm -rf /"]) == ["rm -rf /"]
 
     def test_read_flag_ahead_of_the_key_still_means_read(self):
-        assert git_config_exec_payload(["config", "--get", "core.pager", "rm -rf /"]) is None
-        assert git_config_exec_payload(["config", "--file", "cfg", "--get", "core.pager", "rm -rf /"]) is None
+        assert git_config_exec_payloads(["config", "--get", "core.pager", "rm -rf /"]) == []
+        assert git_config_exec_payloads(["config", "--file", "cfg", "--get", "core.pager", "rm -rf /"]) == []
 
     def test_edit_arms_nothing(self):
         # --edit spawns the ALREADY configured core.editor and names no program itself, exactly
         # like `git commit`, which is not blocked either.
-        assert git_config_exec_payload(["config", "--edit"]) is None
-        assert git_config_exec_payload(["config", "--global", "-e"]) is None
+        assert git_config_exec_payloads(["config", "--edit"]) == []
+        assert git_config_exec_payloads(["config", "--global", "-e"]) == []
 
     def test_key_without_a_value_arms_nothing(self):
-        assert git_config_exec_payload(["config", "core.pager"]) is None
+        assert git_config_exec_payloads(["config", "core.pager"]) == []
 
     def test_no_config_subcommand_arms_nothing(self):
-        assert git_config_exec_payload(["status"]) is None
-        assert git_config_exec_payload(["-c", "alias.x=!sh", "status"]) is None
+        assert git_config_exec_payloads(["status"]) == []
+        assert git_config_exec_payloads(["-c", "alias.x=!sh", "status"]) == []
+
+    def test_an_operand_that_spells_a_key_does_not_hide_the_real_one(self):
+        # `man.cfg` is the --file operand, but it prefixes a dangerous key. Stopping at the first
+        # match handed back `core.pager` as the payload and never judged `rm -rf /`.
+        assert "rm -rf /" in git_config_exec_payloads(["config", "-f", "man.cfg", "core.pager", "rm -rf /"])
+        assert "rm -rf /" in git_config_exec_payloads(["config", "--file", "alias.cfg", "core.pager", "rm -rf /"])
 
 
 @pytest.mark.usefixtures("no_shellcheck_underblocks")
@@ -472,6 +496,11 @@ class TestGitConfigWriteVerdicts:
         "git config --get=x core.pager 'rm -rf /'",
         # An option operand that happens to spell a subcommand must not shift the scan.
         "git config --file get core.pager 'rm -rf /'",
+        # Nor may one that spells a dangerous KEY: git writes core.pager into man.cfg.
+        "git config -f man.cfg core.pager 'rm -rf /'",
+        "git config --file help.format.cfg core.editor 'rm -rf /'",
+        "git config --file core.pager.cfg core.editor 'rm -rf /'",
+        "git config --file man.cfg man.custom.cmd 'rm -rf /'",
         # A wrapper hands the whole command through unchanged.
         "timeout 5 git config core.pager 'rm -rf /'",
         "env FOO=1 git config core.pager 'rm -rf /'",
@@ -548,6 +577,180 @@ class TestGitConfigWriteVerdicts:
     def test_injected_form_still_denied(self):
         # The -c path this fix is the persisted twin of must not regress.
         assert validate_command("git -c core.pager='rm -rf /' log").risk_level == RiskLevel.BLOCKED
+
+    def test_payloads_past_the_ceiling_fail_closed(self):
+        # Every payload re-enters validation, and one command can now yield one per pair. Without
+        # a ceiling a 64 KiB `git config` line re-validated thousands of words and ran for tens of
+        # seconds; a hook that outlives its timeout fails OPEN. Exactly MAX_DELEGATOR_TOKENS pairs
+        # fit (the ceiling admits, it does not merely reject).
+        def pairs(n):
+            return "git config " + " ".join(f"core.pager p{i}" for i in range(n))
+
+        assert validate_command(pairs(val_module.MAX_DELEGATOR_TOKENS)).allowed
+        refused = validate_command(pairs(val_module.MAX_DELEGATOR_TOKENS + 1))
+        assert refused.risk_level == RiskLevel.BLOCKED
+        assert "distinct payloads" in (refused.error or "")
+
+    def test_substitution_tier_judges_every_payload_itself(self):
+        # The top level reaches `$()` bodies today, so a verdict test cannot tell whether this
+        # tier's own judge still weighs past a decoy. Ask the judge directly: `core.pager.cfg` is
+        # the --file operand, and its "value" `core.editor` is a harmless word.
+        sub = SubstitutionValidator(BashCommandParser(), load_rules())
+        args = ["git", "config", "--file", "core.pager.cfg", "core.editor", "rm -rf /"]
+        assert sub._git_config_payload_reason(args) is not None
+
+
+class TestKeyRatedGitConfigWriteHelper:
+    def test_viewer_writes_are_rated(self):
+        assert key_rated_git_config_write(["config", "man.viewer", "custom"]) is not None
+        assert key_rated_git_config_write(["git", "config", "help.format", "web"]) is not None
+
+    def test_reads_are_not_rated(self):
+        assert key_rated_git_config_write(["config", "--get", "man.viewer", "custom"]) is None
+        assert key_rated_git_config_write(["config", "man.viewer"]) is None
+
+    def test_other_keys_are_not_rated(self):
+        # Value-judged keys stay value-judged: the key alone cannot decide an editor or a pager.
+        assert key_rated_git_config_write(["config", "core.pager", "less"]) is None
+        assert key_rated_git_config_write(["config", "manual.x", "y"]) is None
+
+    def test_a_key_rated_word_as_the_value_is_not_rated(self):
+        assert key_rated_git_config_write(["config", "user.name", "man.viewer"]) is None
+
+
+@pytest.mark.usefixtures("no_shellcheck_underblocks")
+class TestGitConfigManViewerVerdicts:
+    """`git help <cmd>` runs the viewer these keys pick, so writing them is the weaponisation step.
+
+    Rated on the key: `custom`, `web` and `/tmp/x.sh` are values no command rule can tell from an
+    ordinary one. `git help` itself stays unrated — it is an everyday command.
+    """
+
+    # Every spelling TestGitConfigWriteVerdicts.ATTACKS uses, applied to the viewer keys.
+    WRITES = [
+        "git config man.viewer custom",
+        "git config --global man.viewer custom",
+        "git config man.custom.cmd /tmp/x.sh",
+        "git config --global man.custom.cmd /tmp/x.sh",
+        "git config man.custom.path /tmp/x",
+        "git config help.format web",
+        "git config --global help.format web",
+        "git config --add man.viewer custom",
+        "git config --replace-all man.viewer custom",
+        "git config --local man.viewer custom",
+        "git config set man.viewer custom",
+        "git config --file /tmp/f man.viewer custom",
+        "git -C /tmp config man.viewer custom",
+        "git config man.viewer custom --get",
+        "git config man.viewer custom --list",
+        "git config --get=x man.viewer custom",
+        "git config --file get man.viewer custom",
+        "git config Man.Viewer custom",
+        # A viewer named `true` is still a viewer: git runs man.true.cmd for it.
+        "git config man.viewer true",
+        "timeout 5 git config man.viewer custom",
+        "env X=1 git config man.viewer custom",
+        "nice git config man.viewer custom",
+        "command git config man.viewer custom",
+        "stdbuf -o0 git config man.viewer custom",
+        "find . -maxdepth 0 -exec git config man.viewer custom \\;",
+        "ls && git config man.viewer custom",
+        # A rename writes every key of a section under the NEW name, so `foo.viewer` renamed into
+        # `man` arms the viewer without naming man.viewer (verified against git 2.43).
+        "git config --rename-section foo man",
+        "git config --rename-section foo.custom man.custom",
+        "git config --ren foo man",
+        "git config rename-section foo help",
+        # Renaming a rated section away rates too: the rename moves its keys either way.
+        "git config --rename-section man alias",
+        "git config --ren Man foo",
+        "git config rename-section help foo",
+        # No position is trusted: after `--` a section may be named `-x` (git 2.43 arms the viewer
+        # through this), a value-taking option can swallow the `--`, and `find -exec` trails a `;`.
+        "git config --rename-section -- -x man",
+        "git config --rename-section -- man -x",
+        "git config -f -- --rename-section -- -x man",
+        "find . -maxdepth 0 -exec git config --rename-section man foo \\;",
+        # A --file operand spelled like the rename flag must not hide the write behind it.
+        "git config -f --ren man.viewer custom",
+    ]
+    WORSE_VALUES = [
+        "git config man.custom.cmd 'rm -rf /'",
+        "git config --global man.custom.cmd 'rm -rf /'",
+    ]
+    INJECTIONS = [
+        "git -c man.viewer=custom help add",
+        "git -c man.custom.cmd=/tmp/x.sh help add",
+        "git -c help.format=web help add",
+    ]
+    READS = [
+        "git config --get man.viewer",
+        "git config --get-all man.custom.cmd",
+        "git config --list",
+        "git config --get help.format",
+        "git config --get man.viewer custom",
+        "git config --unset man.viewer",
+    ]
+    UNCHANGED = [
+        "git help add",
+        "git help",
+        "git help config",
+        "git status",
+        "git config user.name x",
+        "git config pull.rebase true",
+        "git config --global core.editor vim",
+        "git config --global help.autocorrect 10",
+        "git config --global manual.x y",
+        "git config user.name man.viewer",
+        "git config --rename-section foo bar",
+        "git config --rename-section manual foo",
+        # Whole section names only: `he` and `ma` merely begin `help` and `man`.
+        "git config --rename-section he ma",
+    ]
+
+    @pytest.mark.parametrize("command", WRITES)
+    def test_viewer_write_asks(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed
+        assert result.matched_rules == ["ast_contextual_high:git"]
+
+    @pytest.mark.parametrize("command", WRITES)
+    def test_viewer_write_is_denied_in_a_substitution(self, command):
+        result = validate_command(f'echo "$({command})"')
+        assert result.risk_level >= RiskLevel.HIGH
+        assert not result.allowed
+
+    @pytest.mark.parametrize("command", WORSE_VALUES)
+    def test_a_worse_value_still_wins(self, command):
+        # The key-level HIGH must not cap the value's own verdict.
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["shell_delegated_payload"]
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", INJECTIONS)
+    def test_injected_viewer_matches_core_pager(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["ast_dangerous_combo:git"]
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", ["nice grep config man.1 README", "timeout 10 grep -n config man.conf notes.txt"])
+    def test_a_wrapper_without_git_is_not_a_config_write(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    def test_a_delegated_write_keeps_its_rating(self):
+        result = validate_command("sh -c 'git config man.viewer custom'")
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed
+
+    @pytest.mark.parametrize("command", READS + UNCHANGED)
+    def test_reads_and_everyday_git_stay_safe(self, command):
+        for spelling in (command, f'echo "$({command})"'):
+            result = validate_command(spelling)
+            assert result.risk_level == RiskLevel.SAFE
+            assert result.allowed
 
 
 class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:

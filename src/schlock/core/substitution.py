@@ -434,9 +434,20 @@ def _is_git_boolean(value: str) -> bool:
     return value.strip().lower() in _GIT_BOOLEAN_VALUES
 
 
+# git config keys rated on the KEY alone, whatever the value. `git help <cmd>` shows the page
+# through a viewer these keys choose: help.format picks man/info/web, man.viewer names the viewer,
+# and man.<tool>.cmd / man.<tool>.path give the program git runs for it. So
+# `git config man.viewer custom` plus `git config man.custom.cmd PROG` turn an everyday
+# `git help add` into a run of PROG. The values an attack needs (`custom`, `web`, `/tmp/x.sh`)
+# are words no command rule can tell from ordinary ones, so judging the value, as
+# `git_config_exec_payloads` does, cannot see this. Rate the write that arms the viewer, never
+# `git help` itself: that is an everyday command.
+_KEY_RATED_GIT_CONFIGS = frozenset({"help.format", "man."})
+
 # git -c config keys that execute arbitrary commands when set via -c (top-level under-block fix).
-# Lowercased for case-insensitive match against the config key.
-_DANGEROUS_GIT_CONFIGS = frozenset(
+# Lowercased for case-insensitive match against the config key. Includes the key-rated keys:
+# `-c man.viewer=custom help add` injects the same viewer the persisted write arms.
+_DANGEROUS_GIT_CONFIGS = _KEY_RATED_GIT_CONFIGS | frozenset(
     {
         "alias.",  # alias.x=!cmd executes a shell command
         "core.askpass",  # program invoked to obtain credentials -> RCE
@@ -482,8 +493,10 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     # A boolean value selects a built-in and names no executable
                     # (e.g. core.fsmonitor=true); only a path/command value is RCE. A bare
                     # `-c key` (no =VALUE) is key=true to git -> also benign. See #97.
+                    # Not for a key-rated key: git reads man.viewer=true as a viewer NAMED
+                    # `true`, so the key decides there, not the value.
                     _, _, value = config_val.partition("=")
-                    if _is_git_boolean(value):
+                    if _is_git_boolean(value) and dangerous_prefix not in _KEY_RATED_GIT_CONFIGS:
                         continue
                 return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
     return None
@@ -512,33 +525,20 @@ _GIT_CONFIG_READ_FLAGS = frozenset(
 )
 
 
-def git_config_exec_payload(args: list[str]) -> str | None:
-    """Return the command string a `git config` WRITE arms for later execution, else None.
+def _git_config_writes(args: list[str]) -> list[tuple[str, str]]:
+    """Return each (key, value) pair a `git config` command may WRITE, in order; [] for a read.
 
-    `git -c core.pager=CMD log` runs CMD once; `git config core.pager CMD` PERSISTS it and runs it
-    on every later git invocation in that repo or for that user, outliving the session that wrote
-    it. `dangerous_git_config` above guards the injected form; this is its persisted twin, over the
-    same `_DANGEROUS_GIT_CONFIGS` key set.
-
-    Returns the payload rather than a verdict, so each caller judges it with the machinery it
-    already has. That is what keeps `git config --global core.editor vim` SAFE — the payload `vim`
-    is a safe command — while `core.pager 'rm -rf /'` inherits `rm -rf /`'s verdict. The key alone
-    cannot decide it: setting an editor or a pager is an everyday command, and only the VALUE says
-    whether this one is an attack.
-
-    Pure; the shared extractor, with each tier applying its own judgement. `args` may or may not
-    include the leading "git" token.
-
-    Known ceilings. A value that is not a command gets whatever verdict that text has AS a command,
-    so `core.hooksPath hooks-dir` (a directory) reads SAFE, as the bare word does. `git config
-    --edit` is not flagged either: it spawns the editor ALREADY configured and names no program,
-    exactly like `git commit`.
+    Over-approximates by design: every adjacent pair of positionals not preceded by a read flag is
+    a candidate, operands of options like `--file F` included, so a caller must weigh EVERY pair
+    and match the KEY by prefix rather than trusting a position. `args` may or may not include the
+    leading "git" token.
     """
     if "config" not in args:
-        return None
+        return []
     # Scan from the `config` token rather than assuming a position: git's own global options
-    # (`git -C dir`, `git -c k=v`, `git --no-pager`) displace the subcommand. A stray `config`
-    # elsewhere costs nothing — a payload is only returned when a dangerous KEY and a VALUE follow.
+    # (`git -C dir`, `git -c k=v`, `git --no-pager`) displace the subcommand, and knowing which of
+    # them take a value would be a list that fails open on the one it misses. The cost is the other
+    # direction: a stray `config` (`git grep config man.c help.c`) can over-rate, never under-rate.
     rest = args[args.index("config") + 1 :]
 
     # Positionals only, each carrying how many read flags preceded it. The KEY is found by prefix
@@ -553,23 +553,99 @@ def git_config_exec_payload(args: list[str]) -> str | None:
             continue
         positionals.append((arg, reads_seen))
 
-    for i, (key, reads_before_key) in enumerate(positionals[:-1]):
-        if reads_before_key:
-            continue  # a read's <name> <value-pattern> pair, not a write
+    # A pair after a read flag is a read's <name> <value-pattern>, not a write.
+    return [(key, positionals[i + 1][0]) for i, (key, reads_before_key) in enumerate(positionals[:-1]) if not reads_before_key]
+
+
+def git_config_exec_payloads(args: list[str]) -> list[str]:
+    """Return each command string a `git config` WRITE may arm for later execution; [] if none.
+
+    `git -c core.pager=CMD log` runs CMD once; `git config core.pager CMD` PERSISTS it and runs it
+    on every later git invocation in that repo or for that user, outliving the session that wrote
+    it. `dangerous_git_config` above guards the injected form; this is its persisted twin, over the
+    same `_DANGEROUS_GIT_CONFIGS` key set.
+
+    Returns payloads rather than a verdict, so each caller judges them with the machinery it
+    already has. That is what keeps `git config --global core.editor vim` SAFE — the payload `vim`
+    is a safe command — while `core.pager 'rm -rf /'` inherits `rm -rf /`'s verdict. The key alone
+    cannot decide it: setting an editor or a pager is an everyday command, and only the VALUE says
+    whether this one is an attack. The few keys whose attack values look ordinary are rated on the
+    key instead, by `key_rated_git_config_write`.
+
+    Pure; the shared extractor, with each tier applying its own judgement. `args` may or may not
+    include the leading "git" token.
+
+    EVERY candidate pair, not the first match: an option operand can spell a key, and stopping there
+    judges the wrong word. `git config -f man.cfg core.pager 'rm -rf /'` would hand back
+    `core.pager` and never look at `rm -rf /`. Returning a decoy's value too costs one extra
+    validation of a harmless word.
+
+    Known ceilings. A value that is not a command gets whatever verdict that text has AS a command,
+    so `core.hooksPath hooks-dir` (a directory) reads SAFE, as the bare word does. `git config
+    --edit` is not flagged either: it spawns the editor ALREADY configured and names no program,
+    exactly like `git commit`.
+    """
+    payloads = []
+    for key, value in _git_config_writes(args):
         key_lower = key.lower()
         for dangerous_prefix in _DANGEROUS_GIT_CONFIGS:
             if not key_lower.startswith(dangerous_prefix):
                 continue
-            value = positionals[i + 1][0]
             if dangerous_prefix == "alias.":
                 # Same refinement as the -c form: git runs an alias as a shell command only when
                 # its value starts with '!'. `alias.st status` is an ordinary git-subcommand alias.
                 stripped = value.lstrip()
-                if not stripped.startswith("!"):
-                    return None
-                return stripped[1:].strip() or None
+                if stripped.startswith("!"):
+                    payloads.append(stripped[1:].strip())
             # A boolean value selects a built-in and names no executable (core.fsmonitor=true).
-            return None if _is_git_boolean(value) else value
+            elif not _is_git_boolean(value):
+                payloads.append(value)
+            break
+    return [p for p in payloads if p]
+
+
+def _rename_section_candidates(args: list[str]) -> list[str]:
+    """Return every word that may name a section `git config --rename-section OLD NEW` renames, else [].
+
+    git accepts any unambiguous abbreviation of a long option, so `--ren` already means
+    --rename-section (`--re` is ambiguous: --remove-section, --replace-all). `rename-section` is
+    the subcommand spelling of newer git.
+
+    Every word after `config` is a candidate, not just the last two positionals, because no position
+    can be trusted: after `--` a section may be named `-x`, a value-taking option can swallow the
+    `--` itself (`-f -- --rename-section -- -x man`), and a `find -exec` clause trails a `;`. A decoy
+    word costs an over-rating, never a miss.
+    """
+    if "config" not in args:
+        return []
+    rest = args[args.index("config") + 1 :]
+    flagged = any(len(arg) >= len("--ren") and "--rename-section".startswith(arg) for arg in rest)
+    return rest if flagged or "rename-section" in rest else []
+
+
+def key_rated_git_config_write(args: list[str]) -> str | None:
+    """Return a reason if a `git config` command WRITES a key in `_KEY_RATED_GIT_CONFIGS`, else None.
+
+    The key decides, whatever the value: see `_KEY_RATED_GIT_CONFIGS`. Reads (`--get man.viewer`,
+    `--list`) write nothing and stay unrated. Pure; `args` may or may not include the leading "git"
+    token. A value that is itself a dangerous command still gets that command's own, worse verdict
+    through `git_config_exec_payloads`, which covers the same keys.
+
+    Over-approximates like the walk it shares: a `--file` operand spelled like one of these keys
+    (`-f man.cfg`) rates too, and so does renaming the `man` section away.
+    """
+    prefixes = tuple(_KEY_RATED_GIT_CONFIGS)
+    for key, _ in _git_config_writes(args):
+        if key.lower().startswith(prefixes):
+            return f"git config {key} chooses a program that git runs later"
+    for word in _rename_section_candidates(args):
+        # A rename writes every key of the section under its NEW name, so `foo.viewer custom`
+        # renamed into `man` arms the viewer without ever naming man.viewer. `help` holds
+        # help.format, `man.custom` holds man.custom.cmd. The OLD name matches too, which is what
+        # rates renaming `man` away.
+        section = word.lower() + "."
+        if any(prefix.startswith(section) or section.startswith(prefix) for prefix in prefixes):
+            return f"git config renames a section named {word}, moving keys that choose a program git runs"
     return None
 
 
@@ -1585,16 +1661,16 @@ class SubstitutionValidator:
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
-        payload = git_config_exec_payload(args)
-        if not payload or self.rule_engine is None:
+        if self.rule_engine is None:
             return None
-        try:
-            literals = self.parser.extract_string_literals(payload, self.parser.parse(payload))
-        except Exception:  # noqa: BLE001 - unparseable payload: judge it with nothing suppressed
-            literals = []
-        match = self.rule_engine.match_command(payload, string_literals=literals)
-        if match and match.matched and self._amplify_risk(match.risk_level) in (RiskLevel.BLOCKED, RiskLevel.HIGH):
-            return f"git config persists an executable value: {match.message}"
+        for payload in git_config_exec_payloads(args):
+            try:
+                literals = self.parser.extract_string_literals(payload, self.parser.parse(payload))
+            except Exception:  # noqa: BLE001 - unparseable payload: judge it with nothing suppressed
+                literals = []
+            match = self.rule_engine.match_command(payload, string_literals=literals)
+            if match and match.matched and self._amplify_risk(match.risk_level) in (RiskLevel.BLOCKED, RiskLevel.HIGH):
+                return f"git config persists an executable value: {match.message}"
         return None
 
     def _has_dangerous_inner_structure(  # noqa: PLR0911, PLR0912, PLR0915
@@ -1649,8 +1725,11 @@ class SubstitutionValidator:
                     args.append(part.word)
 
             if base_command == "git" and args:
-                # The persisted twin of the -c check: judge the VALUE, not the key.
-                git_reason = dangerous_git_config(args) or self._git_config_payload_reason(args)
+                # The persisted twin of the -c check: judge the VALUE, not the key — except for the
+                # keys whose attack values look ordinary, which are rated on the key.
+                git_reason = (
+                    dangerous_git_config(args) or self._git_config_payload_reason(args) or key_rated_git_config_write(args)
+                )
                 if git_reason:
                     return True, git_reason
 
