@@ -120,14 +120,15 @@ class TestReDoSProtection:
 
         assert elapsed < self.MAX_VALIDATION_TIME, f"ReDoS detected: {elapsed:.3f}s for input: {pathological_input[:50]}..."
 
-    @pytest.mark.parametrize("head", ["tee", "> ", "rm"])
+    @pytest.mark.parametrize("head", ["tee", "> ", "rm", "rm -f"])
     def test_blank_run_after_a_truncation_head_is_linear(self, safety_rules_path, head):
         r"""A long blank run after `tee`, `>` or `rm` is scanned once, not once per backtrack.
 
         The blank-operand guard is `(?=\s+\S)` in FRONT of the quantifier
-        (LAB-4360). Written as `\s+(?!\s*$)` it re-scans the run on every
-        backtracking step: 20,000 blanks cost 500ms at the regex layer against
-        2ms for the base pattern, on a hook that runs before every bash call.
+        (LAB-4360; for `rm`, `(?=\s*\S)` after the flag run, LAB-4470). Written
+        as `\s+(?!\s*$)` it re-scans the run on every backtracking step: 20,000
+        blanks cost 500ms at the regex layer against 2ms for the base pattern,
+        on a hook that runs before every bash call.
         Measured at the regex layer because the whole validator already spends
         over a second on this input in other patterns, which would hide it.
         """

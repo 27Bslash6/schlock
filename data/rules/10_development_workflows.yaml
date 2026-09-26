@@ -188,7 +188,27 @@ rules:
   - name: single_delete
     description: Deleting files without backup
     risk_level: MEDIUM
-    patterns: ['^rm(?=\s+\S)\s+[^-]']
+    # After `rm` and one blank: a run of dash-led flags, each followed by exactly
+    # one blank, then a target, which is anything that is not a dash-led token: a
+    # non-dash char (a blank included) or a bare `-` (a filename to GNU rm). A `--`
+    # is the exception: it ends option parsing, so the token after it is the target
+    # however many dashes it leads with — `rm -- -file` deletes `-file` (LAB-4470).
+    # Its branch is reached only when the greedy flag run gives the `--` back, so
+    # never make that run atomic or possessive.
+    # The parser joins words with a single space, so two consecutive blanks anywhere
+    # can only be a whitespace-led filename: `"rm" ' -f'` rebuilds as `rm  -f` and
+    # `"rm" -f ' -f'` as `rm -f  -f`, both indistinguishable from a flag with no
+    # target, and both delete. The ambiguity takes the higher rating at every
+    # position (LAB-4360, LAB-4428) — except when only blanks remain. The raw text
+    # reaches this pattern untrimmed, so `rm  ` and `rm -f  ` arrive as typed and
+    # delete nothing; `(?=\s*\S)` after the flag run keeps them SAFE where the
+    # blank target would accept them (LAB-4360, LAB-4470). Still one scan of the
+    # blanks: every give-back of the run lands on a `-`, where the lookahead
+    # decides in one char. Linear because each flag iteration ends in exactly one
+    # `\s`, so a run splits one way only. The earlier `^rm\s+(?:\S*\s+)*[^-\s]`
+    # shape, with a `\s+` separator and no blank target, was exponential (146ms at
+    # 20 blanks). Keep the single `\s`.
+    patterns: ['^rm\s(?:-\S*\s)*(?=\s*\S)(?:[^-]|-(?!\S)|--\s\S)']
     alternatives: ["Backup first"]
 
   - name: git_push
