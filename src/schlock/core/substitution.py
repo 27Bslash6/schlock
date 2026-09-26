@@ -1236,6 +1236,11 @@ class SubstitutionValidator:
         Returns:
             SubstitutionNode or None if extraction fails
         """
+        # The peel drops each group's read redirects with the wrapper, and bash expands a redirect
+        # target before it runs the command — so $( ( cat ) < "$(bash)" ) runs bash. The nested
+        # walk below therefore reads the PRE-peel node, whose group `redirects` the walk descends
+        # at every layer. Walking the peeled node read SAFE while $(cat < "$(bash)") BLOCKs (LAB-5648).
+        unpeeled = getattr(node, "command", None)
         node = _unwrap_compound(node)
         inner_command, literal_ranges = self._extract_inner_command_text(node)
         # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
@@ -1272,7 +1277,7 @@ class SubstitutionValidator:
         nested: list[SubstitutionNode] = []
         if depth < MAX_SUBSTITUTION_DEPTH and hasattr(node, "command"):
             try:
-                inner_ast = [node.command] if node.command else []
+                inner_ast = [unpeeled] if unpeeled else []
                 nested = self.extract_substitutions(inner_ast, depth + 1)
             except Exception:  # noqa: S110 - Parse errors treated as suspicious AST
                 nested = []  # Failed to parse nested - treat as no nested subs
