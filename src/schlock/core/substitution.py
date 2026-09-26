@@ -26,6 +26,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+from .parser import without_fd_variables
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -877,8 +879,18 @@ def _command_tokens(node: Any) -> list[tuple[str, bool]]:
     The first word is exempt whatever its shape: a quoted command name is still the command
     being run, so ``$('rm -rf /' foo)`` must keep matching the rule it names.
     """
-    parts = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
+    parts = [p for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
     return [(part.word, index > 0 and _is_opaque_argument(part)) for index, part in enumerate(parts)]
+
+
+def _leading_part(node: Any) -> Any:
+    """A command node's first part less any `{varname}` prefix, else None.
+
+    Every command-name lookup below starts here, so `{fd}<x date` leads with its redirect
+    exactly as `3<x date` does, rather than naming `{fd}` as the command.
+    """
+    parts = without_fd_variables(getattr(node, "parts", None) or [])
+    return parts[0] if parts else None
 
 
 # Shapes that hand one of their own arguments to a shell. These take the command as a SEPARATE
@@ -1352,17 +1364,11 @@ class SubstitutionValidator:
         """
         kind = getattr(node, "kind", None)
         if kind == "command":
-            parts = getattr(node, "parts", None)
-            if parts and hasattr(parts[0], "word"):
-                return parts[0].word
-            return None
+            return getattr(_leading_part(node), "word", None)
         if kind == "pipeline":
             for part in getattr(node, "parts", []):
                 if getattr(part, "kind", None) == "command":
-                    parts = getattr(part, "parts", None)
-                    if parts and hasattr(parts[0], "word"):
-                        return parts[0].word
-                    return None
+                    return getattr(_leading_part(part), "word", None)
             return None
         return None
 
@@ -1426,18 +1432,13 @@ class SubstitutionValidator:
         # Handle pipeline - get first command in pipeline
         if hasattr(cmd_node, "kind") and cmd_node.kind == "pipeline":
             if hasattr(cmd_node, "parts") and cmd_node.parts:
-                first_cmd = cmd_node.parts[0]
-                if hasattr(first_cmd, "parts") and first_cmd.parts:
-                    first_word = first_cmd.parts[0]
-                    if hasattr(first_word, "word"):
-                        return first_word.word
+                return getattr(_leading_part(cmd_node.parts[0]), "word", None)
             return None
 
         # Handle simple command
-        if hasattr(cmd_node, "parts") and cmd_node.parts:
-            first_part = cmd_node.parts[0]
-            if hasattr(first_part, "word"):
-                return first_part.word
+        first_part = _leading_part(cmd_node)
+        if hasattr(first_part, "word"):
+            return first_part.word
 
         # Handle compound command (command list). A control-flow compound that survived
         # _unwrap_compound ($(if …; fi), $(for …; done)) leads with a ReservedwordNode, whose
@@ -1448,12 +1449,11 @@ class SubstitutionValidator:
             first = cmd_node.list[0]
             if getattr(first, "kind", None) == "reservedword":
                 return None
-            if hasattr(first, "parts") and first.parts:
-                if getattr(first.parts[0], "kind", None) == "reservedword":
-                    return None
-                first_part = first.parts[0]
-                if hasattr(first_part, "word"):
-                    return first_part.word
+            first_part = _leading_part(first)
+            if getattr(first_part, "kind", None) == "reservedword":
+                return None
+            if hasattr(first_part, "word"):
+                return first_part.word
 
         return None
 
@@ -1519,10 +1519,9 @@ class SubstitutionValidator:
 
     def _has_brace_expansion_in_command(self, cmd_node: Any) -> bool:
         """Check if command name uses brace expansion."""
-        if not hasattr(cmd_node, "parts") or not cmd_node.parts:
+        first_part = _leading_part(cmd_node)
+        if first_part is None:
             return False
-
-        first_part = cmd_node.parts[0]
 
         # Check if first part has brace expansion
         if hasattr(first_part, "kind") and first_part.kind == "compound":
@@ -1538,10 +1537,9 @@ class SubstitutionValidator:
 
     def _has_variable_as_command(self, cmd_node: Any) -> bool:
         """Check if command name is a variable reference."""
-        if not hasattr(cmd_node, "parts") or not cmd_node.parts:
+        first_part = _leading_part(cmd_node)
+        if first_part is None:
             return False
-
-        first_part = cmd_node.parts[0]
 
         # Check for parameter/variable node
         if hasattr(first_part, "kind"):
@@ -1645,7 +1643,7 @@ class SubstitutionValidator:
         # Check for output redirections and dangerous arguments
         if hasattr(cmd_node, "parts"):
             args: list[str] = []
-            for part in cmd_node.parts:
+            for part in without_fd_variables(cmd_node.parts):
                 # Any write redirection: $(echo x > file), $(… >| file), $(… &> file), $(… <> file)
                 if _is_write_redirect(part):
                     return True, "output redirection in substitution"
@@ -2232,8 +2230,7 @@ class SubstitutionValidator:
         # A full implementation would track parent references in AST traversal
         for node in ast_nodes or []:
             if hasattr(node, "kind") and node.kind == "command":
-                if hasattr(node, "parts") and node.parts:
-                    first_word = node.parts[0]
-                    if hasattr(first_word, "word"):
-                        return first_word.word
+                first_word = _leading_part(node)
+                if hasattr(first_word, "word"):
+                    return first_word.word
         return None
