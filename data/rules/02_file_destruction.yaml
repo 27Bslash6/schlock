@@ -52,10 +52,9 @@ rules:
     # The target is one character: it only has to exist. A longer run matches exactly the same
     # commands but stretches the span past a closing quote or into the next word, so a quoted
     # example (`echo ': > f'`) escaped string-literal suppression and rated as a truncation.
-    # The target is not a blank, so in `2>  /dev/null` the `/dev/null` check sees the operand and
-    # not the second blank. `/dev/null` is excluded only as a whole word, ended by a blank or a
-    # shell metacharacter: `/dev/null.bak` is a different file, and writing to it truncates it.
-    patterns: ["^\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^\\s|&;]", ":\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^\\s|&;]", "\\btrue\\s+(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^\\s|&;]", "\\btruncate\\s+.{0,100}(-s|--size)\\s*0", "\\becho\\s+-n\\s+(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^\\s|&;]", "\\bprintf\\s+[\"']\\s*[\"']?\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^\\s|&;]", "\\btee(?=\\s+\\S)\\s+(?!.{0,50}-a)(?!/dev/null(?:[\\s|&;()<>`]|$))[^|&;]{1,200}"]
+    # `/dev/null` is excluded only as a whole word, ended by a blank or a shell metacharacter:
+    # `/dev/null.bak` is a different file, and writing to it truncates it.
+    patterns: ["^\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^|&;]", ":\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^|&;]", "\\btrue\\s+(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^|&;]", "\\btruncate\\s+.{0,100}(-s|--size)\\s*0", "\\becho\\s+-n\\s+(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^|&;]", "\\bprintf\\s+[\"']\\s*[\"']?\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>(?=\\s+\\S)\\s+(?!/dev/null(?:[\\s|&;()<>`]|$))[^|&;]", "\\btee(?=\\s+\\S)\\s+(?!.{0,50}-a)(?!/dev/null(?:[\\s|&;()<>`]|$))[^|&;]{1,200}"]
     alternatives: ["Use proper log rotation", "Backup before truncating", "Use >> for append"]
 
   - name: vcs_directory_deletion
