@@ -2,6 +2,7 @@
 
 import re
 import shutil
+import sys
 
 import pytest
 import yaml
@@ -20,6 +21,11 @@ def _segment_count(command: str) -> int:
     """
     parser = BashCommandParser()
     return len(parser.extract_command_segments(command, parser.parse(command)))
+
+
+def _shipped_whitelist(rules_dir) -> list[str]:
+    """The whitelist patterns schlock ships, read from disk."""
+    return yaml.safe_load((rules_dir / "00_whitelist.yaml").read_text())["whitelist"]
 
 
 @pytest.fixture
@@ -1034,15 +1040,10 @@ class TestWhitelistClearsOnlyWhatItDescribes:
         """
         return data_dir / "rules"
 
-    @staticmethod
-    def _shipped_whitelist(shipped_rules_dir) -> list[str]:
-        text = (shipped_rules_dir / "00_whitelist.yaml").read_text()
-        return yaml.safe_load(text)["whitelist"]
-
     @pytest.fixture
     def chmod_tmp_patterns(self, shipped_rules_dir):
         """The two /tmp chmod entries, compiled, straight from the shipped YAML."""
-        pats = [p for p in self._shipped_whitelist(shipped_rules_dir) if p.startswith("^chmod")]
+        pats = [p for p in _shipped_whitelist(shipped_rules_dir) if p.startswith("^chmod")]
         assert len(pats) == 2, f"expected exactly 2 /tmp chmod entries, got {pats}"
         return [re.compile(p) for p in pats]
 
@@ -1253,6 +1254,11 @@ class TestDeclaredCountIsWhatBashRuns:
     line and hide a reverted rule.
     """
 
+    NPM_TEE = r"^npm\s+run\s+\S+(\s+2>&1)?\s*\|\s*tee\s+\S+$"
+    FIND_TEE = r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$"
+    FIND_EXEC = r"^find\s+\S+\s+-name\s+\S+\s+-exec\s+rm\s+\{\}\s+\\;$"
+    FOO_BAR_ANY = r"^foo\s*\|\s*bar[\s\S]*$"
+
     @staticmethod
     def _engine(tmp_path, pattern: str) -> RuleEngine:
         rules = tmp_path / "user_whitelist.yaml"
@@ -1262,7 +1268,8 @@ class TestDeclaredCountIsWhatBashRuns:
     @pytest.mark.parametrize(
         ("source", "declared"),
         [
-            # A redirection's `&` sits beside `>` or `<`, before or after, in any spelling.
+            # Beside `>` or `<`, before or after, literal, escaped or bracketed, a separator
+            # character belongs to a redirection.
             (r"^a\s+2>&1$", 0),
             (r"^a\s+>&2$", 0),
             (r"^a\s+<&3$", 0),
@@ -1270,35 +1277,58 @@ class TestDeclaredCountIsWhatBashRuns:
             (r"^a\s+&>>\S+$", 0),
             (r"^a\s+2\>&1$", 0),
             (r"^a\s+2[>]&1$", 0),
-            (r"^a\s+&\>\S+$", 0),
             (r"^a\s+\<&3$", 0),
             (r"^a\s+[<]&3$", 0),
-            (r"^a\s+2>\&1$", 0),
-            (r"^a\s+2>[&]1$", 0),
+            (r"^make\s+\S+(\s+>\|\s*\S+)?$", 0),  # `>|` writes past noclobber; not a pipe
             # ...so a pipeline entry keeps its one pipe, whether the redirection is required or not.
             (r"^npm\s+run\s+\S+\s+2>&1\s*\|\s*tee\s+\S+$", 1),
-            (r"^npm\s+run\s+\S+(\s+2>&1)?\s*\|\s*tee\s+\S+$", 1),
+            (NPM_TEE, 1),
             (r"^npm\s+test\s+&>\s*\S+$", 0),
             # `|&` pipes stderr too and `&&` is AND: both still join two commands.
             (r"^a\s*\|&\s*b$", 1),
             (r"^a\s*&&\s*b$", 1),
             # After a literal backslash a separator is escaped: bash reads `\;` as an argument.
-            (r"^find\s+\S+\s+-name\s+\S+\s+-exec\s+rm\s+\{\}\s+\\;$", 0),
-            (r"^find\s+\S+\s+-exec\s+rm\s+\{\}\s+[\\];$", 0),
-            (r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$", 1),
+            (FIND_EXEC, 0),
+            (r"^echo\s+a[\\];\s+\S+$", 0),
+            (FIND_TEE, 1),
             (r"^echo\s+a\\&\s+\S+$", 0),
             (r"^echo\s+a\\\|\s+\S+$", 0),
-            (r"^echo\s+a\\\;\s+\S+$", 0),
-            # A verbose flag, global or scoped, or an inline comment carries text that is never
-            # matched. Such an entry is read as declaring nothing: it clears no line.
+            # An optional separator is not a promise of another command.
+            (r"^npm\s+run\s+\S+(\s+&?>\s*\S+)?\s*\|\s*tee\s+\S+$", 1),
+            (r"^a\s*;?\s*b$", 0),
+            (r"^a\s*;*\s*b$", 0),
+            # A separator with nothing after it but blanks and the end ends the last command.
+            (r"^npm\s+run\s+\S+\s*&$", 0),
+            (r"^npm\s+run\s+dev &\s*$", 0),
+            (r"^npm run dev & $", 0),
+            (r"^npm\s+run\s+dev\s+&\s+$", 0),
+            (r"^npm\s+run\s+dev\s*&\s?$", 0),
+            (r"^npm\s+run\s+dev\s*&\Z", 0),
+            pytest.param(
+                r"^npm\s+run\s+dev\s*&\z", 0, marks=pytest.mark.skipif(sys.version_info < (3, 14), reason="\\z is new")
+            ),
+            (r"^make\s+\S+\s*;\s*make\s+test\s*;$", 1),
+            # Text that is never matched, or that matches nothing, declares nothing: an entry with a
+            # verbose flag (global or scoped), an inline comment or a lookaround clears no line.
             (r"(?x) ^make \s+ \S+ $  # build; nothing else", 0),
             (r"^make\s+\S+(?#one; command)$", 0),
             (r"(?ix) ^make \s+ \S+ $  # build; nothing else", 0),
             (r"(?sx) ^make \s+ \S+ $  # a; b", 0),
             ("(?x:^make \\s+ \\S+ # a; b\n)$", 0),
-            # A flag group that is not verbose, or that turns verbose off, changes nothing.
+            (r"^(?!.*;)make\s+\S+$", 0),
+            (r"^(?=.*\|)gh\s+auth\s+token\s*\|\s*docker.*$", 0),
+            (r"^make\s+\S+(?<!;)$", 0),
+            (r"^make\s+\S+(?<=[^;])$", 0),
+            # So does an entry spelling a character by its code, which could be `\`, `>` or `;`.
+            (r"^echo\s+a\x5c;\s+\S+$", 0),
+            (r"^echo\s+a\134;\s+\S+$", 0),
+            (r"^echo\s+a\u005c;\s+\S+$", 0),
+            (r"^echo\s+a\U0000005c;\s+\S+$", 0),
+            (r"^echo\s+a\N{REVERSE SOLIDUS};\s+\S+$", 0),
+            # A group that is not one of those changes nothing.
             (r"(?i:^a\s*;\s*b)$", 1),
             (r"(?-x:^a\s*;\s*b)$", 1),
+            (r"^(?P<cmd>a)\s*;\s*b$", 1),
         ],
     )
     def test_only_what_bash_reads_as_a_separator_is_declared(self, source, declared):
@@ -1307,10 +1337,11 @@ class TestDeclaredCountIsWhatBashRuns:
 
     def test_shipped_entries_keep_their_declared_counts(self, data_dir):
         """Only the gh/docker pipeline declares a separator; every other shipped entry speaks for one command."""
-        shipped = yaml.safe_load((data_dir / "rules" / "00_whitelist.yaml").read_text())["whitelist"]
-        assert any("docker" in pattern for pattern in shipped)
+        shipped = _shipped_whitelist(data_dir / "rules")
+        pipeline = [pattern for pattern in shipped if pattern.startswith(r"^gh\s+auth\s+token")]
+        assert len(pipeline) == 1
         for pattern in shipped:
-            assert _declared_separators(pattern) == (1 if "docker" in pattern else 0), pattern
+            assert _declared_separators(pattern) == (1 if pattern in pipeline else 0), pattern
 
     @pytest.mark.parametrize("tail", ["\n\\", "\n \\", "\n\t\\", ";\\", "&\\"])
     def test_a_lone_trailing_backslash_is_a_command_the_parser_does_not_count(self, tmp_path, tail):
@@ -1321,7 +1352,7 @@ class TestDeclaredCountIsWhatBashRuns:
         planted on PATH. The parser drops the word without counting it, so the count sees two
         commands where bash runs three.
         """
-        engine = self._engine(tmp_path, r"^foo\s*\|\s*bar[\s\S]*$")
+        engine = self._engine(tmp_path, self.FOO_BAR_ANY)
         (entry,) = engine.whitelist_patterns
         command = "foo | bar x" + tail
 
@@ -1331,46 +1362,34 @@ class TestDeclaredCountIsWhatBashRuns:
 
     def test_an_escaped_trailing_backslash_is_an_argument_and_still_clears(self, tmp_path):
         r"""An even run is escaped backslashes: `bar x\\` hands `bar` the argument `x\`."""
-        engine = self._engine(tmp_path, r"^foo\s*\|\s*bar[\s\S]*$")
+        engine = self._engine(tmp_path, self.FOO_BAR_ANY)
         for command in ("foo | bar x", "foo | bar x\\\\"):
             assert _segment_count(command) == 2, command
             assert engine.is_whitelisted_whole(command, 2), command
 
-    # (user entry, line, risk level with the entry, a rule that must fire). Each line clears the
-    # gate on the count alone before this fix; the risk level is the one it gets with no entry.
+    # (user entry, line, a rule that must fire). Each line clears the gate before this fix.
     ROWS = [
-        (
-            r"^npm\s+run\s+\S+(\s+2>&1)?\s*\|\s*tee\s+\S+$",
-            "npm run build;rm${IFS}-rf${IFS}~ | tee log",
-            RiskLevel.BLOCKED,
-            "ifs_obfuscation",
-        ),
-        (
-            r"^find\s+\S+\s+-name\s+\S+\s+-exec\s+rm\s+\{\}\s+\\;$",
-            r"find x;rm${IFS}-rf${IFS}~ -name y -exec rm {} \;",
-            RiskLevel.BLOCKED,
-            "ifs_obfuscation",
-        ),
-        (
-            r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$",
-            "find src -exec wc {} \\; | tee\nreboot",
-            RiskLevel.HIGH,
-            "file_truncation",
-        ),
-        (r"^echo\s+a\\&\s+\S+$", r"echo a\& x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
-        (r"^echo\s+a\\\|\s+\S+$", r"echo a\| x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
-        (r"(?x) ^make \s+ \S+ $  # build; nothing else", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
-        (r"^make\s+\S+(?#one; command)$", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
-        (r"(?ix) ^make \s+ \S+ $  # build; nothing else", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
-        (r"(?sx) ^make \s+ \S+ $  # a; b", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
-        ("(?x:^make \\s+ \\S+ # a; b\n)$", "make x;rm${IFS}-rf${IFS}~", RiskLevel.BLOCKED, "ifs_obfuscation"),
-        (r"^foo\s*\|\s*bar[\s\S]*$", "foo | bar x\n\\", RiskLevel.SAFE, None),
-        (r"^foo\s*\|\s*bar[\s\S]*$", "foo | bar x\n \\", RiskLevel.SAFE, None),
-        (r"^foo\s*\|\s*bar[\s\S]*$", "foo | bar x\n\t\\", RiskLevel.SAFE, None),
+        (NPM_TEE, "npm run build;rm${IFS}-rf${IFS}~ | tee log", "ifs_obfuscation"),
+        (FIND_EXEC, r"find x;rm${IFS}-rf${IFS}~ -name y -exec rm {} \;", "ifs_obfuscation"),
+        (FIND_TEE, "find src -exec wc {} \\; | tee\nreboot", "file_truncation"),
+        (r"^echo\s+a\\&\s+\S+$", r"echo a\& x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (r"^echo\s+a\\\|\s+\S+$", r"echo a\| x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (r"(?x) ^make \s+ \S+ $  # build; nothing else", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (r"^make\s+\S+(?#one; command)$", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (r"(?ix) ^make \s+ \S+ $  # build; nothing else", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (r"(?sx) ^make \s+ \S+ $  # a; b", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        ("(?x:^make \\s+ \\S+ # a; b\n)$", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (FOO_BAR_ANY, "foo | bar x\n\\", None),
+        (FOO_BAR_ANY, "foo | bar x\n \\", None),
+        (FOO_BAR_ANY, "foo | bar x\n\t\\", None),
+        (FOO_BAR_ANY, "foo | bar x;\\", None),
+        (r"^make\s+\S+(\s+>\|\s*\S+)?$", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (r"^(?!.*;)make\s+\S+$", "make x&&rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        (r"^npm\s+run\s+\S+\s*&$", "npm run dev;rm${IFS}-rf${IFS}~ &", "ifs_obfuscation"),
     ]
 
-    @pytest.mark.parametrize(("pattern", "command", "risk", "rule"), ROWS)
-    def test_the_whole_line_check_refuses_a_line_with_an_undeclared_command(self, tmp_path, pattern, command, risk, rule):
+    @pytest.mark.parametrize(("pattern", "command"), [row[:2] for row in ROWS])
+    def test_the_whole_line_check_refuses_a_line_with_an_undeclared_command(self, tmp_path, pattern, command):
         engine = self._engine(tmp_path, pattern)
         (entry,) = engine.whitelist_patterns
 
@@ -1378,8 +1397,8 @@ class TestDeclaredCountIsWhatBashRuns:
         assert not engine.is_whitelisted_whole(command, _segment_count(command))
 
     @pytest.mark.usefixtures("no_shellcheck")
-    @pytest.mark.parametrize(("pattern", "command", "risk", "rule"), ROWS)
-    def test_the_line_gets_the_verdict_it_gets_with_no_entry(self, tmp_path, data_dir, pattern, command, risk, rule):
+    @pytest.mark.parametrize(("pattern", "command", "rule"), ROWS)
+    def test_the_line_gets_the_verdict_it_gets_with_no_entry(self, tmp_path, data_dir, pattern, command, rule):
         """Refusing the whitelist is not refusing the command: the line is judged one command at a time.
 
         Matched rules are compared by inclusion. For the `make` rows the segment loop's prefix
@@ -1393,22 +1412,20 @@ class TestDeclaredCountIsWhatBashRuns:
         data["whitelist"].append(pattern)
         whitelist.write_text(yaml.safe_dump(data))
 
-        result = validator.validate_command(command, config_path=str(rules_dir))
+        with_entry = validator.validate_command(command, config_path=str(rules_dir))
+        without = validator.validate_command(command, config_path=str(data_dir / "rules"))
 
-        assert result.message != "Command is whitelisted"
-        assert result.risk_level == risk
+        assert with_entry.message != "Command is whitelisted"
+        assert with_entry.risk_level == without.risk_level
+        assert set(with_entry.matched_rules) <= set(without.matched_rules)
         if rule is None:
-            assert result.message == "No security rules matched"
-            assert result.matched_rules == []
+            assert with_entry.message == without.message == "No security rules matched"
         else:
-            assert rule in result.matched_rules
+            assert rule in with_entry.matched_rules
 
     @pytest.mark.parametrize(
         ("pattern", "command"),
-        [
-            (r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$", r"find src -exec wc {} \; | tee log"),
-            (r"^npm\s+run\s+\S+(\s+2>&1)?\s*\|\s*tee\s+\S+$", "npm run build | tee log"),
-        ],
+        [(FIND_TEE, r"find src -exec wc {} \; | tee log"), (NPM_TEE, "npm run build | tee log")],
     )
     def test_the_line_an_entry_was_written_for_now_clears(self, tmp_path, pattern, command):
         """The over-count also cost the author their own line: declared three commands, found two."""
