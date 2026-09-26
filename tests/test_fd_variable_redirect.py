@@ -325,10 +325,12 @@ class TestEveryConsumerParsesThroughTheTag:
             _mark_fd_variables("git {fd}xi push", ast)
 
     def test_no_other_bashlex_parse_call(self):
-        # BashCommandParser.parse tags; _parse_succeeds only asks whether a synthetic probe parses.
+        # _bounded_parse is the one call, so every parse is CPU-bounded (LAB-5659). Its callers are
+        # BashCommandParser.parse, which tags, and _parse_succeeds, which only asks whether a
+        # synthetic probe parses.
         src = pathlib.Path(__file__).parent.parent / "src"
         found = {(path.relative_to(src).as_posix(), owner) for path in src.rglob("*.py") for owner in _bashlex_parse_calls(path)}
-        assert found == {("schlock/core/parser.py", "parse"), ("schlock/core/parser.py", "_parse_succeeds")}
+        assert found == {("schlock/core/parser.py", "_bounded_parse")}
 
 
 def _import_aliases(tree):
