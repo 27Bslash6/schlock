@@ -28,10 +28,14 @@ logger = logging.getLogger(__name__)
 
 # CPU seconds one bashlex parse may use (LAB-5659). Some inputs send bashlex's parser into a
 # loop that never returns and keeps allocating, so every parse is bounded and one that runs out
-# is denied. The bound is CPU time, not wall time: a loaded machine slows a parse down without
-# making it use more CPU, so load cannot turn a legitimate command into a denial. The largest
-# legitimate parse measured, a 64 KiB command, used 0.76 s.
-PARSE_CPU_BUDGET = 3.0
+# is denied. The bound is the process's user CPU time, not wall time: load from other processes
+# slows a parse down without making it use more CPU. The largest legitimate parse measured, a
+# 64 KiB (MAX_COMMAND_SIZE) script of newline-separated commands, used 1.55 s on Python 3.10 on a
+# fast CPU; a slower CPU needs more, so the budget leaves ~6x. A runaway never finishes, so a
+# generous budget costs nothing but the seconds before its denial.
+PARSE_CPU_BUDGET = 10.0
+
+_BUDGET_MESSAGE = "Command too complex to analyse: parsing ran past its CPU budget"
 
 
 class _ParseBudgetSignal(BaseException):
@@ -39,6 +43,17 @@ class _ParseBudgetSignal(BaseException):
 
 
 _budget_armed = False
+# Set when a parse runs out, cleared by reset_parse_budget. While set, every parse fails at once:
+# callers that catch a parse failure and carry on (the substitution walk re-parses each body it
+# finds) would otherwise spend one full budget per runaway body, and enough of them outlast any
+# hook timeout.
+_budget_spent = False
+
+
+def reset_parse_budget() -> None:
+    """Give parsing its budget back. Called at the start of each top-level validation."""
+    global _budget_spent  # noqa: PLW0603 - module state shared with _bounded_parse
+    _budget_spent = False
 
 
 def _on_parse_budget(signum: int, frame: Any) -> None:
@@ -50,25 +65,31 @@ def _on_parse_budget(signum: int, frame: Any) -> None:
 def _bounded_parse(src: str) -> list[Any]:
     """``bashlex.parse(src)``, raising ParseBudgetError once it uses PARSE_CPU_BUDGET of CPU.
 
-    The timer is ITIMER_VIRTUAL (SIGVTALRM), so it cannot disturb a SIGALRM deadline armed by the
-    caller. Signals are delivered only to the main thread, and Windows has no setitimer: there,
-    and inside a parse that is already bounded, the parse runs unbounded.
+    The one place library code installs a signal handler: bounding the parse here covers every
+    caller, not only the hook. The timer is ITIMER_VIRTUAL (SIGVTALRM), so a caller's SIGALRM
+    deadline is untouched, and a caller's own ITIMER_VIRTUAL and handler are put back afterwards.
+    Python runs signal handlers only on the main thread and Windows has no setitimer: there the
+    parse runs unbounded, as it did before.
     """
-    global _budget_armed  # noqa: PLW0603 - one flag shared with the signal handler
-    if _budget_armed or not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+    global _budget_armed, _budget_spent  # noqa: PLW0603 - flags shared with the signal handler
+    if _budget_spent:
+        raise ParseBudgetError(_BUDGET_MESSAGE)
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
         return bashlex.parse(src)
-    previous = signal.signal(signal.SIGVTALRM, _on_parse_budget)
-    _budget_armed = True
-    signal.setitimer(signal.ITIMER_VIRTUAL, PARSE_CPU_BUDGET)
+    previous_handler = signal.signal(signal.SIGVTALRM, _on_parse_budget)
+    previous_timer = (0.0, 0.0)
     try:
+        _budget_armed = True
+        previous_timer = signal.setitimer(signal.ITIMER_VIRTUAL, PARSE_CPU_BUDGET)
         return bashlex.parse(src)
     except _ParseBudgetSignal:
-        raise ParseBudgetError(f"Command too complex to analyse: parsing used over {PARSE_CPU_BUDGET:g} s of CPU") from None
+        _budget_spent = True
+        raise ParseBudgetError(_BUDGET_MESSAGE) from None
     finally:
         _budget_armed = False
-        signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+        signal.setitimer(signal.ITIMER_VIRTUAL, *previous_timer)
         # None: the previous handler was installed outside Python and cannot be put back.
-        signal.signal(signal.SIGVTALRM, signal.SIG_DFL if previous is None else previous)
+        signal.signal(signal.SIGVTALRM, signal.SIG_DFL if previous_handler is None else previous_handler)
 
 
 # Each AND-OR list operator and the `simple_list1` production its `$( … )` close should reduce
@@ -968,6 +989,8 @@ class BashCommandParser:
         try:
             ast = _bounded_parse(command)
         except ParseBudgetError:
+            # Not rewrapped below: that message quotes the command, and a quoted `<<heredoc`
+            # would route the denial to the heredoc fallback, which parses it again.
             raise
         except bashlex.errors.ParsingError as e:
             # Preserve original bashlex error for debugging

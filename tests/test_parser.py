@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 import bashlex
 import pytest
@@ -671,51 +672,88 @@ class TestParseBudget:
             pytest.fail("parse was not bounded", pytrace=False)
 
         previous = signal.signal(signal.SIGALRM, expire)
-        signal.setitimer(signal.ITIMER_REAL, 20)
+        signal.setitimer(signal.ITIMER_REAL, 30)
         yield
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+        parser_mod.reset_parse_budget()  # a spent budget must not leak into later tests
 
     @pytest.fixture
     def runaway_parse(self, monkeypatch):
-        """Make every bashlex parse spin, swallowing Exception the way parser code may."""
+        """Make every bashlex parse spin, swallowing Exception the way parser code may. Returns the call count."""
+        calls = []
 
         def spin(*args, **kwargs):
+            calls.append(args)
             while True:
                 with contextlib.suppress(Exception):  # proves the budget signal is not an Exception
                     sum(range(1000))
 
         monkeypatch.setattr(parser_mod, "PARSE_CPU_BUDGET", 0.2)
         monkeypatch.setattr(bashlex, "parse", spin)
+        return calls
 
-    def test_pathological_heredoc_is_denied_within_the_budget(self):
-        """The real input, end to end, in a child capped at 1 GiB so a regression cannot run away."""
+    @staticmethod
+    def _validate_in_capped_child(command, budget):
+        """(stdout words, wall seconds) of validate_command in a child capped at 1 GiB, so a regression cannot run away."""
 
         def cap_memory():
             resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
 
         probe = (
             "import sys\n"
+            "from schlock.core import parser\n"
             "from schlock.core.validator import validate_command\n"
+            "parser.PARSE_CPU_BUDGET = float(sys.argv[2])\n"
             "r = validate_command(sys.argv[1])\n"
             "print(r.risk_level.name, r.allowed)\n"
         )
+        started = time.monotonic()
         try:
             done = subprocess.run(  # noqa: S603 - fixed interpreter and script
-                [sys.executable, "-c", probe, self.PATHOLOGICAL],
+                [sys.executable, "-c", probe, command, str(budget)],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=20,
                 preexec_fn=cap_memory,  # noqa: PLW1509 - no threads are started before the fork
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            pytest.fail("validate_command did not return on the pathological heredoc", pytrace=False)
-        assert done.stdout.split() == ["BLOCKED", "False"], done.stderr
+            pytest.fail("validate_command did not return", pytrace=False)
+        return done.stdout.split(), time.monotonic() - started, done.stderr
+
+    def test_pathological_heredoc_is_denied_within_the_budget(self):
+        words, _, stderr = self._validate_in_capped_child(self.PATHOLOGICAL, 1.0)
+        assert words == ["BLOCKED", "False"], stderr
+
+    def test_many_runaway_bodies_cost_one_budget(self):
+        """Each git config payload is re-parsed by a caller that catches the failure and carries on."""
+        body = "x=$(cat <<EOF\n$" + "{x\nEOF\n)"
+        command = "".join(f"echo \"$(git config alias.a{n} '!{body}')\";" for n in range(20))
+        words, wall, stderr = self._validate_in_capped_child(command, 0.5)
+        assert words == ["BLOCKED", "False"], stderr
+        assert wall < 8, f"{wall:.1f}s: the budget was spent once per body"  # 20 bodies x 0.5 s = 10 s
 
     def test_runaway_parse_raises_parse_budget_error(self, runaway_parse):
         with pytest.raises(ParseBudgetError, match="too complex to analyse"):
             parser_mod.BashCommandParser().parse("echo hello")
+
+    def test_a_spent_budget_fails_later_parses_at_once(self, runaway_parse):
+        parser = parser_mod.BashCommandParser()
+        for _ in range(3):
+            with pytest.raises(ParseBudgetError):
+                parser.parse("echo hello")
+        assert len(runaway_parse) == 1
+        parser_mod.reset_parse_budget()
+        with pytest.raises(ParseBudgetError):
+            parser.parse("echo hello")
+        assert len(runaway_parse) == 2
+
+    def test_a_new_command_gets_a_fresh_budget(self, runaway_parse, monkeypatch, no_shellcheck):
+        with pytest.raises(ParseBudgetError):
+            parser_mod.BashCommandParser().parse("echo hello")
+        monkeypatch.undo()
+        assert validate_command("echo fresh budget").allowed
 
     def test_timer_and_handler_are_restored(self, runaway_parse):
         before = signal.getsignal(signal.SIGVTALRM)
@@ -725,6 +763,17 @@ class TestParseBudget:
         assert signal.getsignal(signal.SIGVTALRM) is before
         # The caller's own SIGALRM deadline (the guard fixture's) is still armed.
         assert signal.getitimer(signal.ITIMER_REAL)[0] > 0
+
+    def test_a_callers_virtual_timer_is_put_back(self, parser):
+        previous = signal.signal(signal.SIGVTALRM, signal.SIG_IGN)
+        try:
+            signal.setitimer(signal.ITIMER_VIRTUAL, 100)
+            parser.parse("echo hello")
+            assert signal.getitimer(signal.ITIMER_VIRTUAL)[0] > 99
+            assert signal.getsignal(signal.SIGVTALRM) is signal.SIG_IGN
+        finally:
+            signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+            signal.signal(signal.SIGVTALRM, previous)
 
     def test_timer_is_disarmed_after_a_normal_parse(self, parser):
         parser.parse("echo hello")
@@ -737,11 +786,12 @@ class TestParseBudget:
         assert result.risk_level.name == "BLOCKED"
         assert "too complex to analyse" in result.message
 
-    def test_commit_filter_parse_is_bounded(self, runaway_parse):
-        CommitMessageFilter({"enabled": True, "rules": {}}).filter_commit_message('git commit -m "budget test"')
+    def test_commit_filter_falls_back_under_a_runaway_parse(self, runaway_parse):
+        result = CommitMessageFilter({"enabled": True, "rules": {}}).filter_commit_message('git commit -m "budget test"')
+        assert (result.original_message, result.was_modified, result.error) == ("budget test", False, None)
 
     def test_parse_off_the_main_thread_still_works(self, parser):
-        """Signals reach only the main thread, so a worker thread parses unbounded rather than failing."""
+        """Python runs signal handlers only on the main thread, so a worker thread parses unbounded rather than failing."""
         out = []
         worker = threading.Thread(target=lambda: out.append(parser.parse("echo hello")))
         worker.start()
