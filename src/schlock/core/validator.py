@@ -24,7 +24,14 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner
+from .parser import (
+    FD_VARIABLE,
+    WRAPPER_COMMANDS,
+    BashCommandParser,
+    has_compound_redirects,
+    heredoc_owner,
+    resolve_multicall,
+)
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -390,9 +397,12 @@ def _check_dangerous_command_flags(
     Returns:
         ValidationResult if dangerous combo found, None otherwise
     """
-    for cmd_name, args in commands_with_args:
-        # Strip path prefix (e.g., /usr/bin/nc -> nc)
-        base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
+    for cmd_name, raw_args in commands_with_args:
+        # Strip path prefix (e.g., /usr/bin/nc -> nc), then resolve a multicall applet so
+        # `busybox awk '...'` is checked as `awk '...'` — parity with the substitution tier, which
+        # already normalises busybox/toybox. Without this, `busybox awk` skips the awk pipe check.
+        base_path_stripped = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
+        base_name, args = resolve_multicall(base_path_stripped, raw_args)
 
         if base_name in DANGEROUS_COMMAND_FLAGS:
             flags, description, alternatives = DANGEROUS_COMMAND_FLAGS[base_name]

@@ -628,8 +628,9 @@ _AWK_PIPE_KEYWORD = re.compile(r"\b(?:printf?|getline)\b")
 _AWK_DIVIDE, _AWK_NONVAR, _AWK_REGEX, _AWK_HEADER, _AWK_EITHER = "div", "nonvar", "regex", "header", "either"
 # What a `/` right after a word does; after any other name it divides. A word marked _AWK_REGEX that
 # some awk takes for a variable would strip real code, so each entry is what every awk accepting a `/`
-# there does: gawk, mawk, nawk and busybox checked. `getline`, `and`, `or`, `not`, `func` are values,
-# or variables in some awks; `length` is a value in most but opens a regex in mawk, so it is EITHER.
+# there does: gawk, mawk, nawk and busybox checked. `and`, `or`, `not`, `func` are omitted (variables
+# in some awks); `length` is a value in most but opens a regex in mawk, so it is EITHER; `getline` is
+# a non-lvalue value, so a `/=` after it is ambiguous (gawk reads a regex).
 _AWK_WORD_STATE = {
     **dict.fromkeys(
         ("print", "printf", "return", "exit", "else", "do", "in", "break", "continue"),
@@ -637,19 +638,22 @@ _AWK_WORD_STATE = {
     ),
     **dict.fromkeys(("if", "while", "for"), _AWK_HEADER),
     **dict.fromkeys(("case", "length"), _AWK_EITHER),
+    "getline": _AWK_NONVAR,
 }
 _AWK_NUMBER = re.compile(r"\d+\.?\d*(?:[eE][+-]?\d+)?")
+# Unary prefix operators: their operand's result is a non-lvalue, so a `/=` after `++x`/`-x`/`!x`
+# is ambiguous (gawk reads a regex) even though the operand is a bare name.
+_AWK_PREFIX_OPS = frozenset({"!", "~", "-", "+", "++", "--"})
 # A `\` continues a line when a newline follows it (mawk also allows blanks between). Both wrong
 # readings — ending the statement, or ending a string/regex early — could strip a pipe, so treat it
 # as a join everywhere it can appear.
 _AWK_LINE_CONT = re.compile(r"\\[ \t\r]*\n")
 # A bracket expression all four awks agree ends at the same `]`: `[`, an optional `^`, then a run of
-# plain members (not `[`, `]`, `\`) and `\x` escapes (not `\]`), then `]`. A `\]` (busybox closes,
-# others escape), a `/` inside... no — `/` is a plain member here and closes consistently on the awks
-# that accept it. A nested `[`, a `[:class:]`, or a leading `]` (even after `^`) is parsed differently,
-# so a regex containing one is kept raw rather than guessed. The `^` is possessive so `[^]...]` cannot
-# backtrack into reading `^` as a member and `]` as the close.
-_AWK_SIMPLE_CLASS = re.compile(r"\[\^?+(?:[^\[\]\\\n]|\\[^\]\n])+\]")
+# plain members (not `[`, `]`, `\`), `\x` escapes (not `\]`), and POSIX `[:class:]`/`[.coll.]`/`[=eq=]`
+# sub-brackets, then `]`. A `\]` (busybox closes the class, others escape it), a leading `]` (even
+# after `^`), or a bare nested `[` is parsed differently, so a regex containing one is kept raw rather
+# than guessed. The `^` is possessive so `[^]...]` cannot backtrack into reading `^` as a member.
+_AWK_SIMPLE_CLASS = re.compile(r"\[\^?+(?:\[[:.=][^\]\n]*[:.=]\]|\\[^\]\n]|[^\[\]\\\n])+\]")
 
 
 def _awk_skip_regex(prog: str, i: int) -> int | None:
@@ -722,8 +726,8 @@ def _awk_slash(prog: str, i: int, slash: str) -> tuple[str, int, str] | None:
         return None
     if slash in (_AWK_DIVIDE, _AWK_NONVAR):  # division
         return "/", i + 1, _AWK_REGEX
-    end = _awk_skip_regex(prog, i)  # regex literal
-    return None if end is None else ("//", end, _AWK_DIVIDE)
+    end = _awk_skip_regex(prog, i)  # regex literal — itself a non-lvalue value (a `/=` after it is a regex)
+    return None if end is None else ("//", end, _AWK_NONVAR)
 
 
 def _awk_after_punct(c: str, slash: str, headers: list[bool]) -> str:
@@ -767,7 +771,10 @@ def _awk_strip_literals(prog: str) -> str:
             chunk, i, slash = act
             out.append(chunk)
         elif c.isalnum() or c == "_":  # name or number
-            j, slash = _awk_scan_word(prog, i, bool(out) and out[-1] == "$")
+            prev = out[-1] if out else ""
+            j, slash = _awk_scan_word(prog, i, prev == "$")
+            if slash == _AWK_DIVIDE and prev in _AWK_PREFIX_OPS:  # `++x`/`-x`: operand is non-lvalue
+                slash = _AWK_NONVAR
             out.append(prog[i:j])
             i = j
         elif c == "\n":  # ends the statement: a `/` opening the next line starts a regex

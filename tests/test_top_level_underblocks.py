@@ -151,6 +151,13 @@ class TestTopLevelAwkCommandPipe:
             "awk 'BEGIN{c=ARGV[1]; y = length /\"/; print 1 | c}' 'rm -rf /'",
             # busybox reads `\\]` in a bracket as a literal, closing the class where others escape it
             "awk 'BEGIN{c=ARGV[1]; if ($0 ~ /[\\]/) x=1; print 1 | c}' 'rm -rf /'",
+            # a multicall applet must be checked as the applet, not the wrapper (parity with subst)
+            "busybox awk 'BEGIN{print 1 | \"id\"}'",
+            "toybox awk 'BEGIN{c=ARGV[1]; print 1 | c}' id",
+            # gawk opens a regex on `/=` after a regex literal or a prefix-incremented operand
+            "awk 'BEGIN{c=ARGV[1]; y = /a/ /=/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = ++x /=/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; ARGV[1]=\"\"; y = getline /=/; print 1 | c}' 'rm -rf /'",
         ],
     )
     def test_command_pipe_blocks(self, command):
@@ -175,6 +182,8 @@ class TestTopLevelAwkCommandPipe:
             "awk 'NR == 1\n/a|b/ {print}' f",  # a regex pattern opening the second line
             "awk '{gsub(/[ \\t]+/, \"|\"); print}' f",  # `\t` in a bracket does not move its end
             "awk '{$1 /= 100; print $1 \"|\" $2}' f",  # a field is an lvalue: `/=` is compound-assign
+            "awk '{gsub(/[[:space:]]+/, \"|\"); print}' f",  # a POSIX class is not kept raw
+            "busybox awk '{print $1}' f",  # a benign multicall applet is not blocked
         ],
     )
     def test_non_exec_awk_not_blocked(self, command):

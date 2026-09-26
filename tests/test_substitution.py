@@ -2929,6 +2929,8 @@ class TestDangerousAwkHelper:
             ["awk", '{$1 /= 100; print $1 "|" $2}'],  # a field is an lvalue: `/=` is compound-assign
             ["awk", '{y = length($0) / 2; print y "|" $1}'],  # length(...) is a value: `/` divides
             ["awk", '/[/]/ {print $1 "|" $2}'],  # `/` in a simple class does not open a pipe
+            ["awk", '{gsub(/[[:space:]]+/, "|"); print}'],  # a POSIX class ends where all awks agree
+            ["awk", '$1 ~ /^[[:alpha:]]+$/ {print $1 "|" $2}'],
         ],
     )
     def test_safe_awk(self, args):
@@ -3007,6 +3009,11 @@ class TestDangerousAwkHelper:
             ["awk", 'BEGIN{c=ARGV[1]; if ("x" ~ /[[:alpha:]/"]/) y=1; print 1 | c}'],  # mawk, gawk
             # a `\<CR><LF>` continuation joins the line before the scan, as awk does
             ["awk", "BEGIN{c=ARGV[1]; x = 8 \\\r\n/ 2; print 1 | c; z = 4 / 1}"],
+            # `/=` after other non-lvalue values gawk reads as a regex: a regex literal, a prefix
+            # `++x`/`-x`/`!x` operand (all gawk)
+            ["awk", "BEGIN{c=ARGV[1]; y = /a/ /=/; print 1 | c}"],
+            ["awk", "BEGIN{c=ARGV[1]; x=4; y = ++x /=/; print 1 | c}"],
+            ["awk", "BEGIN{c=ARGV[1]; x=4; y = -x /=/; print 1 | c}"],
         ],
     )
     def test_dangerous_awk(self, args):
