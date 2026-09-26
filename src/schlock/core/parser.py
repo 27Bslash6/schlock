@@ -15,14 +15,60 @@ import contextlib
 import logging
 import re
 import shlex
+import signal
+import threading
 from typing import Any, NamedTuple, Optional
 
 import bashlex
 import bashlex.errors
 
-from schlock.exceptions import ParseError
+from schlock.exceptions import ParseBudgetError, ParseError
 
 logger = logging.getLogger(__name__)
+
+# CPU seconds one bashlex parse may use (LAB-5659). Some inputs send bashlex's parser into a
+# loop that never returns and keeps allocating, so every parse is bounded and one that runs out
+# is denied. The bound is CPU time, not wall time: a loaded machine slows a parse down without
+# making it use more CPU, so load cannot turn a legitimate command into a denial. The largest
+# legitimate parse measured, a 64 KiB command, used 0.76 s.
+PARSE_CPU_BUDGET = 3.0
+
+
+class _ParseBudgetSignal(BaseException):
+    """Raised by the SIGVTALRM handler. A BaseException, so no `except Exception` inside bashlex swallows it."""
+
+
+_budget_armed = False
+
+
+def _on_parse_budget(signum: int, frame: Any) -> None:
+    # A signal that lands after the parse has returned must not raise into whatever runs next.
+    if _budget_armed:
+        raise _ParseBudgetSignal
+
+
+def _bounded_parse(src: str) -> list[Any]:
+    """``bashlex.parse(src)``, raising ParseBudgetError once it uses PARSE_CPU_BUDGET of CPU.
+
+    The timer is ITIMER_VIRTUAL (SIGVTALRM), so it cannot disturb a SIGALRM deadline armed by the
+    caller. Signals are delivered only to the main thread, and Windows has no setitimer: there,
+    and inside a parse that is already bounded, the parse runs unbounded.
+    """
+    global _budget_armed  # noqa: PLW0603 - one flag shared with the signal handler
+    if _budget_armed or not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        return bashlex.parse(src)
+    previous = signal.signal(signal.SIGVTALRM, _on_parse_budget)
+    _budget_armed = True
+    signal.setitimer(signal.ITIMER_VIRTUAL, PARSE_CPU_BUDGET)
+    try:
+        return bashlex.parse(src)
+    except _ParseBudgetSignal:
+        raise ParseBudgetError(f"Command too complex to analyse: parsing used over {PARSE_CPU_BUDGET:g} s of CPU") from None
+    finally:
+        _budget_armed = False
+        signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+        # None: the previous handler was installed outside Python and cannot be put back.
+        signal.signal(signal.SIGVTALRM, signal.SIG_DFL if previous is None else previous)
 
 
 # Each AND-OR list operator and the `simple_list1` production its `$( … )` close should reduce
@@ -38,7 +84,7 @@ _ANDOR_CORRECTION_SPECS = (
 def _parse_succeeds(src: str) -> bool:
     """True if vendored bashlex parses ``src`` without raising (used by the correction self-check)."""
     try:
-        bashlex.parse(src)
+        _bounded_parse(src)
         return True
     except Exception:  # noqa: BLE001 - any failure means "did not parse", which is all we need
         return False
@@ -906,6 +952,7 @@ class BashCommandParser:
             ParseError: If bashlex fails to parse the command syntax, or a
                 `{varname}` redirect prefix cannot be read with certainty
                 (see _mark_fd_variables)
+            ParseBudgetError: If the parse uses more than PARSE_CPU_BUDGET of CPU
 
         Example:
             >>> parser = BashCommandParser()
@@ -919,7 +966,9 @@ class BashCommandParser:
             raise ValueError("Command cannot be whitespace-only")
 
         try:
-            ast = bashlex.parse(command)
+            ast = _bounded_parse(command)
+        except ParseBudgetError:
+            raise
         except bashlex.errors.ParsingError as e:
             # Preserve original bashlex error for debugging
             raise ParseError(

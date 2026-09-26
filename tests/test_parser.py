@@ -1,12 +1,20 @@
 """Tests for BashCommandParser."""
 
+import contextlib
 import logging
+import resource
+import signal
+import subprocess
+import sys
+import threading
 
 import bashlex
 import pytest
 
 from schlock.core import parser as parser_mod
-from schlock.exceptions import ParseError
+from schlock.core.validator import validate_command
+from schlock.exceptions import ParseBudgetError, ParseError
+from schlock.integrations.commit_filter import CommitMessageFilter
 
 
 class TestBashCommandParser:
@@ -646,3 +654,96 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [(seg.text, seg.string_literals) for seg in pairs] == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
     text, literals = pairs[0].text, pairs[0].string_literals
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
+
+
+class TestParseBudget:
+    """Every bashlex parse is bounded, and one that runs out is denied (LAB-5659).
+
+    Each test runs under a wall-clock alarm so a regression fails instead of hanging the suite.
+    """
+
+    # bashlex 0.18 never returns on this input and keeps allocating as it goes.
+    PATHOLOGICAL = "x=$(cat <<EOF\n$" + "{x=[[ a ]]\nEOF\n)"
+
+    @pytest.fixture(autouse=True)
+    def wall_clock_guard(self):
+        def expire(signum, frame):
+            pytest.fail("parse was not bounded", pytrace=False)
+
+        previous = signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, 20)
+        yield
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+    @pytest.fixture
+    def runaway_parse(self, monkeypatch):
+        """Make every bashlex parse spin, swallowing Exception the way parser code may."""
+
+        def spin(*args, **kwargs):
+            while True:
+                with contextlib.suppress(Exception):  # proves the budget signal is not an Exception
+                    sum(range(1000))
+
+        monkeypatch.setattr(parser_mod, "PARSE_CPU_BUDGET", 0.2)
+        monkeypatch.setattr(bashlex, "parse", spin)
+
+    def test_pathological_heredoc_is_denied_within_the_budget(self):
+        """The real input, end to end, in a child capped at 1 GiB so a regression cannot run away."""
+
+        def cap_memory():
+            resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+
+        probe = (
+            "import sys\n"
+            "from schlock.core.validator import validate_command\n"
+            "r = validate_command(sys.argv[1])\n"
+            "print(r.risk_level.name, r.allowed)\n"
+        )
+        try:
+            done = subprocess.run(  # noqa: S603 - fixed interpreter and script
+                [sys.executable, "-c", probe, self.PATHOLOGICAL],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                preexec_fn=cap_memory,  # noqa: PLW1509 - no threads are started before the fork
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("validate_command did not return on the pathological heredoc", pytrace=False)
+        assert done.stdout.split() == ["BLOCKED", "False"], done.stderr
+
+    def test_runaway_parse_raises_parse_budget_error(self, runaway_parse):
+        with pytest.raises(ParseBudgetError, match="too complex to analyse"):
+            parser_mod.BashCommandParser().parse("echo hello")
+
+    def test_timer_and_handler_are_restored(self, runaway_parse):
+        before = signal.getsignal(signal.SIGVTALRM)
+        with pytest.raises(ParseBudgetError):
+            parser_mod.BashCommandParser().parse("echo hello")
+        assert signal.getitimer(signal.ITIMER_VIRTUAL) == (0.0, 0.0)
+        assert signal.getsignal(signal.SIGVTALRM) is before
+        # The caller's own SIGALRM deadline (the guard fixture's) is still armed.
+        assert signal.getitimer(signal.ITIMER_REAL)[0] > 0
+
+    def test_timer_is_disarmed_after_a_normal_parse(self, parser):
+        parser.parse("echo hello")
+        assert signal.getitimer(signal.ITIMER_VIRTUAL) == (0.0, 0.0)
+
+    def test_validate_command_denies_a_runaway_parse(self, runaway_parse, no_shellcheck):
+        """Denied outright: the word "heredoc" must not route it to the heredoc fallback, which re-parses."""
+        result = validate_command("cat <<heredoc\nbudget test\nheredoc")
+        assert not result.allowed
+        assert result.risk_level.name == "BLOCKED"
+        assert "too complex to analyse" in result.message
+
+    def test_commit_filter_parse_is_bounded(self, runaway_parse):
+        CommitMessageFilter({"enabled": True, "rules": {}}).filter_commit_message('git commit -m "budget test"')
+
+    def test_parse_off_the_main_thread_still_works(self, parser):
+        """Signals reach only the main thread, so a worker thread parses unbounded rather than failing."""
+        out = []
+        worker = threading.Thread(target=lambda: out.append(parser.parse("echo hello")))
+        worker.start()
+        worker.join()
+        assert out and out[0]
