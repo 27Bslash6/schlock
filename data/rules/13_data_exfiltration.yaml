@@ -11,17 +11,21 @@ rules:
     description: Accessing browser credential stores enables account takeover
     risk_level: BLOCKED
     patterns:
+      # Runs here and in browser_local_storage_theft, electron_app_token_theft,
+      # cloud_cache_theft and package_manager_token_theft are `[^;|&]{0,200}` so
+      # each reader word costs a bounded scan; why 200: database_credential_theft
+      # in 03_credential_theft.yaml.
       # Chrome/Chromium (macOS)
-      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*(Application Support|\.config)/(Google Chrome|Chromium|BraveSoftware)/(Default|Profile)/(Cookies|Login Data|History|Web Data)'
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]{0,200}(Application Support|\.config)/(Google Chrome|Chromium|BraveSoftware)/(Default|Profile)/(Cookies|Login Data|History|Web Data)'
       # Chrome/Chromium (Linux)
-      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*\.config/(google-chrome|chromium|BraveSoftware)/(Default|Profile)/(Cookies|Login Data|History)'
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]{0,200}\.config/(google-chrome|chromium|BraveSoftware)/(Default|Profile)/(Cookies|Login Data|History)'
       # Firefox (macOS and Linux)
-      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*(\.mozilla|Application Support)/[Ff]irefox/[^;|&]*\.(sqlite|json)'
-      - 'sqlite3\s+[^;|&]*(cookies\.sqlite|places\.sqlite|logins\.json|formhistory\.sqlite)'
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]{0,200}(\.mozilla|Application Support)/[Ff]irefox/[^;|&]{0,200}\.(sqlite|json)'
+      - 'sqlite3\s+[^;|&]{0,200}(cookies\.sqlite|places\.sqlite|logins\.json|formhistory\.sqlite)'
       # Safari
-      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*Library/Safari/(Cookies\.binarycookies|History\.db|Bookmarks\.plist)'
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]{0,200}Library/Safari/(Cookies\.binarycookies|History\.db|Bookmarks\.plist)'
       # Edge (Chromium-based)
-      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]*(Microsoft Edge)/(Default|Profile)/(Cookies|Login Data)'
+      - '(cat|less|head|tail|strings|sqlite3|cp|scp|rsync|tar)\s+[^;|&]{0,200}(Microsoft Edge)/(Default|Profile)/(Cookies|Login Data)'
     alternatives:
       - "Browser credentials require explicit user consent"
       - "Never access browser storage programmatically"
@@ -31,10 +35,10 @@ rules:
     risk_level: BLOCKED
     patterns:
       # Chrome/Chromium Local Storage
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*(google-chrome|chromium|Chrome)/[^;|&]*Local Storage'
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*(google-chrome|chromium|Chrome)/[^;|&]*leveldb'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}(google-chrome|chromium|Chrome)/[^;|&]{0,200}Local Storage'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}(google-chrome|chromium|Chrome)/[^;|&]{0,200}leveldb'
       # Firefox storage
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*firefox/[^;|&]*webappsstore\.sqlite'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}firefox/[^;|&]{0,200}webappsstore\.sqlite'
     alternatives:
       - "Session tokens in browser storage are sensitive"
       - "Access requires explicit user consent"
@@ -48,13 +52,13 @@ rules:
     risk_level: BLOCKED
     patterns:
       # Slack tokens
-      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]*(Slack|slack)/[^;|&]*(storage|leveldb|Local Storage)'
+      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]{0,200}(Slack|slack)/[^;|&]{0,200}(storage|leveldb|Local Storage)'
       # Discord tokens
-      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]*(discord|Discord)/[^;|&]*(leveldb|Local Storage)'
+      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]{0,200}(discord|Discord)/[^;|&]{0,200}(leveldb|Local Storage)'
       # VSCode/Cursor tokens
-      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]*(Code|Cursor)/[^;|&]*(storage|State)'
+      - '(cat|less|strings|grep|cp|tar)\s+[^;|&]{0,200}(Code|Cursor)/[^;|&]{0,200}(storage|State)'
       # Generic Electron apps
-      - 'strings\s+[^;|&]*Application Support/[^;|&]*/[^;|&]*leveldb'
+      - 'strings\s+[^;|&]{0,200}Application Support/[^;|&]{0,200}/[^;|&]{0,200}leveldb'
     alternatives:
       - "Application tokens are sensitive credentials"
       - "Never extract tokens from Electron app storage"
@@ -109,15 +113,15 @@ rules:
     risk_level: BLOCKED
     patterns:
       # AWS CLI cache
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.aws/cli/cache/'
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.aws/sso/cache/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.aws/cli/cache/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.aws/sso/cache/'
       # Kubernetes cache
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.kube/cache/'
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.kube/http-cache/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.kube/cache/'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.kube/http-cache/'
       # GCloud
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.config/gcloud/[^;|&]*(credentials|access_tokens)'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.config/gcloud/[^;|&]{0,200}(credentials|access_tokens)'
       # Azure
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.azure/[^;|&]*(accessTokens|msal_token_cache)'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.azure/[^;|&]{0,200}(accessTokens|msal_token_cache)'
     alternatives:
       - "Cloud credential caches contain sensitive tokens"
       - "Use cloud provider CLI for authorized access"
@@ -127,16 +131,16 @@ rules:
     risk_level: BLOCKED
     patterns:
       # npm tokens
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.npm/_authToken'
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.npmrc[^;|&]*authToken'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.npm/_authToken'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.npmrc[^;|&]{0,200}authToken'
       # PyPI tokens
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.pypirc'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.pypirc'
       # Cargo/crates.io
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.cargo/credentials'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.cargo/credentials'
       # Gem/RubyGems
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.gem/credentials'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.gem/credentials'
       # Docker registry
-      - '(cat|less|strings|cp|tar)\s+[^;|&]*\.docker/config\.json'
+      - '(cat|less|strings|cp|tar)\s+[^;|&]{0,200}\.docker/config\.json'
     alternatives:
       - "Package manager tokens enable publishing malicious packages"
       - "Never exfiltrate registry credentials"

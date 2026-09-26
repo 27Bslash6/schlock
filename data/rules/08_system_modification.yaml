@@ -144,15 +144,18 @@ rules:
     description: DNS manipulation enables phishing and C2 redirection
     risk_level: BLOCKED
     patterns:
+      # Runs are `[^;|&]{0,200}` so each `cat`, `echo` or `nmcli` costs a bounded scan;
+      # why 200: database_credential_theft in 03_credential_theft.yaml.
+      #
       # /etc/hosts manipulation
       - '>\s*/etc/hosts'
       - '>>\s*/etc/hosts'
-      - 'echo[^;|&]*>>\s*/etc/hosts'
-      - 'cat[^;|&]*>\s*/etc/hosts'
+      - 'echo[^;|&]{0,200}>>\s*/etc/hosts'
+      - 'cat[^;|&]{0,200}>\s*/etc/hosts'
       # /etc/resolv.conf manipulation
       - '>\s*/etc/resolv\.conf'
-      - 'echo[^;|&]*>\s*/etc/resolv\.conf'
-      - 'cat[^;|&]*>\s*/etc/resolv\.conf'
+      - 'echo[^;|&]{0,200}>\s*/etc/resolv\.conf'
+      - 'cat[^;|&]{0,200}>\s*/etc/resolv\.conf'
       # systemd-resolved manipulation
       - 'systemd-resolve\s+--set-dns'
       - 'resolvectl\s+dns'
@@ -160,7 +163,7 @@ rules:
       - 'networksetup\s+-setdnsservers'
       - 'scutil\s+--set\s+DNS'
       # NetworkManager DNS
-      - 'nmcli\s+[^;|&]*dns'
+      - 'nmcli\s+[^;|&]{0,200}dns'
     alternatives:
       - "DNS changes redirect all network traffic"
       - "Attackers use DNS hijacking for credential phishing"
