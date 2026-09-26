@@ -2786,7 +2786,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # Validate command/process substitution using AST-based analysis
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
-            sub_results = sub_validator.validate_all_substitutions(ast)
+            # `parse_target`, not `command`: the heredoc walk slices bodies by positions from
+            # `ast`, and a quoted body is blanked only in `parse_target`. Handed `command`, it
+            # read back the literal body bash never expands and denied it (LAB-2756).
+            sub_results = sub_validator.validate_all_substitutions(ast, command=parse_target)
 
             # Worst verdict wins, and the join is NOT made here. Returning a denial from this
             # point skips every pass below it — the AST dangerous-flag pass (the only thing that
