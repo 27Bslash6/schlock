@@ -787,17 +787,22 @@ def _stdin_here_string(parts: "list[Any]") -> Optional[str]:
     return by_fd.get(0)
 
 
-def _command_words(node: Any) -> "list[str]":
-    """Word tokens (command name + args) of a command node.
+def command_word_parts(node: Any) -> "list[Any]":
+    """Word nodes (command name + args) of a command node.
 
     Skips assignments, redirections and a redirection's `{varname}` prefix. Every argv
-    view in this module reads a command through here.
+    view reads a command through here, so they all agree on which word is the name.
     """
     return [
-        part.word
+        part
         for part in without_fd_variables(getattr(node, "parts", None) or [])
         if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
     ]
+
+
+def _command_words(node: Any) -> "list[str]":
+    """Word tokens (command name + args) of a command node; see `command_word_parts`."""
+    return [part.word for part in command_word_parts(node)]
 
 
 def heredoc_owner(node: Any) -> Optional[str]:
