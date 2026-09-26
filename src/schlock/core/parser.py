@@ -587,7 +587,10 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
        substitution) raises: bashlex folded the operator into the word
        (`{fd}>\<newline>o`) and split the command where bash runs it whole.
     2. Only a word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection
-       other than `&>`/`&>>`, is looked at further.
+       other than `&>`/`&>>`, is looked at further. `{$v}` is an argument: an
+       expansion in the name, so bashlex never spells it `{name}`, which is how bash
+       reads it. `{$'fd'}` and `{$"fd"}` are arguments only because bashlex leaves
+       their quoting on the word.
     3. A line continuation anywhere in its enclosing top-level word raises: inside a
        word that holds one, bashlex's offsets stop tracking the source. This comes
        before rule 4, so a continuation is refused even around a quoted word.
