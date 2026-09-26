@@ -161,6 +161,8 @@ class TestLookalikesStayArguments:
         [
             '{f"d"}<in',  # a quote in the NAME
             '{"fd"}<in',
+            "{$'fd'}<in",  # decoded before the prefix is read, so read like `{"fd"}`
+            "{f$'d'}<in",
             "{fd[]}<in",  # an empty subscript
             "{fd[0][1]}<in",  # two subscripts
             "{fd[0]]}<in",  # a stray `]`

@@ -511,7 +511,11 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     # quoting; shlex also removes quotes nested inside `$(…)` / `${…}`, which bash keeps.
     # A backslash anywhere disables the rebuild: the marker scan has no escape handling,
     # so `\"` would shift every quoted run after it, and inside `$'…'` a backslash may be
-    # an ANSI-C escape that shlex cannot decode.
+    # an ANSI-C escape that shlex cannot decode. Without a rebuild (a backslash, or a
+    # span shlex cannot read as one word, such as whitespace inside `$(…)`) the word
+    # stays as parse() left it: _DollarQuoteDecoder has already read every `$'…'` /
+    # `$"…"` word the way bash does, markers gone. Stripping a leading `$` from that
+    # text would eat a real one: `> $"$HOME"/.bash\rc` would write `HOME/.bashrc`.
     target_pos = getattr(target, "pos", None)
     span = command[target_pos[0] : target_pos[1]] if command is not None and target_pos else ""
     rebuilt: list[str] = []
@@ -520,27 +524,6 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
             rebuilt = shlex.split(_QUOTED_RUN_OR_DOLLAR_MARKER.sub(r"\1", span))
     if len(rebuilt) == 1:
         word = rebuilt[0]
-    elif command is not None:
-        # No rebuild (a backslash, or a span shlex cannot read as one word, such as
-        # whitespace inside `$(…)`): keep bashlex's word less its leading markers. Drive
-        # the strip off bashlex's one-character PARAMETER parts, not off the first source
-        # characters: a leading empty fragment (`''$'/dev/'\sda`) moves the `$` off the
-        # start and defeats a positional test, while the part is still there. A real
-        # expansion is wider than one character (`$HOME` spans five), so it is never
-        # stripped. This assumes bashlex left the markers in the word: a word decoded
-        # before it gets here has none, and the strip would eat a real `$` instead.
-        for part in sorted(getattr(target, "parts", None) or [], key=lambda x: getattr(x, "pos", (0,))[0]):
-            pos = getattr(part, "pos", None)
-            is_dollar_quote = (
-                getattr(part, "kind", None) == "parameter"
-                and pos
-                and pos[1] - pos[0] == 1
-                and command[pos[1] : pos[1] + 1] in ("'", '"')
-            )
-            if is_dollar_quote and word.startswith("$"):
-                word = word[1:]
-            else:
-                break
 
     # Did the SOURCE glue the operator to its target? Read the character before the
     # target rather than computing where the operator ended: bashlex NORMALISES the
