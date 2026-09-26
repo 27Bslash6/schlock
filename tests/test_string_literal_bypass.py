@@ -6,12 +6,13 @@ ENTIRE match (both start AND end) falls within a string literal.
 Also tests FIX 2: Empty quoted string range bug fix.
 """
 
+import re
 from unittest.mock import patch
 
 import pytest
 
 from schlock.core.parser import BashCommandParser
-from schlock.core.rules import RiskLevel
+from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import clear_caches, validate_command
 from schlock.exceptions import ParseError
 
@@ -157,6 +158,136 @@ class TestEmptyQuotedStringRangeFix:
                 assert start <= end, f"Invalid range in '{command}': ({start}, {end})"
 
 
+class TestSuppressionIsPerOccurrence:
+    """A suppressed occurrence must not disable its rule for the whole command.
+
+    `RuleEngine.match_command` used `pattern.search`, which yields only the
+    FIRST occurrence. When that one sat inside a quoted string the code moved
+    straight on to the next pattern, so every later occurrence - including
+    unquoted, executable ones - went unexamined. Quoting a decoy up front
+    therefore disarmed the rule for the rest of the command (LAB-4321).
+
+    `rm -rf /` does not guard this: `system_destruction`'s `[^;|&]` run crosses
+    the newline, so its first match starts inside the decoy, ends at the payload,
+    and is never suppressed. The one `fork_bomb` pattern that matches this
+    spelling matches wholly inside the decoy, and the payload fragments under
+    segment-by-segment validation, so it is the shape that actually exercises
+    the leak.
+    """
+
+    FORK_BOMB = ":(){ :|:& };:"
+
+    def test_quoted_decoy_does_not_hide_a_later_unquoted_danger(self, rules_dir_path):
+        """Suppression is per-occurrence: the range covers the decoy, not the payload."""
+        engine = RuleEngine(rules_dir_path)
+        command = f"cat '{self.FORK_BOMB}'\n{self.FORK_BOMB}"
+        start = command.index("'")
+        end = command.index("'", start + 1) + 1
+
+        match = engine.match_command(command, string_literals=[(start, end)])
+
+        assert match.matched, "quoted decoy suppressed the rule for the unquoted fork bomb"
+        assert match.risk_level == RiskLevel.BLOCKED
+
+    def test_non_shell_heredoc_decoy_does_not_hide_a_later_danger(self, rules_dir_path):
+        """Same leak via the other suppression range: heredoc body, then real payload."""
+        command = f"cat <<EOF\n{self.FORK_BOMB}\nEOF\n{self.FORK_BOMB}"
+        parser = BashCommandParser()
+        heredoc_ranges = parser.extract_heredoc_ranges(command, parser.parse(command))
+
+        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=heredoc_ranges)
+
+        assert match.matched, "heredoc decoy suppressed the rule for the payload after the terminator"
+        assert match.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "start_delta,is_shell,expect_match,description",
+        [
+            # An inert non-shell heredoc body is suppressed.
+            (0, False, False, "inert body, sole occurrence - stays suppressed"),
+            # The discriminator, in the under-block direction. A shell runs its
+            # heredoc body, so the identical text must still match.
+            (0, True, True, "same body fed to a shell - it executes, so it matches"),
+            # Containment is both-ended, like `_is_in_string_literal`. A range
+            # opening inside the match does not cover it and cannot excuse it.
+            (4, False, True, "range opens mid-match - not covered, not inert"),
+        ],
+    )
+    def test_heredoc_suppression_covers_exactly_the_inert_body(
+        self, rules_dir_path, start_delta, is_shell, expect_match, description
+    ):
+        """Every decision `_is_in_non_shell_heredoc` makes, pinned in the direction that fails.
+
+        Each row kills its own mutant: disabling the heredoc arm of
+        `_first_executable_match`, making `_is_in_non_shell_heredoc` ignore
+        `is_shell`, or dropping its `start <= match_start` bound. The last has no
+        other guard - without it, the rest of the suite stays green. The end-to-end
+        row for the same shape (`tests/test_dangerous_commands.py`, "Heredoc with
+        rm -rf") cannot stand in: its helper answers a false positive with
+        `pytest.skip`, so it degrades to a skip on the heredoc-arm regression and
+        passes outright on the other two.
+
+        Ranges come from the parser rather than hand-counted offsets: it emits
+        `(10, 27, False)` here, running through the terminator line, so a
+        hand-built body-only range would be testing a shape production never
+        produces.
+        """
+        command = f"cat <<EOF\n{self.FORK_BOMB}\nEOF"
+        parser = BashCommandParser()
+        ((start, end, _),) = parser.extract_heredoc_ranges(command, parser.parse(command))
+
+        match = RuleEngine(rules_dir_path).match_command(command, heredoc_ranges=[(start + start_delta, end, is_shell)])
+
+        assert match.matched is expect_match, description
+        if expect_match:
+            assert match.risk_level == RiskLevel.BLOCKED, description
+            assert match.rule is not None and match.rule.name == "fork_bomb", description
+        else:
+            assert match.risk_level == RiskLevel.SAFE, description
+            # Not the whitelist short-circuit, which returns the same (False, SAFE) pair.
+            assert match.message == "No security rules matched", description
+
+    @pytest.mark.parametrize(
+        "template,description",
+        [
+            # The parser derives a literal for the decoy and the newline stops the
+            # pattern spanning both, so only a scan past the decoy reaches the payload.
+            ("cat '{bomb}'\n{bomb}", "quoted decoy, payload on the next line"),
+            # The same through a heredoc segment: the decoy is suppressed as data,
+            # and only the per-occurrence scan reaches the payload.
+            ("cat '{bomb}' <<'EOF'\nbody\nEOF\n{bomb}", "canonical opener"),
+        ],
+    )
+    def test_quoted_decoy_does_not_hide_the_payload_end_to_end(self, safety_rules_path, template, description):
+        """End to end, through the parser that derives the suppression ranges."""
+        command = template.format(bomb=self.FORK_BOMB)
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED, description
+        assert result.allowed is False, description
+
+    def test_scan_advances_one_char_so_an_overlapping_match_survives(self, rules_dir_path):
+        """The scan steps by `match.start() + 1`, not `match.end()`.
+
+        A later match that OVERLAPS the suppressed one starts before it ends, so
+        resuming at `end()` steps straight over it - which is what `re.finditer`
+        does. Greedy bounded quantifiers make this reachable with the shipped
+        rules: a later-starting match can reach a target the first one cannot.
+        Pinned on a synthetic pattern so it states the helper's contract rather
+        than a rule file's current wording.
+        """
+        engine = RuleEngine(rules_dir_path)
+        pattern = re.compile(r"A.{0,3}B")
+        command = "AA..BB"
+        assert [m.span() for m in pattern.finditer(command)] == [(0, 5)], "finditer stops after the first"
+
+        match = engine._first_executable_match(pattern, command, [(0, 5)], None)
+
+        assert match is not None, "an overlapping executable match was stepped over"
+        assert match.span() == (1, 6)
+
+
 class TestQuotedTokenDoesNotSuppressReconstructedPass:
     """LAB-1732: a quoted token must not disable the quote-stripped rule pass.
 
@@ -246,10 +377,9 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             ("bash <<EOF | tee log\nrm -rf /\nEOF", False, RiskLevel.BLOCKED),
             # A heredoc NESTED in a substitution is not a direct redirect, so
             # _close_heredocs never sees it and it rides inside the outer
-            # segment's slice as inert `cat` output that `diff` only reads.
-            # Its range is derived off the parent AST, so the segment reads the body
-            # as text (LAB-912); the whole-command scan still denies it, exactly as
-            # it does `echo lead && diff …` with the same body.
+            # segment's slice. Its range is derived off the parent AST (LAB-912);
+            # inside `<( … )` that range is is_shell - whatever reads the
+            # substitution may run it - so the body is scanned as code.
             ("diff /dev/null <(cat <<EOF\nrm -rf /\nEOF\n); chmod +x x", False, RiskLevel.BLOCKED),
         ],
     )
