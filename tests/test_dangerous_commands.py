@@ -577,6 +577,11 @@ class TestP0FileTruncation:
             # Starting with `/dev/null` does not make a path `/dev/null`.
             "true 2> /dev/null.bak",
             "foo | tee /dev/null.bak",
+            # A quoted operand can start with a blank: `"true" 2> ' ;'` reconstructs to
+            # `true 2>  ;`, and only a target that may be a blank reaches it. That is why
+            # `true 2>  /dev/null` stays a false positive.
+            "\"true\" 2> ' ;'",
+            "'true' > ' /dev/null'",
         ],
     )
     def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
