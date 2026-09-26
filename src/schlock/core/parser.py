@@ -19,6 +19,7 @@ from typing import Any, NamedTuple, Optional
 import bashlex
 import bashlex.errors
 
+from schlock.core.substitution import _SUBSTITUTION_INTRODUCERS
 from schlock.exceptions import ParseError
 
 logger = logging.getLogger(__name__)
@@ -1592,6 +1593,71 @@ class BashCommandParser:
                     )
                 )
         return bodies
+
+    def mask_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> str:
+        """`command` with each outermost substitution body blanked, every offset kept.
+
+        SECURITY: a rule's gap stops at `;`, `|`, `&` and newlines so the
+        whole-command scan cannot pair one command's reader with the next command's
+        word. A separator inside a substitution is data, but a regex can only
+        balance so many paren levels, so a separator in a body nested deeper than
+        the gap balances ends it: `cat $(printf %s $(dirname $(pwd)) | head -1)/.env`
+        reads a `.env` and rated SAFE. bashlex already knows where each body ends,
+        at any depth. Blanking the bodies turns each substitution into one opaque
+        word and leaves every top-level separator in place, so a rule matched
+        against this text reaches past a substitution and still cannot cross into
+        another command.
+
+        Redirect targets are walked too (`cat < $(…)/.env`). A `parameter` node
+        has no children, so a `${…}` holding a substitution has its whole
+        interior blanked from the node's own span.
+
+        This reaches a target OUTSIDE every body. A target inside one is blanked
+        with it, so reaching that stays the rule's own gap's job.
+
+        Length-preserving, so the caller's literal and heredoc ranges still index
+        it. A span is blanked only when its opener is at the node's start and its
+        closer where _body_end looks: a `\\<newline>` earlier in the word moves
+        bashlex's offsets, and a span left as written only costs this pass a match.
+        """
+        spans: list[tuple[int, int]] = []
+
+        def visit(node: Any) -> None:
+            if not hasattr(node, "kind"):
+                return
+            pos = getattr(node, "pos", None)
+            if node.kind in ("commandsubstitution", "processsubstitution") and pos:
+                end = self._body_end(command, pos)
+                if end is not None and command.startswith(_SUBSTITUTION_INTRODUCERS, pos[0]):
+                    spans.append((self._body_start(command, pos[0]), end))
+                return  # An inner body is inside this one, blanked with it.
+            if node.kind == "parameter" and pos:
+                interior = command[pos[0] + 2 : pos[1] - 1]
+                if (
+                    command.startswith("${", pos[0])
+                    and command[pos[1] - 1 : pos[1]] == "}"
+                    and any(opener in interior for opener in _SUBSTITUTION_INTRODUCERS)
+                ):
+                    spans.append((pos[0] + 2, pos[1] - 1))
+                return
+            for attr in ("parts", "command", "list", "pipe", "compound", "redirects", "output"):
+                child = getattr(node, attr, None)
+                if isinstance(child, list):
+                    for item in child:
+                        visit(item)
+                elif child:
+                    visit(child)
+
+        for node in ast_nodes or []:
+            visit(node)
+        # One join, not a splice per body: 64 KB of `$(x)` is thousands of bodies.
+        pieces: list[str] = []
+        done = 0
+        for start, end in sorted(spans):  # Outermost bodies never overlap.
+            pieces += (command[done:start], " " * (end - start))
+            done = end
+        pieces.append(command[done:])
+        return "".join(pieces)
 
     @staticmethod
     def _body_start(command: str, part_start: int) -> int:
