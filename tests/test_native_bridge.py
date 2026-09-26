@@ -93,10 +93,10 @@ class TestBinaryResolution:
 
 @needs_binary
 class TestCorpusParseability:
-    """All 24 constructs must reach exit 0 with non-empty JSON (T2a acceptance)."""
+    """All 26 constructs must reach exit 0 with non-empty JSON (T2a acceptance)."""
 
     def test_corpus_covers_the_bashlex_failing_constructs(self):
-        assert len(CORPUS) == 24
+        assert len(CORPUS) == 26
         assert sum(1 for c in CORPUS if c["bashlex_fails"]) >= 7
 
     @pytest.mark.parametrize("case", CORPUS, ids=[c["name"] for c in CORPUS])

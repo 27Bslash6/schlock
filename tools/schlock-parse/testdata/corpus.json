@@ -50,6 +50,16 @@
     "bashlex_fails": false
   },
   {
+    "name": "here-string-stdin-program",
+    "script": "bash <<< \"rm -rf /\"",
+    "bashlex_fails": false
+  },
+  {
+    "name": "here-string-compound",
+    "script": "{ true; bash; } <<< \"rm -rf /\"",
+    "bashlex_fails": false
+  },
+  {
     "name": "comments-and-blank-lines",
     "script": "# leading comment\n\necho after-blank # trailing",
     "bashlex_fails": false

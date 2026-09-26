@@ -6,7 +6,7 @@ sees *at least* as much danger as bashlex does. Two gates carry the weight:
 1. **Output parity, superset direction.** Parseability is necessary but not
    sufficient (spec §9 T2): a native AST that parses `case ... esac` while
    producing FEWER command segments than bashlex is a silent under-block. Every
-   construct in the 24-entry corpus is run through all four detection outputs on
+   construct in the 26-entry corpus is run through all five detection outputs on
    both tiers and the native result must be a superset. Superset, not equality,
    because mvdan/sh parses seven constructs bashlex cannot — there the native
    tier legitimately reveals more (spec §4).
@@ -67,11 +67,13 @@ KNOWN_FALLBACK_CEILINGS = {
     "ansi-c-quoting": "T3 — ANSI-C decoding; bashlex under-decodes, so T3's oracle rules",
     "comments-and-blank-lines": "CLI parses comments off, so a trailing one reads as a prefix parse",
     "arith-command": "bashlex misreads `(( … ))` as a command named after the expression",
+    "here-string-compound": "AstView maps `<<<` on a CallExpr (op 73); a compound's redirects "
+    "raise UnmappedNodeError instead (LAB-4686)",
 }
 
 
 def walker_outputs(command: str, ast_nodes: list) -> "dict[str, set]":
-    """Run all four detection walkers over `ast_nodes`, as comparable sets.
+    """Run all five detection walkers over `ast_nodes`, as comparable sets.
 
     Sets, not lists: parity is about WHAT was detected, and bashlex's traversal
     order is not a contract either walker family relies on.
@@ -86,6 +88,7 @@ def walker_outputs(command: str, ast_nodes: list) -> "dict[str, set]":
             (sub.substitution_type.name, sub.inner_command, sub.base_command)
             for sub in sub_validator.extract_substitutions(ast_nodes)
         },
+        "stdin_programs": set(parser.extract_stdin_program_redirects(ast_nodes)),
     }
 
 
@@ -100,6 +103,28 @@ def bashlex_outputs(command: str) -> "dict[str, set] | None":
         return walker_outputs(command, parser.parse(command))
     except Exception:  # noqa: BLE001 - any bashlex failure means "no baseline to compare against"
         return None
+
+
+#: Corpus rows this walker exists to exercise. Checked individually, not "any
+#: one of the corpus" — the `command`-kind and `compound`-kind sinks in
+#: `_here_string_program` are separate code paths, so a regression isolated to
+#: one would still leave the other producing a non-empty set and pass a
+#: corpus-wide vacuity check trivially (LAB-4686 expert-panel security finding).
+STDIN_PROGRAM_CORPUS_NAMES = ["here-string-stdin-program", "here-string-compound"]
+
+
+@pytest.mark.parametrize("name", STDIN_PROGRAM_CORPUS_NAMES)
+def test_stdin_programs_corpus_entry_is_not_vacuous(name):
+    """`stdin_programs` must be non-empty on each dedicated here-string-program row (bashlex tier).
+
+    Registering the walker in `walker_outputs` alone proves nothing if a
+    corpus `<<<` row yields `[]` — the superset gate would pass vacuously
+    without ever exercising the new walker (LAB-4686).
+    """
+    command = next(entry["script"] for entry in CORPUS if entry["name"] == name)
+    outputs = bashlex_outputs(command)
+    assert outputs is not None, f"{name}: bashlex could not parse {command!r}"
+    assert outputs["stdin_programs"], f"{name}: produced an empty stdin_programs set"
 
 
 @needs_binary
