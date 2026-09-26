@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -196,3 +197,42 @@ class TestSelfProtectStaysFailOpen:
 
     def test_write_tool_hook_has_no_exit_guard(self):
         assert "exit 2" not in _hook_command("Write|Edit|MultiEdit|NotebookEdit")
+
+
+class TestPreToolUseFailsClosedOnNonTerminatingValidation:
+    """A validation that never returns must block; Claude Code lets a timed-out hook through (LAB-4959)."""
+
+    def test_unterminated_brace_heredoc_denies_promptly(self, tmp_path):
+        """The LAB-4959 repro, through the real hook and its vendored bashlex: vanilla bashlex never returns."""
+        payload = {"tool_name": "Bash", "tool_input": {"command": 'git commit -m "$(cat << EOF\n${\nEOF\n)"; echo ran'}}
+
+        start = time.monotonic()
+        result = _run(_hook_command("Bash"), REPO_ROOT, payload, home=tmp_path)
+
+        # Well inside the soft deadline, so this pins the parse itself returning.
+        assert time.monotonic() - start < 10
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_stall_the_soft_deadline_cannot_interrupt_blocks(self, tmp_path):
+        """SIGALRM held off (as C code holding the GIL would): the watchdog exits and `|| exit 2` blocks."""
+        stub = f"""
+import signal, sys, time
+sys.path.insert(0, {str(HOOKS_DIR)!r})
+import pre_tool_use
+
+def stall(command):
+    signal.pthread_sigmask(signal.SIG_BLOCK, {{signal.SIGALRM}})
+    time.sleep(30)
+
+pre_tool_use.validate_command = stall
+pre_tool_use.VALIDATION_DEADLINE_S = 0.1
+pre_tool_use.HARD_DEADLINE_S = 1
+pre_tool_use.main()
+"""
+        root = _stub_plugin_root(tmp_path / "plugin", stub)
+
+        result = _run(_hook_command("Bash"), root, BASH_PAYLOAD, home=tmp_path)
+
+        assert result.returncode == 2, f"expected a block, got rc={result.returncode} stdout={result.stdout!r}"
+        assert result.stdout.strip() == ""

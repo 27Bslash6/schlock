@@ -1,6 +1,7 @@
 """Tests for BashCommandParser."""
 
 import logging
+import signal
 
 import bashlex
 import pytest
@@ -646,3 +647,67 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [(seg.text, seg.string_literals) for seg in pairs] == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
     text, literals = pairs[0].text, pairs[0].string_literals
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
+
+
+def _parse_hung(signum, frame):
+    pytest.fail("parse did not return within 5 s")
+
+
+# A heredoc body the tokenizer never brace-matches, so an unclosed `${` reaches the expander.
+UNTERMINATED_BRACE = [
+    'git commit -m "$(cat << EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<-EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<\tEOF\n${\nEOF\n)"',
+    'echo "$(sh << EOF\n${\nEOF\n)"',
+    'git push --force "$(cat << EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<EOF\nfix: handle ${ in paths\nEOF\n)" && git push',
+    'echo "$(cat <<EOF\na ${b\nEOF\n)"',
+]
+
+
+class TestUnterminatedBraceExpansion:
+    """bashlex 0.18 loops forever on an unclosed `${` (LAB-4959); schlock makes it raise."""
+
+    @pytest.fixture(autouse=True)
+    def _bounded(self):
+        # A regression hangs rather than fails; the alarm turns that into a failure where it exists.
+        # A timer already armed (pytest-timeout's signal method) bounds the hang itself, and re-arming
+        # ITIMER_REAL would silently cancel its deadline for the rest of the run.
+        if not hasattr(signal, "setitimer") or signal.getitimer(signal.ITIMER_REAL)[0]:
+            yield
+            return
+        previous = signal.signal(signal.SIGALRM, _parse_hung)
+        signal.setitimer(signal.ITIMER_REAL, 5)
+        yield
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+    @pytest.mark.parametrize("command", UNTERMINATED_BRACE)
+    def test_unclosed_brace_raises(self, command):
+        with pytest.raises(ParseError, match="no closing"):
+            parser_mod.BashCommandParser().parse(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'git commit -m "$(cat <<EOF\nuse ${HOME} here\nEOF\n)"',
+            'git commit -m "$(cat <<EOF\n${\nx}\nEOF\n)"',
+            'echo "${x:-default}"',
+            "echo ${HOME} $1",
+        ],
+    )
+    def test_closed_brace_still_parses(self, command):
+        assert parser_mod.BashCommandParser().parse(command)
+
+    def test_closed_brace_keeps_its_parameter(self):
+        ast = parser_mod.BashCommandParser().parse('git commit -m "$(cat <<EOF\nuse ${HOME} here\nEOF\n)"')
+        params = []
+
+        class Visitor(bashlex.ast.nodevisitor):
+            def visitparameter(self, node, value):
+                params.append(value)
+
+        for node in ast:
+            Visitor().visit(node)
+        assert "HOME" in params
