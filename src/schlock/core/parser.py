@@ -4,11 +4,16 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks.
+Regex-based parsing is explicitly NOT supported due to security risks. The one
+regex here (_QUOTED_RUN_OR_DOLLAR_MARKER) only re-reads the quoting of a single
+redirect target whose boundaries bashlex has already fixed; see _redirect_words.
 """
 
 import bisect
+import contextlib
 import logging
+import re
+import shlex
 from typing import Any, NamedTuple, Optional
 
 import bashlex
@@ -140,6 +145,34 @@ _apply_andor_substitution_correction()
 # put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
 # the rbash drift with a different interpreter.
 _HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
+
+# Redirection operators whose operand is DATA rather than a path, and so must stay
+# out of the reconstruction that _redirect_words feeds (LAB-2760).
+# `<<<` is the load-bearing entry: a here-string payload sits on `.output` and only
+# executes when the command is a shell, so emitting it unsuppressed would over-block
+# `cat <<< "rm -rf /"`, which merely prints text. Deciding shell-vs-data for that
+# operand is `_here_string_program`'s job (LAB-2768), which re-enters the payload as
+# code when the sink is an interpreter; this set only keeps it out of the path
+# reconstruction, so the two mechanisms never see the same operand twice.
+# `<<`/`<<-` cost nothing to exclude and change no verdict either way - a heredoc
+# BODY lives on `.heredoc`, which _redirect_words never reads, so only the inert
+# delimiter token (`EOF`) is at stake. They are listed because a delimiter is data
+# by the same rule, not because anything depends on it: do NOT read this as "the
+# heredoc body would escape without them".
+_DATA_REDIRECT_OPERATORS = frozenset({"<<", "<<-", "<<<"})
+
+# Redirection operators that write a file exactly as a plainer operator does, but
+# whose spelling no path rule can read (LAB-2760): every disk/boot rule is
+# `>\s*/dev/[sh]d[a-z]`, and both `|` and `&` break that `\s*`. `>|` is `>` with
+# noclobber overridden - strictly more dangerous, never less - and bash itself
+# reads `>& word` as `&> word` when no fd is given.
+_OPERATOR_ALIASES = {">|": ">", ">&": "&>"}
+
+# A quoted run or a `$$` (group 1, kept) or the `$` that opens `$'…'` / `$"…"` outside
+# any quotes (dropped by `.sub(r"\1", …)`). Matching the runs first consumes a `$`
+# inside them, and `$$` is the PID, so neither is taken for a marker. No escape
+# handling: only apply it to a span with no backslash.
+_QUOTED_RUN_OR_DOLLAR_MARKER = re.compile(r"""('[^']*'|"[^"]*"|\$\$)|\$(?=['"])""")
 
 # Quoted-substitution body text may total this many times the command's length
 # before extract_quoted_substitution_bodies fails closed. Bodies nest, so text
@@ -368,6 +401,147 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
             continue
         saw_option = True
     return True
+
+
+def has_compound_redirects(ast_nodes: list[Any]) -> bool:
+    """Whether any node redirects at the COMPOUND level (`{ …; } > f`, `done > f`).
+
+    These are the redirections no segment can see: _segment_nodes recurses past the
+    compound into its `.list`, so the redirection belongs to none of the resulting
+    segments (LAB-2760). The multi-segment branch uses this to decide whether it
+    needs a whole-command pass at all. The gate is a latency guard: that pass costs
+    two more reconstructions and their match passes on every multi-segment command,
+    and only a compound redirect gives it text no segment already sees.
+    """
+
+    def visit(node) -> bool:
+        if not hasattr(node, "kind"):
+            return False
+        if getattr(node, "redirects", None):
+            return True
+        for attr in ("parts", "command", "list", "pipe", "compound"):
+            child = getattr(node, attr, None)
+            if isinstance(child, list):
+                if any(visit(item) for item in child):
+                    return True
+            elif child and visit(child):
+                return True
+        return False
+
+    return any(visit(node) for node in ast_nodes or [])
+
+
+def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Optional[tuple]]]:
+    r"""One redirection, rendered as reconstruction words: operator, then target.
+
+    SECURITY (LAB-2760): a redirect target is never inert the way an argument can
+    be - the path IS the effect - so it is emitted with span ``None`` and can never
+    earn a suppression range (see _quoting_is_load_bearing, consulted only for a
+    non-None span). That is what makes `echo a > "/dev/sda"` classify as
+    `echo a > /dev/sda` rather than disappearing.
+
+    The cost of that choice is a hard match on a filename that itself contains rule
+    text (`git log > "notes about rm -rf / incident.md"`). Measured, it changes no
+    verdict: `extract_string_literals` does not descend into `redirect.output`
+    either, so the ORIGINAL-form pass already matches those unsuppressed. Fixing it
+    means teaching both passes at once, which is not this ticket.
+
+    The operator travels with the target, because every disk/boot rule is written
+    `>\s*/dev/[sh]d[a-z]` - matching on the redirection, not a bare path. The bare
+    target would reconstruct to `echo a /dev/sda` and still miss.
+
+    Spacing is REPRODUCED, never normalised. Reconstruction exists to resolve
+    quoting and escapes; re-spacing changes which rules match, and rule 04's
+    `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before `/dev/` - so emitting
+    `2>/dev/null` as `2> /dev/null` silently reclassifies `shred old.txt 2>/dev/null`
+    from log tampering to filesystem wiping. The fd is likewise glued back on
+    (`2>`, not `2` `>`) because bashlex splits it into `input`; that is fidelity,
+    not a defence against any particular rule.
+
+    Returns:
+        [] for a redirection with no path operand - a `<<`-family operator
+        (_DATA_REDIRECT_OPERATORS), or an fd-closing `2>&-`, whose `output` bashlex
+        leaves as a bare `-` string rather than a word or an fd.
+    """
+    operator: Optional[str] = getattr(node, "type", None)
+    if operator is None or operator in _DATA_REDIRECT_OPERATORS:
+        return []
+
+    fd = getattr(node, "input", None)
+    target = getattr(node, "output", None)
+
+    if isinstance(target, int):
+        # fd duplication (`2>&1`): no path, and the source glues it.
+        glued_fd = f"{fd}{operator}" if isinstance(fd, int) else operator
+        return [(f"{glued_fd}{target}", None)]
+
+    word: Optional[str] = getattr(target, "word", None)
+    if word is None:
+        # `2>&-` closes an fd - bashlex leaves `output` a bare `-` string.
+        return []
+
+    # bashlex keeps the `$` of `$'…'` / `$"…"` in the word at whatever offset it sits
+    # (`/$'dev'/sda` → `/$dev/sda`), and its quote removal breaks on adjacent quoted
+    # runs (`""'/dev/sda'` → `'/dev/sda'`), so the target matches no path rule. Where it
+    # can, rebuild the word from the SOURCE span: drop every marker outside quotes, then
+    # let shlex do POSIX quote removal. That is bash's reading of the span's top-level
+    # quoting; shlex also removes quotes nested inside `$(…)` / `${…}`, which bash keeps.
+    # A backslash anywhere disables the rebuild: the marker scan has no escape handling,
+    # so `\"` would shift every quoted run after it, and inside `$'…'` a backslash may be
+    # an ANSI-C escape that shlex cannot decode.
+    target_pos = getattr(target, "pos", None)
+    span = command[target_pos[0] : target_pos[1]] if command is not None and target_pos else ""
+    rebuilt: list[str] = []
+    if span and "\\" not in span:
+        with contextlib.suppress(ValueError):
+            rebuilt = shlex.split(_QUOTED_RUN_OR_DOLLAR_MARKER.sub(r"\1", span))
+    if len(rebuilt) == 1:
+        word = rebuilt[0]
+    elif command is not None:
+        # No rebuild (a backslash, or a span shlex cannot read as one word, such as
+        # whitespace inside `$(…)`): keep bashlex's word less its leading markers. Drive
+        # the strip off bashlex's one-character PARAMETER parts, not off the first source
+        # characters: a leading empty fragment (`''$'/dev/'\sda`) moves the `$` off the
+        # start and defeats a positional test, while the part is still there. A real
+        # expansion is wider than one character (`$HOME` spans five), so it is never
+        # stripped. This assumes bashlex left the markers in the word: a word decoded
+        # before it gets here has none, and the strip would eat a real `$` instead.
+        for part in sorted(getattr(target, "parts", None) or [], key=lambda x: getattr(x, "pos", (0,))[0]):
+            pos = getattr(part, "pos", None)
+            is_dollar_quote = (
+                getattr(part, "kind", None) == "parameter"
+                and pos
+                and pos[1] - pos[0] == 1
+                and command[pos[1] : pos[1] + 1] in ("'", '"')
+            )
+            if is_dollar_quote and word.startswith("$"):
+                word = word[1:]
+            else:
+                break
+
+    # Did the SOURCE glue the operator to its target? Read the character before the
+    # target rather than computing where the operator ended: bashlex NORMALISES the
+    # descriptor, so source `02>` arrives as `input=2` and any width arithmetic on
+    # `len(str(fd))` is one short, inventing a gap that is not there. That mattered -
+    # rule 04's `\bshred\s+.{0,100}\s+/dev/` keys on whitespace before `/dev/`, so a
+    # phantom gap reclassified `shred old.txt 02>/dev/null` from log tampering to
+    # filesystem wiping. Reconstruction resolves quoting and escapes; it must never
+    # re-space. Found by adversarial review - the fd matrix that cleared the
+    # arithmetic used 0/1/2/3/10, none of them zero-padded.
+    glued = bool(
+        target_pos and command is not None and 0 < target_pos[0] <= len(command) and not command[target_pos[0] - 1].isspace()
+    )
+
+    if operator == ">|" or (operator == ">&" and fd is None):
+        operator = _OPERATOR_ALIASES[operator]
+    if isinstance(fd, int):
+        operator = f"{fd}{operator}"
+
+    if glued:
+        # One token, so the joining space cannot open a gap the source did not have.
+        return [(f"{operator}{word}", None)]
+
+    return [(operator, None), (word, None)]
 
 
 def _stdin_here_string(redirect_nodes: "list[Any]") -> Optional[str]:
@@ -850,10 +1024,11 @@ class BashCommandParser:
         suppression, never a missed match.
 
         For heredoc ranges it is the LIVE case, and both outcomes are load-bearing.
-        A heredoc nested in a substitution (`diff <(cat <<EOF ... EOF)`) sits INLINE
+        A heredoc nested in a substitution (`x=$(cat <<EOF ... EOF)`) sits INLINE
         in the slice - _close_heredocs only ever reaches a command's own redirects,
         so nothing else suppresses it, and `cat` merely emits that text. It is
-        inside the span, so it rebases and keeps suppressing. The segment's OWN
+        inside the span, so it rebases and keeps suppressing. (One inside `<( … )`
+        rebases too, but is is_shell, so it never suppresses.) The segment's OWN
         body sits PAST the span; _close_heredocs re-appends it at an offset this
         slice cannot describe, so it is dropped - correct twice over, because the
         only body it ever appends is a shell's, and a shell's body is code that
@@ -962,8 +1137,28 @@ class BashCommandParser:
             )
         return results
 
-    def _collect_words(self, ast_nodes: list[Any]) -> list[tuple[str, Optional[tuple]]]:
-        """Collect the word parts that make up the reconstructed command.
+    def _collect_words(
+        self, ast_nodes: list[Any], include_redirects: bool = True, command: Optional[str] = None
+    ) -> list[tuple[str, Optional[tuple]]]:
+        r"""Collect the word parts that make up the reconstructed command.
+
+        SECURITY (LAB-2760): redirections are collected too, via
+        _redirect_words. A `redirect` node carries no `.word`, so walking `.word`
+        parts alone dropped the target out of the reconstruction entirely - and
+        because the ORIGINAL-form pass matches `>\s*/dev/sd[a-z]` against text
+        that still holds the quote characters, two quote marks were enough to
+        hide a disk from both passes at once (`echo a > "/dev/sda"` was SAFE).
+
+        BOTH forms are needed, which is what `include_redirects` is for. A large
+        family of rules is written to STOP at a redirect on purpose - rule 08's
+        `(rm|mv|cp)\s+[^>]{0,200}/(etc|sys|...)/` excludes `>` by name "to avoid
+        matching through redirects like 2>/dev/null", and rule 03 anchors bare
+        `^\s*env\s*$`. Those rules were matching the redirect-FREE
+        reconstruction, so emitting the redirect INTO it silently un-matched them:
+        `fdisk 2>/dev/null /dev/sda` and `env > creds.txt` both went
+        BLOCKED -> allowed. The redirect-free form is therefore load-bearing in
+        its own right, not a legacy shape; _match_original_and_reconstructed runs
+        both and takes the higher risk.
 
         Returns:
             List of (word_text, original_span) tuples in reconstruction order.
@@ -980,6 +1175,8 @@ class BashCommandParser:
                     for part in node.parts:
                         if hasattr(part, "word"):
                             words.append((part.word, getattr(part, "pos", None)))
+                        elif include_redirects and getattr(part, "kind", None) == "redirect":
+                            words.extend(_redirect_words(part, command))
                     return  # Don't recurse further into this command
 
                 # Recursively visit child nodes for other structures
@@ -991,6 +1188,13 @@ class BashCommandParser:
                                 visit(item)
                         elif child:
                             visit(child)
+
+                # A compound (`{ ...; } > /dev/sda`, `done > /dev/sda`) hangs its
+                # redirections off `redirects`, never off `parts`, so the loop
+                # above cannot reach them. Source order puts them last.
+                if include_redirects:
+                    for redirect in getattr(node, "redirects", None) or []:
+                        words.extend(_redirect_words(redirect, command))
 
         for node in ast_nodes or []:
             visit(node)
@@ -1018,6 +1222,15 @@ class BashCommandParser:
             'rm -rf /'
         """
         return " ".join(word for word, _ in self._collect_words(ast_nodes))
+
+    def reconstruct_without_redirects(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
+        """The reconstruction as it stood before LAB-2760: words only, no redirections.
+
+        Kept as a SEPARATE pass rather than a migration step. See _collect_words -
+        rules that deliberately exclude `>` only match this form, so it has to keep
+        being matched alongside the redirect-bearing one.
+        """
+        return self._reconstruct(command, ast_nodes, include_redirects=False)
 
     def reconstruct_command_with_suppression_ranges(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
         """Reconstruct the command AND rebase its suppression ranges onto it.
@@ -1055,11 +1268,75 @@ class BashCommandParser:
             >>> parser.reconstruct_command_with_suppression_ranges('echo "rm -rf /"', ast)
             ('echo rm -rf /', [(5, 14)])
         """
-        words = self._collect_words(ast_nodes)
+        return self._reconstruct(command, ast_nodes, include_redirects=True)
+
+    def _reconstruct(self, command: str, ast_nodes: list[Any], *, include_redirects: bool) -> tuple[str, list[tuple]]:
+        """Shared body of the two reconstruction passes."""
+        words = self._collect_words(ast_nodes, include_redirects=include_redirects, command=command)
+        # A command-substitution word carries its heredoc body VERBATIM (`$(cat <<EOF
+        # … EOF)` is one word spanning the body), so the body reaches the
+        # reconstruction where no heredoc range suppresses it - the original-form pass
+        # gets `heredoc_ranges`, this one never did. Suppress an inert one here, or every
+        # reconstruction pass scores text that `cat` merely prints as an executed
+        # command. A body inside `<( … )` is never inert (`extract_heredoc_ranges`):
+        # whatever reads the substitution may run it.
+        #
+        # SECURITY: suppress the BODY, never the word that carries it, and only in the
+        # word that actually OWNS it. Two separate mistakes were made here, each found
+        # by adversarial review, each turning a BLOCKED command SAFE:
+        #
+        # 1. Containing an inert heredoc does not make a whole shell word inert. Bash
+        #    concatenates whatever follows the closing paren into the SAME word, so
+        #    `$(cat <<EOF … EOF)mk''fs …` is one word whose tail is an executed command
+        #    name; suppressing the word swallowed the name.
+        # 2. TEXT EQUALITY IS NOT PROVENANCE. Searching every word for the body's text
+        #    suppressed words that merely happened to contain it - an empty heredoc's
+        #    range is its own DELIMITER, so `mk''fs "mkfs" <<mkfs` suppressed the
+        #    executable name because the delimiter spelled the same thing.
+        #
+        # So ownership is a span test (is this heredoc inside this word's source?) and
+        # only the position within the owning word is a text search - quote resolution
+        # shifts offsets, so the source offset alone cannot be reused, but it does
+        # bound the answer: resolution only REMOVES characters, so the body sits at or
+        # before its source offset, and no earlier than that offset minus everything
+        # resolution removed.
+        #
+        # The ownership test is NOT redundant with that bound, however much it looks
+        # it. A non-owning word gives a negative window end, and Python reads a
+        # negative `end` as relative to the string's end rather than as an empty
+        # interval - `"MARKER_suffix_long".rfind("MARKER", 0, -1)` is 0, not -1. That
+        # is a real suppression on a word that owns nothing, and only the span test
+        # stops it, however much the bound looks sufficient.
+        #
+        # The window says an occurrence COULD be the body, never that it IS. Where it
+        # admits more than one, the mapping is unestablished and suppression is
+        # DECLINED rather than guessed - picking either end silently mis-attributes a
+        # range on a security-relevant API, and leaves the real body unsuppressed
+        # anyway. Declining costs at most a false positive; guessing costs provenance.
+        inert_heredocs = [(s, e) for s, e, is_shell in self.extract_heredoc_ranges(command, ast_nodes) if not is_shell]
         ranges = []
         offset = 0
 
         for word, span in words:
+            for start, end in inert_heredocs:
+                if span is None or not (span[0] <= start and end <= span[1]):
+                    continue  # this word does not own that heredoc
+                body = command[start:end]
+                if not body:
+                    continue
+                highest = start - span[0]
+                resolved_away = max(0, (span[1] - span[0]) - len(word))
+                # No clamp on `high`: ownership above guarantees `highest >= 0`, so the
+                # negative-end wrap cannot arise here. Clamping anyway would give this
+                # hazard a second guard that no test can distinguish from the first,
+                # and an unfalsifiable guard is how the previous two defects survived
+                # review. One guard, pinned by a test.
+                low = max(0, highest - resolved_away)
+                high = highest + len(body)
+                found = word.find(body, low, high)
+                if found < 0 or word.find(body, found + 1, high) >= 0:
+                    continue  # unlocatable, or ambiguous - do not guess which copy is the body
+                ranges.append((offset + found, offset + found + len(body)))
             if span is not None and self._quoting_is_load_bearing(command, word, span):
                 # Absorb the following joining space. In the source that offset
                 # held the closing quote, a character no rule pattern can cross;
@@ -1119,13 +1396,18 @@ class BashCommandParser:
 
         Returns:
             List of (start, end, is_shell) tuples for heredoc content ranges.
-            is_shell=True means the heredoc will be executed by a shell.
+            is_shell=True means the body may run as code: a shell owns it, or it
+            sits inside a process substitution, whose reader may run what it prints.
         """
         heredoc_ranges = []
 
-        def visit(node, parent_cmd=None):
+        def visit(node, parent_cmd=None, in_process=False):
             """Recursively visit AST nodes to find heredocs."""
             if hasattr(node, "kind"):
+                # A heredoc inside `<( … )` is code whatever runs it: the reader of the
+                # substitution may execute what it prints (`bash <(cat <<EOF … )`), and
+                # nothing here knows the reader. Same rule as `_bashlex_heredocs`.
+                in_process = in_process or node.kind == "processsubstitution"
                 # Track command name for determining if heredoc goes to shell
                 cmd_name = None
                 if node.kind == "command" and hasattr(node, "parts") and node.parts:
@@ -1136,7 +1418,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False
+                        is_shell = in_process or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -1145,9 +1427,9 @@ class BashCommandParser:
                         child = getattr(node, attr)
                         if isinstance(child, list):
                             for item in child:
-                                visit(item, cmd_name or parent_cmd)
+                                visit(item, cmd_name or parent_cmd, in_process)
                         elif child:
-                            visit(child, cmd_name or parent_cmd)
+                            visit(child, cmd_name or parent_cmd, in_process)
 
         for node in ast_nodes or []:
             visit(node)
