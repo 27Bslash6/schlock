@@ -641,6 +641,19 @@ class TestCredentialConfigVerdicts:
     @pytest.mark.parametrize(
         "command",
         [
+            "git config --global user.name 'Credential Team'",
+            "git config --global user.name InsteadOf",
+            "git config --global user.email Credential@example.test",
+        ],
+    )
+    def test_capitalised_values_are_not_keys(self, command):
+        # Only key-shaped spellings are case-folded. Folding the bare words denied these identity
+        # writes, which the case-sensitive rule on main allowed.
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "git config --global credential.helper store",
             "git config --global credential.helper 'cache --timeout=3600'",
             # AC-3: the per-URL spelling gets the plain one's verdict. Capitalised, so it is the
