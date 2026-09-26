@@ -443,71 +443,63 @@ def _is_decoder(name: str) -> bool:
     return any(c in name for c in "*?[") and any(fnmatch.fnmatchcase(d, name) for d in _DECODERS)
 
 
-def _is_rewritten(word: str) -> bool:
-    """A word bash rewrites before use (`$F`, `` `echo -d` ``, `{-d,f}`, `[-]d`, `~-`): its value is unknowable here."""
-    return any(c in word for c in "$`{*?[~")
-
-
 def _is_decode_flag(arg: str) -> bool:
     """`-d`, `-D` (BSD), a bundle carrying either (`-di`), a `--decode` prefix, or a word bash rewrites.
 
-    A rewritten word is read as a decode flag because the only cost of guessing wrong is
-    blocking an encode whose output is run as a command.
+    A word bash rewrites (`$F`, `` `echo -d` ``, `{-d,f}`, `[-]d`, `~-`) is read as a decode flag
+    because its value is unknowable here, and the only cost of guessing wrong is blocking an
+    encode whose output is run as a command.
     """
-    if _is_rewritten(arg):
+    if any(c in arg for c in "$`{*?[~"):
         return True
     if arg.startswith("--"):
         return arg != "--" and "--decode".startswith(arg)
     return arg.startswith("-") and ("d" in arg or "D" in arg)
 
 
-_EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
+def _parameter_runs_decode(value: Any, seen: "dict[str, bool]") -> bool:
+    """True if a `${…}` body runs a base-N decode: `${v:-$(base64 -d x)}`, when `v` is unset.
 
-
-def _invokes_decode(words: "list[str]") -> bool:
-    """True if a command's words invoke a base-N decode, directly or through a wrapper.
-
-    The decoder must be the command, or an operand of a wrapper (`env base64 -d`,
-    `busybox base64 -d`) or of a first word bash rewrites (`$W base64 -d` may be `env`). A
-    literal command that only names one, `printf '%s' base64 -d`, decodes nothing. Past the
-    first word every operand is a candidate, as in `heredoc_owner`. Basename only to find the
-    decoder: its arguments stay raw, so `${D%/}` keeps its `$` and `/tmp/-d` stays a file.
+    bashlex leaves a parameter node childless, so the body is parsed here as the substitution
+    validator parses it (LAB-1731): `#` is not a comment inside `${…}`, so it is blanked. That
+    validator also refuses a body that will not parse, so False for one opens nothing. `seen`
+    holds the answer per body text, because every enclosing command walks the same body again:
+    without it a body nested N substitutions deep was parsed and walked N times.
     """
-    names = [word.split("/")[-1] for word in words]
-    if not names or not (_is_decoder(names[0]) or names[0] in _EXEC_WRAPPERS or _is_rewritten(words[0])):
-        return False
-    at = next((i for i, name in enumerate(names) if _is_decoder(name)), None)
-    return at is not None and any(_is_decode_flag(word) for word in words[at + 1 :])
-
-
-def _parameter_body(node: Any) -> "list[Any]":
-    """The parsed body of a `${…}` holding a `$( )` or backquote; [] if it holds none or will not parse.
-
-    bashlex leaves a parameter node childless, so `${v:-$(base64 -d x)}` hid its decode although
-    bash runs it whenever `v` is unset. Parsed as the substitution validator parses it
-    (LAB-1731): `#` is not a comment inside `${…}`, so it is blanked. That validator also
-    refuses a body that will not parse, so an empty result here opens nothing.
-    """
-    value = getattr(node, "value", None)
     if not isinstance(value, str) or ("$(" not in value and "`" not in value):
-        return []
-    try:
-        return BashCommandParser().parse(value.replace("#", "_"))
-    except (ParseError, ValueError):
-        return []
+        return False
+    if value not in seen:
+        try:
+            nodes = BashCommandParser().parse(value.replace("#", "_"))
+        except ParseError:
+            nodes = []
+        seen[value] = any(_runs_decode(n, seen) for n in nodes)
+    return seen[value]
 
 
-def _runs_decode(node: Any) -> bool:
-    """True if a base-N decode runs anywhere under `node`, nested and `${…}` substitutions included."""
+def _runs_decode(node: Any, seen: "dict[str, bool]") -> bool:
+    """True if a base-N decode runs anywhere under `node`, nested and `${…}` substitutions included.
+
+    Matches the decoder anywhere in a command's words, not only as its name, so a wrapper
+    (`env base64 -d`, `busybox base64 -d`) is not a way around it. That also reads a decoder
+    merely named as an argument (`printf '%s' base64 -d`), deliberately: no list of commands
+    that run their operands is complete (`fakeroot`, `numactl`, a shell function), and no list of
+    ones that do not survives the same line redefining a name (`printf(){ "$@"; }`).
+    """
     kind = getattr(node, "kind", None)
-    if kind == "command" and _invokes_decode(_command_words(node)):
-        return True
+    if kind == "command":
+        # Basename only to find the decoder: its arguments stay raw, so `${D%/}` keeps its `$`
+        # and `/tmp/-d` stays a file.
+        words = _command_words(node)
+        at = next((i for i, w in enumerate(words) if _is_decoder(w.split("/")[-1])), None)
+        if at is not None and any(_is_decode_flag(w) for w in words[at + 1 :]):
+            return True
     if kind == "parameter":
-        return any(_runs_decode(c) for c in _parameter_body(node))
+        return _parameter_runs_decode(getattr(node, "value", None), seen)
     for attr in ("parts", "command", "list", "pipe", "compound"):
         child = getattr(node, attr, None)
         children = child if isinstance(child, list) else [child] if child is not None else []
-        if any(_runs_decode(c) for c in children):
+        if any(_runs_decode(c, seen) for c in children):
             return True
     return False
 
@@ -525,13 +517,16 @@ def _is_bare_expansion(word: Any) -> bool:
     return sum(p.pos[1] - p.pos[0] for p in parts) == end - start
 
 
+_EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
+
+
 def _is_env_assignment(word: str) -> bool:
     """`NAME=value` as a wrapper operand (`env NAME=value cmd`): assigned, never executed."""
     name, eq, _ = word.partition("=")
     return bool(eq) and name.isidentifier()
 
 
-def _runs_decoded_output(node: Any) -> bool:
+def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     """True if a command node executes the output of a base-N decode as a command.
 
     `$(base64 -d x)` runs the decoded bytes as a command — the decode-and-execute shape
@@ -558,7 +553,7 @@ def _runs_decoded_output(node: Any) -> bool:
         text = getattr(word, "word", "")
         if in_wrapper and (text.startswith("-") or text[:1].isdigit() or _is_env_assignment(text)):
             continue
-        if _runs_decode(word):
+        if _runs_decode(word, seen):
             return True
         if text.split("/")[-1] in _EXEC_WRAPPERS:
             in_wrapper = True
@@ -1525,6 +1520,7 @@ class BashCommandParser:
             ['eval command detected']
         """
         dangers = []
+        decode_seen: dict[str, bool] = {}  # per `${…}` body text, see _parameter_runs_decode
 
         # Check for dangerous pipelines (curl | sh patterns)
         pipeline_dangers = self._detect_dangerous_pipelines(ast_nodes)
@@ -1563,7 +1559,7 @@ class BashCommandParser:
                 # SECURITY: kubectl exec, docker exec use "exec" as argument
                 # We must NOT flag those - they're container tools, not shell exec.
                 if node.kind == "command":
-                    if _runs_decoded_output(node):
+                    if _runs_decoded_output(node, decode_seen):
                         dangers.append("base-N decoded output executed as a command")
 
                     cmd_name = self._get_command_name(node)

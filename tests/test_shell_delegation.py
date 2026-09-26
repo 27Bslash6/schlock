@@ -882,9 +882,12 @@ class TestBase64DecodeAtCommandPosition:
             "xargs $(base64 -d x)",
             "bash -c '\nenv $(base64 -d x)'",
             'bash <<< "\nnohup $(base64 -d x)"',
-            # A first word bash rewrites may be a wrapper: `/usr/bin/e?v` globs to env.
-            "$(/usr/bin/e?v base64 -d x)",
-            "$(`echo env` base64 -d x)",
+            # A runner no list names still runs the decoder it is handed, and a name that
+            # only prints can be redefined on the same line: why the decoder is matched anywhere.
+            "$(fakeroot base64 -d x)",
+            "$(numactl -N0 base64 -d x)",
+            'f(){ "$@"; }; $(f base64 -d x)',
+            'printf(){ "$@"; }; $(printf base64 -d x)',
             # bashlex leaves `${…}` childless; bash runs the fallback's decode when `v` is unset.
             "${v:-$(base64 -d x)}",
             '"${v:-$(base64 -d x)}"',
@@ -930,17 +933,3 @@ class TestBase64DecodeAtCommandPosition:
     )
     def test_decode_as_data_is_not_escalated(self, command):
         assert validate_command(command).risk_level == RiskLevel.HIGH
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            # A literal command that only names a decoder runs no decode.
-            "$(printf '%s' base64 -d)",
-            "$(echo base64 -d)",
-            "$(grep base64 -d f)",
-            "$(echo x | grep base64 -d)",
-            "${v:-$(printf '%s' base64 -d)}",
-        ],
-    )
-    def test_decoder_named_as_an_argument_is_not_a_decode(self, command):
-        assert validate_command(command).risk_level < RiskLevel.BLOCKED
