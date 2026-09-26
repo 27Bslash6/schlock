@@ -1972,6 +1972,20 @@ class TestGroupedAndRedirectedSubstitutions:
         assert "non-simple command in substitution" in result.message.lower()
 
     @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(date() { ./payload; }; date)"; rm -rf /',
+            'echo "$(if true; then ./payload; fi)" && rm -rf /',
+        ],
+    )
+    def test_fail_closed_denial_keeps_a_later_rule_name(self, command):
+        """The guard's denial names no rule, so it defers: a later command's rule still reaches the audit log."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "system_destruction" in result.matched_rules, result.matched_rules
+        assert "non-simple command in substitution" in result.message.lower()
+
+    @pytest.mark.parametrize(
         ("command", "risk", "allowed"),
         [
             ('echo "$(cd foo; make)"', RiskLevel.HIGH, False),  # unknown segment stays ask, not deny
