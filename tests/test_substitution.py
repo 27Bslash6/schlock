@@ -1986,8 +1986,8 @@ class TestGroupedAndRedirectedSubstitutions:
     def test_substitution_denial_does_not_downgrade_a_stronger_rule(self):
         """Worst verdict wins, not the first one found.
 
-        A substitution denial short-circuits the rule pass, so a weaker-than-BLOCKED one used to
-        DOWNGRADE commands the rules deny outright — `base64` is merely an unknown command inside
+        A substitution denial used to short-circuit the rule pass, so a weaker-than-BLOCKED one
+        DOWNGRADED commands the rules deny outright — `base64` is merely an unknown command inside
         a substitution (HIGH -> ask) while the whole command is base64-piped-to-shell (BLOCKED).
         Falling through to the rule pass is not a fix: that pass works on extracted segments,
         where a match inside a double-quoted word is suppressed as a string literal.

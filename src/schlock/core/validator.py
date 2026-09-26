@@ -2583,7 +2583,7 @@ def validate_command(
     """Validate a command for safety — the main validation API.
 
     Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
-    verdict above SAFE too weak to have short-circuited it. The join lives HERE, outside the
+    verdict above SAFE that did not short-circuit it (all but a rule-named BLOCKED). The join lives HERE, outside the
     passes, because a join made at any one pass is a join the passes added after it will miss:
     that is precisely how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked
     back down to HIGH merely by having a substitution appended. Whatever returns first, the
@@ -2625,15 +2625,16 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
     config_path: Optional[str] = None,
     *,
     _depth: int = 0,
-    _deferred: Optional[list[SubstitutionValidationResult]] = None,
+    _deferred: list[SubstitutionValidationResult],
     _shellcheck: bool = True,
     _derived: bool = False,
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution verdict above SAFE, and not a rule-named BLOCKED, is placed
-    there for the caller to join. It is a list rather than a return value so that every one of
-    this function's returns carries it without having to remember to.
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE, other than a rule-named
+    BLOCKED, is placed there for the caller to join. It is a list rather than a return value so
+    that every one of this function's returns carries it without having to remember to. It is
+    required: a caller that passed none would silently drop every deferred verdict.
 
     Validate command for safety.
 
@@ -2801,13 +2802,13 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # it is owed the join too, and deferring it also keeps the pre-join verdict uncached.
                 if sub_result.allowed and sub_result.risk_level == RiskLevel.SAFE:
                     continue
-                # A structural denial (a compound or function body the substitution layer refuses
-                # to read) names no rule, and returning it here hid the rule a later pass names:
-                # `echo "$(:(){ :|:& };:)"` stayed BLOCKED but lost `fork_bomb` from the audit log.
-                # Deferred, it still wins the join — nothing outranks BLOCKED.
-                if sub_result.risk_level == RiskLevel.BLOCKED and (sub_result.matched_rules or _deferred is None):
+                # A BLOCKED verdict that names no rule (the non-simple-command guard, a blacklist
+                # hit, a depth or topology refusal) is deferred too, so a later pass can name one:
+                # returned here, `echo "$(:(){ :|:& };:)"` stayed BLOCKED but lost `fork_bomb` from
+                # the audit log. It still wins the join, since nothing outranks BLOCKED.
+                if sub_result.risk_level == RiskLevel.BLOCKED and sub_result.matched_rules:
                     return _substitution_verdict(sub_result)
-                if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
+                if not _deferred or sub_result.risk_level > _deferred[-1].risk_level:
                     _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection
