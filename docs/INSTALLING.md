@@ -341,6 +341,5 @@ After installation:
 ## Support
 
 - **Issues**: https://github.com/27b-io/schlock/issues
-- **Discussions**: https://github.com/27b-io/schlock/discussions
 - **Security**: security@27b.io
 - **Documentation**: [README.md](../README.md) | [CONFIGURATION.md](CONFIGURATION.md)
