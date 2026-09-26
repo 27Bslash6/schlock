@@ -443,33 +443,67 @@ def _is_decoder(name: str) -> bool:
     return any(c in name for c in "*?[") and any(fnmatch.fnmatchcase(d, name) for d in _DECODERS)
 
 
+def _is_rewritten(word: str) -> bool:
+    """A word bash rewrites before use (`$F`, `` `echo -d` ``, `{-d,f}`, `[-]d`, `~-`): its value is unknowable here."""
+    return any(c in word for c in "$`{*?[~")
+
+
 def _is_decode_flag(arg: str) -> bool:
     """`-d`, `-D` (BSD), a bundle carrying either (`-di`), a `--decode` prefix, or a word bash rewrites.
 
-    A word bash rewrites (`$F`, `` `echo -d` ``, `{-d,f}`, `[-]d`, `~-`) is read as a decode flag
-    because its value is unknowable here, and the only cost of guessing wrong is blocking an
-    encode whose output is run as a command.
+    A rewritten word is read as a decode flag because the only cost of guessing wrong is
+    blocking an encode whose output is run as a command.
     """
-    if any(c in arg for c in "$`{*?[~"):
+    if _is_rewritten(arg):
         return True
     if arg.startswith("--"):
         return arg != "--" and "--decode".startswith(arg)
     return arg.startswith("-") and ("d" in arg or "D" in arg)
 
 
-def _runs_decode(node: Any) -> bool:
-    """True if a base-N decode runs anywhere under `node`, nested substitutions included.
+_EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
 
-    Matches the decoder anywhere in a command's words, not only as its name, so a wrapper
-    (`env base64 -d`, `busybox base64 -d`) is not a way around it.
+
+def _invokes_decode(words: "list[str]") -> bool:
+    """True if a command's words invoke a base-N decode, directly or through a wrapper.
+
+    The decoder must be the command, or an operand of a wrapper (`env base64 -d`,
+    `busybox base64 -d`) or of a first word bash rewrites (`$W base64 -d` may be `env`). A
+    literal command that only names one, `printf '%s' base64 -d`, decodes nothing. Past the
+    first word every operand is a candidate, as in `heredoc_owner`. Basename only to find the
+    decoder: its arguments stay raw, so `${D%/}` keeps its `$` and `/tmp/-d` stays a file.
     """
-    if getattr(node, "kind", None) == "command":
-        # Basename only to find the decoder: its arguments stay raw, so `${D%/}` keeps its `$`
-        # and `/tmp/-d` stays a file.
-        words = _command_words(node)
-        at = next((i for i, w in enumerate(words) if _is_decoder(w.split("/")[-1])), None)
-        if at is not None and any(_is_decode_flag(w) for w in words[at + 1 :]):
-            return True
+    names = [word.split("/")[-1] for word in words]
+    if not names or not (_is_decoder(names[0]) or names[0] in _EXEC_WRAPPERS or _is_rewritten(words[0])):
+        return False
+    at = next((i for i, name in enumerate(names) if _is_decoder(name)), None)
+    return at is not None and any(_is_decode_flag(word) for word in words[at + 1 :])
+
+
+def _parameter_body(node: Any) -> "list[Any]":
+    """The parsed body of a `${…}` holding a `$( )` or backquote; [] if it holds none or will not parse.
+
+    bashlex leaves a parameter node childless, so `${v:-$(base64 -d x)}` hid its decode although
+    bash runs it whenever `v` is unset. Parsed as the substitution validator parses it
+    (LAB-1731): `#` is not a comment inside `${…}`, so it is blanked. That validator also
+    refuses a body that will not parse, so an empty result here opens nothing.
+    """
+    value = getattr(node, "value", None)
+    if not isinstance(value, str) or ("$(" not in value and "`" not in value):
+        return []
+    try:
+        return BashCommandParser().parse(value.replace("#", "_"))
+    except (ParseError, ValueError):
+        return []
+
+
+def _runs_decode(node: Any) -> bool:
+    """True if a base-N decode runs anywhere under `node`, nested and `${…}` substitutions included."""
+    kind = getattr(node, "kind", None)
+    if kind == "command" and _invokes_decode(_command_words(node)):
+        return True
+    if kind == "parameter":
+        return any(_runs_decode(c) for c in _parameter_body(node))
     for attr in ("parts", "command", "list", "pipe", "compound"):
         child = getattr(node, attr, None)
         children = child if isinstance(child, list) else [child] if child is not None else []
@@ -489,9 +523,6 @@ def _is_bare_expansion(word: Any) -> bool:
         return False
     start, end = word.pos
     return sum(p.pos[1] - p.pos[0] for p in parts) == end - start
-
-
-_EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
 
 
 def _is_env_assignment(word: str) -> bool:

@@ -882,6 +882,18 @@ class TestBase64DecodeAtCommandPosition:
             "xargs $(base64 -d x)",
             "bash -c '\nenv $(base64 -d x)'",
             'bash <<< "\nnohup $(base64 -d x)"',
+            # A first word bash rewrites may be a wrapper: `/usr/bin/e?v` globs to env.
+            "$(/usr/bin/e?v base64 -d x)",
+            "$(`echo env` base64 -d x)",
+            # bashlex leaves `${…}` childless; bash runs the fallback's decode when `v` is unset.
+            "${v:-$(base64 -d x)}",
+            '"${v:-$(base64 -d x)}"',
+            "${v:+$(base64 -d x)}",
+            "${v-`base64 -d x`}",
+            "env ${v:-$(base64 -d x)}",
+            "$(echo ${v:-$(base64 -d x)})",
+            # `#` is not a comment inside `${…}`: flock locks `#<first word>` and runs the rest.
+            "${v:-flock #$(base64 -d x)}",
         ],
     )
     def test_decode_run_as_a_command_is_blocked(self, command):
@@ -911,7 +923,24 @@ class TestBase64DecodeAtCommandPosition:
             'nohup ./server --key "$(base64 -d k)"',
             # A quoted empty word is not dropped, so the decode stays an argument.
             '"" $(base64 -d x)',
+            # Also inside a `${…}` fallback.
+            "echo ${v:-$(base64 -d x)}",
+            "X=${v:-$(base64 -d x)}",
         ],
     )
     def test_decode_as_data_is_not_escalated(self, command):
         assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A literal command that only names a decoder runs no decode.
+            "$(printf '%s' base64 -d)",
+            "$(echo base64 -d)",
+            "$(grep base64 -d f)",
+            "$(echo x | grep base64 -d)",
+            "${v:-$(printf '%s' base64 -d)}",
+        ],
+    )
+    def test_decoder_named_as_an_argument_is_not_a_decode(self, command):
+        assert validate_command(command).risk_level < RiskLevel.BLOCKED
