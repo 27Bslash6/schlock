@@ -6,6 +6,7 @@ from schlock.core import validator as val_module
 from schlock.core.parser import BashCommandParser, _reads_stdin_as_program
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
+    _BOOTSTRAP_GIT_CONFIGS,
     SubstitutionValidator,
     dangerous_find,
     dangerous_git_config,
@@ -528,12 +529,10 @@ class TestGitConfigWriteVerdicts:
         "git config alias.st status",
         "git config core.pager 'less -FRX'",
         "git config core.fsmonitor true",
-        "git config core.hooksPath .githooks",
         "git config --global init.defaultBranch main",
         "git config --global core.editor /opt/homebrew/bin/nvim",
-        # Documented ceiling, pinned so it cannot change unnoticed: a value that is not a command
-        # gets that text's verdict AS a command, and an unknown path is SAFE bare.
-        "git config core.hooksPath hooks-dir",
+        # core.hooksPath moved to TestGitConfigPersistenceKeys.PATH_VALUED: a path-valued key is
+        # rated on the key now, so a hooks directory prompts rather than reading SAFE.
     ]
 
     @pytest.mark.parametrize("command", ATTACKS)
@@ -616,6 +615,106 @@ class TestKeyRatedGitConfigWriteHelper:
 
     def test_a_key_rated_word_as_the_value_is_not_rated(self):
         assert key_rated_git_config_write(["config", "user.name", "man.viewer"]) is None
+
+    def test_a_boolean_on_a_path_valued_key_is_not_rated(self):
+        # git reads core.fsmonitor=true as "use the built-in monitor", not as a program named true.
+        assert key_rated_git_config_write(["config", "core.fsmonitor", "true"]) is None
+        assert key_rated_git_config_write(["config", "core.fsmonitor", "rs-git-fsmonitor"]) is not None
+
+    def test_a_boolean_on_a_bootstrap_key_is_still_rated(self):
+        # include.path=true includes a file NAMED true, which an attacker can write.
+        assert key_rated_git_config_write(["config", "include.path", "true"]) is not None
+
+    def test_keys_narrows_the_check(self):
+        args = ["config", "core.hooksPath", ".githooks"]
+        assert key_rated_git_config_write(args) is not None
+        assert key_rated_git_config_write(args, _BOOTSTRAP_GIT_CONFIGS) is None
+
+
+@pytest.mark.usefixtures("no_shellcheck_underblocks")
+class TestGitConfigPersistenceKeys:
+    """Persisting a key arms more than injecting it with `-c` does, so the key set covers both.
+
+    Three kinds. Command-valued keys are judged on the VALUE, which keeps an ordinary editor, LFS
+    filter or merge tool SAFE. Path-valued keys are rated on the KEY at HIGH (ask), since their
+    attack value is a harmless-looking path and their everyday value is ordinary setup. Bootstrap
+    keys load config or hooks from a file and are BLOCKED on the key.
+    """
+
+    ATTACKS = [
+        "git config --global include.path /tmp/evil.gitconfig",
+        "git config --global includeIf.gitdir:~/work/.path /tmp/evil.gitconfig",
+        "git config --global init.templateDir /tmp/evil",
+        "git config --global filter.lfs.smudge 'rm -rf /'",
+        "git config --global mergetool.evil.cmd 'rm -rf /'",
+        "git config --global difftool.evil.cmd 'rm -rf /'",
+        "git config --global core.gitProxy 'rm -rf /'",
+        "git config --global core.alternateRefsCommand 'rm -rf /'",
+        "git config --global uploadpack.packObjectsHook 'rm -rf /'",
+        # A path-valued key still gets its value's own, worse verdict.
+        "git config core.hooksPath 'rm -rf /'",
+    ]
+    PATH_VALUED = [
+        "git config core.hooksPath .githooks",
+        "git config core.hooksPath hooks-dir",
+        "git config core.hooksPath /tmp/evilhooks",
+        "git config core.askpass /usr/bin/ssh-askpass",
+        "git config gpg.program gpg2",
+        "git config core.fsmonitor rs-git-fsmonitor",
+    ]
+    ORDINARY_WRITES = [
+        "git config core.fsmonitor true",
+        "git config --global filter.lfs.smudge 'git-lfs smudge -- %f'",
+        "git config --global filter.lfs.required true",
+        "git config --global mergetool.keepBackup false",
+        "git config --global difftool.prompt false",
+        "git config --get include.path",
+        # ssh.variant is an enum (ssh, plink, putty, ...). git compares it and never runs it:
+        # verified against git 2.43 with a helper script as the value.
+        "git config --global ssh.variant 'rm -rf /'",
+    ]
+    INJECTED = [
+        "git -c include.path=/tmp/evil.gitconfig status",
+        "git -c init.templateDir=/tmp/evil clone u",
+        "git -c filter.x.smudge=pwn checkout .",
+        "git -c mergetool.x.cmd=pwn mergetool",
+        "git -c difftool.x.cmd=pwn difftool",
+        "git -c core.gitProxy=pwn fetch",
+        "git -c core.alternateRefsCommand=pwn fetch",
+        "git -c uploadpack.packObjectsHook=pwn fetch",
+    ]
+
+    @pytest.mark.parametrize("command", ATTACKS)
+    def test_attack_is_denied_at_both_tiers(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert not result.allowed
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", PATH_VALUED)
+    def test_path_valued_key_asks_at_top_level_and_is_denied_in_a_substitution(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.HIGH
+        assert result.allowed
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", ORDINARY_WRITES)
+    def test_ordinary_writes_stay_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+        assert validate_command(f'echo "$({command})"').risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize("command", INJECTED)
+    def test_injected_form_is_denied(self, command):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    def test_injected_boolean_on_a_path_valued_key_stays_safe(self):
+        assert validate_command("git -c core.fsmonitor=true status").risk_level == RiskLevel.SAFE
+
+    def test_wrapped_bootstrap_write_asks(self):
+        # Ceiling, pinned: the BLOCKED check reads git's own args, like the `-c` check beside it,
+        # so a wrapper reaches only the HIGH key-rated path. That still asks; `-c` through a
+        # wrapper reads SAFE.
+        assert validate_command("timeout 5 git config include.path /tmp/evil").risk_level == RiskLevel.HIGH
 
 
 @pytest.mark.usefixtures("no_shellcheck_underblocks")
