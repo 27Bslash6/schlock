@@ -1952,6 +1952,10 @@ class TestGroupedAndRedirectedSubstitutions:
             'echo "$({ date() { rm -rf /; }; date; })"',
             'echo "$(foo() { rm -rf /; }; foo)"',
             'echo "$(function date { rm -rf /; }; date)"',
+            # A body no rule matches: the guard's denial is the only one, and it must survive the
+            # deferral to validate_command's join.
+            'echo "$(date() { ./payload; }; date)"',
+            'echo "$(if true; then ./payload; fi)"',
             # A grouping that carries its own redirection is a real write, not inert grouping.
             'echo "$( (ls) > /tmp/x )"',
         ],

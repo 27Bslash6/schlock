@@ -2631,7 +2631,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution verdict above SAFE and below BLOCKED is placed
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE, and not a rule-named BLOCKED, is placed
     there for the caller to join. It is a list rather than a return value so that every one of
     this function's returns carries it without having to remember to.
 
@@ -2794,14 +2794,18 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # a blocked segment). A weaker substitution verdict returned here therefore DOWNGRADED
             # commands those passes deny outright. Consulting match_command() from here does not
             # fix it: that helper is whitelist-gated, so a whitelisted first word makes it report
-            # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
-            # weaker is handed to the caller, which joins it against the completed verdict.
+            # SAFE for the whole command. Only a BLOCKED verdict that names its rule short-circuits;
+            # anything else is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
                 # An allowed verdict above SAFE is a rule match that decides the level (LAB-4223):
                 # it is owed the join too, and deferring it also keeps the pre-join verdict uncached.
                 if sub_result.allowed and sub_result.risk_level == RiskLevel.SAFE:
                     continue
-                if sub_result.risk_level == RiskLevel.BLOCKED:
+                # A structural denial (a compound or function body the substitution layer refuses
+                # to read) names no rule, and returning it here hid the rule a later pass names:
+                # `echo "$(:(){ :|:& };:)"` stayed BLOCKED but lost `fork_bomb` from the audit log.
+                # Deferred, it still wins the join — nothing outranks BLOCKED.
+                if sub_result.risk_level == RiskLevel.BLOCKED and (sub_result.matched_rules or _deferred is None):
                     return _substitution_verdict(sub_result)
                 if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
                     _deferred[:] = [sub_result]
