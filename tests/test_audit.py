@@ -7,15 +7,18 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+import pytest
 from platformdirs import user_data_dir
 
 from schlock.integrations.audit import (
+    COMMAND_LOG_LIMIT,
     AuditContext,
     AuditEvent,
     AuditLogger,
     get_audit_logger,
     get_null_device,
 )
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 class TestAuditContext:
@@ -423,3 +426,107 @@ class TestAuditLoggerThreadSafety:
                 parsed = json.loads(line)
                 assert "command" in parsed
                 assert parsed["command"].startswith("echo thread")
+
+
+class TestCommandLength:
+    """The logged command is capped per entry: a short cap by default, the commit filter's own
+    bound for entries the filter judged, and every cut is marked. Both caps count bytes. The flat
+    500-character cap this replaced dropped the heredoc body of a `git commit -F -` that a
+    root-cause later needed."""
+
+    @staticmethod
+    def _log_and_read(log_file: Path, command: str, violations=None, **kwargs) -> dict:
+        AuditLogger(log_file=log_file).log_validation(
+            command=command, risk_level="LOW", violations=violations or [], decision="allow", **kwargs
+        )
+        return json.loads(log_file.read_text().splitlines()[-1])
+
+    def test_commit_command_is_bounded_by_filter_size_limit(self, tmp_path):
+        """The full-length path is still bounded: past MAX_COMMAND_SIZE the entry is cut and marked."""
+        command = "git commit -m '" + "x" * (MAX_COMMAND_SIZE + 1000) + "'"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
+        assert len(entry["command"]) == MAX_COMMAND_SIZE
+        assert entry["command_truncated"] is True
+
+    def test_non_ascii_commit_command_is_bounded_in_bytes(self, tmp_path):
+        """The cap bounds BYTES, so a multi-byte command cannot log past it by counting characters.
+
+        40k CJK characters are 120 KB - under a character-counted 64 KiB cap, twice a byte-counted one.
+        The cut lands on a code-point boundary, so the entry is still decodable text.
+        """
+        command = "git commit -m '" + "中" * 40000 + "'"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
+        kept = len(entry["command"].encode("utf-8"))
+        assert MAX_COMMAND_SIZE - 4 < kept <= MAX_COMMAND_SIZE  # at the cap, not merely under it
+        assert entry["command_truncated"] is True
+        assert entry["command"].endswith("中")  # cut landed on a code point, not inside one
+
+    def test_secret_past_short_cap_is_redacted_in_full_commit_entry(self, tmp_path):
+        """Redaction runs over the whole command, not just its first 500 bytes."""
+        command = "git commit -m '" + "x" * 600 + "' && curl 'https://x/?token=sk-live-abc123'"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=True)
+        assert "***REDACTED***" in entry["command"]
+        assert "sk-live-abc123" not in entry["command"]
+        assert entry["command_truncated"] is False
+
+    @pytest.mark.parametrize("is_git_commit", [False, True], ids=["short-cap", "commit-cap"])
+    def test_url_credential_split_by_the_cut_is_redacted(self, tmp_path, is_git_commit):
+        """The userinfo rule anchors on the `@` that FOLLOWS the secret. A cut between the two left the
+        secret with nothing to match, so the scrub runs before the cut, whichever cap applies."""
+        cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
+        clone = "git clone https://alice:TOPSECRET"
+        command = "echo " + "x" * (cap - len(clone) - len("echo  && ")) + " && " + clone + "@github.com/o/r"
+        assert len(command.encode()) - len("@github.com/o/r") == cap  # the cut lands between secret and `@`
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=is_git_commit)
+        assert entry["command_truncated"] is True
+        assert "TOPSECRET" not in entry["command"]
+        assert entry["command"].endswith("://***REDACTED***@")  # the split secret is logged as its whole marker
+
+    @pytest.mark.parametrize("is_git_commit", [False, True], ids=["short-cap", "commit-cap"])
+    def test_redaction_growth_does_not_push_window_text_out(self, tmp_path, is_git_commit):
+        """The cap picks which of the COMMAND's bytes are logged, and redaction never changes that pick. Each
+        marker outgrows its one-byte secret by 13 bytes, so counted after scrubbing, enough of them pushed a
+        chained command that sits well inside the window past the cut."""
+        cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
+        command = "curl -d '" + '{"token":"s"}' * (cap // 25) + "' https://x; echo KEEP-ME " + "x" * cap + " token=LATER"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command, is_git_commit=is_git_commit)
+        assert entry["command_truncated"] is True
+        assert "KEEP-ME" in entry["command"]
+        # The cut falls in the filler, so the entry is the redacted window - nothing from past it, not even the
+        # later secret's marker.
+        assert entry["command"] == AuditLogger()._scrub_secrets(command[:cap])
+
+    def test_secret_straddling_the_cut_is_logged_as_its_whole_marker(self, tmp_path):
+        """A secret the cut splits is logged as its complete marker, and nothing from past the cut follows it."""
+        command = 'curl -d \'{"token":"' + "S" * COMMAND_LOG_LIMIT + "\"}' https://x; echo AFTER"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert entry["command"] == 'curl -d \'{"token":"***REDACTED***'
+        assert entry["command_truncated"] is True
+
+    def test_cut_inside_text_a_replacement_copies_maps_one_to_one(self, tmp_path):
+        """A replacement copies a header name, a JSON key or whitespace unchanged, and those runs are unbounded.
+        A cut inside one keeps the command's own bytes - keeping the whole replacement logged text from past the
+        cut, a whole 2 KB header scheme under a 500-byte cap."""
+        command = "curl -H 'Authorization: " + "A" * 2000 + " x' https://x"
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert entry["command"] == command[:COMMAND_LOG_LIMIT]
+        assert entry["command_truncated"] is True
+
+    def test_lone_surrogates_do_not_move_the_cut(self, tmp_path):
+        """The hook's json.load turns a `\\ud800` escape into a lone surrogate. The cut must count it as the
+        three bytes surrogatepass encodes, or it lands early and drops the chained command after it."""
+        command = "echo " + "\ud800" * 150 + "; echo KEEP-ME " + "x" * COMMAND_LOG_LIMIT
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert "KEEP-ME" in entry["command"]
+        assert entry["command_truncated"] is True
+
+    def test_redaction_marker_does_not_push_a_fitting_command_out(self, tmp_path):
+        """The cap counts the command's own bytes. The marker is longer than a short secret, so a cap counted
+        after scrubbing cut the tail off a command that fit - here, the chained command."""
+        head, tail = "mysql --password p -e 'SELECT 1' ", " && rm -rf /tmp/x"
+        command = head + "x" * (COMMAND_LOG_LIMIT - len(head) - len(tail)) + tail
+        assert len(command.encode()) == COMMAND_LOG_LIMIT
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert entry["command_truncated"] is False
+        assert entry["command"].endswith(tail)
+        assert " p " not in entry["command"]

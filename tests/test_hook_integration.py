@@ -31,7 +31,7 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
-from schlock.integrations.audit import AuditLogger
+from schlock.integrations.audit import COMMAND_LOG_LIMIT, AuditLogger
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
 from schlock.setup.config_writer import RISK_PRESETS
 
@@ -657,3 +657,42 @@ class TestUnscannableMessageHookHandling:
         assert block_calls, "expected a block audit entry on validation error"
         joined = " ".join(block_calls[-1].kwargs["violations"]).lower()
         assert "unscannable" in joined  # warn detection survives the error-deny path
+
+
+class TestAuditCommandLength:
+    """The hook hands the audit logger the whole command and says whether the commit filter
+    recognized a `git commit`; the logger picks the cap. Read the written JSONL line back, since
+    the cap used to live at the call sites."""
+
+    @staticmethod
+    def _run(tmp_path, command: str) -> dict:
+        log_file = tmp_path / "audit.jsonl"
+        with patch("pre_tool_use.get_audit_logger", return_value=AuditLogger(log_file=log_file)):
+            handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+        return json.loads(log_file.read_text().splitlines()[-1])
+
+    def test_commit_with_heredoc_body_is_logged_in_full(self, tmp_path):
+        """Observed shape: a ~3 KB `git commit -F - <<'EOF'` chained with a push. A flat cap kept
+        the opener and dropped the body and everything after the terminator - the part that
+        explained what the filter had judged."""
+        body = "\n".join(f"line {i}: " + "x" * 60 for i in range(40))
+        command = f"git add -A && git commit -q -F - <<'EOF'\nfeat: probe\n\n{body}\nEOF\ngit push origin HEAD"
+        assert len(command) > COMMAND_LOG_LIMIT
+        entry = self._run(tmp_path, command)
+        assert entry["command"] == command
+        assert entry["command_truncated"] is False
+
+    def test_commit_logged_in_full_when_filter_unavailable(self, tmp_path):
+        """The commit cap must not hinge on the filter loading: get_filter() is None when its
+        config fails to load, and the commit still reaches the audit log."""
+        command = "git commit -m '" + "x" * 2_000 + "'"
+        with patch("pre_tool_use.get_filter", return_value=None):
+            entry = self._run(tmp_path, command)
+        assert entry["command"] == command
+        assert entry["command_truncated"] is False
+
+    def test_non_commit_command_is_capped_and_marked(self, tmp_path):
+        """Everything the filter did not judge keeps the short cap, and the entry says it was cut."""
+        entry = self._run(tmp_path, "echo " + "x" * 10_000)
+        assert len(entry["command"]) == COMMAND_LOG_LIMIT
+        assert entry["command_truncated"] is True
