@@ -678,9 +678,9 @@ def _shell_delegated_payloads(
         # command straight through (`timeout 5 git config core.pager PROG`) and this scan keys on
         # the `config` token rather than on the first word.
         if base == "git" or base in WRAPPER_COMMANDS:
-            from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
+            from schlock.core.substitution import git_config_exec_payloads  # noqa: PLC0415
 
-            found.append(git_config_exec_payload(args))
+            found.extend(git_config_exec_payloads(args))
 
         if base == "watch":
             found.append(_watch_payload(args))
