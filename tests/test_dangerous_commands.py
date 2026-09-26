@@ -574,6 +574,9 @@ class TestP0FileTruncation:
             # A quoted target is still a target.
             'true 2> "my file"',
             "true > 'my file'",
+            # Starting with `/dev/null` does not make a path `/dev/null`.
+            "true 2> /dev/null.bak",
+            "foo | tee /dev/null.bak",
         ],
     )
     def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
@@ -590,6 +593,10 @@ class TestP0FileTruncation:
             "true 2>&1",
             "true >&2",
             ": 2> /dev/null",
+            # A shell metacharacter ends the `/dev/null` word as a blank does.
+            "(true 2> /dev/null)",
+            "echo `true 2> /dev/null`",
+            "true 2> /dev/null; ls",
             # Appending is not truncating.
             "true >> ~/.aws/credentials",
             "true 2>> ~/.aws/credentials",
