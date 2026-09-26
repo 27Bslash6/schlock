@@ -1117,6 +1117,16 @@ class TestHeredocSurroundings:
             # Pinned with the danger after the opener: `rm -rf / <<'EOF' \ ` is
             # denied on the base command alone and never reaches the fallback.
             ("chmod -R 777 <<'EOF' / \\ \nx\nEOF", "the dangerous command itself ends in an escaped space"),
+            # An ESCAPED blank is word text to bash, not a word boundary, so a `#`
+            # glued to it opens no comment: the logical line runs on, and the
+            # backslash-newline after the `#` joins the payload onto the command
+            # line, where bash runs it (sentinel-confirmed). Reading the `#` as a
+            # comment ends the line early and hands the payload to the heredoc
+            # body instead. Every character in _WORD_START_AFTER can be escaped
+            # this way.
+            ("cat <<'EOF' \\ #\\\n; rm -rf /\nbody\nEOF", "escaped blank before a glued `#`, one line"),
+            ("cat <<'EOF' \\\t#\\\n; rm -rf /\nbody\nEOF", "escaped tab before a glued `#`, one line"),
+            ("cat <<'EOF' \\;#\\\n; rm -rf /\nbody\nEOF", "escaped `;` before a glued `#`, one line"),
             # LAB-4270: bash never reads `<<` as a redirection inside a parameter
             # or arithmetic expansion - `${x:-q<<b }` expands to the literal
             # `q<<b`, `$((1<<2))` is a left shift. Reading one as an opener
@@ -1757,6 +1767,9 @@ class TestHeredocSurroundings:
             ("echo a#b <<c", ["c"], "…and a `#` glued to plain word text is text as well"),
             ("( echo )#c <<b", [], "but a subshell's `)` ends a command, so there `#` really is a comment"),
             ("cat 2>#f <<b", [], "and after a redirection operator, where the word is open but `prefix` is not"),
+            ("cat <<'A' \\ #x <<b", ["A", "b"], "an escaped blank is word text, so a `#` glued to it is text"),
+            ("cat <<'A' #x <<b", ["A"], "…where after a real blank it is a comment"),
+            ("cat <<'A' \\\\ #x <<b", ["A"], "an escaped backslash ends one column early, so the blank after it is real"),
         ],
     )
     def test_expansion_boundaries_match_bash(self, line, delimiters, description):

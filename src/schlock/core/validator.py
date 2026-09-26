@@ -1633,6 +1633,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     openers: list[tuple[str, bool, int, int]] = []
     continued = False
     pos = 0
+    after_escape = -1  # index just past the last `\x` pair; the `#` branch reads it
     opener_serials: list[int] = []
     if scan.contexts[-1].prefix:
         scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
@@ -1791,6 +1792,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             continued = pos + 1 >= len(line)
             out.append(line[pos : pos + 2])
             pos += 2
+            after_escape = pos
         elif char == "$" and pos + 1 < len(line) and line[pos + 1] in "'\"":
             # $'…' is ANSI-C quoting, $"…" is locale translation; $" is
             # otherwise an ordinary double quote.
@@ -1815,7 +1817,13 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             ctx.glob = True  # a glob character; no later `[` in this word is a subscript either
             out.append(char)
             pos += 1
-        elif char == "#" and not frames and not ctx.prefix and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+        elif (
+            char == "#"
+            and not frames
+            and not ctx.prefix
+            and pos != after_escape
+            and (pos == 0 or line[pos - 1] in _WORD_START_AFTER)
+        ):
             # `#` is ordinary inside every frame - `${#x}`, `${x#pre}` - so the
             # comment branch must not abandon the scan mid-expansion. An open
             # word rules it out too, for its own reason: `ctx.prefix` means text
@@ -1827,6 +1835,11 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             # The cost of using `prefix` is that a lone operator can be the folded
             # text - `cat >\<newline>#f` reads `#f` as a word - which is a shape
             # bash rejects outright, so it can invent an opener but not hide one.
+            # `pos != after_escape` is the same rule for an escape on this line:
+            # `cat \ #x` is the one argument ` #x`, and the raw lookup at
+            # `line[pos - 1]` cannot tell that escaped blank from a real one.
+            # Read as a comment, the logical line ends early and the commands
+            # after it are handed to _neuter_heredocs as body text.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
