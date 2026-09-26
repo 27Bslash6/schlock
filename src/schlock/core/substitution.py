@@ -622,8 +622,10 @@ _AWK_PIPE_KEYWORD = re.compile(r"\b(?:printf?|getline)\b")
 #   _AWK_REGEX   - operand expected (start, after `;`/`{`/`=`/binary op): a `/` opens a regex, and a
 #                  NAME here is a fresh primary that could be an lvalue (a `/=` after it divides).
 #   _AWK_HEADER  - an `if`/`while`/`for` whose `(...)` follows (its `)` ends no value).
-#   _AWK_PREFIX  - just after a unary `!`/`~`/`-`/`+`/`++`/`--`: a `/` opens a regex, but a NAME here
-#                  is the operator's operand, so the result is a non-lvalue (a `/=` after it is a regex).
+#   _AWK_PREFIX  - just after an operator whose following operand is a non-lvalue: a unary
+#                  `!`/`~`/`++`/`--` or any arithmetic operator `+ - * / % ^` (a `/=` after that
+#                  operand's name is a regex on gawk, since `a + b` is not an assignment target). A `/`
+#                  here opens a regex.
 #   _AWK_DIVIDE  - after a bare lvalue name or `]`: a `/` divides and a `/=` is divide-assign.
 #   _AWK_NONVAR  - after a non-lvalue value (number, string, `)`, `getline`, or a NAME that follows
 #                  another value): a `/` divides, but gawk reads a `/=` here as a regex, so it is
@@ -649,8 +651,11 @@ _AWK_WORD_STATE = {
 }
 _AWK_NUMBER = re.compile(r"\d+\.?\d*(?:[eE][+-]?\d+)?")
 # States at which a NAME is a fresh primary (could be an lvalue). Anywhere else — after a value
-# (concatenation) or a unary prefix — a NAME is a non-lvalue, so a `/=` after it is ambiguous.
+# (concatenation) or an operator operand — a NAME is a non-lvalue, so a `/=` after it is ambiguous.
 _AWK_LVALUE_POS = frozenset({_AWK_REGEX, _AWK_HEADER})
+# Operators after which the following operand is a non-lvalue: unary `!`/`~` and the arithmetic
+# operators (`/` is handled as division in _awk_slash). `a + b`, `-x`, `!x` are not `/=` targets.
+_AWK_OPERAND_OPS = frozenset("!~+-*%^")
 # A `\` continues a line when a newline follows it (mawk also allows blanks between). Both wrong
 # readings — ending the statement, or ending a string/regex early — could strip a pipe, so treat it
 # as a join everywhere it can appear.
@@ -731,8 +736,8 @@ def _awk_slash(prog: str, i: int, slash: str) -> tuple[str, int, str] | None:
     """
     if slash == _AWK_EITHER or (slash == _AWK_NONVAR and prog[i + 1 : i + 2] == "="):
         return None
-    if slash in (_AWK_DIVIDE, _AWK_NONVAR):  # division
-        return "/", i + 1, _AWK_REGEX
+    if slash in (_AWK_DIVIDE, _AWK_NONVAR):  # division — an arithmetic op, so its operand is non-lvalue
+        return "/", i + 1, _AWK_PREFIX
     end = _awk_skip_regex(prog, i)  # regex literal — itself a non-lvalue value (a `/=` after it is a regex)
     return None if end is None else ("//", end, _AWK_NONVAR)
 
@@ -748,9 +753,9 @@ def _awk_after_punct(c: str, slash: str, headers: list[bool]) -> str:
         return _AWK_REGEX if headers and headers.pop() else _AWK_NONVAR
     if c == "]":  # ends an array/field lvalue: `/` divides
         return _AWK_DIVIDE
-    if c in "!~" or (c in "+-" and slash not in (_AWK_DIVIDE, _AWK_NONVAR, _AWK_EITHER)):
-        return _AWK_PREFIX  # a unary prefix: its operand is a non-lvalue (binary +/- follows a value)
-    return _AWK_REGEX
+    if c in _AWK_OPERAND_OPS:  # an arithmetic/unary operator: its operand is a non-lvalue
+        return _AWK_PREFIX
+    return _AWK_REGEX  # a boundary (`;` `{` `=` `,` `?` `:` `(` comparison/logical): next name is a fresh lvalue
 
 
 def _awk_strip_literals(prog: str) -> str:

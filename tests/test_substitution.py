@@ -2933,6 +2933,7 @@ class TestDangerousAwkHelper:
             ["awk", '$1 ~ /^[[:alpha:]]+$/ {print $1 "|" $2}'],
             ["awk", '{x /= 2; print x "|" $2}'],  # a bare-name lvalue at statement start: `/=` divides
             ["awk", 'BEGIN{x = 8; y = x /= 2; print y "|" x}'],  # x after `=` is a fresh lvalue
+            ["awk", '{y = $1 + $2 / 2; print y "|" $3}'],  # a `/` after an arithmetic operand divides
         ],
     )
     def test_safe_awk(self, args):
@@ -3022,6 +3023,9 @@ class TestDangerousAwkHelper:
             ["awk", "BEGIN{c=ARGV[1]; x=4; y = ++ x /=/; print 1 | c}"],
             ["awk", 'BEGIN{c=ARGV[1]; a="p"; b="q"; y = a b /=/; print 1 | c}'],
             ["awk", "BEGIN{c=ARGV[1]; x=2; y = length x /=/; print 1 | c}"],
+            # a binary arithmetic operator's operand is a non-lvalue too: `a + b` is no `/=` target
+            ["awk", "BEGIN{c=ARGV[1]; a=1; b=2; y = a + b /=/; print 1 | c}"],
+            ["awk", "BEGIN{c=ARGV[1]; a=8; b=2; y = a / b /=/; print 1 | c}"],
         ],
     )
     def test_dangerous_awk(self, args):
