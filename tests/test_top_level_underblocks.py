@@ -146,6 +146,11 @@ class TestTopLevelAwkCommandPipe:
             "awk 'BEGIN{c=ARGV[1]; ARGV[1]=\"\"; y = getline / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
             # busybox (the `awk` on Alpine) opens a regex after break/continue
             "awk 'BEGIN{c=ARGV[1]; while (1) { break /\"/ } print 1 | c; y = \"a\"}' 'rm -rf /'",
+            # gawk opens a regex on `/=` after a non-lvalue value; mawk after a bare `length`
+            "awk 'BEGIN{c=ARGV[1]; y = 4 /=/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; y = length /\"/; print 1 | c}' 'rm -rf /'",
+            # busybox reads `\\]` in a bracket as a literal, closing the class where others escape it
+            "awk 'BEGIN{c=ARGV[1]; if ($0 ~ /[\\]/) x=1; print 1 | c}' 'rm -rf /'",
         ],
     )
     def test_command_pipe_blocks(self, command):
@@ -168,6 +173,8 @@ class TestTopLevelAwkCommandPipe:
             "awk '{print $1 \"|\" $2}' f",  # a pipe inside a string literal
             "awk '{n++} /a|b/ {print}' f",  # only a `/` directly after ++ is ambiguous
             "awk 'NR == 1\n/a|b/ {print}' f",  # a regex pattern opening the second line
+            "awk '{gsub(/[ \\t]+/, \"|\"); print}' f",  # `\t` in a bracket does not move its end
+            "awk '{$1 /= 100; print $1 \"|\" $2}' f",  # a field is an lvalue: `/=` is compound-assign
         ],
     )
     def test_non_exec_awk_not_blocked(self, command):

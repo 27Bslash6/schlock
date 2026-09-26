@@ -2924,6 +2924,11 @@ class TestDangerousAwkHelper:
             ["awk", "{print $1} # x|y", "f"],  # a pipe inside a comment (LAB-4832 panel)
             ["awk", "{n++} /a|b/ {print}"],  # only a `/` directly after ++ is ambiguous
             ["awk", "NR == 1\n/a|b/ {print}"],  # a regex pattern opening the second line
+            # FP guards: legit one-liners a too-blunt fix would over-block
+            ["awk", '{gsub(/[ \\t]+/, "|"); print}'],  # `\t` in a bracket does not move its end
+            ["awk", '{$1 /= 100; print $1 "|" $2}'],  # a field is an lvalue: `/=` is compound-assign
+            ["awk", '{y = length($0) / 2; print y "|" $1}'],  # length(...) is a value: `/` divides
+            ["awk", '/[/]/ {print $1 "|" $2}'],  # `/` in a simple class does not open a pipe
         ],
     )
     def test_safe_awk(self, args):
@@ -2989,6 +2994,19 @@ class TestDangerousAwkHelper:
             ["awk", 'BEGIN{c=ARGV[1]; x = 1in /"/; print 1 | c; y = "a"}'],
             ["awk", 'BEGIN{c=ARGV[1]; x = 0x1in /"/; print 1 | c; y = "a"}'],
             ["awk", "BEGIN{c=ARGV[1]; x = 0x1in / 2; print 1 | c; z = 4 / 1}"],
+            # `length` with no args is a value in most awks but opens a regex in mawk
+            ["awk", 'BEGIN{c=ARGV[1]; y = length /"/; print 1 | c}'],
+            # `/=` after a non-lvalue value opens a regex in gawk, divides elsewhere
+            ["awk", "BEGIN{c=ARGV[1]; y = 4 /=/; print 1 | c}"],
+            ["awk", 'BEGIN{c=ARGV[1]; y = "q" /=/; print 1 | c}'],
+            ["awk", "BEGIN{c=ARGV[1]; y = (4) /=/; print 1 | c}"],
+            # a bracket the awks parse differently -> kept raw: `\]` (busybox closes, others escape),
+            # a leading `]` after `^`, a `[:class:]`
+            ["awk", "BEGIN{c=ARGV[1]; if ($0 ~ /[\\]/) x=1; print 1 | c}"],  # busybox
+            ["awk", 'BEGIN{c=ARGV[1]; if ("x" ~ /[^]/"]/) y=1; print 1 | c}'],  # mawk, gawk
+            ["awk", 'BEGIN{c=ARGV[1]; if ("x" ~ /[[:alpha:]/"]/) y=1; print 1 | c}'],  # mawk, gawk
+            # a `\<CR><LF>` continuation joins the line before the scan, as awk does
+            ["awk", "BEGIN{c=ARGV[1]; x = 8 \\\r\n/ 2; print 1 | c; z = 4 / 1}"],
         ],
     )
     def test_dangerous_awk(self, args):
