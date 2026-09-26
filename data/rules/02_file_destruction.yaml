@@ -46,7 +46,22 @@ rules:
   - name: file_truncation
     description: File truncation can instantly destroy data
     risk_level: HIGH
-    patterns: ["^\\s*>(?=\\s+\\S)\\s+(?!/dev/null)[^|&;]{1,200}", ":\\s*>(?=\\s+\\S)\\s+(?!/dev/null)[^|&;]{1,200}", "\\btrue\\s+>(?=\\s+\\S)\\s+(?!/dev/null)[^|&;]{1,200}", "\\btruncate\\s+.{0,100}(-s|--size)\\s*0", "\\becho\\s+-n\\s+>(?=\\s+\\S)\\s+(?!/dev/null)[^|&;]{1,200}", "\\bprintf\\s+[\"']\\s*[\"']?\\s*>(?=\\s+\\S)\\s+(?!/dev/null)[^|&;]{1,200}", "\\btee(?=\\s+\\S)\\s+(?!.{0,50}-a)(?!/dev/null)[^|&;]{1,200}"]
+    # A write redirection truncates whatever descriptor it names, so `2>`, `{fd}>` and `&>`
+    # count as `>`. The fd must start a word (`(?<!\S)`): in `echo 10:30> f` the `30` is part of
+    # the argument, not a descriptor on `:`.
+    # The target is one character: it only has to exist. A longer run matches exactly the same
+    # commands but stretches the span past a closing quote or into the next word, so a quoted
+    # example (`echo ': > f'`) escaped string-literal suppression and rated as a truncation.
+    # `/dev/null` is excluded only as a whole word, ended by a blank or a shell metacharacter:
+    # `/dev/null.bak` is a different file, and writing to it truncates it. In the `>` patterns the
+    # check runs before the blank run, so `2>  /dev/null` is a discard however many blanks it has.
+    # The target itself may still be a blank: that is the only way to reach a quoted target that
+    # starts with one (`"true" 2> ' ;'` reconstructs to `true 2>  ;`).
+    # Reconstruction keeps a quoted blank run but collapses an unquoted one, so the quoted target
+    # in `"true" > ' /dev/null'` reconstructs to the discard `true >  /dev/null`. Only the raw text
+    # can tell them apart, so the raw patterns accept a quoted producer word (`"true"`, `':'`) and
+    # `>|`, which the raw text does not alias to `>`.
+    patterns: ["^\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>\\|?(?=\\s+\\S)(?!\\s+/dev/null(?:[\\s|&;()<>`]|\\Z))\\s+[^|&;]", ":[\"']?\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>\\|?(?=\\s+\\S)(?!\\s+/dev/null(?:[\\s|&;()<>`]|\\Z))\\s+[^|&;]", "\\btrue[\"']?\\s+(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>\\|?(?=\\s+\\S)(?!\\s+/dev/null(?:[\\s|&;()<>`]|\\Z))\\s+[^|&;]", "\\btruncate\\s+.{0,100}(-s|--size)\\s*0", "\\becho[\"']?\\s+[\"']?-n[\"']?\\s+(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>\\|?(?=\\s+\\S)(?!\\s+/dev/null(?:[\\s|&;()<>`]|\\Z))\\s+[^|&;]", "\\bprintf[\"']?\\s+[\"']\\s*[\"']?\\s*(?:(?<!\\S)(?:\\d+|\\{[A-Za-z_]\\w*\\})|&)?>\\|?(?=\\s+\\S)(?!\\s+/dev/null(?:[\\s|&;()<>`]|\\Z))\\s+[^|&;]", "\\btee(?=\\s+\\S)\\s+(?!.{0,50}-a)(?!/dev/null(?:[\\s|&;()<>`]|\\Z))[^|&;]{1,200}"]
     alternatives: ["Use proper log rotation", "Backup before truncating", "Use >> for append"]
 
   - name: vcs_directory_deletion
