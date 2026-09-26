@@ -59,8 +59,9 @@ _WHITELIST_DISQUALIFIER = re.compile(r"\.\.|[<>\n\r]")
 # legal. A bare \r is refused there by _NON_BASH_BLANK.
 _WHOLE_LINE_DISQUALIFIER = re.compile(r"\.\.|[<>]")
 
-# One token of a whitelist pattern's SOURCE: an escape, a bracket expression, or one character.
-_SOURCE_TOKEN = re.compile(r"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|.", re.DOTALL)
+# One token of a whitelist pattern's SOURCE: an escape, a bracket expression, a `{m,n}`
+# quantifier, or one character.
+_SOURCE_TOKEN = re.compile(r"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|\{\d*(?:,\d*)?\}|.", re.DOTALL)
 # The tokens that write a command separator, so `is_whitelisted_whole` can ask how many commands
 # an entry claims to describe. A literal pipe is matched as a regex spells it (`\|` or `[|]`);
 # `&` and `;` are not metacharacters and mean themselves. A BARE `|` is deliberately absent: it
@@ -71,25 +72,26 @@ _SOURCE_TOKEN = re.compile(r"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|.", re.DOTALL)
 _SEPARATOR_TOKENS = frozenset({"\\|", "[|]", ";", "\\;", "[;]", "&", "\\&", "[&]"})
 # Separator tokens bash does not read as a separator, by what sits next to them. Beside `<` or `>`
 # a `&` or `|` belongs to a redirection (`2>&1`, `&>log`, `>|`). After a literal backslash a
-# separator is escaped: `\;`, find's terminator, is an argument. Followed by `?` or `*` it is
-# optional, so the entry does not promise the command after it. Counting any of these declares a
-# command the entry never describes, and the line gets to add one. Each reading errs toward
-# counting fewer, which fails closed: `\\\\;` in a pattern is an escaped backslash and then a real
-# `;`, and goes uncounted.
+# separator is escaped: `\;`, find's terminator, is an argument. Followed by `?`, `*` or a
+# quantifier with no minimum (`{0,1}`) it is optional, so the entry does not promise the command
+# after it. Counting any of these declares a command the entry never describes, and the line gets
+# to add one. Each reading errs toward counting fewer, which fails closed: `\\\\;` in a pattern is
+# an escaped backslash and then a real `;`, and goes uncounted.
 _REDIRECTION_TOKENS = frozenset({"<", "\\<", "[<]", ">", "\\>", "[>]"})
 _BACKSLASH_TOKENS = frozenset({"\\\\", "[\\\\]"})
-_OPTIONAL_TOKENS = frozenset({"?", "*"})
-# Tokens that can close a pattern without adding a word: blanks, quantifiers and the end anchor. A
-# separator followed by nothing else ends the last command (`npm run dev &`) rather than starting
-# another one.
-_PATTERN_END_TOKENS = frozenset({"\\s", " ", "*", "+", "?", "$", "\\Z", "\\z"})
+_OPTIONAL_QUANTIFIER = re.compile(r"[?*]|\{0*(?:,\d*)?\}")
+# A token that can close a pattern without adding a word: a blank in any spelling (` `, `\s`, `\t`,
+# `\ `, `[ \t]`), a quantifier, or the end anchor. A separator followed by nothing else ends the
+# last command (`npm run dev &`) rather than starting another one.
+_CLOSING_TOKEN = re.compile(r"[ \t\n*+?$]|\\[ tnsZz]|\[(?:[ \t\n]|\\[ tns])+\]|\{\d*(?:,\d*)?\}")
 # Syntax a token walk cannot count through. A verbose flag (global or scoped) lets `#` start a
 # comment, and an inline `(?#...)` is one: text that is never matched. A lookaround matches no text
-# at all. A character spelled by its code (`\x5c`, `\134`, `\N{...}`) could be a backslash, a `>`
-# or a separator the walk cannot see. A pattern holding any of them counts as declaring none, so it
-# clears no line and its commands are judged one at a time. The raw-source search also fires on an
-# escaped `\(?x` or `\\x`, which only ever refuses.
-_UNCOUNTABLE_SYNTAX = re.compile(r"\(\?(?:[aiLmsux]*x|#|<?[=!])|\\(?:[xuU0-7]|N\{)")
+# at all. A character spelled by its code (`\x5c`, `\134`, `\N{...}`) or repeated by a
+# backreference (`\8`, `(?P=name)`) could be a backslash, a `>` or a separator the walk cannot see.
+# A pattern holding any of them counts as declaring none, so it clears no line and its commands are
+# judged one at a time. The raw-source search also fires on an escaped `\(?x` or `\\x`, which only
+# ever refuses.
+_UNCOUNTABLE_SYNTAX = re.compile(r"\(\?(?:[aiLmsux]*x|#|<?[=!]|P=)|\\(?:[xuU0-9]|N\{)")
 # Whitespace that `\s` and `str.strip` accept but bash does not treat as blank: \r, \v, \f,
 # \x1c-\x1f and the Unicode spaces are WORD characters to bash. Only space, tab and newline aren't.
 _NON_BASH_BLANK = re.compile(r"[^\S \t\n]")
@@ -105,15 +107,14 @@ def _declared_separators(source: str) -> int:
     if _UNCOUNTABLE_SYNTAX.search(source):
         return 0
     tokens = _SOURCE_TOKEN.findall(source)
-    closing = _PATTERN_END_TOKENS | _SEPARATOR_TOKENS
-    while tokens and tokens[-1] in closing:
+    while tokens and (tokens[-1] in _SEPARATOR_TOKENS or _CLOSING_TOKEN.fullmatch(tokens[-1])):
         tokens.pop()
     count, was_separator = 0, False
     for before, token, after in zip(["", *tokens], tokens, [*tokens[1:], ""]):
         is_separator = (
             token in _SEPARATOR_TOKENS
             and before not in _BACKSLASH_TOKENS
-            and after not in _OPTIONAL_TOKENS
+            and not _OPTIONAL_QUANTIFIER.fullmatch(after)
             and not _REDIRECTION_TOKENS & {before, after}
         )
         if is_separator and not was_separator:

@@ -1297,6 +1297,9 @@ class TestDeclaredCountIsWhatBashRuns:
             (r"^npm\s+run\s+\S+(\s+&?>\s*\S+)?\s*\|\s*tee\s+\S+$", 1),
             (r"^a\s*;?\s*b$", 0),
             (r"^a\s*;*\s*b$", 0),
+            (r"^make\s+\S+\s*;{0,1}\s*make\s+test$", 0),
+            (r"^a\s*;{,1}\s*b$", 0),
+            (r"^a\s*;{1}\s*b$", 1),  # a minimum of one is a promise
             # A separator with nothing after it but blanks and the end ends the last command.
             (r"^npm\s+run\s+\S+\s*&$", 0),
             (r"^npm\s+run\s+dev &\s*$", 0),
@@ -1304,6 +1307,15 @@ class TestDeclaredCountIsWhatBashRuns:
             (r"^npm\s+run\s+dev\s+&\s+$", 0),
             (r"^npm\s+run\s+dev\s*&\s?$", 0),
             (r"^npm\s+run\s+dev\s*&\Z", 0),
+            (r"^npm\s+run\s+\S+\s*&[ \t]*$", 0),
+            (r"^npm\s+run\s+\S+\s*&[ ]?$", 0),
+            (r"^npm\s+run\s+\S+\s*&[\s]*$", 0),
+            (r"^npm\s+run\s+\S+\s*&\t?$", 0),
+            (r"^npm\s+run\s+\S+\s*&\ ?$", 0),
+            (r"^npm\s+run\s+\S+\s*&\n?$", 0),
+            (r"^npm\s+run\s+\S+\s*&\s{0,2}$", 0),
+            (r"^npm\s+run\s+\S+\s*&{0,1}$", 0),
+            ("^npm run dev &\t\n$", 0),
             pytest.param(
                 r"^npm\s+run\s+dev\s*&\z", 0, marks=pytest.mark.skipif(sys.version_info < (3, 14), reason="\\z is new")
             ),
@@ -1325,6 +1337,10 @@ class TestDeclaredCountIsWhatBashRuns:
             (r"^echo\s+a\u005c;\s+\S+$", 0),
             (r"^echo\s+a\U0000005c;\s+\S+$", 0),
             (r"^echo\s+a\N{REVERSE SOLIDUS};\s+\S+$", 0),
+            # ...and so does one repeating a group, which could be a backslash.
+            (r"^echo\s+(?P<e>\\)x\s+a(?P=e);\s+\S+$", 0),
+            (r"^(1)(2)(3)(4)(5)(6)(7)(\\)\s*a\8;\s+\S+$", 0),
+            (r"^(1)(2)(3)(4)(5)(6)(7)(8)(\\)\s*a\9;\s+\S+$", 0),
             # A group that is not one of those changes nothing.
             (r"(?i:^a\s*;\s*b)$", 1),
             (r"(?-x:^a\s*;\s*b)$", 1),
@@ -1386,6 +1402,8 @@ class TestDeclaredCountIsWhatBashRuns:
         (r"^make\s+\S+(\s+>\|\s*\S+)?$", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
         (r"^(?!.*;)make\s+\S+$", "make x&&rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
         (r"^npm\s+run\s+\S+\s*&$", "npm run dev;rm${IFS}-rf${IFS}~ &", "ifs_obfuscation"),
+        (r"^npm\s+run\s+\S+\s*&[ \t]*$", "npm run dev;rm${IFS}-rf${IFS}~ &", "ifs_obfuscation"),
+        (r"^make\s+\S+\s*;{0,1}\s*make\s+test$", "make x;rm${IFS}-rf${IFS}~ make test", "ifs_obfuscation"),
     ]
 
     @pytest.mark.parametrize(("pattern", "command"), [row[:2] for row in ROWS])
