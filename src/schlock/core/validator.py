@@ -446,6 +446,25 @@ def _check_dangerous_command_flags(
                     matched_rules=["ast_dangerous_combo:git"],
                 )
 
+            # include.path / init.templateDir load config or hooks nobody sees in the command, so
+            # they are BLOCKED on the key here, not elevated to HIGH with the other key-rated keys.
+            from schlock.core.substitution import _BOOTSTRAP_GIT_CONFIGS, key_rated_git_config_write  # noqa: PLC0415
+
+            bootstrap_reason = key_rated_git_config_write(args, _BOOTSTRAP_GIT_CONFIGS)
+            if bootstrap_reason:
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: {bootstrap_reason}",
+                    alternatives=[
+                        "Set the keys you need directly with `git config`, so each one is checked",
+                        "Copy hooks into the repository yourself instead of setting init.templateDir",
+                    ],
+                    exit_code=1,
+                    error=None,
+                    matched_rules=["ast_dangerous_combo:git"],
+                )
+
     return None
 
 
