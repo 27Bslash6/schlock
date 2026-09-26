@@ -851,9 +851,10 @@ _STRUCTURED_WORD = re.compile(r"^\S*=")
 _GLUED_MULTIWORD_OPTION = re.compile(r"^-[^-\s]\S*\s+\S")
 
 # Vetted commands that can hand git an argv the caller wrote: git itself, `op run -- git …`,
-# `find -exec`, awk's `system()` and `print |`, sed's `e`. Their own structural checks deny the
-# exec modes too; listing them here keeps this guard from leaning on those checks.
-# `sort --compress-program` and `sdiff --diff-program` run a program with arguments of their own.
+# `find -exec`, awk's `system()` and `print |`, sed's `e`. For awk this list is load-bearing, not
+# a spare: `print | c` with the target in a variable passes `_AWK_DANGEROUS_TEXT`, and only this
+# guard then sees the glued value. Deliberately not listed: `sort --compress-program` and
+# `sdiff --diff-program` run a program with arguments of their own, never arguments the caller wrote.
 _VETTED_LAUNCHERS: frozenset[str] = frozenset({"git", "op", "find", "awk", "sed"})
 
 

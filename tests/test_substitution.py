@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from schlock.core import validator as validator_module
-from schlock.core.parser import WRAPPER_COMMANDS, BashCommandParser
+from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
     _VETTED_LAUNCHERS,
@@ -20,6 +20,7 @@ from schlock.core.substitution import (
     SubstitutionType,
     SubstitutionValidationResult,
     SubstitutionValidator,
+    _hides_a_glued_git_payload,
     dangerous_awk,
     dangerous_sed,
 )
@@ -60,10 +61,22 @@ class TestSubstitutionConstants:
         overlap = SAFE_SUBSTITUTION_COMMANDS & DANGEROUS_SUBSTITUTION_COMMANDS
         assert len(overlap) == 0, f"Commands in both lists: {overlap}"
 
-    def test_vetted_commands_that_run_others_are_launchers(self):
-        """The glued-git-option guard exempts vetted readers, so a vetted wrapper must be a launcher."""
-        wrappers = SAFE_SUBSTITUTION_COMMANDS & (WRAPPER_COMMANDS | validator_module._DELEGATOR_COMMANDS)
-        assert wrappers <= _VETTED_LAUNCHERS, wrappers - _VETTED_LAUNCHERS
+    def test_whitelisted_wrapper_or_delegator_is_a_launcher(self):
+        """The glued-git-option guard exempts vetted readers, so a whitelisted delegator must be a launcher.
+
+        git, op, awk and sed are hand-vetted launchers outside the delegator table; the parametrised
+        guard test below pins each of them.
+        """
+        delegators = SAFE_SUBSTITUTION_COMMANDS & validator_module._DELEGATOR_COMMANDS
+        assert delegators <= _VETTED_LAUNCHERS, delegators - _VETTED_LAUNCHERS
+
+    @pytest.mark.parametrize("launcher", ["git", "op", "find", "awk", "sed"])
+    def test_glued_git_guard_scans_every_launcher(self, launcher):
+        """Called directly, below the structural checks, so dropping any launcher fails here."""
+        assert _hides_a_glued_git_payload([launcher, "git", "difftool", "-xa b"])
+
+    def test_glued_git_guard_skips_a_vetted_reader(self):
+        assert not _hides_a_glued_git_payload(["printf", "%s", "git", "-xa b"])
 
 
 class TestSubstitutionDataClasses:
