@@ -2749,7 +2749,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     risk_level=RiskLevel.BLOCKED,
                     message=f"BLOCKED: Dangerous shell construct detected - {', '.join(dangerous_constructs)}",
                     alternatives=[
-                        "Never use eval or exec - they enable arbitrary code execution",
+                        "Never use eval, exec or decoded output as code - they enable arbitrary code execution",
                         "Run commands directly instead of dynamically generating them",
                     ],
                     exit_code=1,

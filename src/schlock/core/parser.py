@@ -8,6 +8,7 @@ Regex-based parsing is explicitly NOT supported due to security risks.
 """
 
 import bisect
+import fnmatch
 import logging
 from typing import Any, NamedTuple, Optional
 
@@ -427,6 +428,143 @@ def heredoc_owner(node: Any) -> Optional[str]:
     if words[0] in WRAPPER_COMMANDS:
         return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), words[0])
     return words[0]
+
+
+# coreutils' base-N decoders. `basenc` takes the encoding as a flag, so its `-d` alone decides.
+# ponytail: named decoders only; `openssl enc -d -a`, `xxd -r` and friends keep the substitution
+# validator's unknown-command floor (HIGH). Add a name here when one earns a BLOCKED of its own.
+_DECODERS = ("base64", "base32", "basenc")
+
+
+def _is_decoder(name: str) -> bool:
+    """A decoder's basename, or a glob that bash could expand to one (`/usr/bin/bas?64`)."""
+    if name in _DECODERS:
+        return True
+    return any(c in name for c in "*?[") and any(fnmatch.fnmatchcase(d, name) for d in _DECODERS)
+
+
+def _is_decode_flag(arg: str) -> bool:
+    """`-d`, `-D` (BSD), a bundle carrying either (`-di`), a `--decode` prefix, or a word bash rewrites.
+
+    A word bash rewrites (`$F`, `` `echo -d` ``, `{-d,f}`, `[-]d`, `~-`) is read as a decode flag
+    because its value is unknowable here, and the only cost of guessing wrong is blocking an
+    encode whose output is run as a command.
+    """
+    if any(c in arg for c in "$`{*?[~"):
+        return True
+    if arg.startswith("--"):
+        return arg != "--" and "--decode".startswith(arg)
+    return arg.startswith("-") and ("d" in arg or "D" in arg)
+
+
+def _parameter_runs_decode(value: Any, seen: "dict[str, bool]") -> bool:
+    """True if a `${…}` body runs a base-N decode: `${v:-$(base64 -d x)}`, when `v` is unset.
+
+    bashlex leaves a parameter node childless, so the body is parsed here as the substitution
+    validator parses it (LAB-1731): `#` is not a comment inside `${…}`, so it is blanked. A body
+    that will not parse counts as a decode. That validator already refuses a truly unparseable
+    one, so this costs nothing there, but `parse` also reports running out of stack as a
+    ParseError: under `{ ` nested 243 deep this parse failed where the validator's succeeded,
+    and reading that as "no decode" let the payload through at HIGH. `seen` holds the answer
+    per body text, because every enclosing command walks the same body again: without it a
+    body nested N substitutions deep was parsed and walked N times.
+    """
+    if not isinstance(value, str) or ("$(" not in value and "`" not in value):
+        return False
+    if value not in seen:
+        try:
+            nodes = BashCommandParser().parse(value.replace("#", "_"))
+        except ParseError:
+            seen[value] = True
+        else:
+            seen[value] = any(_runs_decode(n, seen) for n in nodes)
+    return seen[value]
+
+
+def _runs_decode(node: Any, seen: "dict[str, bool]") -> bool:
+    """True if a base-N decode runs anywhere under `node`, nested and `${…}` substitutions included.
+
+    Matches the decoder anywhere in a command's words, not only as its name, so a wrapper
+    (`env base64 -d`, `busybox base64 -d`) is not a way around it. That also reads a decoder
+    merely named as an argument (`printf '%s' base64 -d`), deliberately: no list of commands
+    that run their operands is complete (`fakeroot`, `numactl`, a shell function), and no list of
+    ones that do not survives the same line redefining a name (`printf(){ "$@"; }`).
+    """
+    kind = getattr(node, "kind", None)
+    if kind == "command":
+        # Basename only to find the decoder: its arguments stay raw, so `${D%/}` keeps its `$`
+        # and `/tmp/-d` stays a file.
+        words = _command_words(node)
+        at = next((i for i, w in enumerate(words) if _is_decoder(w.split("/")[-1])), None)
+        if at is not None and any(_is_decode_flag(w) for w in words[at + 1 :]):
+            return True
+    if kind == "parameter":
+        return _parameter_runs_decode(getattr(node, "value", None), seen)
+    for attr in ("parts", "command", "list", "pipe", "compound"):
+        child = getattr(node, attr, None)
+        children = child if isinstance(child, list) else [child] if child is not None else []
+        if any(_runs_decode(c, seen) for c in children):
+            return True
+    return False
+
+
+def _is_bare_expansion(word: Any) -> bool:
+    """True if a word is nothing but unquoted expansions, which bash drops when they are empty.
+
+    `$(true) $(base64 -d f)` runs the decode as the command: the empty first word vanishes.
+    The word's parts covering its whole span is what rules out literal text and quotes.
+    """
+    parts = getattr(word, "parts", None) or []
+    if not parts or any(getattr(p, "kind", None) not in ("commandsubstitution", "parameter") for p in parts):
+        return False
+    start, end = word.pos
+    return sum(p.pos[1] - p.pos[0] for p in parts) == end - start
+
+
+_EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
+
+
+def _is_env_assignment(word: str) -> bool:
+    """`NAME=value` as a wrapper operand (`env NAME=value cmd`): assigned, never executed."""
+    name, eq, _ = word.partition("=")
+    return bool(eq) and name.isidentifier()
+
+
+def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
+    """True if a command node executes the output of a base-N decode as a command.
+
+    `$(base64 -d x)` runs the decoded bytes as a command — the decode-and-execute shape
+    `base64_shell_execution` exists for, reached without any `| sh` or `<<<` for a regex to see.
+    The substitution validator alone rates it an unknown command (HIGH), because it does not
+    know where the substitution sits, and position is the whole difference: the same decode in
+    an argument or assignment (`TOKEN=$(echo "$S" | base64 -d)`) only produces data (LAB-4702).
+
+    "The command" is every word bash may execute, not just the first: a leading bare expansion
+    can vanish, and a wrapper (`env`, `nohup`, `timeout 5`, `builtin`) executes an operand. So the
+    scan walks words until the first literal one, the command that actually runs; past a wrapper
+    it also steps over flags, `NAME=value` and numeric operands. It deliberately does NOT scan
+    every wrapper operand the way `_classify_sink` does: there a false hit only re-validates a
+    payload, here it is an un-promptable BLOCKED, and `timeout 30 curl -H "$(… | base64 -d)"`
+    or `sudo mysql -p"$(base64 -d pw)"` pass the decode as DATA to the command the wrapper runs.
+    ponytail: a wrapper's literal operand ends the scan, so `flock /tmp/l $(base64 -d x)` and
+    `timeout -s KILL 5 $(…)` stay at the substitution floor (HIGH). Per-wrapper operand arity
+    would close that; nothing here models it yet.
+    """
+    in_wrapper = False
+    for word in getattr(node, "parts", []):
+        if getattr(word, "kind", None) in ("assignment", "redirect"):
+            continue
+        text = getattr(word, "word", "")
+        if in_wrapper and (text.startswith("-") or text[:1].isdigit() or _is_env_assignment(text)):
+            continue
+        if _runs_decode(word, seen):
+            return True
+        if text.split("/")[-1] in _EXEC_WRAPPERS:
+            in_wrapper = True
+            continue
+        if not _is_bare_expansion(word):
+            return False
+    return False
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -1386,6 +1524,7 @@ class BashCommandParser:
             ['eval command detected']
         """
         dangers = []
+        decode_seen: dict[str, bool] = {}  # per `${…}` body text, see _parameter_runs_decode
 
         # Check for dangerous pipelines (curl | sh patterns)
         pipeline_dangers = self._detect_dangerous_pipelines(ast_nodes)
@@ -1424,6 +1563,9 @@ class BashCommandParser:
                 # SECURITY: kubectl exec, docker exec use "exec" as argument
                 # We must NOT flag those - they're container tools, not shell exec.
                 if node.kind == "command":
+                    if _runs_decoded_output(node, decode_seen):
+                        dangers.append("base-N decoded output executed as a command")
+
                     cmd_name = self._get_command_name(node)
 
                     # Direct eval/exec invocation
