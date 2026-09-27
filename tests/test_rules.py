@@ -1243,7 +1243,7 @@ class TestWhitelistRefusesCommandSeparators:
 
 
 class TestDeclaredCountIsWhatBashRuns:
-    """LAB-5377: an entry must not declare more commands than bash finds in the text it matches.
+    """An entry must not declare more commands than bash finds in the text it matches.
 
     `is_whitelisted_whole` clears a line when the parser finds one more command than the entry
     writes separators. A separator character bash does not read as one -- a redirection's `&`, an
@@ -1258,6 +1258,8 @@ class TestDeclaredCountIsWhatBashRuns:
     FIND_TEE = r"^find\s+src\s+-exec\s+wc\s+\{\}\s+\\;\s*\|\s*tee\s+[\w.]+$"
     FIND_EXEC = r"^find\s+\S+\s+-name\s+\S+\s+-exec\s+rm\s+\{\}\s+\\;$"
     FOO_BAR_ANY = r"^foo\s*\|\s*bar[\s\S]*$"
+    # FIND_TEE with find's `\;` written some way other than the one token the walk reads as its escape.
+    FIND_TEE_RESPELLED = tuple(map(FIND_TEE.replace, [r"\\;"] * 4, [r"(?:\\);", r"(\\);", r"\\{1};", r"\\+;"]))
 
     @staticmethod
     def _engine(tmp_path, pattern: str) -> RuleEngine:
@@ -1293,6 +1295,14 @@ class TestDeclaredCountIsWhatBashRuns:
             (FIND_TEE, 1),
             (r"^echo\s+a\\&\s+\S+$", 0),
             (r"^echo\s+a\\\|\s+\S+$", 0),
+            # Only the token right before a separator is read as its escape. Any other backslash atom --
+            # grouped, repeated, in a wider class, or escaping another backslash -- declares nothing.
+            *[(pattern, 0) for pattern in FIND_TEE_RESPELLED],
+            (FIND_TEE.replace(r"\\;", r"[\\\\];"), 1),  # a class of two backslashes is still one
+            (r"^echo\s+a[\w\\]\s+\S+\s*;\s*b$", 0),
+            (r"^echo\s+a\\\\;\s+\S+$", 0),
+            (r"^echo\s+a\\\s+\S+\s*;\s*b$", 0),
+            (r"^echo\s+[^\\]+\s*;\s*b$", 1),  # a negated class is an argument slot
             # An optional separator is not a promise of another command.
             (r"^npm\s+run\s+\S+(\s+&?>\s*\S+)?\s*\|\s*tee\s+\S+$", 1),
             (r"^a\s*;?\s*b$", 0),
@@ -1300,6 +1310,8 @@ class TestDeclaredCountIsWhatBashRuns:
             (r"^make\s+\S+\s*;{0,1}\s*make\s+test$", 0),
             (r"^a\s*;{,1}\s*b$", 0),
             (r"^a\s*;{1}\s*b$", 1),  # a minimum of one is a promise
+            (r"^a\s*;{}\s*b$", 1),  # `{}` is literal text, not a quantifier
+            (r"^a\s*;{,}\s*b$", 0),  # ...but `{,}` is one, with no minimum
             # A separator with nothing after it but blanks and the end ends the last command.
             (r"^npm\s+run\s+\S+\s*&$", 0),
             (r"^npm\s+run\s+dev &\s*$", 0),
@@ -1395,6 +1407,7 @@ class TestDeclaredCountIsWhatBashRuns:
         (r"(?ix) ^make \s+ \S+ $  # build; nothing else", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
         (r"(?sx) ^make \s+ \S+ $  # a; b", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
         ("(?x:^make \\s+ \\S+ # a; b\n)$", "make x;rm${IFS}-rf${IFS}~", "ifs_obfuscation"),
+        *[(pattern, "find src -exec wc {} \\; | tee\nreboot", "file_truncation") for pattern in FIND_TEE_RESPELLED],
         (FOO_BAR_ANY, "foo | bar x\n\\", None),
         (FOO_BAR_ANY, "foo | bar x\n \\", None),
         (FOO_BAR_ANY, "foo | bar x\n\t\\", None),

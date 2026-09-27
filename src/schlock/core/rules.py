@@ -59,9 +59,11 @@ _WHITELIST_DISQUALIFIER = re.compile(r"\.\.|[<>\n\r]")
 # legal. A bare \r is refused there by _NON_BASH_BLANK.
 _WHOLE_LINE_DISQUALIFIER = re.compile(r"\.\.|[<>]")
 
-# One token of a whitelist pattern's SOURCE: an escape, a bracket expression, a `{m,n}`
-# quantifier, or one character.
-_SOURCE_TOKEN = re.compile(r"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|\{\d*(?:,\d*)?\}|.", re.DOTALL)
+# A `{m,n}` quantifier as Python reads one: at least a digit or a comma. `{}` is literal text.
+_QUANTIFIER = r"\{(?:\d+(?:,\d*)?|,\d*)\}"
+# One token of a whitelist pattern's SOURCE: an escape, a bracket expression, a quantifier, or one
+# character.
+_SOURCE_TOKEN = re.compile(rf"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|{_QUANTIFIER}|.", re.DOTALL)
 # The tokens that write a command separator, so `is_whitelisted_whole` can ask how many commands
 # an entry claims to describe. A literal pipe is matched as a regex spells it (`\|` or `[|]`);
 # `&` and `;` are not metacharacters and mean themselves. A BARE `|` is deliberately absent: it
@@ -75,15 +77,13 @@ _SEPARATOR_TOKENS = frozenset({"\\|", "[|]", ";", "\\;", "[;]", "&", "\\&", "[&]
 # separator is escaped: `\;`, find's terminator, is an argument. Followed by `?`, `*` or a
 # quantifier with no minimum (`{0,1}`) it is optional, so the entry does not promise the command
 # after it. Counting any of these declares a command the entry never describes, and the line gets
-# to add one. Each reading errs toward counting fewer, which fails closed: `\\\\;` in a pattern is
-# an escaped backslash and then a real `;`, and goes uncounted.
+# to add one. Each reading errs toward counting fewer, which fails closed.
 _REDIRECTION_TOKENS = frozenset({"<", "\\<", "[<]", ">", "\\>", "[>]"})
-_BACKSLASH_TOKENS = frozenset({"\\\\", "[\\\\]"})
-_OPTIONAL_QUANTIFIER = re.compile(r"[?*]|\{0*(?:,\d*)?\}")
+_OPTIONAL_QUANTIFIER = re.compile(rf"[?*]|(?=\{{0*[,}}]){_QUANTIFIER}")
 # A token that can close a pattern without adding a word: a blank in any spelling (` `, `\s`, `\t`,
 # `\ `, `[ \t]`), a quantifier, or the end anchor. A separator followed by nothing else ends the
 # last command (`npm run dev &`) rather than starting another one.
-_CLOSING_TOKEN = re.compile(r"[ \t\n*+?$]|\\[ tnsZz]|\[(?:[ \t\n]|\\[ tns])+\]|\{\d*(?:,\d*)?\}")
+_CLOSING_TOKEN = re.compile(rf"[ \t\n*+?$]|\\[ tnsZz]|\[(?:[ \t\n]|\\[ tns])+\]|{_QUANTIFIER}")
 # Syntax a token walk cannot count through. A verbose flag (global or scoped) lets `#` start a
 # comment, and an inline `(?#...)` is one: text that is never matched. A lookaround matches no text
 # at all. A character spelled by its code (`\x5c`, `\134`, `\N{...}`) or repeated by a
@@ -95,6 +95,17 @@ _UNCOUNTABLE_SYNTAX = re.compile(r"\(\?(?:[aiLmsux]*x|#|<?[=!]|P=)|\\(?:[xuU0-9]
 # Whitespace that `\s` and `str.strip` accept but bash does not treat as blank: \r, \v, \f,
 # \x1c-\x1f and the Unicode spaces are WORD characters to bash. Only space, tab and newline aren't.
 _NON_BASH_BLANK = re.compile(r"[^\S \t\n]")
+
+
+def _is_backslash(atom: str) -> bool:
+    """Whether a source token writes a literal backslash: `\\\\`, or a class listing `\\\\`.
+
+    Only the token directly before a separator is read as its escape. A backslash atom anywhere
+    else -- grouped `(?:\\\\);`, repeated `\\\\+;`, escaping another backslash `\\\\\\\\;` --
+    could still be the escape the walk cannot place, so `_declared_separators` counts none.
+    A negated class (`[^\\\\]`) is an argument slot, not a spelling of `\\`.
+    """
+    return atom == "\\\\" or (atom[:1] == "[" and atom[:2] != "[^" and "\\\\" in re.findall(r"\\.", atom))
 
 
 def _declared_separators(source: str) -> int:
@@ -111,9 +122,11 @@ def _declared_separators(source: str) -> int:
         tokens.pop()
     count, was_separator = 0, False
     for before, token, after in zip(["", *tokens], tokens, [*tokens[1:], ""]):
+        if _is_backslash(token) and after not in _SEPARATOR_TOKENS:
+            return 0
         is_separator = (
             token in _SEPARATOR_TOKENS
-            and before not in _BACKSLASH_TOKENS
+            and not _is_backslash(before)
             and not _OPTIONAL_QUANTIFIER.fullmatch(after)
             and not _REDIRECTION_TOKENS & {before, after}
         )
