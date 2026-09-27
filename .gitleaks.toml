@@ -11,5 +11,9 @@ useDefault = true
 [allowlist]
   description = "Test fixtures for secret scrubbing functionality"
   paths = [
-    '''tests/test_audit_scrubbing\.py''',
+    '''^tests/test_audit_scrubbing\.py$''',
+  ]
+  # The fake token in the tests/test_audit.py redaction fixtures, matched exactly.
+  regexes = [
+    '''^sk-live-abc123$''',
   ]
