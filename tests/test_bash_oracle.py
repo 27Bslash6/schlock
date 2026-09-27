@@ -146,9 +146,9 @@ class TestContainment:
             "touch /dev/x 2>/dev/null || echo dev-ro",
             sandbox,
         )
-        lines = result.stdout.split()
-        assert int(lines[0].split("=")[1]) <= 64 and int(lines[1].split("=")[1]) <= 64, result.stdout
-        assert lines[2] == "dev-ro"
+        sizes = re.fullmatch(r"tmp=(\d+)\nhome=(\d+)\ndev-ro\n", result.stdout)
+        assert sizes, (result.stdout, result.stderr)
+        assert int(sizes[1]) <= 64 and int(sizes[2]) <= 64, result.stdout
 
     def test_process_count_is_bounded(self, sandbox):
         result = oracle("ulimit -u", sandbox)
