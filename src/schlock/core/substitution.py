@@ -1086,12 +1086,15 @@ def _names_option(word: str, options: frozenset[str]) -> bool:
 def _op_executes_an_argument(args: list[str]) -> bool:
     """Does this ``op`` invocation run a shell command (`op run`) rather than read the vault?
 
-    `op run` executes its argument and no delegation path re-validates it. Allowlist the subcommand
-    the way git's is: the first non-flag word must be a known read-only one, else op fails closed. An
-    expanded word (`op $'run'`, `op {run,}`) never equals a literal member, so it fails closed too. A
-    value taken by a global flag (`op --account A read`) is read as the subcommand and fails closed —
-    an accepted over-block on a rare shape.
+    `op run` executes its argument and no delegation path re-validates it. It suppresses nothing
+    unless all three hold: every word is a plain literal (so no `$'run'` / `{run,}` expands past the
+    check), no word is ``run`` (so a global flag's value cannot be misread as the subcommand while
+    the real ``run`` sits later, e.g. ``op --account read run``), and the first non-flag word is a
+    known read-only subcommand. The cost is an over-block on an expanded read (`op read op://…/$X`)
+    only when it also carries a dangerous-looking argument.
     """
+    if any(not _is_plain_literal(word) for word in args) or "run" in args:
+        return True
     for word in args:
         if word.startswith("-"):
             continue
@@ -1132,6 +1135,35 @@ def _runs_an_exec_option(words: list[str]) -> bool:
     return False
 
 
+# The positive signals that a git subcommand runs one of its own arguments, used to catch a git
+# command a wrapper hands off (`op run -- git …`, `find … -exec git …`) wherever it sits in the
+# segment, not only at its head. Restores the command-agnostic floor main had before the head-only
+# rule, but by these signals alone — never the head rule's fail-closed default — so an ordinary
+# `git` argument (`grep -rn git src`) is not read as a subcommand. `submodule foreach`,
+# `submodule--helper foreach` and `bisect run` take the command as the word after the subcommand;
+# `remote-ext`, `for-each-repo` and `filter-branch` execute what they are given by name alone.
+_GIT_POSITIONAL_EXEC = frozenset({"remote-ext", "for-each-repo", "filter-branch"})
+_GIT_POSITIONAL_EXEC_PAIRS = {"submodule": "foreach", "submodule--helper": "foreach", "bisect": "run"}
+
+
+def _git_exec_shape_anywhere(words: list[str]) -> bool:
+    """Does a ``git`` anywhere in the segment carry a shape that runs one of its arguments?"""
+    for index, word in enumerate(words):
+        if word.rsplit("/", 1)[-1] != "git":
+            continue
+        subcommand, args = _git_subcommand(words[index + 1 :])
+        if not subcommand:
+            continue
+        options = _GIT_EXEC_OPTIONS.get(subcommand)
+        if options and any(_names_option(arg, options) for arg in args):
+            return True
+        if subcommand in _GIT_POSITIONAL_EXEC:
+            return True
+        if _GIT_POSITIONAL_EXEC_PAIRS.get(subcommand) in args:
+            return True
+    return False
+
+
 def _executes_an_argument(words: list[str]) -> bool:
     """Does this command segment hand one of its own arguments to a shell?
 
@@ -1140,7 +1172,11 @@ def _executes_an_argument(words: list[str]) -> bool:
     payload suppressed). Deliberately coarse — a match disables suppression for its own segment,
     which only ever costs a false positive on a dangerous-looking argument, never a missed denial.
     """
-    return any(word in _ARGUMENT_EXECUTING_FLAGS for word in words) or _runs_an_exec_option(words)
+    return (
+        any(word in _ARGUMENT_EXECUTING_FLAGS for word in words)
+        or _runs_an_exec_option(words)
+        or _git_exec_shape_anywhere(words)
+    )
 
 
 def _collect_spans(segment: list[tuple[int, str, bool]], text: str, ranges: list[tuple[int, int]]) -> None:

@@ -1852,15 +1852,43 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git remote-ext o safe & grep -rn 'rm -rf' docs)\"",
             # a pipeline inside a list goes through _render_segment_tokens, the third render site
             "echo \"$(true && git lfs ls-files | grep -c 'rm -rf')\"",
-            # `git` sitting in another command's argument list names no subcommand — the word after
-            # it must not be read as one and failed closed.
+            # `git` sitting in another command's argument list names no subcommand, and a plain
+            # git word with no exec shape after it must not trip the anywhere floor.
             "echo \"$(grep -rn git src 'rm -rf')\"",
             "echo \"$(grep -rn git -e 'rm -rf' src)\"",
+            'echo "$(echo git status)"',
+            'echo "$(ls -d git)"',
+            'echo "$(cat git/config)"',
         ],
     )
     def test_fail_closed_is_scoped_to_the_git_segment(self, command):
         """Failing closed on a git subcommand suppresses that segment only, and only when git leads it."""
         assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A git command a wrapper runs executes wherever it sits, not only at the segment head.
+            # op reaches it through a flag value that spells an inert subcommand with the real `run`
+            # later; find reaches it through an expansion that carries no flag text.
+            "echo \"$(op --account read run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op --config read run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(find . $E git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . ${E} git submodule foreach 'rm -rf /' ';')\"",
+            # the floor is positive-signal, so it covers keyed options and every positional shape
+            "echo \"$(op run -- git fetch --upload-pack 'rm -rf /' origin)\"",
+            "echo \"$(op run -- git remote-ext o 'rm -rf /')\"",
+            "echo \"$(xargs git submodule--helper foreach 'rm -rf /')\"",
+            "echo \"$(find . -exec git for-each-repo --config=x rebase -x 'rm -rf /' main ';')\"",
+            # op run executes a non-git command too; the flag-value shape must not hide the `run`
+            "echo \"$(op --account read run -- watch 'rm -rf /')\"",
+        ],
+    )
+    def test_a_wrapped_git_exec_shape_is_caught_anywhere(self, command):
+        """A git exec shape a wrapper hands off executes wherever it sits in the segment."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         "command",
