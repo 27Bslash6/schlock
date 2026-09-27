@@ -1755,3 +1755,32 @@ class TestNewlineEndsRmOperandSpan:
         result = validate_command(command, config_path=safety_rules_path)
         assert rule in result.matched_rules
         assert result.risk_level == risk
+
+    @pytest.mark.parametrize(
+        ("rule", "text"),
+        [
+            ("vcs_directory_deletion", 'rm -f "absent\nname" .git/config'),
+            ("vcs_directory_deletion", "rm -f 'absent\nname' .hg"),
+            ("vcs_directory_deletion", 'rm "x\ny" -rf .svn'),
+            ("hidden_glob_destruction", 'rm -fr "absent\nname" .*'),
+            ("hidden_glob_destruction", 'rm .* "x\ny" -rf'),
+            ("ssh_known_hosts_manipulation", 'rm -f "a\nb" ~/.ssh/known_hosts'),
+            ("history_evasion_extended", "rm -f 'a\nb' ~/.bash_history"),
+        ],
+    )
+    def test_span_crosses_a_quoted_newline(self, safety_rules_path, rule, text):
+        """A newline inside a quoted operand is data: the rm goes on to a later, real target."""
+        engine = RuleEngine(safety_rules_path)
+        assert any(p.search(text) for p in engine.compiled_patterns[rule]), f"{rule} stopped inside a quote in {text!r}"
+
+    @pytest.mark.parametrize(
+        ("command", "risk"),
+        [
+            ('rm -f "absent\nname" .git/config', RiskLevel.HIGH),
+            ('rm -fr "absent\nname" .*', RiskLevel.BLOCKED),
+            ("rm -rf it's .git", RiskLevel.BLOCKED),  # an unpaired quote is an ordinary character
+        ],
+    )
+    def test_quoted_newline_keeps_the_verdict(self, safety_rules_path, command, risk):
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.risk_level == risk, f"{command!r} rated {result.risk_level.name} via {result.matched_rules}"

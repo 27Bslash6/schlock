@@ -20,9 +20,9 @@ rules:
     description: rm -rf .* can delete parent directory via .. glob expansion
     risk_level: BLOCKED
     patterns:
-      # rm with recursive flags and .* glob; spans stop at a newline (see vcs_directory_deletion)
-      - '\brm\s+[^;|&\n]*(-rf|-fr|-r\s+-f|-f\s+-r)[^;|&\n]*\s+\.\*(\s|$)'
-      - '\brm\s+\.\*[^;|&\n]*(-rf|-fr|-r\s+-f|-f\s+-r)'
+      # rm with recursive flags and .* glob; spans stop at a bare newline (see vcs_directory_deletion)
+      - '\brm\s+(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*(-rf|-fr|-r\s+-f|-f\s+-r)(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*\s+\.\*(\s|$)'
+      - '\brm\s+\.\*(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*(-rf|-fr|-r\s+-f|-f\s+-r)'
       # Direct .* at end of rm command
       - '\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?\.\*\s*$'
     alternatives:
@@ -74,17 +74,20 @@ rules:
       # reason: `\brm` anchors at every line and each anchor dragged both spans
       # to the end of the command, so a 200-line `rm -rf <path>` cleanup cost
       # over a second (a 40KB one, several) on a hook that runs before every
-      # Bash call. Accepted residual: a newline INSIDE one word -- quoted, or in
-      # a `$( )` -- is data, not a boundary, yet now also ends the span, so that
-      # shape is rated only by whatever else matches it (recursive_delete when a
-      # `-r` flag is present). hidden_glob_destruction above carries the same
-      # change.
+      # Bash call. A newline inside a quoted word is data, not a boundary: an
+      # operand like "a<LF>b" must not hide a later `.git` operand. So each span
+      # reads a paired quote as one atom that may hold a newline, and a quote
+      # with no partner as an ordinary character; the lookaheads leave exactly
+      # one reading at each quote, so the loop cannot backtrack between them.
+      # Accepted residual: a newline inside `$( )` still ends the span.
+      # hidden_glob_destruction above, ssh_known_hosts_manipulation and
+      # history_evasion_extended carry the same span.
       # .git directory deletion
-      - '\brm\s+[^;|&\n]*\.git(/|\s|$)'
-      - '\brm\s+[^;|&\n]*-[rf]+[^;|&\n]*\.git(/|\s|$)'
+      - '\brm\s+(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*\.git(/|\s|$)'
+      - '\brm\s+(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*-[rf]+(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*\.git(/|\s|$)'
       # .hg (Mercurial), .svn (Subversion)
-      - '\brm\s+[^;|&\n]*\.(hg|svn)(/|\s|$)'
-      - '\brm\s+[^;|&\n]*-[rf]+[^;|&\n]*\.(hg|svn)(/|\s|$)'
+      - '\brm\s+(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*\.(hg|svn)(/|\s|$)'
+      - '\brm\s+(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*-[rf]+(?:[^;|&\n"'']|"[^";|&]*"|''[^'';|&]*''|"(?![^";|&]*")|''(?![^'';|&]*''))*\.(hg|svn)(/|\s|$)'
     alternatives:
       - "Use 'git clean -fd' to remove untracked files"
       - "Backup .git directory before deletion"
