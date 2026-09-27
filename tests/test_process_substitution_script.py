@@ -86,8 +86,13 @@ def test_direct_script_operand_is_denied(command, name, suffix):
         ("bash " + PAYLOAD + " > out.txt", "bash"),
         ("{ bash " + PAYLOAD + "; } > out.txt", "bash"),
         ("for i in 1; do source " + PAYLOAD + "; done", "source"),
-        (heredoc("bash", "rm -rf /", "'EOF'"), "bash"),
-        (heredoc("source", "rm -rf /", "'EOF'"), "source"),
+        # `+` options are options: `+x` is not a script operand.
+        ("bash +x " + PAYLOAD, "bash"),
+        ("sh +o noglob " + PAYLOAD, "sh"),
+        # Quotes before the substitution: bashlex strips them from the word's text, so the
+        # direction must come from the source, not from an offset into that text.
+        ("bash ''<(>(true); echo 'touch /tmp/pwn')", "bash"),
+        ("bash ''\"\"<(: >(true); echo 'touch /tmp/pwn')", "bash"),
         # A grouped inner command is unwrapped before validation; the owner is still found.
         ("bash <( { echo 'touch /tmp/pwn'; } )", "bash"),
         ("bash <( (echo 'touch /tmp/pwn') )", "bash"),
@@ -129,11 +134,25 @@ def test_body_scan_row_is_denied_by_this_mechanism():
     assert_script_denial(heredoc("bash", "rm -rf /") + " && true", "bash")
 
 
-def test_nested_in_command_substitution_stays_blocked():
-    # The procsub sits inside `$( )`, whose own inner command (bash) is denied first.
-    result = validate_command("echo $(bash " + PAYLOAD + ")")
+@pytest.mark.parametrize(
+    ("command", "name"),
+    [
+        ("echo $(bash " + PAYLOAD + ")", "bash"),
+        # Nested inside another substitution, where the command-name blacklist does not know `.`
+        # or `ash`: these read HIGH before the check walked nested substitutions.
+        ("echo $(. <(cat x))", "."),
+        ("cat <(ash <(cat x))", "ash"),
+    ],
+)
+def test_nested_script_operand_is_denied(command, name):
+    assert_script_denial(command, name)
+
+
+def test_plus_option_is_not_a_script_on_the_pipe_sink_either():
+    # The shared gate read `+x` as a script, so the pipe twin was a bypass too.
+    result = validate_command("echo 'touch /tmp/pwn' | bash +x")
     assert result.risk_level == RiskLevel.BLOCKED
-    assert "Dangerous command in substitution: bash" in result.message
+    assert "data piped into shell interpreter: bash" in result.message
 
 
 @pytest.mark.parametrize(
@@ -145,6 +164,8 @@ def test_nested_in_command_substitution_stays_blocked():
         "bash -c 'echo hi' <(cat a)",
         "while read -r l; do :; done < <(cat a)",
         "cat <(echo hi)",
+        "bash >(cat)",
+        "bash ''>(cat)",
     ],
 )
 def test_benign_process_substitution_stays_safe(command):

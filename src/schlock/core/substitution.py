@@ -1072,7 +1072,8 @@ def _strip_group_terminator(node: Any) -> Any:
 
 
 # `source FILE` and `. FILE` run FILE in the current shell, so a process substitution
-# there is a script exactly as it is for `bash FILE`.
+# there is a script exactly as it is for `bash FILE`. Delete once `source`/`.` are in
+# STDIN_EXEC_INTERPRETERS, so that set stays the one source of truth.
 _SOURCING_BUILTINS = frozenset({"source", "."})
 
 
@@ -1174,8 +1175,12 @@ class SubstitutionValidator:
                 return  # Don't recurse into substitution here - handled by _create_substitution_node
 
             if node.kind == "processsubstitution":
-                # Determine if input <(cmd) or output >(cmd)
-                sub_type = SubstitutionType.PROCESS_INPUT  # Default, could enhance detection
+                # Read the direction from the source, which the node's position indexes. A word's
+                # text cannot tell: bashlex strips its quotes, so `bash ''<(… >(…) …)` shifted a
+                # word-relative read onto the inner `>(` (LAB-4808). No source reads as input,
+                # which is the side that gets checked.
+                is_output = command is not None and command[node.pos[0] : node.pos[0] + 2] == ">("
+                sub_type = SubstitutionType.PROCESS_OUTPUT if is_output else SubstitutionType.PROCESS_INPUT
                 sub_node = self._create_substitution_node(node, sub_type, current_depth, command, budget)
                 if sub_node:
                     substitutions.append(sub_node)
@@ -2367,16 +2372,26 @@ class SubstitutionValidator:
         results: list[SubstitutionValidationResult] = []
 
         for sub in substitutions:
-            # Before the inner command is judged, and instead of it: whether `echo` or `cat`
-            # passes says nothing about the program it prints, and the inner verdict must not
-            # depend on that command resolving at all (LAB-4808).
-            is_script, reason = self.check_process_substitution_context(ast_nodes, sub)
-            if is_script:
+            # Replaces the inner verdict: it must not depend on the inner command resolving (LAB-4808).
+            reason = self._script_substitution(ast_nodes, sub)
+            if reason:
                 results.append(SubstitutionValidationResult(allowed=False, risk_level=RiskLevel.BLOCKED, message=reason))
                 continue
             results.append(self.validate_substitution(sub))
 
         return results
+
+    def _script_substitution(self, ast_nodes: list[Any], sub: SubstitutionNode) -> str:
+        """The denial for the first process substitution run as a script in `sub`'s tree, else "".
+
+        Nested ones too: `validate_substitution` judges a nested `. <(X)` only by its command
+        name, and `.` is not blacklisted, so `echo $(. <(X))` read HIGH. They are nodes of
+        `ast_nodes`, so the identity lookup finds their owners.
+        """
+        is_script, reason = self.check_process_substitution_context(ast_nodes, sub)
+        if is_script:
+            return reason
+        return next(filter(None, (self._script_substitution(ast_nodes, n) for n in sub.nested_substitutions)), "")
 
     def check_process_substitution_context(self, ast_nodes: list[Any], sub_node: SubstitutionNode) -> tuple[bool, str]:
         """Whether a process substitution is the script an interpreter runs (LAB-4808).
@@ -2388,8 +2403,9 @@ class SubstitutionValidator:
         Script position is `source`/`.`'s operand, or an interpreter's first operand with
         no unambiguous program before it. The pipe detector's own set and gate decide it,
         so the two sinks cannot drift: `bash -o pipefail <(X)` is a script, `bash script.sh
-        <(X)` and `bash -c P <(X)` are not. `>(X)` gives the interpreter a pipe that X
-        reads, never X's output. Wrapped shells (`env bash <(X)`) are LAB-4706's.
+        <(X)` and `bash -c P <(X)` are not. `>(X)` (PROCESS_OUTPUT) gives the interpreter a
+        pipe that X reads, never X's output. Wrapped shells (`env`/`command`/`exec`/`sudo`
+        `bash <(X)`) are LAB-4706's.
 
         Args:
             ast_nodes: The AST `sub_node` was extracted from.
@@ -2406,9 +2422,6 @@ class SubstitutionValidator:
         words, at = owner
         name = words[0].word.split("/")[-1]
         if at == 0 or (name not in STDIN_EXEC_INTERPRETERS and name not in _SOURCING_BUILTINS):
-            return False, ""
-        start = sub_node.source_node.pos[0] - words[at].pos[0]
-        if words[at].word[start : start + 2] == ">(":
             return False, ""
         if not _reads_stdin_as_program(name, [word.word for word in words[1:at]]):
             return False, ""

