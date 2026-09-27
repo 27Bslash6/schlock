@@ -777,6 +777,7 @@ class TestTopLevelAwkSystem:
             # number or behind a continuation, where the number or variable ends at `system`.
             "awk '{system\\\n($0)}' f",
             "awk '{system \\\r\n($0)}' f",
+            "awk '{system\\ \n($0)}' f",
             "awk 'BEGIN{x=1system(\"id\")}'",
             "awk '{x=1system($0)}' f",
             "awk 'BEGIN{x\\\nsystem(\"id\")}'",
@@ -812,6 +813,10 @@ class TestTopLevelAwkSystem:
             "x=$(awk '{print $1 \" filesystem\" (NR)}' f)",
             # An awk string that reads like a flag is not a flag.
             "x=$(awk '\"-l\" == $1' f)",
+            # `\(` is a literal paren in an awk regex or string, not a continuation before a call.
+            "awk '/system\\(/ {print}' f",
+            "x=$(awk '/system\\(/ {print}' /dev/null)",
+            "x=$(awk '{print \"system\\(\"}' /dev/null)",
         ],
     )
     def test_benign_awk_stays_safe(self, command):
@@ -832,8 +837,9 @@ class TestTopLevelAwkSystem:
             [("awk", ["system" * (MAX_COMMAND_SIZE // 6)])],
             [("awk", ["system" + " \\\n" * (MAX_COMMAND_SIZE // 3)])],
             [("awk", [("system" + " " * 58) * (MAX_COMMAND_SIZE // 64)])],
+            [("awk", [("system\\" + " " * 58) * (MAX_COMMAND_SIZE // 65)])],
         ],
-        ids=["awk_dense", "system_dense", "system_one_long_gap", "system_many_gaps"],
+        ids=["awk_dense", "system_dense", "system_one_long_gap", "system_many_gaps", "system_backslash_blanks"],
     )
     def test_check_is_linear_on_64kb(self, commands_with_args):
         start = time.process_time()
