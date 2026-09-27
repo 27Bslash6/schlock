@@ -822,18 +822,24 @@ _SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 
 
 def _shift_positions(node: Any, offset: int) -> None:
-    """Move every node in a subtree `offset` places right (a re-parsed fragment back into its command)."""
-    if isinstance(node, list):
-        for item in node:
-            _shift_positions(item, offset)
-        return
-    if not hasattr(node, "kind"):
-        return
-    if getattr(node, "pos", None):
-        node.pos = (node.pos[0] + offset, node.pos[1] + offset)
-    for value in vars(node).values():
-        if isinstance(value, list) or hasattr(value, "kind"):
-            _shift_positions(value, offset)
+    """Move every node in a subtree `offset` places right (a re-parsed fragment back into its command).
+
+    Each node once, by identity: bashlex links some nodes twice (a `function` node holds its
+    name and body in `parts` AND in `.name`/`.body`), and a node shifted twice indexes nothing.
+    """
+    seen: set[int] = set()
+    pending = [node]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, list):
+            pending.extend(item)
+            continue
+        if not hasattr(item, "kind") or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if getattr(item, "pos", None):
+            item.pos = (item.pos[0] + offset, item.pos[1] + offset)
+        pending.extend(value for value in vars(item).values() if isinstance(value, list) or hasattr(value, "kind"))
 
 
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
@@ -1433,6 +1439,10 @@ class BashCommandParser:
         ``#`` is blanked first: it opens a comment on a command line but is plain text inside
         ``${…}``, and SubstitutionValidator._substitutions_in_parameter records what that cost.
         Node positions in the AST are relative to the returned text, not the outer command.
+
+        Every call returns a FRESH tree, and that is load-bearing: _parameter_code_parts shifts
+        the positions of the nodes it gets in place. A memo here must hand out copies, or a
+        shared tree is shifted again by every reader and the raw body pass reads the wrong text.
         """
         reparsed = value.replace("#", "_")
         return reparsed, self.parse(reparsed)
@@ -1457,7 +1467,12 @@ class BashCommandParser:
                 return []
             try:
                 _, body = self.parameter_body(value)
-            except (ParseError, ValueError):
+            except (ParseError, ValueError) as exc:
+                # A spent budget or a stack overflow is about where the walker stands, not about
+                # the body: SubstitutionValidator re-parses it from a shallow stack and can decode
+                # it, so swallowing either here left only its HIGH verdict. Raise to the validator.
+                if isinstance(exc, ParseBudgetError) or isinstance(getattr(exc, "original_error", None), RecursionError):
+                    raise
                 return []
             found: list[Any] = []
 

@@ -26,7 +26,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
-from .parser import _SUBSTITUTION_INTRODUCERS, EXEC_CHILD_ATTRS, _resolve_multicall, without_fd_variables
+from .parser import _SUBSTITUTION_INTRODUCERS, _resolve_multicall, without_fd_variables
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1211,14 +1211,8 @@ class SubstitutionValidator:
             # reaches the simple form and misses every compound one. An fd-duplication target is an
             # int with no `kind` and falls straight back out of visit(). `heredoc` stays
             # off the list: the redirect branch above reads its body.
-            for attr in EXEC_CHILD_ATTRS:
-                if hasattr(node, attr):
-                    child = getattr(node, attr)
-                    if isinstance(child, list):
-                        for item in child:
-                            visit(item, current_depth)
-                    elif child:
-                        visit(child, current_depth)
+            for child in self.parser.exec_children(node):
+                visit(child, current_depth)
 
         for node in ast_nodes or []:
             visit(node, depth)
