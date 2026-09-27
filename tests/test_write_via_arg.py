@@ -167,7 +167,8 @@ class TestFindWriteFlagsTopLevel:
             "sort -t $'\\'' -o /etc/cron.d/x f",
             "find . -name $'\\'' -fprint /etc/cron.d/x",
             "find . -name $'a\\'b' -fprint /etc/cron.d/x",
-            # `$$` is the PID: the `'` after it opens a PLAIN quote, which a backslash closes.
+            # `$$` is the PID: the `'` after it opens a PLAIN quote. A backslash is literal inside
+            # it, so the next `'` closes it.
             "sort -t $$'\\' -o /etc/cron.d/x f",
             "sort -t $$'\\' -o/etc/cron.d/x f",
             "find . -name $$'\\' -fprint /etc/cron.d/x",
@@ -175,6 +176,17 @@ class TestFindWriteFlagsTopLevel:
             "find . -name $$$$'\\' -fprint /etc/cron.d/x",
             # `$$$'` is the PID then an ANSI-C span, so the `\'` in it does not close it.
             "sort -t $$$'\\'' -o /etc/cron.d/x f",
+            # bash deletes a backslash-newline before it reads the word, so a split `$` run pairs
+            # as if it were joined: `$\<nl>$$'` is `$$$'` and `$\<nl>$'` is `$$'`.
+            "sort -T $\\\n$$'\\'' -o /etc/cron.d/x in.txt",
+            "sort -T $\\\n$$'\\'' -o/etc/cron.d/x in.txt",
+            "find . -name $\\\n$$'\\'' -fprint /etc/cron.d/x",
+            "find . -name $$$\\\n$$'\\'' -fprint /etc/cron.d/x",
+            "sort -T $\\\n$'\\' -o /etc/cron.d/x in.txt",
+            "find . -name $\\\n$'\\' -fprint /etc/cron.d/x",
+            # `$$\<nl>'` is still the PID then a PLAIN quote.
+            "sort -T $$\\\n'\\' -o /etc/cron.d/x in.txt",
+            "find . -name $$\\\n'\\' -fprint /etc/cron.d/x",
             # A quote opens mid-word too.
             "sort -t'|' -o /etc/cron.d/x f",
             "find . -name a'|'b -fprint /etc/cron.d/x",
@@ -204,6 +216,8 @@ class TestFindWriteFlagsTopLevel:
             "find . -name x; echo -fprint /etc/cron.d/x",
             "find . -name x | tee -a log -fprint /etc/cron.d/x",
             "sort -t $';' in.txt; echo -o /etc/cron.d/x",
+            "sort -T $\\\n$$'\\'' in.txt; echo -o /etc/cron.d/x",
+            "find . -name $\\\n$'\\' ; echo -fprint /etc/cron.d/x",
         ],
     )
     def test_benign_find_stays_safe(self, command):

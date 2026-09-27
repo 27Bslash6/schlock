@@ -639,10 +639,11 @@ def dangerous_find(args: list[str]) -> str | None:
     indifferent to a leading "find" token. See #97.
 
     An arg that the shell may still expand is not emulated. One that holds a `-` together with a
-    brace, `$` or backtick is denied outright, which covers a flag spelled visibly in the source
-    however it is split up. A value the shell supplies only at run time is outside what this check
-    can see. `find {src,lib}` and `find dir{1..3}` stay allowed. The cost is real: an ordinary
-    expanded path or pattern that holds a `-`, such as `"$HOME/.config/my-app"`, is denied here too.
+    brace, `$` or backtick is denied outright, which covers a flag whose `-` is written literally
+    in the source, however the rest of it is split up. A value the shell supplies only at run
+    time is outside what this check can see. `find {src,lib}` and `find dir{1..3}` stay allowed.
+    The cost is real: an ordinary expanded path or pattern that holds a `-`, such as
+    `"$HOME/.config/my-app"`, is denied here too.
     """
     for arg in args:
         if arg in _DANGEROUS_FIND_FLAGS:
@@ -1899,9 +1900,10 @@ class SubstitutionValidator:
                 if git_reason:
                     return True, git_reason
 
-            # find (-exec*/-ok*/-delete) and kubectl (state-modifying subcommands) via shared
-            # helpers. dangerous_kubectl is reused at the top level (HIGH); top-level find stays
-            # command-aware via the find_exec_dangerous / recursive_delete YAML rules. See #97.
+            # find (-exec*/-ok*/-delete/-fprint*/-fls) and kubectl (state-modifying subcommands) via
+            # shared helpers. dangerous_kubectl is reused at the top level (HIGH); top-level find stays
+            # command- and target-aware via the find_exec_dangerous / recursive_delete /
+            # write_via_arg_persistence YAML rules. See #97.
             if base_command == "find" and args:
                 find_reason = dangerous_find(args)
                 if find_reason:
