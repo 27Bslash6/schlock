@@ -70,7 +70,7 @@ class TestDashCPayload:
         assert _dash_c_payload(["deploy.sh", "-c", "production"]) is None
 
     def test_plus_option_is_an_option_not_an_operand(self):
-        # Panel on #204: `bash +o pipefail -c PROG` runs PROG (set(1) syntax, verified against
+        # `bash +o pipefail -c PROG` runs PROG (set(1) syntax, verified against
         # bash/dash). Pre-fix `+o` was read as the script operand and the scan ended: None.
         assert _dash_c_payload(["+o", "pipefail", "-c", "rm -rf /"]) == "rm -rf /"
         assert _dash_c_payload(["+x", "-c", "rm -rf /"]) == "rm -rf /"
@@ -665,12 +665,24 @@ class TestHereStringPayloadExtraction:
         assert self._extract('( timeout 5 bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
 
     def test_rbash_reads_stdin_as_program(self):
-        # rbash is in _SHELL_COMMANDS (the `-c` path caught it); the here-string surface must agree.
+        # rbash is in SHELL_COMMANDS (the `-c` path caught it); the here-string surface must agree.
         assert self._extract('rbash <<< "rm -rf /"') == [("rbash", "rm -rf /")]
+
+    def test_csh_and_tcsh_read_stdin_as_program(self):
+        # LAB-4442: csh/tcsh are in SHELL_COMMANDS (the `-c` path caught them); the here-string
+        # surface must agree, the same drift rbash had.
+        assert self._extract('csh <<< "rm -rf /"') == [("csh", "rm -rf /")]
+        assert self._extract('tcsh <<< "rm -rf /"') == [("tcsh", "rm -rf /")]
 
     def test_wrapped_shell_with_dash_c_is_not_a_stdin_program(self):
         # `timeout 5 bash -c "echo hi" <<< X`: bash runs the -c program; the here-string is inert.
         assert self._extract('timeout 5 bash -c "echo hi" <<< "rm -rf /"') == []
+
+    def test_csh_and_tcsh_dash_c_means_here_string_is_inert_data(self):
+        # LAB-4691: csh/tcsh -c runs the -c program, exactly like bash -c; the here-string is
+        # data on a stdin nothing reads.
+        assert self._extract('csh -c "echo safe" <<< "rm -rf /"') == []
+        assert self._extract('tcsh -c "echo safe" <<< "rm -rf /"') == []
 
     def test_here_string_off_a_non_stdin_redirect_is_ignored(self):
         # A plain input redirect (`< file`) is not a here-string; nothing to surface.
@@ -743,12 +755,21 @@ class TestHereStringDelegationEvasion:
             'if true; then bash; fi <<< "rm -rf /"',
             # rbash is a shell the `-c` path already caught; the `<<<` spelling must agree.
             'rbash <<< "rm -rf /"',
+            # LAB-4442: same drift as rbash, for csh/tcsh.
+            'csh <<< "rm -rf /"',
+            'tcsh <<< "rm -rf /"',
             # Decoys: a trailing here-string on another fd, and a wrapper operand that shares a
             # shell's basename. bash runs the stdin payload in every case (verified).
             'bash <<< "rm -rf /" 3<<< "ls"',
             'bash 3<<< "rm -rf /" <&3',
             'flock ./bash sh <<< "rm -rf /"',
             'strace -o bash sh <<< "rm -rf /"',
+            # Explicit stdin designators (_STDIN_PATHS, LAB-4696): bash/sh treat these path
+            # spellings of stdin as the program to run, same as no operand at all - untested
+            # pre-fix (verified against real bash).
+            'bash /dev/stdin <<< "rm -rf /"',
+            'sh /dev/fd/0 <<< "rm -rf /"',
+            'bash /proc/self/fd/0 <<< "rm -rf /"',
         ],
     )
     def test_here_string_payload_is_blocked(self, command):
@@ -809,7 +830,7 @@ class TestHereStringBenignUnchanged:
 
 
 class TestLauncherDelegation:
-    """LAB-4699: `<shell> … -c PROG` behind a launcher gets the bare payload's verdict.
+    """`<shell> … -c PROG` behind a launcher gets the bare payload's verdict.
 
     Pre-fix (`main` @ `65afe74`, ShellCheck unavailable) none of these launchers was in
     WRAPPER_COMMANDS, so nothing re-entered validation on the payload and its own rule match sat
@@ -817,8 +838,8 @@ class TestLauncherDelegation:
     in front of a *multi-flag* `-c` (`bash -euo pipefail -c`, `bash --norc -c`): every one of the
     `_LAUNCHERS` below was **SAFE / allowed=True** on `L bash -euo pipefail -c 'rm -rf /'`, and
     `L bash <<< 'rm -rf /'` was **HIGH / allowed=True**. The single-flag `L bash -c 'rm -rf /'`
-    was already BLOCKED by the `nested_shell_execution` regex, which is why the ticket's title
-    names the non-first-flag `-c`. Known wrappers (`timeout`, `sudo`, `env`) re-entered on every
+    was already BLOCKED by the `nested_shell_execution` regex, so the gap is the
+    non-first-flag `-c`. Known wrappers (`timeout`, `sudo`, `env`) re-entered on every
     form and stayed BLOCKED.
 
     The fix is membership: the wrapper branch of `_shell_delegated_payloads` re-enters the full
@@ -828,7 +849,7 @@ class TestLauncherDelegation:
     is `exec` (`pnpm exec vitest`, `direnv exec . make`, `screen -X eval`) is not read as the
     shell builtin.
 
-    Panel on #204 surfaced a sibling gap in the shared `-c` extractor: a `+`-prefixed option
+    A sibling gap sat in the shared `-c` extractor: a `+`-prefixed option
     (`bash +o pipefail -c PROG`, set(1) syntax) was read as the leading script operand, so the
     scan ended and the bare AND every wrapped spelling were SAFE. Fixed in `_dash_c_payload` and
     `_reads_stdin_as_program`; pinned below.
@@ -936,9 +957,9 @@ class TestLauncherDelegation:
 
     @pytest.mark.parametrize("launcher", _LAUNCHERS)
     def test_multiflag_dash_c_is_blocked_by_reentry(self, launcher):
-        # AC-2, the gap form. Pre-fix: SAFE / allowed=True for every launcher. The rule is asserted
+        # The gap form. Pre-fix: SAFE / allowed=True for every launcher. The rule is asserted
         # exactly: nothing but re-entry catches this spelling today, and a regex that started to
-        # would be the `-c`-anchored backstop #202 deleted as evadable - worth a failing test.
+        # would be a `-c`-anchored regex backstop, already rejected as evadable - worth a failing test.
         command = f"{launcher} bash -euo pipefail -c 'rm -rf /'"
         result = validate_command(command)
         assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
@@ -956,10 +977,10 @@ class TestLauncherDelegation:
 
     @pytest.mark.parametrize("launcher", _LAUNCHERS)
     def test_single_flag_dash_c_stays_blocked(self, launcher):
-        # AC-2. Already BLOCKED pre-fix: the `nested_shell_execution` regex sees the literal
+        # Already BLOCKED pre-fix: the `nested_shell_execution` regex sees the literal
         # `bash -c '…'` spelling whatever precedes it, and a BLOCKED regex verdict short-circuits
         # Step 5c, so the rule recorded is the regex, not the re-entry. Pinned as "one of the two"
-        # so a regex tightening (#202 made the sibling base64 pattern deterministic) that hands
+        # so a regex tightening (as the sibling base64 pattern was made deterministic) that hands
         # the catch over to re-entry keeps the verdict pinned without a brittle rule-name failure.
         command = f"{launcher} bash -c 'rm -rf /'"
         result = validate_command(command)
@@ -969,8 +990,8 @@ class TestLauncherDelegation:
 
     @pytest.mark.parametrize("launcher", _LAUNCHERS)
     def test_wrapped_herestring_decode_is_blocked(self, launcher):
-        # AC-2. On `main` the `base64_shell_execution` regex spans from the outer `bash` into the
-        # quote (its match starts outside the literal, so it is not suppressed); #202's tempered
+        # On `main` the `base64_shell_execution` regex spans from the outer `bash` into the
+        # quote (its match starts outside the literal, so it is not suppressed); a tempered
         # pattern stops at the inner `sh`, so the catch moves to re-entry. Either way BLOCKED.
         command = f"{launcher} bash -euo pipefail -c 'sh <<< \"$(base64 -d x)\"'"
         result = validate_command(command)
@@ -997,7 +1018,7 @@ class TestLauncherDelegation:
     def test_wrapped_here_string_is_blocked(self, launcher):
         # Third consumer of WRAPPER_COMMANDS: `_classify_sink` walks a wrapper's operands for a
         # stdin-executing interpreter, so `uv run bash <<< PROG` surfaces PROG the way `timeout 5
-        # bash <<< PROG` does (LAB-2768). Pre-fix: HIGH / allowed=True (the outer `recursive_delete`
+        # bash <<< PROG` does. Pre-fix: HIGH / allowed=True (the outer `recursive_delete`
         # regex saw the text, nothing re-validated it as code).
         command = f"{launcher} bash <<< 'rm -rf /'"
         result = validate_command(command)
@@ -1008,7 +1029,7 @@ class TestLauncherDelegation:
     @pytest.mark.parametrize(
         "command",
         [
-            # Panel on #204. Pre-fix (bare AND wrapped, `main` @ `65afe74`): `-c` forms SAFE /
+            # Pre-fix (bare AND wrapped, `main` @ `65afe74`): `-c` forms SAFE /
             # allowed=True, `<<<` forms HIGH / allowed=True. Real bash/sh run every one of these.
             "bash +o pipefail -c 'rm -rf /'",
             "sh +e -c 'rm -rf /'",
@@ -1027,7 +1048,6 @@ class TestLauncherDelegation:
     @pytest.mark.parametrize(
         "command",
         [
-            # AC-3 verbatim.
             "uv run ruff check",
             "uv run python -c 'print(1)'",
             "poetry run pytest -x",
@@ -1081,7 +1101,116 @@ class TestLauncherDelegation:
         ],
     )
     def test_benign_launcher_tail_stays_safe(self, command):
-        # AC-3: absolute verdicts pinned against `main` @ `65afe74` (SAFE / allowed=True, unchanged).
+        # absolute verdicts pinned against `main` @ `65afe74` (SAFE / allowed=True, unchanged).
         result = validate_command(command)
         assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}: {result.message}"
         assert result.allowed is True
+
+
+# A heredoc body is code when its consumer is a shell - the consumer as bash resolves it, past
+# assignment prefixes and wrappers, not the first word. `heredoc_owner` does that resolving.
+# These rows pin the shapes test_validator.py's TestQuotedHeredocDelimiter does not; each one
+# scored SAFE (or HIGH/allowed beside a matching sibling) before `heredoc_owner` existed.
+_HEREDOC_BODY = "\nrm -rf /\nEOF"
+
+
+class TestWrappedShellHeredoc:
+    """A wrapped or assignment-prefixed shell heredoc scores as its bare `bash <<EOF` twin."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "nohup bash <<EOF" + _HEREDOC_BODY,
+            "command bash <<EOF" + _HEREDOC_BODY,
+            "nice bash <<EOF" + _HEREDOC_BODY,
+            "env FOO=1 bash <<EOF" + _HEREDOC_BODY,
+            "/usr/bin/env bash <<EOF" + _HEREDOC_BODY,
+            "timeout -k 1 5 bash <<EOF" + _HEREDOC_BODY,
+            # ANY shell operand, and only a shell: flock locks a file named python3 and runs bash.
+            # Resolving against STDIN_EXEC_INTERPRETERS instead would stop at python3.
+            "flock ./python3 bash <<EOF" + _HEREDOC_BODY,
+            # A sibling segment that matches its own rule must not stand in for the body.
+            "env bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "FOO=1 bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "timeout 5 sh <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "nohup bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "flock ./python3 bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+        ],
+    )
+    def test_wrapped_shell_heredoc_blocks(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # No sibling match: these once blocked only via the raw whole-command rescan. Pinned
+            # so a change to that rescan cannot reopen them.
+            "env bash <<EOF && true" + _HEREDOC_BODY,
+            "env bash <<EOF | cat" + _HEREDOC_BODY,
+            # Controls that block on their own: the bare twin, and sudo's privilege rule.
+            "bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "sudo bash <<EOF" + _HEREDOC_BODY,
+            # Not gated on `-c`: that program can itself read the heredoc (`bash -c bash`).
+            "bash -c bash <<EOF" + _HEREDOC_BODY,
+            "bash -c bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "bash -c 'echo hi' <<EOF" + _HEREDOC_BODY,
+        ],
+    )
+    def test_shell_heredoc_stays_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+
+class TestHeredocBenignUnchanged:
+    """Non-shell heredoc consumers keep their verdicts, wrapped or not."""
+
+    @pytest.mark.parametrize(
+        ("command", "risk"),
+        [
+            ("kubectl apply -f - <<EOF\napiVersion: v1\nkind: Pod\nEOF", RiskLevel.HIGH),
+            # A Python body is not bash: text a bash rule would match stays unscanned.
+            ("python3 <<EOF\nprint('chmod 777 f')\nEOF", RiskLevel.SAFE),
+            ("env python3 <<EOF\nprint('chmod 777 f')\nEOF", RiskLevel.SAFE),
+            # A wrapper around a non-shell consumer leaves the body inert text.
+            ("env cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
+            # test_validator.py pins only `allowed` for this one; the risk level is pinned here.
+            ("timeout 5 cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
+        ],
+    )
+    def test_benign_heredoc_verdict_unchanged(self, command, risk):
+        result = validate_command(command)
+        assert result.risk_level == risk, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+
+class TestSyntheticRuleNamedInMatchedRules:
+    """LAB-5003: Steps 5b/5c name the rule that set the verdict, even on multi-segment commands.
+
+    On `main` @ `4ca7af0` the two `chmod +x x; ...` cases reported only `['chmod_exec']`: the
+    segment loop filled `all_matched_rules` and the join preferred it, dropping the synthetic
+    rule. Verdicts were already right; this pins the audit trail.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "risk", "rules"),
+        [
+            ('chmod +x x; watch "rm -rf /"', RiskLevel.BLOCKED, ["chmod_exec", "shell_delegated_payload"]),
+            ("chmod +x x; kubectl apply -f x.yaml", RiskLevel.HIGH, ["chmod_exec", "ast_contextual_high:kubectl"]),
+            # Single segment: the list stays empty and the join falls back to the synthetic rule.
+            ('watch "rm -rf /"', RiskLevel.BLOCKED, ["shell_delegated_payload"]),
+            ("kubectl apply -f x.yaml", RiskLevel.HIGH, ["ast_contextual_high:kubectl"]),
+        ],
+    )
+    def test_verdict_rule_is_named(self, command, risk, rules):
+        result = validate_command(command)
+        assert (result.risk_level, result.matched_rules) == (risk, rules)
+
+    def test_compound_redirect_segment_keeps_the_payload_rule(self):
+        # Passes on main, where no segment rule matches here. A compound-redirect pass that
+        # fills the segment list (#180) must not push the payload rule out of it.
+        result = validate_command('{ echo a; } > "$HOME/.bashrc"; watch "rm -rf /"')
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "shell_delegated_payload" in result.matched_rules
