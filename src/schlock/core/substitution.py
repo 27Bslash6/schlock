@@ -1013,16 +1013,19 @@ _GIT_EXEC_OPTIONS = {
 # foreach` and `remote-ext` take one positionally, `submodule foreach` / `bisect run` /
 # `filter-branch` / `daemon` likewise. None of those can be trusted from the name, so only this
 # audited allowlist is. A name is admitted only if it is a non-deprecated builtin (so no alias can
-# shadow it) with no argument that names a program, pager, editor or tool, and no config write
-# (`config` is excluded: its write form arms a later exec). Omitting a safe name costs at most an
-# over-block on a dangerous-LOOKING quoted argument; admitting an unsafe one is a bypass, so when
-# in doubt it stays out.
+# shadow it) with no argument that names a program, pager, editor or tool. `config` runs nothing it
+# is handed; the value a write persists for later execution is judged by its own guard
+# (_git_config_payload_reason here, the validator at the top level), which honours the payload's
+# quoting — scanning the whole line instead would deny reads and quoted payloads the top level
+# allows. Omitting a safe name costs at most an over-block on a dangerous-LOOKING quoted argument;
+# admitting an unsafe one is a bypass, so when in doubt it stays out.
 _GIT_INERT_SUBCOMMANDS = frozenset(
     {
         "log", "show", "diff", "diff-tree", "diff-index", "diff-files", "status", "blame",
         "annotate", "shortlog", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file",
         "describe", "name-rev", "show-ref", "show-branch", "for-each-ref", "symbolic-ref",
         "merge-base", "cherry", "count-objects", "var", "version", "commit", "tag", "reflog",
+        "config",
     }
 )  # fmt: skip
 # git's own options that take their value as the NEXT word (git.c handle_options); matched exactly,
