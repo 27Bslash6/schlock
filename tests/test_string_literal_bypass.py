@@ -84,8 +84,8 @@ class TestEverySuppressionRangeIsConsulted:
     only over-block, but the next person to batch, sort or bisect that lookup
     gets no signal from the suite if they get the multi-range case wrong - and
     bounds taken from the wrong pair of ranges (min start, max end) widen the
-    suppressed span and under-block. Found by the LAB-4321 expert panel
-    (LAB-4325); every row below is the sole kill for at least one mutation.
+    suppressed span and under-block. Every row below is the sole kill for at
+    least one mutation.
     """
 
     @pytest.mark.parametrize(
@@ -104,7 +104,7 @@ class TestEverySuppressionRangeIsConsulted:
             # envelope over all ranges (min start, max end), a bisect that
             # checks start and end against different ranges, and a start-only
             # containment check - the Bug #1 rows above stopped pinning that
-            # last one once LAB-1732 gave bare quoted tokens like "safe" no
+            # last one once bare quoted tokens like "safe" stopped getting a
             # range at all.
             ('echo "x rm" -rf / "y z"', False, RiskLevel.BLOCKED),
         ],
