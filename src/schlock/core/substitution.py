@@ -49,6 +49,13 @@ _SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 # every body containing "<(", and fail closed on one that also breaks the wrapper.
 _HEREDOC_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`")
 
+# The byte after ``${`` that makes it a bash 5.3 function substitution (``${ cmd; }``,
+# ``${| cmd; }``), which runs ``cmd`` in the current shell. bashlex reads either one as a
+# plain ``parameter`` node whose value starts with that byte. Every bash before 5.3 rejects
+# them as a bad substitution, so treating them as commands changes no older shell's verdict.
+_FUNSUB_LEADERS: tuple[str, ...] = (" ", "\t", "\n", "|")
+_FUNSUB_OPENERS: tuple[str, ...] = tuple("${" + lead for lead in _FUNSUB_LEADERS)
+
 # How many heredoc bodies one top-level validation may re-parse before it gives up and denies.
 # MAX_SUBSTITUTION_DEPTH does NOT bound this: a heredoc nested in a substitution nested in a
 # heredoc re-parses the whole remaining inner text at every level, which measured 1.1s on a
@@ -1276,11 +1283,17 @@ class SubstitutionValidator:
         ~3us for the substring scan that leaves the common case ($x, ${x:-plain}) untouched.
         """
         value = getattr(node, "value", None)
-        if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
+        if not isinstance(value, str):
+            return []
+        # A function substitution is a command, not an expansion, and it needs no introducer
+        # to run one: ``echo "${ rm -rf ~; }"`` was ALLOWED/SAFE while bash 5.3 ran it. Deny it
+        # outright rather than re-parse it; no shell before 5.3 accepts the form at all.
+        is_funsub = value.startswith(_FUNSUB_LEADERS)
+        if not is_funsub and not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
             # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
             return []
 
-        if depth < MAX_SUBSTITUTION_DEPTH:
+        if not is_funsub and depth < MAX_SUBSTITUTION_DEPTH:
             reparsed = value.replace("#", "_")
             try:
                 inner_ast = self.parser.parse(reparsed)
@@ -1378,7 +1391,9 @@ class SubstitutionValidator:
             source = value
 
         body, _, _ = (source or value).rpartition("\n")
-        if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS):
+        # A function substitution opener is an introducer here too: the re-parse is what hands
+        # its ``parameter`` node to _substitutions_in_parameter, which denies it.
+        if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS + _FUNSUB_OPENERS):
             return []
 
         if budget is None:
