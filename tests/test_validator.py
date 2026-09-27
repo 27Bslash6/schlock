@@ -2579,21 +2579,49 @@ class TestHeredocSurroundings:
         assert result.allowed is False, description
         assert "Unreadable heredoc delimiter" in (result.error or ""), description
 
-    def test_an_unreadable_heredoc_for_an_inert_consumer_still_passes(self, safety_rules_path):
+    @pytest.mark.parametrize("opener", ["<<'A;B'", "<< 'A;B'"], ids=["glued", "spaced"])
+    @pytest.mark.parametrize(
+        "head,risk,rules",
+        [
+            ("cat", RiskLevel.LOW, []),
+            ("grep x", RiskLevel.LOW, []),
+            ("jq .", RiskLevel.LOW, []),
+            ("sort", RiskLevel.LOW, []),
+            ("wc -l", RiskLevel.LOW, []),
+            ("mail -s hi a@b.c", RiskLevel.LOW, []),
+            ("tee out.txt", RiskLevel.HIGH, ["file_truncation"]),
+        ],
+    )
+    def test_an_unreadable_heredoc_for_an_inert_consumer_still_passes(self, safety_rules_path, opener, head, risk, rules):
         """The guard above keys on the CONSUMER, not on the delimiter being unreadable.
 
-        Denying every delimiter without a bare spelling would take this with it, and
+        Denying every delimiter without a bare spelling would take these with it, and
         `cat <<'A;B' > f` is an ordinary file write whose body bash never executes. The
-        body is unread here too - that is simply not a hazard when nothing runs it.
+        body is unread here too - that is simply not a hazard when nothing runs it. Each
+        keeps the verdict its head earns alone (`tee` truncates its file operand).
 
-        `cat` only, deliberately: an interpreter that executes its body is not an inert
-        consumer, and pinning its verdict here would turn the guard's ceiling (see its
-        CEILING comment) into a contract.
+        Commands that read their stdin as data only: an interpreter that executes its body
+        is not an inert consumer, and is refused (next test).
         """
-        result = validate_command("cat <<'A;B'\nrm -rf /\nA;B", config_path=safety_rules_path)
+        result = validate_command(f"{head} {opener}\nrm -rf /\nA;B", config_path=safety_rules_path)
 
-        assert result.allowed is True
-        assert result.risk_level < RiskLevel.HIGH
+        assert result.allowed is True, result.message
+        assert result.risk_level == risk
+        assert result.matched_rules == rules
+
+    def test_an_unreadable_heredoc_for_an_interpreter_fails_closed(self, safety_rules_path):
+        """`python3` with no program source runs its stdin, so this body is a program nothing read.
+
+        `test_a_shell_heredoc_it_cannot_read_fails_closed`, for a non-shell interpreter:
+        bash runs the body through python3 (checked with a filesystem witness), and this
+        scored LOW on the head alone.
+        """
+        result = validate_command("python3 <<'A;B'\nrm -rf /\nA;B", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == []
+        assert result.message.startswith("BLOCKED: Cannot read the program 'python3' would run from this heredoc")
 
     def test_invalid_shell_after_a_readable_heredoc_still_denies(self, safety_rules_path):
         """A readable heredoc followed by shell bash itself rejects.
@@ -3657,9 +3685,8 @@ class TestADelimiterBashlexWouldMisread:
             "cat <<A\\;B\nhello\nA;B\nrm -rf /\nA\\;B",
             "cat <<$'EOF'\nhello\nEOF\nrm -rf /\n$'EOF'",
             'cat <<$"EOF"\nhello\nEOF\nrm -rf /\n$"EOF"',
-            "cat <<'EOF'\r\nhello\r\nEOF\r\nrm -rf /\r\n'EOF'\r",
         ],
-        ids=["no-bare-spelling", "blank-in-word", "leading-dash", "backslash", "ansi-c", "locale", "crlf"],
+        ids=["no-bare-spelling", "blank-in-word", "leading-dash", "backslash", "ansi-c", "locale"],
     )
     def test_the_command_after_bashs_terminator_is_validated(self, safety_rules_path, command):
         result = validate_command(command, config_path=safety_rules_path)
@@ -3678,6 +3705,72 @@ class TestADelimiterBashlexWouldMisread:
 
         assert result.allowed is False
         assert "ANSI-C escape" in (result.error or "")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestACrlfQuotedHeredocIsRead:
+    """A CRLF line ends in `\r`, so `<<'EOF'` there has the delimiter `EOF\r`.
+
+    Bash reads the `\r` as part of the word and ends the body at a line reading `EOF\r`,
+    not at a bare `EOF` (checked against real bash with filesystem witnesses). The
+    normaliser refused that word, so the command went to the fallback, which drops a quoted
+    body and refused a benign `bash` heredoc it had not read. Now the body is read.
+    """
+
+    def test_the_rewrite_keeps_the_carriage_return(self):
+        command = "bash <<'EOF'\r\necho hi\r\nEOF\r\n"
+        normalised = val_module._normalise_heredoc_delimiters(command)
+
+        assert normalised.text.split("\n")[0] == "bash <<EOF\r  "  # padded by the two quotes it lost
+        assert len(normalised.text) == len(command)
+        assert [command[start:end] for _, start, end in normalised.blanked] == ["echo hi\r"]
+
+    @pytest.mark.parametrize("shell", ["bash", "sh"])
+    def test_a_benign_shell_body_is_allowed(self, safety_rules_path, shell):
+        result = validate_command(f"{shell} <<'EOF'\r\necho hi\r\nEOF\r\n", config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+        assert result.risk_level <= RiskLevel.LOW
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash <<'EOF'\r\nrm -rf /\r\nEOF\r\n",
+            "bash <<-'EOF'\r\n\trm -rf /\r\n\tEOF\r\n",
+            # A bare `EOF` line does not end this body, so bash runs what follows it.
+            "bash <<'EOF'\r\necho x\r\nEOF\nrm -rf /\nEOF\r\n",
+        ],
+        ids=["body", "tab-stripped", "past-a-bare-terminator"],
+    )
+    def test_a_shell_body_is_validated_as_code(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<'EOF'\r\nhello\r\nEOF\r\nrm -rf /\r\n'EOF'\r",
+            "cat <<'EOF'\r\nhello\r\nEOF\r\nrm -rf /\r\nEOF",
+        ],
+        ids=["quoted-line-after", "bare-line-after"],
+    )
+    def test_the_command_after_the_terminator_is_validated(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "system_destruction" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        ["cat <<'EOF'\r\nrm -rf /\r\nEOF\r\n", "cat <<'EOF'\r\nx\r\nEOF\nrm -rf /\nEOF\r\n"],
+        ids=["body", "past-a-bare-terminator"],
+    )
+    def test_an_inert_body_stays_allowed(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
 
 
 @pytest.mark.usefixtures("no_shellcheck")
@@ -3753,9 +3846,10 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
 
     It used to check only the first opener's head as written, so a shell anywhere else read
     as an ordinary command whose body was inert - LOW or SAFE, while bash ran the body.
-    Before this fix each case here was allowed. Every heredoc is now checked, by the
-    command bashlex attaches it to. `<<'A;B'` is used because it has no bare spelling,
-    which is what sends a command down this path.
+    Every heredoc is now checked, by the command bashlex attaches it to, and so is a
+    non-shell interpreter that runs its stdin. `<<'A;B'` is used because it has no bare
+    spelling, which is what sends a command down this path. The allowed cases are the
+    controls: a body the named program reads as data.
     """
 
     @pytest.mark.parametrize(
@@ -3766,16 +3860,122 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
             ("{ bash <<'A;B'\nrm -rf /\nA;B\n}", "bash"),
             ("ls <<'X'\nt\nX\nbash <<'A;B'\nrm -rf /\nA;B", "bash"),
             ("/bin/bash <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("/bin/sh <<'A;B'\nrm -rf /\nA;B", "sh"),
             ("FOO=1 bash <<'A;B'\nrm -rf /\nA;B", "bash"),
             ("env bash <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("timeout 5 bash <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("nohup bash <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("'bash' <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("\"bash\" <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("ba'sh' <<'A;B'\nrm -rf /\nA;B", "bash"),
+            ("\\bash <<'A;B'\nrm -rf /\nA;B", "bash"),
         ],
-        ids=["for-loop", "if", "group", "behind-another-heredoc", "full-path", "assignment-prefix", "wrapped"],
+        ids=[
+            "for-loop",
+            "if",
+            "group",
+            "behind-another-heredoc",
+            "full-path",
+            "full-path-sh",
+            "assignment-prefix",
+            "wrapped",
+            "wrapped-with-operand",
+            "nohup",
+            "single-quoted",
+            "double-quoted",
+            "part-quoted",
+            "backslashed",
+        ],
     )
     def test_a_shell_anywhere_is_refused(self, safety_rules_path, command, shell):
         result = validate_command(command, config_path=safety_rules_path)
 
         assert result.allowed is False
-        assert f"Unreadable heredoc delimiter in front of shell interpreter '{shell}'" in (result.error or "")
+        assert result.matched_rules == []
+        assert f"Unreadable heredoc delimiter in front of interpreter '{shell}'" in (result.error or "")
+
+    @pytest.mark.parametrize("name", sorted(parser.SHELL_COMMANDS | parser.STDIN_EXEC_INTERPRETERS))
+    def test_every_program_that_runs_its_stdin_is_refused(self, safety_rules_path, name):
+        """Every shell, and every interpreter the pipe and here-string checks treat as running
+        its stdin, is refused here too - read from the live sets, so a name added to either
+        is covered without touching this test. A shell must never be a name this path lets by.
+        """
+        result = validate_command(f"{name} <<'A;B'\nrm -rf /\nA;B", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == []
+        assert result.message.startswith(f"BLOCKED: Cannot read the program '{name}' would run from this heredoc")
+
+    @pytest.mark.parametrize(
+        "head,interpreter",
+        [
+            ("python3", "python3"),
+            ("perl", "perl"),
+            ("ruby", "ruby"),
+            ("node", "node"),
+            ("php", "php"),
+            ("env python3", "python3"),
+            ("timeout 5 python3", "python3"),
+            ("python3 -", "python3"),
+            ("python3 -u", "python3"),
+        ],
+    )
+    def test_an_interpreter_that_runs_its_stdin_is_refused(self, safety_rules_path, head, interpreter):
+        """A program is not only a shell's: `python3 <<X` runs the body as Python, and bash runs
+        each of these bodies (checked with a filesystem witness for every python3 row, perl
+        and node). The body was dropped unread and the head scored alone, LOW.
+        """
+        result = validate_command(f"{head} <<'A;B'\nimport os; os.system('rm -rf /')\nA;B", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == []
+        assert result.message.startswith(f"BLOCKED: Cannot read the program '{interpreter}' would run from this heredoc")
+
+    @pytest.mark.parametrize(
+        "head",
+        ["python3 script.py", "node app.js", "python3 -c 'print(1)'", "gawk '{print}'"],
+        ids=["script", "node-script", "inline-code", "awk-program"],
+    )
+    def test_an_interpreter_that_reads_its_stdin_as_data_is_not(self, safety_rules_path, head):
+        """A named program runs, and the heredoc is only its input (bash-checked for the first three).
+
+        The refusal asks what `_classify_sink` asks of a here-string, so these keep the verdict
+        they had before interpreters were refused.
+        """
+        result = validate_command(f"{head} <<'A;B'\nimport os; os.system('rm -rf /')\nA;B", config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+        assert result.risk_level == RiskLevel.LOW
+        assert result.matched_rules == []
+
+    @pytest.mark.parametrize("command", ["awk <<'X'\nbody\nX", "awk '{print}' <<'X'\nbody\nX"])
+    def test_awk_reads_a_heredoc_as_data(self, safety_rules_path, command):
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+        assert result.risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize("shell", ["csh", "tcsh", "rbash"])
+    def test_a_readable_shell_heredoc_is_validated_as_code(self, safety_rules_path, shell):
+        """The readable twin of the refusal: the body reaches the shell-delegation check."""
+        result = validate_command(f"{shell} <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules
+
+    def test_a_plain_second_heredoc_is_read(self, safety_rules_path):
+        result = validate_command("ls <<'X'\nt\nX\nbash <<EOF\nrm -rf /\nEOF", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "system_destruction" in result.matched_rules
+
+    def test_a_wrapped_dash_c_shell_is_caught_by_its_rule(self, safety_rules_path):
+        result = validate_command('env bash -c "rm -rf /"', config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "nested_shell_execution" in result.matched_rules
 
     @pytest.mark.parametrize(
         "command",
