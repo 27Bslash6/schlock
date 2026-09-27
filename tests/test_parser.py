@@ -82,6 +82,28 @@ class TestBashCommandParser:
             parser.parse(invalid_command)
         assert error_substring in str(exc.value)
 
+    @pytest.mark.parametrize(
+        ("command", "original_type"),
+        [
+            ("curl -H 'Authorization: Bearer SEKRIT0123456789abcdef' http://x ) ( ;;", bashlex.errors.ParsingError),
+            # bashlex's NotImplementedError text is a dump of the parse tree, words included.
+            ("coproc curl -H X-Key:SEKRIT0123456789abcdef x", NotImplementedError),
+            # One of the fixed texts a parse error shows: it holds none of the command.
+            ("curl -H X-Key:SEKRIT0123456789abcdef $((1+1))", NotImplementedError),
+            ('echo "$(' * 100 + "echo hi" + ')"' * 100, RecursionError),
+        ],
+        ids=["syntax-error", "unsupported", "unsupported-arithmetic", "too-deep"],
+    )
+    def test_parse_error_never_quotes_the_command(self, parser, caplog, command, original_type):
+        """The error's text reaches the deny reason and the hook's ERROR log; the command stays out of both."""
+        with caplog.at_level(logging.DEBUG), pytest.raises(ParseError) as exc:
+            parser.parse(command)
+        assert isinstance(exc.value.original_error, original_type)  # kept for the heredoc route and debugging
+        for text in (str(exc.value), caplog.text):
+            assert command not in text
+            assert repr(command) not in text
+            assert "SEKRIT" not in text
+
     def test_parse_empty_command(self, parser):
         """Raise ValueError on empty command."""
         with pytest.raises(ValueError) as exc:

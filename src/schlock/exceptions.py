@@ -23,20 +23,24 @@ class ParseError(Exception):
         >>> raise ParseError("Invalid syntax", original_error=bashlex.errors.ParsingError())
     """
 
-    def __init__(self, message: str, original_error: Optional[Exception] = None):
+    def __init__(self, message: str, original_error: Optional[Exception] = None, *, show_original: bool = True):
         """Initialize ParseError with message and optional original error.
 
         Args:
             message: Human-readable error description
             original_error: Original bashlex exception (preserved for debugging)
+            show_original: False keeps the original's text out of ``str()``. Its text
+                reaches deny reasons and ERROR logs, and some originals hold the
+                command's words.
         """
         self.message = message
         self.original_error = original_error
+        self.show_original = show_original
         super().__init__(self.message)
 
     def __str__(self) -> str:
         """Return string representation with original error context if available."""
-        if self.original_error:
+        if self.original_error and self.show_original:
             return f"{self.message} (original: {self.original_error})"
         return self.message
 

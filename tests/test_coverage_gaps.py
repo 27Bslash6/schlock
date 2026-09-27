@@ -37,6 +37,13 @@ class TestParseErrorCoverage:
         assert "Test message" in result
         assert "original: original issue" in result
 
+    def test_str_hides_original_error_when_asked(self):
+        """show_original=False keeps the original's text out of str() but keeps the original."""
+        original = NotImplementedError("dump holding the command's words")
+        error = ParseError("Test message", original_error=original, show_original=False)
+        assert str(error) == "Test message"
+        assert error.original_error is original
+
 
 class TestConfigurationErrorCoverage:
     """Cover ConfigurationError edge cases."""

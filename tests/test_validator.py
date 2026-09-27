@@ -2909,8 +2909,8 @@ class TestParseFailureFailsClosed:
         assert result.message.startswith("Parse error:")
         # Without this the assertion above also passes for an ordinary ParseError,
         # and the RecursionError-to-ParseError conversion the docstring is about
-        # could be dropped with the test still green.
-        assert "maximum recursion depth" in result.message
+        # could be dropped with the test still green. The type is named, not its text.
+        assert "RecursionError" in result.message
 
     # --- documented residual (NOT a fix; pins current behaviour so a change is
     # --- visible). LAB-3094, untouched by this ticket.
