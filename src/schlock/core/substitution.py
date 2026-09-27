@@ -646,9 +646,14 @@ def dangerous_find(args: list[str]) -> str | None:
 # comparison like `$1 > "m"` inside a substitution is acceptable; missing system()/pipe-to-command/
 # file writes is not. Known ceiling: a pipe/redirect target held in a VARIABLE (`print | c`) evades
 # this text scan — the parser's pipe-to-shell layer and YAML rules remain as backstops. See #104.
+#
+# AWK_SYSTEM_CALL is shared with the top-level check. Real awks run `system \<newline> ("cmd")`
+# (a backslash-newline continuation before the `(`) and `x=1system("cmd")` (no word boundary
+# before the name), so the pattern allows backslashes in the gap and anchors on neither side.
+AWK_SYSTEM_CALL = r"system[\s\\]*\("
 _AWK_DANGEROUS_TEXT = re.compile(
-    r"system\s*\("  # system("cmd") — arbitrary exec
-    r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
+    AWK_SYSTEM_CALL  # system("cmd") — arbitrary exec
+    + r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
     r'|\|\s*"'  # print | "cmd" — pipe to a command
     r'|"\s*\|'  # "cmd" | … — command string on the left of a pipe
     r"|\|&"  # gawk |& coprocess

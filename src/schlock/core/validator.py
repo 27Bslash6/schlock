@@ -34,7 +34,7 @@ from .parser import (
     reset_parse_budget,
 )
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
-from .substitution import SubstitutionValidationResult, SubstitutionValidator
+from .substitution import AWK_SYSTEM_CALL, SubstitutionValidationResult, SubstitutionValidator
 
 logger = logging.getLogger(__name__)
 
@@ -727,16 +727,24 @@ def _shell_delegated_payloads(
     return list(dict.fromkeys(payloads))
 
 
+_AWK_COMMANDS = frozenset({"awk", "gawk", "mawk", "nawk"})
+_AWK_SYSTEM_CALL = re.compile(AWK_SYSTEM_CALL)
+
+
 def _check_contextual_high_risk(
     commands_with_args: list[tuple[str, list[str]]],
 ) -> Optional[tuple[str, str]]:
     """Return (base_name, reason) for the first kubectl command that modifies cluster state or
-    executes code, else None.
+    executes code, or awk command whose program calls system(), else None.
 
-    Top-level parity with the SubstitutionValidator kubectl check (which BLOCKs these inside
+    Top-level parity with the SubstitutionValidator kubectl and awk checks (which BLOCK these inside
     `$()`/`<()`). At the top level `kubectl delete`/`apply`/`exec` are common legitimate ops, so the
     caller elevates to HIGH (ask) and lets the preset decide, rather than hard-blocking. Reuses the
-    same `dangerous_kubectl` helper as the substitution path.
+    same `dangerous_kubectl` helper and `system(` pattern as the substitution path.
+
+    awk is read per command, from its own arguments, so a `system(` in any block, line or length of
+    the program counts and one in a later, separate command never does. It stays HIGH, matching the
+    `interpreter_dangerous_execution` rating of a `BEGIN{system(...)}` block.
 
     NOTE: find is deliberately NOT handled here. The substitution path blocks *any* `find -exec`
     (conservative), but at the top level read-only `find -exec grep/cat/...` is legitimate, so
@@ -747,11 +755,17 @@ def _check_contextual_high_risk(
 
     for cmd_name, args in commands_with_args:
         base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
-        if base_name != "kubectl":
-            continue
-        reason = dangerous_kubectl(args)
-        if reason:
-            return base_name, reason
+        if base_name in _AWK_COMMANDS:
+            # Every argument, so a -e/--source program is never missed; a -v value or file name
+            # that contains `system(` over-reads. So does a `system(` inside an awk string or
+            # comment: a promptable over-read in the fail-safe direction, and the BEGIN rule
+            # already rates `awk 'BEGIN{print "system(x)"}'` HIGH.
+            if any(_AWK_SYSTEM_CALL.search(arg) for arg in args):
+                return base_name, "awk program calls system(), which runs a shell command"
+        elif base_name == "kubectl":
+            reason = dangerous_kubectl(args)
+            if reason:
+                return base_name, reason
     return None
 
 
@@ -3135,7 +3149,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             )
             # Don't cache config errors
 
-        # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing).
+        # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing,
+        # awk system()).
         # Top-level parity with SubstitutionValidator (which BLOCKs these in $()); at the top level
         # they are common legitimate ops, so elevate to HIGH (ask) and let the preset decide rather
         # than hard-blocking. Only elevate when nothing already matched at >= HIGH. See #97.
