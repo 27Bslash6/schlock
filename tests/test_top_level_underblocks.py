@@ -188,6 +188,8 @@ class TestGitExecPathOverride:
             "git -calias.x='--exec-path=/tmp/evil gc' x",
             "git -c alias.x='--exec-path=/tmp/evil commit' x -m m",
             "echo \"$(git -c alias.x='--exec-path=/tmp/evil gc' x)\"",
+            # git drops a backslash inside the alias's double quotes: this is --exec-path=.
+            r"""git -c alias.x='"--exec-\path=/tmp/evil" gc' x""",
         ],
     )
     def test_value_options_and_aliases_block(self, command):
@@ -196,8 +198,14 @@ class TestGitExecPathOverride:
 
     def test_alias_helper(self):
         assert dangerous_git_config(["-c", "alias.x=-C d --exec-path=x gc", "x"]) is not None
+        # git splits an alias with its own rules, not shlex's (verified, git 2.43): a backslash
+        # escapes the next character outside quotes and inside "...", and is literal in '...'.
+        assert dangerous_git_config(["-c", 'alias.x="--exec-\\path=x" gc', "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x=--exec-\\path=x gc", "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x='--exec-\\path=x' gc", "x"]) is None
         # An alias git cannot split is refused rather than guessed at.
         assert dangerous_git_config(["-c", "alias.x=log 'unclosed", "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x=log x\\", "x"]) is not None
         # A plain alias, and one whose operand merely mentions the option, stay allowed.
         assert dangerous_git_config(["-c", "alias.x=log --oneline", "x"]) is None
         assert dangerous_git_config(["-c", "alias.x=grep -e --exec-path=x", "x"]) is None

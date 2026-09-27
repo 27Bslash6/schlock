@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
@@ -550,13 +549,48 @@ def _git_exec_path_override(args: list[str]) -> str | None:
     return None
 
 
+# git's isspace() (sane_ctype, ctype.c): space, tab, LF and CR. Not \v or \f.
+_GIT_ALIAS_SPACE = " \t\n\r"
+
+
+def _split_git_alias(value: str) -> list[str] | None:
+    """Split an alias value into words as git's split_cmdline() (alias.c) does, or return
+    None where git refuses it (an unclosed quote or a trailing backslash).
+
+    Not shlex: git lets a backslash escape the next character inside double quotes too, so it
+    reads `"--exec-\\path=DIR"` as `--exec-path=DIR` where shlex keeps the backslash. Every
+    whitespace run ends a word, so leading whitespace gives an empty first word, as in git.
+    """
+    words = [""]
+    quote = ""
+    i = 0
+    while i < len(value):
+        c = value[i]
+        if not quote and c in _GIT_ALIAS_SPACE:
+            words.append("")
+            while i + 1 < len(value) and value[i + 1] in _GIT_ALIAS_SPACE:
+                i += 1
+        elif not quote and c in "'\"":
+            quote = c
+        elif c == quote:
+            quote = ""
+        else:
+            if c == "\\" and quote != "'":
+                i += 1
+                if i == len(value):
+                    return None
+                c = value[i]
+            words[-1] += c
+        i += 1
+    return None if quote else words
+
+
 def _alias_exec_path_override(alias_value: str) -> str | None:
     """git feeds a non-! alias back through its global-option parser, so
     `alias.x=--exec-path=DIR gc` redirects the exec path. An alias git itself cannot split
     fails in git too; refuse it rather than guess at its words."""
-    try:
-        alias_words = shlex.split(alias_value)
-    except ValueError:
+    alias_words = _split_git_alias(alias_value)
+    if alias_words is None:
         return GIT_EXEC_PATH_REASON
     return _git_exec_path_override(alias_words)
 
