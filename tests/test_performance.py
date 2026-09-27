@@ -8,9 +8,11 @@ Uses pytest-benchmark for statistically sound measurements:
 
 Run with: pytest tests/test_performance.py -v --benchmark-only
 
-Note: Tests gracefully skip when pytest-benchmark is not installed.
-Install with: uv add --dev pytest-benchmark
+The whole module is marked `slow`, so the local fast gate (`-m "not slow"`)
+skips it. Run it with `pytest tests/test_performance.py` or `make test`.
 """
+
+import os
 
 import pytest
 
@@ -20,7 +22,7 @@ from schlock.core.validator import validate_command
 
 # Check if pytest-benchmark is available
 try:
-    import pytest_benchmark  # noqa: F401  # pyright: ignore[reportMissingImports]
+    import pytest_benchmark  # noqa: F401
 
     HAS_BENCHMARK = True
 except ImportError:
@@ -32,6 +34,8 @@ requires_benchmark = pytest.mark.skipif(
     reason="pytest-benchmark not installed (pip install pytest-benchmark)",
 )
 
+pytestmark = pytest.mark.slow
+
 
 def stats_median_ms(benchmark) -> float:
     """Extract median from benchmark stats in milliseconds.
@@ -42,6 +46,28 @@ def stats_median_ms(benchmark) -> float:
     - stats.stats.median is in seconds
     """
     return benchmark.stats.stats.median * 1000
+
+
+# An absolute millisecond budget only means something on a machine whose speed we
+# control, and a shared CI runner is not one. `test_rule_matching` measured 0.22ms
+# against its 0.2ms budget on Python 3.9 and turned main red while the *same commit*
+# passed the identical assertion in its own PR run minutes earlier -- the runner
+# moved, the code did not. The benchmarks still execute in CI, so a crash in the
+# measured code still fails the build and the timing table still lands in the log;
+# only the verdict on the clock is withheld, because there it grades the runner.
+_IN_CI = os.environ.get("CI", "").lower() == "true" or os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+
+
+def assert_median_under(benchmark, budget_ms: float, what: str) -> None:
+    """Fail when `what`'s median misses its budget -- outside CI only.
+
+    The median is read either way, so a change in pytest-benchmark's stats shape
+    still breaks the build in CI rather than silently reporting nothing.
+    """
+    median_ms = stats_median_ms(benchmark)
+    if _IN_CI:
+        return
+    assert median_ms < budget_ms, f"{what} median too slow: {median_ms:.4f}ms (budget: {budget_ms}ms)"
 
 
 @requires_benchmark
@@ -64,8 +90,7 @@ class TestCachePerformance:
         result = benchmark(populated_cache.get, "cmd500")
         assert result is not None
 
-        median_ms = stats_median_ms(benchmark)
-        assert median_ms < 0.05, f"Cache lookup median too slow: {median_ms:.4f}ms"
+        assert_median_under(benchmark, 0.05, "Cache lookup")
 
     def test_cache_set_performance(self, benchmark):
         """Cache writes should be sub-millisecond."""
@@ -78,8 +103,7 @@ class TestCachePerformance:
 
         benchmark(cache_write)
 
-        median_ms = stats_median_ms(benchmark)
-        assert median_ms < 0.05, f"Cache write median too slow: {median_ms:.4f}ms"
+        assert_median_under(benchmark, 0.05, "Cache write")
 
     @pytest.mark.parametrize("cache_size", [100, 1000, 10000])
     def test_cache_scaling(self, benchmark, cache_size):
@@ -93,9 +117,8 @@ class TestCachePerformance:
         result = benchmark(cache.get, key)
         assert result is not None
 
-        median_ms = stats_median_ms(benchmark)
-        # LRU dict is O(1), so even 10k should be < 0.05ms on typical CI
-        assert median_ms < 0.05, f"Cache size {cache_size} median too slow: {median_ms:.4f}ms"
+        # LRU dict is O(1), so even 10k stays flat.
+        assert_median_under(benchmark, 0.05, f"Cache size {cache_size}")
 
 
 @requires_benchmark
@@ -117,8 +140,7 @@ class TestParserPerformance:
         """Simple commands should parse in < 0.25ms median."""
         benchmark(parser.parse, cmd)
 
-        median_ms = stats_median_ms(benchmark)
-        assert median_ms < 0.25, f"Parser median too slow for '{cmd}': {median_ms:.2f}ms"
+        assert_median_under(benchmark, 0.25, f"Parser on {cmd!r}")
 
     @pytest.mark.parametrize(
         "cmd",
@@ -133,8 +155,7 @@ class TestParserPerformance:
         """Complex pipelines should parse in < 0.75ms median."""
         benchmark(parser.parse, cmd)
 
-        median_ms = stats_median_ms(benchmark)
-        assert median_ms < 0.75, f"Parser median too slow for complex cmd: {median_ms:.2f}ms"
+        assert_median_under(benchmark, 0.75, f"Parser on complex {cmd!r}")
 
 
 @requires_benchmark
@@ -157,8 +178,7 @@ class TestRuleEnginePerformance:
         engine = RuleEngine(safety_rules_path)
         benchmark(engine.match_command, cmd)
 
-        median_ms = stats_median_ms(benchmark)
-        assert median_ms < 0.2, f"Rule matching median too slow for '{cmd}': {median_ms:.2f}ms"
+        assert_median_under(benchmark, 0.2, f"Rule matching on {cmd!r}")
 
 
 @requires_benchmark
@@ -183,9 +203,8 @@ class TestEndToEndPerformance:
         # Benchmark warm path
         benchmark(validate_command, cmd, config_path=safety_rules_path)
 
-        median_ms = stats_median_ms(benchmark)
-        # Warm validation (cached) should be very fast after caching optimization
-        assert median_ms < 0.01, f"Validation median too slow for '{cmd}': {median_ms:.4f}ms"
+        # Warm validation (cached) should be very fast after caching optimization.
+        assert_median_under(benchmark, 0.01, f"Warm validation of {cmd!r}")
 
     def test_cold_validation_performance(self, benchmark, safety_rules_path):
         """Cold validation (uncached) should complete in < 75ms median."""
@@ -199,10 +218,8 @@ class TestEndToEndPerformance:
 
         benchmark(cold_validate)
 
-        median_ms = stats_median_ms(benchmark)
-        # Cold path includes parsing + rule matching
-        # With caching optimization, ~28ms typical - 75ms allows CI headroom
-        assert median_ms < 75.0, f"Cold validation median too slow: {median_ms:.2f}ms"
+        # Cold path includes parsing + rule matching; ~28ms typical.
+        assert_median_under(benchmark, 75.0, "Cold validation")
 
     def test_cached_validation_performance(self, benchmark, safety_rules_path):
         """Cached validation should complete in < 0.01ms median."""
@@ -212,8 +229,7 @@ class TestEndToEndPerformance:
 
         benchmark(validate_command, cmd, config_path=safety_rules_path)
 
-        median_ms = stats_median_ms(benchmark)
-        assert median_ms < 0.01, f"Cached validation median too slow: {median_ms:.4f}ms"
+        assert_median_under(benchmark, 0.01, "Cached validation")
 
 
 @requires_benchmark
@@ -240,8 +256,10 @@ class TestThroughput:
         # Log throughput for visibility
         print(f"\nThroughput: {throughput:.0f} validations/sec")
 
-        # With caching optimization, ~2600/sec typical - 1000/sec allows CI headroom
-        assert throughput > 1000, f"Throughput too low: {throughput:.0f} validations/sec"
+        # ~2600/sec typical. Withheld in CI for the same reason as the median
+        # budgets above: on a shared runner this grades the runner.
+        if not _IN_CI:
+            assert throughput > 1000, f"Throughput too low: {throughput:.0f} validations/sec"
 
 
 class TestMemoryEfficiency:

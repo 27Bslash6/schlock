@@ -31,6 +31,7 @@ import yaml
 from schlock.core import validator
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import clear_caches, validate_command
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 @pytest.fixture(autouse=True)
@@ -693,9 +694,10 @@ class TestACredentialNameNeedsAPosition:
     @pytest.mark.parametrize(
         "command",
         [
-            # The substitution validator does not recurse into a DOUBLE-QUOTED
-            # `$(...)`, so this rule is the only thing covering these. The
-            # unquoted twin is caught by environment_credential_extraction.
+            # Inside a double-quoted `$(...)` the substitution validator runs the inner
+            # command against the rules before any top-level pattern is consulted
+            # (LAB-4182), so the denial is attributed to environment_credential_extraction
+            # matching `printenv <NAME>`.
             'echo "$(printenv GITHUB_TOKEN)"',
             'printf "%s" "$(printenv AWS_SECRET_ACCESS_KEY)"',
             'echo "Bearer $(printenv GITHUB_TOKEN)"',
@@ -703,7 +705,8 @@ class TestACredentialNameNeedsAPosition:
     )
     def test_substituted(self, command, rules_dir_path):
         result = verdict(command, rules_dir_path)
-        assert "extended_credential_exposure" in result.matched_rules, command
+        assert result.risk_level is RiskLevel.BLOCKED, command
+        assert "environment_credential_extraction" in result.matched_rules, command
 
     @pytest.mark.parametrize(
         "command",
@@ -763,7 +766,18 @@ class TestUnanchoredSearchStaysLinear:
     failed search gives up after a fixed number of options.
     """
 
-    ADVERSARY = "git" + " -c user.name=x' y' -C git" * 512 + " status"
+    # n is load-bearing, not arbitrary. The regression is quadratic and the fix is
+    # linear, so the gap between them GROWS with n -- and it has to outgrow the
+    # spread between the fastest and slowest machine that runs this, or no budget
+    # can tell a slow runner from a restored O(n^2). Measured on 3.9, bounded vs
+    # the same rules with the {0,16} option bound removed:
+    #     n= 512   0.44s vs  1.22s   2.8x   <- smaller than the ~3x runner spread
+    #     n=1024   0.80s vs  3.80s   4.8x
+    #     n=2048   1.36s vs 13.61s  10.0x
+    # 512 is why the old 1.0s budget could both false-fail a correct run (CI
+    # measured 1.0013s) and let the unbounded mutant through. 2048 buys the
+    # separation a constant needs.
+    ADVERSARY = "git" + " -c user.name=x' y' -C git" * 2048 + " status"
 
     @pytest.mark.parametrize(
         "operation",
@@ -774,7 +788,18 @@ class TestUnanchoredSearchStaysLinear:
         command = self.ADVERSARY.replace(" status", " " + operation)
         start = time.perf_counter()
         verdict(command, rules_dir_path)
-        assert time.perf_counter() - start < 1.0
+        # Balanced on the machine that gates merges, not on whichever box ran it
+        # last. Scaling the 1.0013s CI measured at n=512 gives ~4.0s there for the
+        # linear implementation, against ~30s for the quadratic one: 2.5x of room
+        # below this budget, 3x of margin above it. A faster box only makes the
+        # check more lenient, and locally this class is `slow` and outside the
+        # default gate anyway. Costs the 3.9 leg ~24s.
+        #
+        # Verified by mutation rather than by argument: drop the {0,16} option
+        # bound from data/rules/10_development_workflows.yaml and all six cases
+        # must go red. Measured 11.25-14.08s mutant vs 1.45-1.60s bounded, under
+        # `pytest --cov` on 3.9. At the old n=512 the mutant passed.
+        assert time.perf_counter() - start < 10.0
 
     def test_cost_grows_linearly_not_quadratically(self, rules_dir_path):
         """A quadratic scan quadruples per doubling; a linear one doubles.
@@ -997,13 +1022,16 @@ class TestDecoyPaddingIsScannedExactly:
 
     A bound here looks like cheap insurance and is not. An earlier cut capped the
     rescan and reported the last SUPPRESSED match on exhaustion, reasoning that
-    padding should buy a denial. It bought the opposite: `validate_command` runs
-    its cross-segment scan only when NO segment matched, so a bogus segment match
-    hides a BLOCKED the whole command would have earned. Padding with 32 repeats
-    of any unanchored low-risk pattern switched off every cross-segment rule.
-    Returning None on exhaustion is no better -- then padding silences the rule.
+    padding should buy a denial. It denies benign text instead: a quoted doc
+    listing many install lines. It also under-blocked while `validate_command`
+    ran its cross-segment scan only when no segment matched; that scan now runs
+    whatever the segments matched, so a bogus segment match no longer hides the
+    BLOCKED. Returning None on exhaustion is no better -- then padding silences
+    the rule.
 
-    Both directions are pinned below at 40 repeats, past where the cap sat.
+    Pinned below at 40 repeats, past where the cap sat. The over-block test is
+    what pins the last-suppressed-match bound; nothing here pins a bound that
+    returns None, because the fork bomb matches on its first iteration.
     Found by adversarial review of this branch (LAB-4321 / PR #170, whose
     rules.py this file's engine change is byte-identical to).
     """
@@ -1012,8 +1040,9 @@ class TestDecoyPaddingIsScannedExactly:
         """The under-block, and the serious one: a fork bomb behind the padding.
 
         `_segment_nodes` fragments `:(){ :|:& };:` into inert `:` segments, so the
-        whole-command scan is the ONLY thing that can see it. A bogus segment match
-        skips that scan.
+        whole-command scan is the ONLY thing that can see it. That scan runs
+        whatever the segments matched, so this is the end-to-end contract rather
+        than the guard on the bound.
         """
         padded = "echo '" + ("pip install -r requirements.txt " * 40) + "' && :(){ :|:& };:"
         assert not verdict(padded, rules_dir_path).allowed
@@ -1025,6 +1054,50 @@ class TestDecoyPaddingIsScannedExactly:
     def test_a_modest_number_of_decoys_still_finds_the_real_read(self, rules_dir_path):
         command = "echo '" + ("od ~/.ssh/id_rsa " * 4) + "' ; nl ~/.ssh/id_ed25519"
         result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "ssh_key_exfiltration" in result.matched_rules
+
+    def test_padding_does_not_silence_the_rule_that_decides_the_verdict(self, rules_dir_path):
+        """The None direction, which no row above can see.
+
+        `test_padding_does_not_hide_a_cross_segment_block` lets `fork_bomb` decide,
+        and `fork_bomb` matches on iteration 1 with nothing suppressed in front of
+        it. Its padded `pip` patterns do exhaust, but they carry HIGH
+        (`pip_system`) and LOW (`pip_requirements`) -- both under BLOCKED, so
+        silencing them cannot move the verdict. `test_padding_does_not_deny_inert_text`
+        asserts a command is allowed, which no amount of silencing can fail. And
+        `test_a_modest_number_of_decoys_still_finds_the_real_read` pads with four
+        decoys, which reaches no cap at all; its `;` is a real separator, so the
+        payload lands in its own segment and that scan never walks past a decoy.
+
+        Here the scan that walks the padding is the only thing between the command
+        and its verdict. ONE `ssh_key_exfiltration` pattern matches both halves:
+        `~/.ssh/identity` inside the quoted `-u` operand, every occurrence
+        suppressed as inert text, then `~/.ssh/id_ed25519` outside it. The `;` are
+        quoted operand data, so this is ONE segment and one scan. `env -u NAME CMD`
+        execs CMD, so the trailing read is real -- an `echo` spelling gives the same
+        scan profile while reading nothing, and would pin a false positive instead.
+        `ssh_key_exfiltration` is the only rule that rates this at all, so a scan
+        that gives up and returns None leaves it SAFE.
+
+        THE PADDING IS SIZED OFF THE INPUT CEILING, NOT OFF A ROUND NUMBER. A row
+        with 40 decoys pins only "no bound at or below 40": a budget of 64, or a
+        byte cap (`if match.start() > 4096: return None`), passes it and still
+        under-blocks -- and a byte cap is the shape a fix for the reader pattern's
+        density cost would take. Filled to MAX_COMMAND_SIZE there is nowhere left
+        for a bound to sit, because `validate_command` refuses anything larger
+        before it parses.
+
+        One dependency worth knowing if this ever goes green for no reason: `env` is
+        in `WRAPPER_COMMANDS`, and shell-delegation re-entry harvests `-c` payload
+        strings only. If it ever harvested a wrapper's residual command vector, the
+        key would get a fresh decoy-free scan and this row would stop testing.
+        """
+        decoy = "cat ~/.ssh/identity; "
+        shape = "env -u '{}' head ~/.ssh/id_ed25519"
+        padded = shape.format(decoy * ((MAX_COMMAND_SIZE - len(shape.format(""))) // len(decoy)))
+        assert len(padded) <= MAX_COMMAND_SIZE
+        result = verdict(padded, rules_dir_path)
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ssh_key_exfiltration" in result.matched_rules
 

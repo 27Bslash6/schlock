@@ -251,6 +251,9 @@ class TestIFSObfuscation:
             ("$IFS", "Direct IFS usage"),
             ("IFS=, cat,/etc/passwd", "IFS override"),
             ("${IFS%?}", "IFS parameter expansion"),
+            ("IFS=,; x=rm,-rf,/; $x", "IFS split of an unquoted expansion"),
+            ("f(){ local IFS=,; x=rm,-rf,/; $x; }; f", "Function-local IFS override"),
+            ("IFS=$'\\n\\t'", "ANSI-C quoted IFS override"),
         ],
     )
     def test_ifs_obfuscation_blocked(self, command, description):
@@ -258,6 +261,7 @@ class TestIFSObfuscation:
         result = validate_command(command)
         assert not result.allowed, f"CRITICAL: {description} was NOT blocked! Command: {command}"
         assert result.risk_level == RiskLevel.BLOCKED
+        assert "ifs_obfuscation" in result.matched_rules, f"{description} blocked by another path: {command}"
 
 
 class TestBase64ShellExecution:
