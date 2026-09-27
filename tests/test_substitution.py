@@ -4,6 +4,7 @@ Targeted tests to improve coverage on uncovered code paths.
 """
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -1365,6 +1366,74 @@ class TestCheckProcessSubstitutionContext:
         assert result is None
 
 
+class TestCommandNameSkipsFdVariablePrefix:
+    """A redirection's `{varname}` prefix is never the command name.
+
+    bash consumes `{fd}` with its redirect, so `{fd}<x date` names its command exactly as
+    `3<x date` does. These lookups read `parts[0]` raw and named `{fd}` instead. Each row
+    pins a `{varname}` spelling and its numeric-fd twin to the same absolute value; a
+    trailing prefix shows the lookup still finds the command. The prefix itself is decided
+    in tests/test_fd_variable_redirect.py.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("{fd}<x date", None),
+            ("3<x date", None),
+            ("date {fd}<x", "date"),
+            ("{fd}<x date | cat", None),
+            ("3<x date | cat", None),
+            ("date {fd}<x | cat", "date"),
+        ],
+    )
+    def test_list_segment_base_command(self, validator, parser, command, expected):
+        assert validator._segment_base_command(parser.parse(command)[0]) == expected
+
+    @pytest.mark.parametrize(
+        ("inner", "expected"),
+        [("{fd}<x date | cat", None), ("3<x date | cat", None), ("date {fd}<x | cat", "date")],
+    )
+    def test_pipeline_base_command(self, validator, parser, inner, expected):
+        (sub,) = validator.extract_substitutions(parser.parse(f"echo $({inner})"))
+        assert sub.base_command == expected
+
+    @pytest.mark.parametrize(("command", "expected"), [("{fd}<x date", None), ("3<x date", None), ("date {fd}<x", "date")])
+    def test_compound_base_command(self, validator, parser, command, expected):
+        """bashlex leads every compound that reaches this branch with a reserved word, so pin it directly."""
+        node = SimpleNamespace(command=SimpleNamespace(kind="compound", list=parser.parse(command)))
+        assert validator._extract_base_command(node) == expected
+
+    @pytest.mark.parametrize(
+        ("command", "brace", "variable"),
+        [
+            ("3<x date", False, False),
+            ("{r,}m {fd}<x -rf /", True, False),
+            ("$CMD {fd}<x", False, True),
+        ],
+    )
+    def test_ast_pattern_checks(self, validator, parser, command, brace, variable):
+        node = parser.parse(command)[0]
+        assert validator._has_brace_expansion_in_command(node) is brace
+        assert validator._has_variable_as_command(node) is variable
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [("{fd}>f bash <(ls)", None), ("3>f bash <(ls)", None), ("bash {fd}>f <(ls)", "bash")],
+    )
+    def test_find_outer_command(self, validator, parser, command, expected):
+        assert validator._find_outer_command(parser.parse(command), None) == expected
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize("prefix", ["{fd}<x", "{fd[0]}<x", "3<x"])
+    def test_denial_names_no_phantom_pattern(self, prefix):
+        result = validate_command(f"echo $({prefix} date)")
+        assert (result.risk_level, result.message) == (
+            RiskLevel.BLOCKED,
+            "BLOCKED: Cannot determine command in substitution",
+        )
+
+
 class TestNestedSubstitutionValidation:
     """Test nested substitution validation paths."""
 
@@ -1862,9 +1931,31 @@ class TestGroupedAndRedirectedSubstitutions:
     @pytest.mark.parametrize(
         "command",
         [
-            # Control flow: branches this module cannot decompose, so no base command is claimed.
+            # Control flow: branches this module cannot decompose.
             'echo "$( if true; then rm -rf /; fi )"',
             'echo "$( for i in 1; do rm -rf /; done )"',
+            'echo "$(while true; do rm -rf /; done)"',
+            'echo "$(until false; do rm -rf /; done)"',
+            # The same clause as one segment of a list or pipeline blocks the whole substitution,
+            # not the unknown-command HIGH of `x=1`.
+            'echo "$(x=1; if true; then rm -rf /; fi)"',
+            'echo "$(date && for f in x; do rm -rf /; done)"',
+            'echo "$(ls | while read f; do rm -rf /; done)"',
+            # A function definition shadows the command it names, so its body runs when the name is
+            # called. bashlex emits kind "function" and its name still resolves as the base command:
+            # before the guard, a whitelisted name (`date`) read SAFE, any other name or the
+            # `function` keyword HIGH.
+            'echo "$(date() { rm -rf /; }; date)"',
+            'echo "$(date() { rm -rf /; })"',
+            'echo "$(date && date() { rm -rf /; })"',
+            'echo "$(ls | date() { rm -rf /; })"',
+            'echo "$({ date() { rm -rf /; }; date; })"',
+            'echo "$(foo() { rm -rf /; }; foo)"',
+            'echo "$(function date { rm -rf /; }; date)"',
+            # A body no rule matches: the guard's denial is the only one, and it must survive the
+            # deferral to validate_command's join.
+            'echo "$(date() { ./payload; }; date)"',
+            'echo "$(if true; then ./payload; fi)"',
             # A grouping that carries its own redirection is a real write, not inert grouping.
             'echo "$( (ls) > /tmp/x )"',
         ],
@@ -1872,20 +1963,45 @@ class TestGroupedAndRedirectedSubstitutions:
     def test_undecomposable_groups_fail_closed(self, command):
         """What cannot be unwrapped must block outright, not degrade to an unknown command.
 
-        A ReservedwordNode's ``.word`` is "if"/"for" — a keyword, not a command. Letting it stand
-        in as the base command rated a whole uninspectable branch as merely unknown (HIGH, which
-        the permissive preset allows).
+        Rating an uninspectable branch as merely unknown (HIGH) lets the permissive preset run it.
+        The message pins the non-simple-command guard, not whichever fallback also happens to deny.
         """
         result = validate_command(command)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
-        assert "cannot determine command" in result.message.lower()
+        assert "non-simple command in substitution" in result.message.lower()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(date() { ./payload; }; date)"; rm -rf /',
+            'echo "$(if true; then ./payload; fi)" && rm -rf /',
+        ],
+    )
+    def test_fail_closed_denial_keeps_a_later_rule_name(self, command):
+        """The guard's denial names no rule, so it defers: a later command's rule still reaches the audit log."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "system_destruction" in result.matched_rules, result.matched_rules
+        assert "non-simple command in substitution" in result.message.lower()
+
+    @pytest.mark.parametrize(
+        ("command", "risk", "allowed"),
+        [
+            ('echo "$(cd foo; make)"', RiskLevel.HIGH, False),  # unknown segment stays ask, not deny
+            ('echo "$(echo a; echo b)"', RiskLevel.SAFE, True),
+        ],
+    )
+    def test_plain_lists_keep_their_rating(self, command, risk, allowed):
+        """The clause block must not bleed onto ordinary lists."""
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (risk, allowed)
 
     def test_substitution_denial_does_not_downgrade_a_stronger_rule(self):
         """Worst verdict wins, not the first one found.
 
-        A substitution denial short-circuits the rule pass, so a weaker-than-BLOCKED one used to
-        DOWNGRADE commands the rules deny outright — `base64` is merely an unknown command inside
+        A substitution denial used to short-circuit the rule pass, so a weaker-than-BLOCKED one
+        DOWNGRADED commands the rules deny outright — `base64` is merely an unknown command inside
         a substitution (HIGH -> ask) while the whole command is base64-piped-to-shell (BLOCKED).
         Falling through to the rule pass is not a fix: that pass works on extracted segments,
         where a match inside a double-quoted word is suppressed as a string literal.
@@ -1894,6 +2010,70 @@ class TestGroupedAndRedirectedSubstitutions:
             result = validate_command(command)
             assert result.allowed is False, command
             assert result.risk_level == RiskLevel.BLOCKED, command
+
+
+class TestPeeledGroupReadRedirects:
+    """A peeled group's read-redirect targets are still walked for nested substitutions (LAB-5648).
+
+    `_unwrap_compound` peels `( … )` / `{ …; }` and its read redirects go with the wrapper, so the
+    nested walk used to see only the inner command: `$( ( cat ) < "$(bash)" )` read SAFE while the
+    ungrouped `$(cat < "$(bash)")` BLOCKs — and bash expands a redirect target before running the
+    command, so `bash` really runs. Each grouped spelling must rate exactly as its ungrouped twin.
+    """
+
+    @pytest.mark.parametrize(
+        ("grouped", "twin", "level", "target"),
+        [
+            ('x=$( ( cat ) < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( cat ) <<< "$(./payload.sh)" )', 'x=$(cat <<< "$(./payload.sh)")', RiskLevel.HIGH, "./payload.sh"),
+            ("x=$( ( cat ) < <(bash) )", "x=$(cat < <(bash))", RiskLevel.BLOCKED, "bash"),
+            ('x=$( { cat; } < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( ( cat ) < "$(bash)" ) )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # inner layer
+            ('x=$( ( ( cat ) ) < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # outer layer
+            ('x=$(ls; ( cat ) < "$(bash)")', 'x=$(ls; cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # list segment
+            ('x=$( ( cat ) < "$(bash)" | cat )', 'x=$(cat < "$(bash)" | cat)', RiskLevel.BLOCKED, "bash"),  # pipeline
+            ('cat <( ( cat ) < "$(bash)" )', 'cat <(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # process subst
+            # A list or pipeline BODY is validated segment by segment, and the group's redirect
+            # belongs to no segment, so it is judged on its own.
+            ('x=$( ( cat | cat ) < "$(bash)" )', 'x=$(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( { cat; ls; } < "$(bash)" )', 'x=$(cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( cat && ls ) < "$(bash)" )', 'x=$(cat < "$(bash)" && ls)', RiskLevel.BLOCKED, "bash"),
+            (
+                'x=$( ( cat | cat ) <<< "$(./payload.sh)" )',
+                'x=$(cat | cat <<< "$(./payload.sh)")',
+                RiskLevel.HIGH,
+                "./payload.sh",
+            ),
+            ('x=$(ls; ( cat; ls ) < "$(bash)")', 'x=$(ls; cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('cat <( ( cat | cat ) < "$(bash)" )', 'cat <(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+        ],
+    )
+    def test_grouped_read_redirect_matches_ungrouped_twin(self, grouped, twin, level, target):
+        """The message must name the redirect-target command, so a parse-error BLOCK cannot pass."""
+        result = validate_command(grouped, _shellcheck=False)
+        twin_result = validate_command(twin, _shellcheck=False)
+        assert twin_result.risk_level == level  # the twin is the reference; it must not have moved
+        assert result.risk_level == level
+        assert result.allowed is twin_result.allowed
+        assert f"in substitution: {target}" in result.message
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=$( ( cat ) < file )",
+            "x=$( { cat; } < file )",
+            'x=$( ( cat ) < "$(echo hi)" )',
+            'x=$(cat < "$(echo hi)")',  # ungrouped reference
+            'x=$( ( cat | cat ) < "$(echo hi)" )',
+            "x=$( ( cat; ls ) < file )",
+            'x=$( ( cat | wc -l ) < "$(date)" )',
+        ],
+    )
+    def test_benign_grouped_reads_stay_safe(self, command):
+        """Walking the redirects must not turn an inert grouped read into a false positive."""
+        result = validate_command(command, _shellcheck=False)
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.SAFE
 
 
 class TestWorstVerdictWins:
