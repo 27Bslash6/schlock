@@ -824,7 +824,8 @@ class TestBase64DecodeAtCommandPosition:
     dropped the here-string spellings to HIGH / allowed=False and the `-c` spellings to
     HIGH / allowed=True, and the bare `$(base64 -d x)` was HIGH - the substitution validator
     scored the decode as merely an unknown command. The fix is positional, not a wider regex:
-    the decode is dangerous where its output becomes the command name, and only there.
+    the decode is dangerous where its output becomes the command name, or where bash evaluates
+    it as arithmetic in a leading assignment's subscript, and only there.
     """
 
     @pytest.mark.parametrize(
@@ -862,6 +863,7 @@ class TestBase64DecodeAtCommandPosition:
             "$(base64 [-]d x)",
             "$(base64 ?d x)",
             "$(base64 ~- x)",
+            "$(base64 *d x)",
             "$(/usr/bin/bas?64 -d x)",
             "$(/usr/bin/base6[4] -d x)",
             # The other coreutils base-N decoders.
@@ -880,6 +882,24 @@ class TestBase64DecodeAtCommandPosition:
             "timeout 5 $(base64 -d x)",
             "nice -n 10 nohup $(base64 -d x)",
             "xargs $(base64 -d x)",
+            # A wrapper's own flag word carries the decode: unquoted it word-splits into the
+            # wrapper's argv, and `env -S` splits the string itself.
+            'env -S"$(base64 -d p)"',
+            'env --split-string="$(base64 -d p)"',
+            "nice -n$(base64 -d p) true",
+            "timeout -$(base64 -d p) 5 true",
+            # GNU env takes any operand with a non-leading `=` as an assignment.
+            "env A-B=1 $(base64 -d x)",
+            "env a[0]=1 $(base64 -d x)",
+            "env A.B=1 $(base64 -d x)",
+            "env é=1 $(base64 -d x)",
+            # A wrapper named by a glob, or by a brace word that expands to it or vanishes.
+            "/usr/bin/en? $(base64 -d x)",
+            "{env,} $(base64 -d x)",
+            "{nohup,} $(base64 -d x)",
+            "{,} $(base64 -d x)",
+            # A decode inside a redirect's process substitution.
+            "$(cat < <(base64 -d x))",
             "bash -c '\nenv $(base64 -d x)'",
             'bash <<< "\nnohup $(base64 -d x)"',
             # A runner no list names still runs the decoder it is handed, and a name that
@@ -907,6 +927,8 @@ class TestBase64DecodeAtCommandPosition:
             "2>/dev/null X+=1 $(base64 -d x)",
             "{fd}>out a[0]=1 $(base64 -d x)",
             "a[0]=1 $(base64 -d x)",
+            # bash rejects this assignment (`not a valid identifier`) and still runs the next word.
+            "a[$(true)]=1 $(base64 -d x)",
             # With no command after it, a subscript is arithmetic: bash runs a `b[$(…)]` it decodes.
             "a[$(base64 -d x)]=1",
             "2>/dev/null a[`base64 -d x`]=1",
@@ -951,6 +973,14 @@ class TestBase64DecodeAtCommandPosition:
             "$(true) X=1 $(base64 -d x)",
             # A subscript without a substitution is still skipped: this assigns the decode.
             "a[0]=$(base64 -d x)",
+            # Only the subscript is arithmetic; the value, decode and all, is only stored.
+            "out[$(basename f)]=$(base64 -d f)",
+            'm["$(id -u)"]=$(base64 -d f)',
+            'for f in *; do out[$(basename "$f")]=$(base64 -d "$f"); done',
+            # A `]=` inside the value is not the subscript's close.
+            "a[0]=$(base64 -d x | grep '[k]=v')",
+            # `--` ends the flags: no decode flag, so this encodes.
+            "$(base64 -- x)",
         ],
     )
     def test_decode_as_data_is_not_escalated(self, command):

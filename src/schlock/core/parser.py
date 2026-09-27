@@ -19,7 +19,7 @@ import re
 import shlex
 import signal
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
@@ -1190,11 +1190,16 @@ def heredoc_owner(node: Any) -> Optional[str]:
 _DECODERS = ("base64", "base32", "basenc")
 
 
-def _is_decoder(name: str) -> bool:
-    """A decoder's basename, or a glob that bash could expand to one (`/usr/bin/bas?64`)."""
-    if name in _DECODERS:
+def _names_one_of(name: str, names: "Iterable[str]") -> bool:
+    """`name` is one of `names`, or a glob that bash could expand to one (`/usr/bin/bas?64`)."""
+    if name in names:
         return True
-    return any(c in name for c in "*?[") and any(fnmatch.fnmatchcase(d, name) for d in _DECODERS)
+    return any(c in name for c in "*?[") and any(fnmatch.fnmatchcase(n, name) for n in names)
+
+
+def _is_decoder(name: str) -> bool:
+    """A decoder's basename, or a glob that bash could expand to one."""
+    return _names_one_of(name, _DECODERS)
 
 
 def _is_decode_flag(arg: str) -> bool:
@@ -1254,7 +1259,9 @@ def _runs_decode(node: Any, seen: "dict[str, bool]") -> bool:
             return True
     if kind == "parameter":
         return _parameter_runs_decode(getattr(node, "value", None), seen)
-    for attr in ("parts", "command", "list", "pipe", "compound"):
+    # `output` and `redirects` reach a redirect's target, as the substitution validator's walk
+    # does: `$(cat < <(base64 -d x))` decodes inside one.
+    for attr in ("parts", "command", "list", "output", "redirects"):
         child = getattr(node, attr, None)
         children = child if isinstance(child, list) else [child] if child is not None else []
         if any(_runs_decode(c, seen) for c in children):
@@ -1279,23 +1286,72 @@ _EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
 
 
 def _is_env_assignment(word: str) -> bool:
-    """`NAME=value` as a wrapper operand (`env NAME=value cmd`): assigned, never executed."""
-    name, eq, _ = word.partition("=")
-    return bool(eq) and name.isidentifier()
+    """`NAME=value` as a wrapper operand (`env NAME=value cmd`): assigned, never executed.
 
-
-def _skips_as_assignment(word: str) -> bool:
-    """True for an assignment word the command-position scan may step over.
-
-    Not one whose subscript holds a substitution: bash evaluates a subscript as arithmetic when
-    no command follows, so that word is read like a command word, decode and all. Reading it when
-    a command does follow costs a BLOCKED only on a word bash rejects (`not a valid identifier`).
+    GNU env takes any operand with a non-leading `=` as an assignment, so `A-B=1`, `a[0]=1` and
+    `é=1` all are; a leading `-` is a flag (`--split-string=…`), read as one by the caller.
     """
-    assignment = _ASSIGNMENT_WORD.match(word)
-    if assignment is None:
+    name, eq, _ = word.partition("=")
+    return bool(eq and name) and not name.startswith("-")
+
+
+def _may_brace_expand(word: str) -> bool:
+    """True if a word may be brace-expanded: `{env,}` becomes `env`, and `{,}` vanishes.
+
+    bashlex has removed quotes, so a quoted `"{a,b}"` reads the same; costs only a longer scan.
+    """
+    opens = any(c == "{" and (i == 0 or word[i - 1] != "$") for i, c in enumerate(word))
+    return opens and "}" in word and ("," in word or ".." in word)
+
+
+def _subscript_parts(word: Any) -> "Optional[list[Any]]":
+    """The parts of an assignment word inside its `name[…]` subscript; None when that is unsure.
+
+    bashlex keeps a substitution's text verbatim in `.word` and lists the parts in order, so the
+    walk steps over each part by its span length and matches `[`/`]` only in what is left. That
+    keeps a `]=` inside the value (`a[0]=$(… | grep '[k]=v')`) out of the subscript. It works on
+    `.word` rather than the source because the source is not at hand here, which bashlex's
+    quote removal makes lossy: `a["]"]=1` reads `a[]]=1`. So the walk refuses (None) whenever the
+    text it reaches is not what a part or a closing `]=` must look like.
+    """
+    text, parts = word.word, iter(sorted(getattr(word, "parts", None) or [], key=lambda p: p.pos))
+    inside: list[Any] = []
+    i, depth = text.index("[") + 1, 1
+    while i < len(text):
+        c = text[i]
+        if c in "$`" or text.startswith(("<(", ">("), i):
+            part = next(parts, None)
+            if part is None:
+                return None
+            end = i + part.pos[1] - part.pos[0]
+            if part.kind in ("commandsubstitution", "processsubstitution") and text[end - 1 : end] not in (")", "`"):
+                return None
+            inside.append(part)
+            i = end
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        depth += {"[": 1, "]": -1}.get(c, 0)
+        if depth == 0:
+            return inside if text.startswith(("=", "+="), i + 1) else None
+        i += 1
+    return None
+
+
+def _assignment_runs_decode(word: Any, seen: "dict[str, bool]") -> bool:
+    """True if a leading assignment word's subscript runs a base-N decode: `a[$(base64 -d x)]=1`.
+
+    bash evaluates the subscript as arithmetic, and that runs any `$(…)` the decode prints. The
+    value on the right of `=` is only assigned, so it is data (`out[$(basename f)]=$(base64 -d f)`).
+    A subscript the walk cannot delimit is read whole, decode and value alike: the fail-closed side.
+    """
+    if "[" not in word.word.partition("=")[0]:
         return False
-    subscript = assignment.group().partition("[")[2]
-    return "$(" not in subscript and "`" not in subscript
+    inside = _subscript_parts(word)
+    if inside is None:
+        return _runs_decode(word, seen)
+    return any(_runs_decode(part, seen) for part in inside)
 
 
 def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
@@ -1316,25 +1372,32 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     or `sudo mysql -p"$(base64 -d pw)"` pass the decode as DATA to the command the wrapper runs.
 
     Words come from _word_parts, as argv does, so a `{fd}` redirect prefix is never the command.
-    Nor is a leading assignment bashlex typed as a word: after a redirect it types `TOKEN=…` so,
-    and reading that as the command both BLOCKED `2>/dev/null TOKEN=$(… | base64 -d) ./run`,
-    which only assigns the decode, and ended the scan before `>o X=1 $(base64 -d x)` ran it.
-    One is read anyway (_skips_as_assignment): with no command after it, `a[$(base64 -d x)]=1`
-    evaluates its subscript as arithmetic, and that runs any `$(…)` the decode prints.
+    Nor is a leading assignment-shaped word, which bashlex types as a word after a redirect or
+    when subscripted: bash assigns it, or rejects it (`not a valid identifier`), and either way
+    runs the next word, so `a[$(true)]=1 $(base64 -d x)` runs the decode. Only its subscript is
+    read for a decode (_assignment_runs_decode); its value is data.
+    A wrapper's own flag is read for a decode before it is stepped over: an unquoted
+    `nice -n$(…)` word-splits into the wrapper's argv, and `env -S"$(…)"` splits the string itself.
+    A wrapper name is glob-matched as a decoder is (`/usr/bin/en?`), and a word that may
+    brace-expand (`{env,}`, `{,}`) is treated as one, since it may name a wrapper or vanish.
     ponytail: a wrapper's literal operand ends the scan, so `flock /tmp/l $(base64 -d x)` and
     `timeout -s KILL 5 $(…)` stay at the substitution floor (HIGH). Per-wrapper operand arity
     would close that; nothing here models it yet.
     """
     in_wrapper = False
     words = _word_parts(getattr(node, "parts", None) or [])
-    start = next((i for i, w in enumerate(words) if not _skips_as_assignment(w.word)), len(words))
+    start = next((i for i, w in enumerate(words) if not _ASSIGNMENT_WORD.match(w.word)), len(words))
+    if any(_assignment_runs_decode(word, seen) for word in words[:start]):
+        return True
     for word in words[start:]:
         text = word.word
-        if in_wrapper and (text.startswith("-") or text[:1].isdigit() or _is_env_assignment(text)):
+        if in_wrapper and _is_env_assignment(text):
             continue
         if _runs_decode(word, seen):
             return True
-        if text.split("/")[-1] in _EXEC_WRAPPERS:
+        if in_wrapper and (text.startswith("-") or text[:1].isdigit()):
+            continue
+        if _names_one_of(text.split("/")[-1], _EXEC_WRAPPERS) or _may_brace_expand(text):
             in_wrapper = True
             continue
         if not _is_bare_expansion(word):
