@@ -84,10 +84,10 @@ class TestTheNextCommandDoesNotCompleteTheRule:
             'chown -R $(printf %s $(dirname $(pwd)) | head -1) "/etc/app"',
             'chown -R $(printf %s $(dirname $(pwd)) | head -1) "/etcetera"',
             # A system dir named inside a substitution is that command's argument, not chown's target.
-            pytest.param("chown -R $(stat -c %U /home) ./dir", marks=pytest.mark.xfail(strict=True)),
-            pytest.param('chown -R "$(stat -c %U /home)" ./dir', marks=pytest.mark.xfail(strict=True)),
-            pytest.param("chown -R `stat -c %U /home` ./dir", marks=pytest.mark.xfail(strict=True)),
-            pytest.param("chown -R $(id -un):$(stat -c %G /var) ./cache", marks=pytest.mark.xfail(strict=True)),
+            "chown -R $(stat -c %U /home) ./dir",
+            'chown -R "$(stat -c %U /home)" ./dir',
+            "chown -R `stat -c %U /home` ./dir",
+            "chown -R $(id -un):$(stat -c %G /var) ./cache",
         ],
     )
     def test_is_not_a_hard_deny(self, command, rules_dir_path):
@@ -321,11 +321,11 @@ DEEP_RESIDUALS = [
     ("recursive_permission_system_dirs", f"for i in 1; do chown -R {D} /etc; done"),
     ("recursive_permission_system_dirs", f"nohup chown -R {D} /etc&"),
     # A quoted or escaped target: the blanked view reads the quote as written.
-    pytest.param("recursive_permission_system_dirs", f"chown {D} -R '/etc'", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f'chown -R {D} "/etc"', marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f"chown -R {D} \\/etc", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f'chown -R {D} "/home"', marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f'echo $(chown {D} -R "/etc")', marks=pytest.mark.xfail(strict=True)),
+    ("recursive_permission_system_dirs", f"chown {D} -R '/etc'"),
+    ("recursive_permission_system_dirs", f'chown -R {D} "/etc"'),
+    ("recursive_permission_system_dirs", f"chown -R {D} \\/etc"),
+    ("recursive_permission_system_dirs", f'chown -R {D} "/home"'),
+    ("recursive_permission_system_dirs", f'echo $(chown {D} -R "/etc")'),
     # A substitution inside an unquoted heredoc body runs when the heredoc is read.
     ("credential_exposure", f"cat <<EOF\n$(cat {D}/.env)\nEOF\necho ok"),
 ]
