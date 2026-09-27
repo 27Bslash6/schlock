@@ -20,17 +20,17 @@ Install schlock for your personal use across all projects.
 
 ```bash
 # Add the GitHub marketplace
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 
 # Install the plugin
-/plugin install schlock@schlock
+/plugin install schlock@27b
 
 # Run setup wizard
 /schlock:setup
 ```
 
 **What just happened:**
-1. Added 27Bslash6/schlock GitHub repo as a plugin marketplace
+1. Added 27b-io/schlock GitHub repo as a plugin marketplace
 2. Installed schlock from that marketplace
 3. Setup wizard configures advertising blocker and creates `.claude/hooks/schlock-config.yaml`
 
@@ -38,7 +38,7 @@ Install schlock for your personal use across all projects.
 
 ```bash
 # Add the marketplace
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 
 # Open plugin browser
 /plugin
@@ -80,24 +80,22 @@ Add to `.claude/settings.json` in your repository root:
 ```json
 {
   "extraKnownMarketplaces": {
-    "schlock": {
+    "27b": {
       "source": {
         "source": "github",
-        "repo": "27Bslash6/schlock"
+        "repo": "27b-io/schlock"
       }
     }
   },
-  "plugins": {
-    "schlock@schlock": {
-      "enabled": true
-    }
+  "enabledPlugins": {
+    "schlock@27b": true
   }
 }
 ```
 
 **What this does:**
-- `extraKnownMarketplaces`: Makes the schlock marketplace available
-- `plugins`: Automatically installs and enables schlock when repo is trusted
+- `extraKnownMarketplaces`: Makes the `27b` marketplace (which hosts schlock) available
+- `enabledPlugins`: Automatically installs and enables schlock when repo is trusted
 
 ### Step 2: Commit Settings
 
@@ -208,14 +206,18 @@ After installation, verify schlock is working:
 **Check marketplace:**
 ```bash
 /plugin marketplace list
-# Should see "schlock" (from 27Bslash6/schlock)
+# Should see "27b" (from 27b-io/schlock)
 ```
 
 **Re-add marketplace:**
+
+> [!WARNING]
+> `/plugin marketplace remove 27b` also uninstalls `schlock@27b`, and may delete the plugin's saved options and data. Until the install below succeeds, schlock is not validating commands. Run the three commands back to back, and only when you have network access to GitHub. Your schlock config (`.claude/hooks/schlock-config.yaml`, `~/.config/schlock/`) is not affected.
+
 ```bash
-/plugin marketplace remove schlock
-/plugin marketplace add 27Bslash6/schlock
-/plugin install schlock@schlock
+/plugin marketplace remove 27b
+/plugin marketplace add 27b-io/schlock
+/plugin install schlock@27b
 ```
 
 ### Commands not available
@@ -228,7 +230,7 @@ After installation, verify schlock is working:
 
 **Enable if disabled:**
 ```bash
-/plugin enable schlock@schlock
+/plugin enable schlock@27b
 ```
 
 ### Setup wizard fails
@@ -283,7 +285,7 @@ python -m json.tool .claude/settings.json
 cat ~/.config/schlock/audit.jsonl
 ```
 
-If empty, hook isn't running. File a bug at: https://github.com/27Bslash6/schlock/issues
+If empty, hook isn't running. File a bug at: https://github.com/27b-io/schlock/issues
 
 ---
 
@@ -292,7 +294,7 @@ If empty, hook isn't running. File a bug at: https://github.com/27Bslash6/schloc
 ### Remove Plugin
 
 ```bash
-/plugin uninstall schlock@schlock
+/plugin uninstall schlock@27b
 ```
 
 **What's removed:**
@@ -321,7 +323,7 @@ rm ~/.config/schlock/audit.jsonl
 ### Remove Marketplace
 
 ```bash
-/plugin marketplace remove schlock
+/plugin marketplace remove 27b
 ```
 
 ---
@@ -340,7 +342,6 @@ After installation:
 
 ## Support
 
-- **Issues**: https://github.com/27Bslash6/schlock/issues
-- **Discussions**: https://github.com/27Bslash6/schlock/discussions
+- **Issues**: https://github.com/27b-io/schlock/issues
 - **Security**: security@27b.io
 - **Documentation**: [README.md](../README.md) | [CONFIGURATION.md](CONFIGURATION.md)
