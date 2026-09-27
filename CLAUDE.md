@@ -14,6 +14,25 @@
 
 **Status**: v0.2.4 production. 850+ tests passing, 92%+ coverage.
 
+## Executing candidate commands: `scripts/bash-oracle` only
+
+Real bash is the ground truth for every parsing question here, so schlock work executes
+the very commands schlock exists to stop. **Never run a corpus line, test vector, probe
+candidate or evasion string through `subprocess`, `bash -c`, `sh -c`, `eval`, `os.system`
+or your own terminal. Run it with `scripts/bash-oracle -- '<command>'`.** A text guard in
+front of a real shell does not make it safe. A check like `if "rm -rf" in cmd` is exactly
+the kind of filter these strings are built to get past: `$'\u72'm -rf ~` passes it and
+deletes the home directory. Proving such filters insufficient is what schlock is for.
+
+The oracle runs real bash with no network, a read-only allowlist of host paths (`/usr`,
+`/etc`), and an empty throwaway HOME and `/tmp`, and it refuses to run if it cannot build
+that sandbox. There is no unsandboxed fallback, and you must not write one. Tests reach it
+through `run_bash_oracle` / `oracle_home` in `tests/conftest.py`. A test that spawns a
+real shell for any other reason (driving git, running the hook manifest) uses fixed,
+test-authored commands only, and must be listed with its reason in `REAL_SHELL_ALLOWLIST`
+in `tests/test_bash_oracle.py`, which fails on any spawn it does not know about. Setup
+(bubblewrap, and the AppArmor profile Ubuntu 23.10+ needs) is in CONTRIBUTING.md.
+
 ## Critical Design Principles
 
 1. **Security is Non-Negotiable**: Bashlex AST parsing is security-critical. No regex shortcuts.
@@ -54,7 +73,8 @@
         asserting the rewritten text still contains the payload - outside every heredoc body
         bashlex reads when it re-parses the rewrite - rather than by asserting a verdict.
      Bash's tokenization is what it must match, so every behavioural change here is decided by
-     running real bash first and pinned by a test that names what bash did.
+     running real bash first (in `scripts/bash-oracle`) and pinned by a test that names what
+     bash did.
    - **Approved exception — re-reading one redirect target.** bashlex mis-dequotes some
      targets (`/dev/$'sda'`, `""'/dev/sda'`), so `_redirect_words` in
      `src/schlock/core/parser.py` re-reads the target's own source span with a quote-run regex
@@ -75,7 +95,8 @@
      is **tagged**; **every other brace-shaped spelling raises `ParseError`**. Do not
      widen the allowlist by modelling bash's subscript grammar: four review rounds of that
      never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
-     must raise, never fall back to "argument". Every spelling is decided by real bash first.
+     must raise, never fall back to "argument". Every spelling is decided by real bash first,
+     in `scripts/bash-oracle`.
    - **Approved exception — the in-word quote scan** (`_quote_pairs` in
      `src/schlock/core/parser.py`, LAB-4950). bashlex drops substitution nodes from words that
      mix quoted runs with code (`'a'$(x)'b'`, `"a"<(x)"b"`). The scan reads one word bashlex

@@ -29,6 +29,15 @@ jobs:
     - name: Install dependencies
       run: uv sync --dev
 
+    - name: Enable the bash oracle sandbox
+      # scripts/bash-oracle runs candidate commands in real bash under bubblewrap. The runner
+      # image restricts unprivileged user namespaces through AppArmor; lift that on this
+      # throwaway VM so the oracle tests run here instead of skipping.
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y --no-install-recommends bubblewrap
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     - name: Lint
       run: uv run ruff check . && uv run ruff format --check .
 

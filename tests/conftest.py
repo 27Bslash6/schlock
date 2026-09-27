@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,3 +139,41 @@ def spawned(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", recording)
     return procs
+
+
+BASH_ORACLE = Path(__file__).resolve().parent.parent / "scripts" / "bash-oracle"
+
+
+def run_bash_oracle(command: str, home: Path, *args: str, path: Optional[str] = None) -> subprocess.CompletedProcess:
+    """Run `command` in real bash inside scripts/bash-oracle, with `home` as the caller's HOME.
+
+    The only way a test may execute a candidate command: see CLAUDE.md.
+    """
+    env = {"PATH": os.environ["PATH"] if path is None else path, "HOME": str(home), "ORACLE_SECRET": "leak-me"}
+    return subprocess.run(
+        [shutil.which("bash") or "/bin/bash", str(BASH_ORACLE), *args, "--", command],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+@pytest.fixture
+def oracle_home(tmp_path):
+    """A throwaway HOME for run_bash_oracle, once the oracle has shown it can build its sandbox.
+
+    Skips where it cannot (bwrap missing, or unprivileged user namespaces restricted). CI
+    provides both, so there the same condition fails instead of silently skipping.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    probe = run_bash_oracle("true", home)
+    if probe.returncode == 125:
+        message = f"bash-oracle cannot build its sandbox here:\n{probe.stderr}"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+    assert probe.returncode == 0, probe.stderr
+    return home
