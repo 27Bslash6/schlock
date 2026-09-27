@@ -722,7 +722,8 @@ def _rsync_payloads(args: list[str]) -> list[str]:
     reading it would mean copying rsync's host parser exactly (brackets, `@`, `rsync://`), where
     every drift is a bypass. No ordinary remote shell (ssh, rsh, `kubectl exec -i`) has that
     shape, so the command is refused instead, through the same fail-closed path as
-    MAX_DELEGATOR_TOKENS.
+    MAX_DELEGATOR_TOKENS. Locality is not judged here either: `rsync -e 'sh -c' src/ dst/`, which
+    execs nothing, is refused too.
 
     Values of the other options are not skipped: a value letter other than `e` ends its cluster
     without consuming the next word, and a long option's value (`--filter X`) is read as a word
@@ -791,7 +792,8 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator gramm
     A first word that is neither a delegator nor a wrapper is never scanned, so
     `echo bash -c "rm -rf /"` (which prints the string) and `grep -c pattern file` are untouched.
 
-    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there).
+    Raises ValueError past MAX_DELEGATOR_TOKENS distinct suffixes (fail closed, see there), and
+    for an rsync `-e` program that runs its next argument as shell code (see _rsync_payloads).
     """
     # Each (command, tail) suffix is extracted at most once per top-level call. The wrapper
     # branch below re-enters on EVERY delegator position and each re-entry rescans its own tail,
@@ -3329,6 +3331,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             if len(stdin_payloads) > MAX_DELEGATOR_TOKENS:
                 raise ValueError(f"Stdin program re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
             payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
+            # The suffix ceiling bounds the scan, not its yield: one `rsync` suffix returns every
+            # `-e` it carries, so the re-entries themselves are capped too.
+            if len(payloads) > MAX_DELEGATOR_TOKENS:
+                raise ValueError(f"Shell payload re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
         for payload in payloads:
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
