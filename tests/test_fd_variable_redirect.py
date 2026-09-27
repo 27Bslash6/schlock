@@ -123,7 +123,8 @@ class TestEverySpellingBashConsumes:
 
     @pytest.mark.parametrize(
         "command",
-        ["{fd}>out chmod 777 ./x", "chmod {fd}>out {fd}>out 777 ./x"],
+        # An append, not `{fd}>out`: that truncates `out`, and file_truncation is then reported in place of chmod_777.
+        ["{fd}>>out chmod 777 ./x", "chmod {fd}>out {fd}>out 777 ./x"],
         ids=["before-the-command-name", "repeated"],
     )
     def test_position_and_repetition(self, command, safety_rules_path):
