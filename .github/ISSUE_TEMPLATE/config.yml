@@ -3,6 +3,3 @@ contact_links:
   - name: Security vulnerability
     url: mailto:security@27b.io
     about: Report security issues privately via email
-  - name: Question / Discussion
-    url: https://github.com/27Bslash6/schlock/discussions
-    about: Ask questions or discuss ideas
