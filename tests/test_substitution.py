@@ -293,6 +293,9 @@ class TestFindDangerousFlags:
             "echo $(find . -fp$'r'int /tmp/l)",
             "echo $(find . -ex{e,e}c id \\;)",
             "echo $(find . -del{e,e}te)",
+            "echo $(find . -ex{e..e}c id \\;)",
+            "echo $(find . -fprin{s..u} /tmp/l)",
+            "echo $(find . -fprint{0..0} /tmp/l)",
         ],
     )
     def test_dangerous_flag_in_substitution_blocked(self, command):
@@ -305,6 +308,7 @@ class TestFindDangerousFlags:
             "echo $(find . -name '*.py' -print0)",
             "echo $(find {src,lib} -name x)",
             "echo $(find . -name '*.{py,js}')",
+            "echo $(find dir{1..3} -name x)",
         ],
     )
     def test_read_only_find_in_substitution_allowed(self, command):
@@ -324,6 +328,12 @@ class TestFindDangerousFlags:
     def test_helper_fails_closed_past_brace_cap(self):
         assert dangerous_find([".", "{a,b}" * 7]) is not None
         assert dangerous_find([".", "{a,b}" * 5]) is None
+        assert dangerous_find([".", "{1..100000}"]) is not None
+
+    def test_helper_expands_descending_stepped_sequence(self):
+        # z x v t ...: step 2 lands on `t` (-fprint); step 5 (z u p ...) never does.
+        assert dangerous_find([".", "-fprin{z..a..2}"]) is not None
+        assert dangerous_find([".", "-fprin{z..a..5}"]) is None
 
 
 class TestGitConfigBypass:
