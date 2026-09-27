@@ -5,6 +5,7 @@ rule engine, and cache. It provides the main validate_command() API and
 handles configuration layering (plugin defaults → user → project).
 """
 
+import fnmatch
 import logging
 import posixpath
 import re
@@ -840,43 +841,57 @@ _PATH_RESPELLING_RE = re.compile(r"/(?:\.?/)+")
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
 
 
-# SELF-PROTECTION: Directories that hold schlock configuration files. Extracting an archive
-# into one overwrites the config without the config file name ever appearing in the command,
-# so the file-name fast path above cannot see it (LAB-4830).
+# SELF-PROTECTION: Directories that hold schlock configuration files. Extracting an archive into
+# one overwrites the config without the config file name ever appearing in the command, so the
+# file-name checks in _check_self_protection cannot see it; _extracts_into_config_dir does.
 SELF_PROTECTION_DIRS = (".claude/hooks", ".config/schlock")
-_CONFIG_DIR_RE = re.compile(r"(?:^|/)(?:" + "|".join(map(re.escape, SELF_PROTECTION_DIRS)) + r")(?:/|$)")
+# A config dir inside one argument, bounded by anything that cannot extend a path component. So
+# `$'.claude/hooks'` (bashlex keeps the `$`), `$(echo .claude/hooks)` and a member rewrite
+# `s,^,.claude/hooks/,` all match, and `.claude/hooks-backup` does not.
+_CONFIG_DIR_RE = re.compile(r"(?<![\w.-])(?:" + "|".join(map(re.escape, SELF_PROTECTION_DIRS)) + r")(?![\w.-])")
+_CONFIG_DIR_PARTS = tuple(tuple(path.split("/")) for path in SELF_PROTECTION_DIRS)
 # Leading option name, so "-C.claude/hooks", "-o.claude/hooks", "--directory=x" yield the path.
-_OPTION_PREFIX_RE = re.compile(r"^--?[A-Za-z][A-Za-z-]*=?")
-# Split a command into shell command-position pieces: real separators, plus the OPENERS of a
-# subshell / process substitution, so `echo $(tar … -C .claude/hooks)` exposes tar as a leading
-# word. Newline and a lone `&` are separators too, so a config dir named in a *later*, unrelated
-# statement never binds to an extractor in an earlier one.
-_ARCHIVE_SEGMENT_SPLIT_RE = re.compile(r"\$\(|[`;\n]|\|\|?|&&?|[<>]\(")
-# Env assignments prefixing a command ("TAR_OPTIONS=-x tar …") — the command is what follows.
-_ARCHIVE_ENV_ASSIGN_RE = re.compile(r'^([A-Za-z_]\w*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+)+')
-# A leading redirection token (`>`, `>>`, `2>`, `<`): its target is not an extraction argument.
-_REDIRECT_RE = re.compile(r"^\d*(?:>>?|<)")
-# Command prefixes that hand off to the next word without changing what it does.
-_EXTRACT_WRAPPERS = frozenset({"sudo", "doas", "command", "busybox", "nice", "stdbuf"})
+_OPTION_PREFIX_RE = re.compile(r"^--?[a-z][a-z-]*=?")
+_GLOB_CHAR_RE = re.compile(r"[*?[]")
+# An innermost brace group. Bash expands it before the extractor ever sees the word.
+_BRACE_GROUP_RE = re.compile(r"\{([^{}]*)\}")
+_MAX_BRACE_ALTERNATIVES = 64
+# A wrapper is looked through at every word naming an extractor, and each look rescans the rest
+# of the argv. Past this many the command fails closed instead of costing O(n^2).
+_MAX_WRAPPED_EXTRACTORS = 16
 _TAR_NAMES = frozenset({"tar", "gtar", "bsdtar"})
 _7Z_NAMES = frozenset({"7z", "7za", "7zr", "7zz"})
-# tar short options that consume the NEXT word as their value.
+# tar short options that take a value: the rest of the cluster ("-Cdir"), else the next word.
 _TAR_ARG_OPTS = frozenset("bCfFgHIKLNTVX")
-# tar long options that consume the next word as their value, so "--exclude -t" does not read
-# `-t` as list mode. Over-listing only ever skips a filename (harmless); under-listing a
-# read-mode value can only fail closed, since an extract mode is checked first.
+# GNU tar and bsdtar long options whose value is required, so it may be the next word. getopt
+# accepts abbreviations, so a prefix of one of these takes a value too. The list must be
+# complete: a missing entry lets its value pose as a read-only mode. An option whose value is
+# optional (--one-top-level[=DIR], --checkpoint[=N]) takes it only after `=` and is not listed.
 _TAR_LONG_WITH_ARG = frozenset(
     {
-        "file", "directory", "exclude", "exclude-from", "exclude-tag", "transform", "xform",
-        "files-from", "label", "owner", "group", "mode", "blocking-factor", "record-size",
-        "use-compress-program", "newer", "after-date", "one-top-level",
+        "add-file", "after-date", "blocking-factor", "cd", "checkpoint-action", "directory",
+        "exclude", "exclude-from", "exclude-tag", "exclude-tag-all", "exclude-tag-under", "file",
+        "files-from", "format", "gid", "gname", "group", "group-map", "hole-detection", "include",
+        "index-file", "info-script", "label", "level", "listed-incremental", "mode", "mtime",
+        "new-volume-script", "newer", "newer-mtime", "newer-mtime-than", "newer-than",
+        "no-quote-chars", "older", "older-mtime", "older-mtime-than", "older-than", "options",
+        "owner", "owner-map", "passphrase", "pax-option", "quote-chars", "quoting-style",
+        "record-size", "rmt-command", "rsh-command", "set-mtime-command", "set-mtime-format",
+        "sort", "sparse-version", "starting-file", "strip-components", "suffix", "tape-length",
+        "to-command", "transform", "uid", "uname", "use-compress-program", "volno-file",
+        "warning", "xattrs-exclude", "xattrs-include", "xform",
     }
 )  # fmt: skip
 # tar modes that never write into the -C directory (list / create / compare / append / update / concat).
 _TAR_READ_MODES = frozenset("tcdruA")
-_TAR_READ_LONG = frozenset({"list", "create", "diff", "compare", "append", "update", "catenate", "concatenate", "delete"})
+_TAR_READ_LONG = frozenset(
+    {"list", "create", "diff", "compare", "append", "update", "catenate", "concatenate", "delete", "test-label"}
+)
 _UNZIP_ARG_OPTS = frozenset("dPxO")
 _UNZIP_READ_OPTS = frozenset("cltpvzZ")  # list, test, stdout, comment, zipinfo
+# 7z commands that never write into the -o directory: add, benchmark, delete, hash, info, list,
+# rename, test, update. Anything else, including no command at all, counts as an extraction.
+_7Z_NON_EXTRACT = frozenset({"a", "b", "d", "h", "i", "l", "rn", "t", "u"})
 
 
 def _short_flags(args: list[str], arg_opts: frozenset[str]) -> set[str]:
@@ -904,112 +919,187 @@ def _short_flags(args: list[str], arg_opts: frozenset[str]) -> set[str]:
     return flags
 
 
-def _tar_modes(args: list[str]) -> set[str]:
-    """Mode tokens that are real options — short letters and `--long` names, values skipped.
+def _names_tar_extract(word: str) -> bool:
+    """True if `word`, read as a tar option, is an extract mode (-x, --extract, --get)."""
+    if word.startswith("--"):
+        return word[2:].startswith(("ext", "ge"))
+    if word.startswith("-"):
+        for ch in word[1:]:
+            if ch == "x":
+                return True
+            if ch in _TAR_ARG_OPTS:
+                return False  # the rest of the cluster is this option's value
+    return False
 
-    Skipping option values (short and long) is what stops an option's argument (`--exclude -t`,
-    `-f -t`) from being read as a mode.
+
+def _tar_scan(args: list[str]) -> tuple[bool, list[str]]:
+    """Read a tar argv: whether it extracts, and the words that may say where members land.
+
+    The mode is read two ways, both erring toward extraction. An extract mode counts in ANY
+    word, even one an option may be taking as its value. A read-only mode counts only in a word
+    no option can be consuming. A valid tar always names a mode, so no visible mode at all
+    (TAR_OPTIONS can supply one) counts as an extraction.
+
+    The destinations are every word except the value of an exclude option, which keeps members
+    out and never writes them, plus each cumulative -C directory: `-C .claude -C hooks` lands in
+    `.claude/hooks` though no single word says so.
     """
-    modes: set[str] = set()
-    i = 0
-    first = True
-    while i < len(args):
-        word = args[i]
-        if word.startswith("--"):
-            name = word[2:].split("=", 1)[0]
-            modes.add("--" + name)
-            if "=" not in word and name in _TAR_LONG_WITH_ARG:
-                i += 1  # value is the next word
+    extracts = read = False
+    destinations: list[str] = []
+    cwd = ""
+    role: Optional[str] = None  # set when the previous option consumes this word as its value
+
+    def take(kind: str, value: str) -> None:
+        nonlocal cwd
+        if kind == "exclude":
+            return
+        destinations.append(value)
+        if kind == "dir":
+            cwd = value if value.startswith(("/", "~", "$")) else posixpath.join(cwd, value)
+            destinations.append(cwd)
+
+    for i, word in enumerate(args):
+        extracts = extracts or _names_tar_extract(word)
+        if role is not None:
+            take(role, word)
+            role = None
+        elif word.startswith("--") and len(word) > 2:
+            name, eq, value = word[2:].partition("=")
+            read = read or name in _TAR_READ_LONG
+            kind = "dir" if name == "cd" or (len(name) >= 3 and "directory".startswith(name)) else "arg"
+            kind = "exclude" if name.startswith("exc") else kind
+            if eq:
+                take(kind, value)
+            elif any(option.startswith(name) for option in _TAR_LONG_WITH_ARG):
+                role = kind
         elif word.startswith("-") and len(word) > 1:
-            j = 1
-            while j < len(word):
-                ch = word[j]
-                modes.add(ch)
+            for j, ch in enumerate(word[1:], 1):
                 if ch in _TAR_ARG_OPTS:
-                    if j == len(word) - 1:
-                        i += 1
+                    kind = {"C": "dir", "X": "exclude"}.get(ch, "arg")
+                    if word[j + 1 :]:
+                        take(kind, word[j + 1 :])
+                    else:
+                        role = kind
                     break
-                j += 1
-        elif first and word and word[0].isalpha():
-            modes.update(word)  # old-style key letters: "tar xf a.tar"
-        first = False
-        i += 1
-    return modes
+                read = read or ch in _TAR_READ_MODES
+        elif i == 0 and word[:1].isalpha():
+            # Old-style keys: "tar xf a.tar".
+            extracts = extracts or "x" in word
+            read = read or bool(set(word) & _TAR_READ_MODES)
+        else:
+            destinations.append(word)
+    return extracts or not read, destinations
 
 
-def _tar_extracts(args: list[str]) -> bool:
-    """True unless tar visibly runs a mode that cannot write into its -C directory.
+def _unzip_scan(args: list[str]) -> tuple[bool, list[str]]:
+    """Read an unzip argv: whether it extracts, and every word but the `-x` exclusion list."""
+    extracts = not (_short_flags(args, _UNZIP_ARG_OPTS) & _UNZIP_READ_OPTS)
+    destinations: list[str] = []
+    excluding = False
+    for word in args:
+        if word.startswith("-"):
+            excluding = word == "-x"  # its patterns run to the next option
+        if not excluding:
+            destinations.append(word)
+    return extracts, destinations
 
-    Inverted on purpose: an invocation with no visible mode (supplied via TAR_OPTIONS, or an
-    abbreviated long option) counts as an extraction. A valid tar always names a mode, so this
-    only costs verdicts on commands that would fail anyway. A visible extract mode outranks a
-    read-mode letter, because a read letter can appear as an unskipped option value.
+
+def _7z_scan(args: list[str]) -> tuple[bool, list[str]]:
+    """Read a 7z argv: whether it extracts, and every word but the `-x` exclusion switches."""
+    command = next((arg for arg in args if not arg.startswith("-")), "")
+    return command.lower() not in _7Z_NON_EXTRACT, [arg for arg in args if not arg.lower().startswith("-x")]
+
+
+# Each extractor's argv reader, returning (extracts, destination words).
+_EXTRACTOR_SCANS = {**dict.fromkeys(_TAR_NAMES, _tar_scan), "unzip": _unzip_scan, **dict.fromkeys(_7Z_NAMES, _7z_scan)}
+
+
+def _brace_alternatives(word: str) -> Optional[list[str]]:
+    """The words bash brace-expands `word` into, or None past _MAX_BRACE_ALTERNATIVES.
+
+    A sequence group (`{a..z}`) becomes `*`, which matches every name it can produce.
     """
-    modes = _tar_modes(args)
-    longs = {m[2:] for m in modes if m.startswith("--")}
-    if "x" in modes or any(name.startswith(("ext", "ge")) for name in longs):  # -x / --extract / --get
+    done: list[str] = []
+    todo = [word]
+    while todo:
+        current = todo.pop()
+        group = next((m for m in _BRACE_GROUP_RE.finditer(current) if "," in m[1] or ".." in m[1]), None)
+        if group is None:
+            done.append(current)
+            continue
+        alternatives = group[1].split(",") if "," in group[1] else ["*"]
+        todo.extend(current[: group.start()] + alt + current[group.end() :] for alt in alternatives)
+        if len(done) + len(todo) > _MAX_BRACE_ALTERNATIVES:
+            return None
+    return done
+
+
+def _path_names_config_dir(path: str) -> bool:
+    """True if one brace-free, case-folded word may be a path running through a config dir.
+
+    A word with a glob is matched as the pattern bash expands, component by component, so
+    `.claude/hoo*` and `.c*/h?oks` match and `schlock-*.tgz` does not.
+    """
+    path = posixpath.normpath(path)
+    if _CONFIG_DIR_RE.search(path):
         return True
-    if longs & _TAR_READ_LONG:
+    if not _GLOB_CHAR_RE.search(path):
         return False
-    return not ({m for m in modes if not m.startswith("--")} & _TAR_READ_MODES)
+    parts = path.replace("[^", "[!").split("/")
+    return any(
+        fnmatch.fnmatchcase(top, first) and fnmatch.fnmatchcase(sub, second)
+        for first, second in zip(parts, parts[1:])
+        for top, sub in _CONFIG_DIR_PARTS
+    )
 
 
 def _names_config_dir(arg: str) -> bool:
-    """True if a single argument resolves to a path inside a config directory.
+    """True if a single argument, as bash expands it, may name a path inside a config directory.
 
-    Normalises before matching so that a quoted, escaped, or dot/double-slash spelling of the
-    same runtime path ("-C'.claude'/hooks", ".claude//hooks", ".claude/./hooks") cannot slip the
-    literal match. normpath does no filesystem access; `~`/`$VAR` are left as text, which the
-    (?:^|/) boundary still anchors.
+    Case-folded, because APFS and NTFS are case-insensitive by default, and normpath-ed, so
+    `.Claude/Hooks`, `.claude//hooks` and `.claude/./hooks` match. normpath does no filesystem
+    access. Braces are expanded first; past the expansion cap the word fails closed.
     """
-    arg = _OPTION_PREFIX_RE.sub("", arg, count=1)
-    arg = arg.replace('"', "").replace("'", "").replace("`", "").replace("\\", "").strip("(){}")
-    if not arg:
+    value = _OPTION_PREFIX_RE.sub("", arg.lower(), count=1)
+    if not value:
         return False
-    return bool(_CONFIG_DIR_RE.search(posixpath.normpath(arg)))
+    alternatives = _brace_alternatives(value) if "{" in value else [value]
+    return alternatives is None or any(_path_names_config_dir(alt) for alt in alternatives)
 
 
-def _extracts_into_config_dir(command: str) -> bool:
-    """Detect an archive extraction (tar/bsdtar, unzip, 7z) that names a config directory.
+def _extracts_into_config_dir(commands_with_args: list[tuple[str, list[str]]]) -> bool:
+    """True if a command extracts an archive (tar/bsdtar, unzip, 7z) into a config directory.
 
-    The extractor must be the command word of a segment (after env assignments and pass-through
-    wrappers such as sudo), so a config dir named as an *argument* to some other command
-    (`grep tar .claude/hooks`) is not mistaken for an extraction. Any of the extractor's own
-    arguments naming the dir counts — the target option ("-C dir", "--directory=dir", "-d dir",
-    "-odir") and a member filter alike ("tar -xf a.tar .claude/hooks" recreates the dir under
-    the cwd) — but redirection targets do not.
+    Reads the parser's argv, never the raw text, so quoting, redirections, grouping and line
+    continuations are bash's, and an extraction quoted as text (`git commit -m "... tar -x ..."`)
+    is one argument to another command. Command names are case-folded like paths.
+
+    A wrapper (`sudo`, `env`, `timeout 5`, `xargs -I{}`, `busybox`) or `find -exec` is looked
+    through at EVERY word that names an extractor, as `_shell_delegated_payloads` does: wrapper
+    options and operands differ per wrapper, and a first-match scan can be decoyed. The price is
+    an over-block of a wrapped command that merely names an extractor before a config dir
+    (`sudo grep -rn tar .claude/hooks`); the same command unwrapped is not blocked. A program
+    handed to a shell (`bash -c`, a shell heredoc) is re-validated by Step 5c, which runs this
+    check on it again.
+
+    Any of the extractor's own words naming the dir counts: the target option ("-C dir",
+    "--directory=dir", "-d dir", "-odir"), a member filter ("tar -xf a.tar .claude/hooks"
+    recreates the dir under the cwd) and a member rewrite (--transform, bsdtar -s) alike.
     """
-    if ".claude" not in command and "schlock" not in command:
-        return False
-    for raw in _ARCHIVE_SEGMENT_SPLIT_RE.split(command):
-        words = _ARCHIVE_ENV_ASSIGN_RE.sub("", raw.strip()).split()
-        k = 0
-        while k < len(words) and words[k].rsplit("/", 1)[-1] in _EXTRACT_WRAPPERS:
-            k += 1
-        if k >= len(words):
-            continue
-        name = words[k].strip("\"'`(){}").rsplit("/", 1)[-1]
-        args: list[str] = []
-        skip = False
-        for word in words[k + 1 :]:
-            if skip:
-                skip = False
-                continue
-            if _REDIRECT_RE.match(word):
-                skip = word[-1] in "<>"  # bare operator: its target is the next word
-                continue
-            args.append(word)
-        if name in _TAR_NAMES:
-            extracts = _tar_extracts(args)
-        elif name == "unzip":
-            extracts = not (_short_flags(args, _UNZIP_ARG_OPTS) & _UNZIP_READ_OPTS)
-        elif name in _7Z_NAMES:
-            command_word = next((arg for arg in args if not arg.startswith("-")), "")
-            extracts = command_word.lower() in ("x", "e")
+    for name, args in commands_with_args:
+        base = name.rsplit("/", 1)[-1].lower()
+        if base in WRAPPER_COMMANDS or base == "find":
+            names = [arg.rsplit("/", 1)[-1].lower() for arg in args]
+            positions = [i for i, word in enumerate(names) if word in _EXTRACTOR_SCANS]
+            if len(positions) > _MAX_WRAPPED_EXTRACTORS:
+                return True
+            wrapped = [(names[i], args[i + 1 :]) for i in positions]
         else:
-            continue
-        if extracts and any(_names_config_dir(arg) for arg in args):
-            return True
+            wrapped = [(base, args)] if base in _EXTRACTOR_SCANS else []
+        for extractor, extractor_args in wrapped:
+            extracts, destinations = _EXTRACTOR_SCANS[extractor](extractor_args)
+            if extracts and any(_names_config_dir(word) for word in destinations):
+                return True
     return False
 
 
@@ -1038,7 +1128,9 @@ def _check_self_protection(command: str, parsed_segments: Optional[list[str]] = 
     or the hook file_path check (layer 3) is bypassed, this hardcoded check blocks
     tampering. Step 3 of validate_command runs it on the raw string; once the command has
     parsed, validate_command runs it again with the parsed segments, because the regex split
-    below keeps `ls & cp ...` and newline-chained commands in one segment.
+    below keeps `ls & cp ...` and newline-chained commands in one segment. An archive
+    extraction names only a config *directory*, so validate_command checks it on the parsed
+    argv instead (`_extracts_into_config_dir`), with the same hard-coded result.
 
     Known limitation: Variable indirection (e.g., f=config.yaml; rm "$f") can bypass
     this check because the expanded path doesn't appear in the command string. Mitigated
@@ -1051,11 +1143,6 @@ def _check_self_protection(command: str, parsed_segments: Optional[list[str]] = 
     Returns:
         ValidationResult blocking the command if it touches a protected path, None otherwise
     """
-    # Check 0: archive extraction into a config directory. Runs before the fast path because
-    # the command names only the directory, never the config file.
-    if _extracts_into_config_dir(command):
-        return _make_self_protection_result(command)
-
     # Detection-only copies, case-folded (APFS and NTFS are case-insensitive by default) with
     # `//` and `/./` collapsed, so a respelling of a protected path still matches.
     probe = _PATH_RESPELLING_RE.sub("/", command.lower())
@@ -3033,6 +3120,13 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 )
                 # Not cached: a parse-level refusal, like the parse errors below.
 
+            # SELF-PROTECTION: an archive extraction into a config directory, read from the
+            # parsed argv. Hard-coded like Step 3, and ahead of the substitution pass so a
+            # `$(tar …)` is refused by this rule rather than by whatever that pass matches.
+            commands_with_args = parser.extract_commands_with_args(ast)
+            if _extracts_into_config_dir(commands_with_args):
+                return _make_self_protection_result(command)
+
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
             if dangerous_constructs:
@@ -3083,7 +3177,6 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # Uses bashlex AST for BOTH command names AND arguments (no regex shortcuts)
             # This catches quoted command names that bypass regex patterns (e.g., "nc" -e)
             # Must run AFTER parsing but BEFORE regex matching for defense in depth
-            commands_with_args = parser.extract_commands_with_args(ast)
             dangerous_check = _check_dangerous_command_flags(commands_with_args)
             if dangerous_check is not None:
                 return dangerous_check

@@ -971,8 +971,8 @@ rules:
 
 
 class TestSelfProtectionArchiveExtraction:
-    """LAB-4830: extracting an archive into a config directory overwrites the config file
-    without its name ever appearing in the command, so layer 2 keys on the directory too."""
+    """Extracting an archive into a config directory overwrites the config file without its
+    name ever appearing in the command, so the hard-coded layer keys on the directory too."""
 
     @pytest.fixture(autouse=True)
     def _hermetic(self, tmp_path, monkeypatch):
@@ -1031,6 +1031,50 @@ class TestSelfProtectionArchiveExtraction:
             "unzip -o evil.zip -d ~/.config//schlock",
             # Reading an archive stored inside the config dir is over-blocked, and that is safe
             "tar -xf .claude/hooks/x.tar -C /tmp/out",
+            # The command word as bash runs it, however it is spelled or prefixed
+            "t'ar' -xf evil.tar -C .claude/hooks",
+            "t''ar -xf evil.tar -C .claude/hooks",
+            r"\tar -xf evil.tar -C .claude/hooks",
+            "env tar -xf evil.tar -C .claude/hooks",
+            "nohup tar -xf evil.tar -C .claude/hooks",
+            "timeout 5 tar -xf evil.tar -C .claude/hooks",
+            "nice -n 19 tar -xf evil.tar -C .claude/hooks",
+            "command -p tar -xf evil.tar -C .claude/hooks",
+            "echo evil.tar | xargs -I{} tar -xf {} -C .claude/hooks",
+            r"find . -name '*.tar' -exec tar -xf {} -C .claude/hooks \;",
+            "{ tar -xf evil.tar -C .claude/hooks; }",
+            "( tar -xf evil.tar -C .claude/hooks )",
+            "if true; then tar -xf evil.tar -C .claude/hooks; fi",
+            "! tar -xf evil.tar -C .claude/hooks",
+            ">/dev/null tar -xf evil.tar -C .claude/hooks",
+            "tar -xf evil.tar 2>&1 -C .claude/hooks",
+            "tar -xf evil.tar \\\n -C .claude/hooks",
+            'cat "$(tar -xf evil.tar -C .claude/hooks)"',
+            # Case-insensitive filesystems (APFS, NTFS) resolve these to the config dir
+            "tar -xf evil.tar -C .Claude/Hooks",
+            "tar -xf evil.tar -C .CLAUDE/HOOKS",
+            "TAR -xf evil.tar -C .claude/hooks",
+            # Expansions that produce the config dir
+            "tar -xf evil.tar -C $'.claude/hooks'",
+            "tar -xf evil.tar -C .claude/hoo*",
+            "tar -xf evil.tar -C .c*/h?oks",
+            "tar -xf evil.tar -C .claude/{hooks,x}",
+            "tar -xf evil.tar -C {/tmp,.claude/hooks}",
+            'tar -xf evil.tar -C "$(echo .claude/hooks)"',
+            # -C is cumulative
+            "tar -xf evil.tar -C .claude -C hooks",
+            "tar -xf evil.tar --directory=.claude --dir hooks",
+            # Member-name rewrites that land members in the config dir
+            "tar -xf evil.tar --transform 's,^,.claude/hooks/,'",
+            "tar -xf evil.tar --xform=s,^,.config/schlock/,",
+            "bsdtar -xf evil.tar -s ',^,.claude/hooks/,'",
+            # A quoted mode is still the mode
+            "7z 'x' evil.7z -o.claude/hooks",
+            "7z X evil.7z -o.claude/hooks",
+            # An optional-argument option does not consume the next word, and a required-argument
+            # one hides a mode-looking value, so neither masks the extraction
+            "tar --one-top-level -x -f evil.tar --suffix -t -C .claude/hooks",
+            "TAR_OPTIONS=-x tar --suffix -t -f evil.tar -C .claude/hooks",
         ],
     )
     def test_extraction_into_config_dir_is_blocked(self, command):
@@ -1085,6 +1129,17 @@ class TestSelfProtectionArchiveExtraction:
             # following unrelated statement) is not an extraction INTO it.
             "tar -xf a.tar -C /opt > .claude/hooks/extract.log",
             "tar -xzf tool.tgz -C /opt\nchmod +x .claude/hooks/pre.sh",
+            # An extraction quoted as text is one argument to another command, not a command
+            "printf '%s\\n' 'example; tar -xf a.tar -C .claude/hooks'",
+            'git commit -m "docs: note that; tar -xf a.tar -C .claude/hooks is blocked"',
+            "cat <<'EOF'\nnote; tar -xf a.tar -C .claude/hooks\nEOF",
+            # Excluding the config dir protects it
+            "tar --exclude=.claude/hooks -xf a.tar -C /opt",
+            "tar -xf a.tar --exclude .claude/hooks -C /opt",
+            "unzip a.zip -x '.claude/hooks/*' -d /opt",
+            "7z x a.7z -o/opt '-x!.claude/hooks'",
+            # A glob that cannot match a config dir
+            "tar -xzf schlock-*.tgz -C /tmp/out",
         ],
     )
     def test_config_dir_mention_does_not_falsely_block(self, command):
@@ -1092,6 +1147,25 @@ class TestSelfProtectionArchiveExtraction:
         result = validate_command(command)
         assert result.matched_rules != ["self_protection:config_write"], f"False block: {command}"
         assert result.risk_level != RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -c 'tar -xf evil.tar -C .claude/hooks'",
+            "bash <<'EOF'\ntar -xf evil.tar -C .claude/hooks\nEOF",
+        ],
+    )
+    def test_extraction_run_by_a_shell_is_blocked(self, command):
+        """AC-1: an extraction handed to a shell as its program is re-validated and blocks."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_wrapper_scan_past_its_ceiling_fails_closed(self):
+        """Each extractor word behind a wrapper rescans the rest of the argv; past the cap, block."""
+        limit = val_module._MAX_WRAPPED_EXTRACTORS
+        assert not val_module._extracts_into_config_dir([("sudo", ["tar"] * limit)])
+        assert val_module._extracts_into_config_dir([("sudo", ["tar"] * (limit + 1))])
 
     def test_extraction_block_ignores_overrides(self, tmp_path, monkeypatch):
         """AC-3: the block survives a user config that disables archive_operations."""
