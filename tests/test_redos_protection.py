@@ -142,7 +142,7 @@ class TestReDoSProtection:
         r"""A long blank run after `tee`, `>` or `rm` is scanned once, not once per backtrack.
 
         The blank-operand guard is `(?=\s+\S)` in FRONT of the quantifier
-        (LAB-4360; for `rm`, `(?=\s*\S)` after the flag run, LAB-4470). Written
+        (LAB-4360; for `rm`, `(?=\s*\S)` after the flag run). Written
         as `\s+(?!\s*$)` it re-scans the run on every backtracking step: 20,000
         blanks cost 500ms at the regex layer against 2ms for the base pattern,
         on a hook that runs before every bash call.

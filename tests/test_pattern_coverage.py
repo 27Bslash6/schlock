@@ -406,7 +406,7 @@ class TestMediumPatternCoverage:
             # `' -f'` is a filename, not a flag; the real target follows it (LAB-4360).
             "\"rm\" ' -f' important.db",
             '"rm" "\\n-f" important.db',
-            # Flags before the target are still a single delete (LAB-4428).
+            # Flags before the target are still a single delete.
             "rm -f data.db",
             "rm -- data.db",
             # Two flags: pins the `*`, a `?` would pass the single-flag rows.
@@ -415,7 +415,7 @@ class TestMediumPatternCoverage:
             "rm\t-f\tdata.db",
             "rm -f\ndata.db",
             # `--` ends option parsing, so the token after it is a target however
-            # many dashes it leads with (LAB-4470). Both reach the rule only when the
+            # many dashes it leads with. Both reach the rule only when the
             # flag run gives the `--` back; the second pins the give-back to any
             # position in the run, not just the first.
             "rm -- -file",
@@ -426,7 +426,7 @@ class TestMediumPatternCoverage:
             "rm -f -",
             # Sole operand named ` -f`. The parser rebuilds this as `rm  -f`, the same
             # string as a flag with no target; the file is really deleted, so the
-            # ambiguity takes the higher rating (LAB-4428). Both spellings reach the
+            # ambiguity takes the higher rating. Both spellings reach the
             # rule: the quoted one via the reconstruction, the literal via the original.
             "\"rm\" ' -f'",
             "rm  -f",
@@ -436,6 +436,10 @@ class TestMediumPatternCoverage:
             "\"rm\" -- ' -f'",
             "r''m -f \\ -f",
             "\"rm\" -f -v ' -x'",
+            # An all-blank operand cannot shield a later victim: the next operand is
+            # non-blank, so the no-operand guard lets it through.
+            "\"rm\" -f ' ' important.db",
+            "\"rm\" -- ' ' important.db",
         ]
         for cmd in commands:
             result = validate_command(cmd, config_path=safety_rules_path)
@@ -443,15 +447,20 @@ class TestMediumPatternCoverage:
             assert "single_delete" in result.matched_rules, f"single_delete not matched: {cmd}"
 
     def test_single_delete_flags_without_target_are_safe(self, safety_rules_path):
-        """A flag run with nothing but blanks after it deletes nothing (LAB-4428, LAB-4470).
+        """A flag run with nothing but blanks after it deletes nothing.
 
         `rm -- ` and `rm -f -- ` are the only rows pinning the `\\S` in the `--`
         branch: without it, `--\\s` alone matches and a bare option terminator reads
         as a delete. `rm -f  ` pins the `(?=\\s*\\S)` after the flag run: the raw
         text is not trimmed before matching, so it reaches the pattern as typed and
         the blank target would take the trailing whitespace as a filename.
+
+        `"rm" -f ' '` is a real delete of a file named by one blank, but it rebuilds
+        to the same `rm -f  ` string and rates SAFE with it. That is the cost the
+        blank-operand guard already accepts for `"rm" ' '`; pinned so a change to it
+        is a decision, not a side effect.
         """
-        for cmd in ["rm -f", "rm --", "rm -f -v", "rm --help", "rm -- ", "rm -f -- ", "rm -f  "]:
+        for cmd in ["rm -f", "rm --", "rm -f -v", "rm --help", "rm -- ", "rm -f -- ", "rm -f  ", "\"rm\" -f ' '"]:
             result = validate_command(cmd, config_path=safety_rules_path)
             assert result.risk_level == RiskLevel.SAFE, f"{cmd!r} rated {result.risk_level.name}: {result.matched_rules}"
 
