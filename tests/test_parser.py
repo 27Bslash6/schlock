@@ -1078,7 +1078,7 @@ class TestMixedQuoteWordDecoding:
     @pytest.mark.parametrize(
         ("word", "expected"),
         [
-            # bash ends a name at its quote; `$Xrm` would be another variable (LAB-4960 panel)
+            # bash ends a name at its quote; `$Xrm` would be another variable
             ("""x"$X"'rm -rf ~'""", "x${X}rm -rf ~"),
             ("""x"$X"\\rm""", "x${X}rm"),
             ("""x"$X"'-rf'""", "x$X-rf"),  # only a name character would lengthen it

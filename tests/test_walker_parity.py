@@ -416,7 +416,7 @@ class TestKnownBashlexUnderDecode:
 
     Pinned so T3 inherits them, and so a bashlex upgrade that changes the
     fallback tier's decode trips a test. (bashlex's quote removal used to be one
-    of these - `'a"b'x` read as `abx` - until LAB-4960 showed the same mangling
+    of these - `'a"b'x` read as `abx` - until it turned out the same mangling
     hid `rm -rf '/'` from the `-c` check; parser._expand_word_internal now re-reads it.)
     """
 

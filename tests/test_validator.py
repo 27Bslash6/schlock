@@ -1368,7 +1368,7 @@ class TestHeredocSurroundings:
         `rm -rf ./build` matches `recursive_delete` at HIGH; only the (stubbed)
         ShellCheck finding raises it to BLOCKED. Behind `ls` no pass would
         spawn ShellCheck on its own, so this pins the escalation's own spawn.
-        (The tail was `rm -r$''f /` until LAB-3005 taught the parser to read
+        (The tail was `rm -r$''f /` until the parser learned to read
         `$''` splices, which now blocks it without ShellCheck.)
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
@@ -4036,7 +4036,7 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
 
 @pytest.mark.usefixtures("no_shellcheck")
 class TestQuotedRunCommandName:
-    """LAB-4960 AC4: a command name spelled as adjacent quoted runs is named as bash names it.
+    """A command name spelled as adjacent quoted runs is named as bash names it.
 
     bashlex took a word that opens and closes with `'` for ONE single-quoted string, so `'r''m'`
     was named `r''m` and `'r''m' -rf /` rated SAFE on `main` @ `cc3475d`. bash removes the quotes
@@ -4058,7 +4058,7 @@ class TestQuotedRunCommandName:
 
 @pytest.mark.usefixtures("no_shellcheck")
 class TestAbuttingQuotedRunsAreNotSuppressedAsOneWord:
-    """LAB-4960 panel: quoted runs that abut must not earn the reconstructed pass's whole-word range.
+    """Quoted runs that abut must not earn the reconstructed pass's whole-word range.
 
     A `"…"` run may hold an empty expansion, and for `ssh`, `trap`, `builtin eval` and `git -c`
     payloads the reconstructed pass is the only reader. Widening `_is_quoted_span` to abutting

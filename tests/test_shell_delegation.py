@@ -934,7 +934,7 @@ class TestSyntheticRuleNamedInMatchedRules:
 
 
 class TestAnsiCDelegationEvasion:
-    """LAB-3005: an ANSI-C `$'...'` payload is judged on what bash runs, on every surface.
+    """An ANSI-C `$'...'` payload is judged on what bash runs, on every surface.
 
     bashlex dequoted `$'rm\\t-rf\\t/'` to `$rmt-rft/`, so the payload each surface re-validated
     was a string bash never runs. Pre-fix verdicts on `main` @ `74d4325` (ShellCheck off):
@@ -1007,7 +1007,7 @@ class TestAnsiCBenignUnchanged:
 
 
 class TestMixedQuotePayloads:
-    """LAB-4960: a `-c` payload spliced from differently-quoted segments is judged as bash runs it.
+    """A `-c` payload spliced from differently-quoted segments is judged as bash runs it.
 
     bashlex read `'rm -rf '"'"'/'"'"''` - the `shlex.quote` idiom for an embedded single quote -
     as `rm -rf '"'"'/'"'"'`, so the payload re-validated was quote soup: HIGH and allowed on
@@ -1028,7 +1028,7 @@ class TestMixedQuotePayloads:
             # The same splice on the other delegation surfaces, which all read the parsed word.
             """watch 'rm -rf '"'"'/'"'"''""",
             """bash <<< 'rm -rf '"'"'/'"'"''""",
-            # The row's three siblings that were already BLOCKED (AC3).
+            # The row's three siblings that were already BLOCKED.
             "bash -c 'rm -rf /'",
             """bash -c 'rm -rf '"/\"""",
             "bash -c rm\\ -rf\\ /",
@@ -1048,7 +1048,7 @@ class TestMixedQuotePayloads:
 
 
 class TestSingleQuotedTextStaysInert:
-    """LAB-4960 panel: bashlex must never read single-quoted text as code.
+    """bashlex must never read single-quoted text as code.
 
     Handing it a word with the `'"'"'` idiom exposed that text to its expansion scanner: a
     quoted backtick or `$(...)` grew a phantom substitution, and a quoted `${` with no `}` after
@@ -1087,7 +1087,7 @@ class TestSingleQuotedTextStaysInert:
         "command",
         [
             """rm -rf ~; : 'x ${'"'"''""",  # blanked: bashlex never sees the `${`
-            "echo $(true)'${'",  # past an expansion nothing is blanked; bashlex's `${` scan refuses it (LAB-4959)
+            "echo $(true)'${'",  # past an expansion nothing is blanked; bashlex's `${` scan refuses it
         ],
     )
     def test_an_unclosed_brace_expansion_returns(self, command):

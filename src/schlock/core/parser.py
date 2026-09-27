@@ -1453,11 +1453,11 @@ def _expand_word_internal(parserobj: Any, wordtoken: Any, *args: Any) -> "tuple[
     bashlex finds a word's boundaries and expansions correctly but removes its quotes wrongly, so
     every check keyed on word text judged a string bash never runs - the `-c` / `watch` / `<<<`
     payloads re-validated as code and the pipe-to-shell interpreter name alike. It reads
-    `$'rm\\t-rf\\t/'` as `$rmt-rft/` and `$"bash"` as `$bash` (LAB-3005); it ignores `"..."`,
+    `$'rm\\t-rf\\t/'` as `$rmt-rft/` and `$"bash"` as `$bash`; it ignores `"..."`,
     so `a"'"b` reads as `ab` and `"a\\qb"` as `aqb`; and it takes any word that opens and closes
     with `'` for ONE single-quoted string, so `'a'"'"'b'` - the idiom `shlex.quote` emits for an
     embedded single quote - reads as `a'"'"'b`, and `'a'$(rm -rf /)'b'` loses its substitution
-    node altogether (LAB-4960). (`$"..."` is locale translation; with no message catalog, which is
+    node altogether. (`$"..."` is locale translation; with no message catalog, which is
     every shell an agent drives, bash reads it as plain `"..."`.)
 
     Re-reading here, where every word of every parse is expanded (nested ones included), keeps
@@ -1476,7 +1476,7 @@ def _expand_word_internal(parserobj: Any, wordtoken: Any, *args: Any) -> "tuple[
     if not _holds_quote(value):
         return _bashlex_expand_word(parserobj, wordtoken, *args)
     blanked = copy.copy(wordtoken)
-    # A `${` left with no `}` after it meets _refuse_unterminated_brace_expansion (LAB-4959).
+    # A `${` left with no `}` after it meets _refuse_unterminated_brace_expansion.
     blanked.value = _blank_single_quotes(value)
     parts, _ = _bashlex_expand_word(parserobj, blanked, *args)
     # bashlex also hangs an empty `parameter` node on the `$` of each `$"` (and each `$'` past the
@@ -2101,7 +2101,7 @@ class BashCommandParser:
         Not "opens and closes with a quote": `'a'$(rm -rf ~)'b'` does both and is
         two runs around code (LAB-4950). Whole-word is the reconstructed pass's
         test because its range covers the whole reconstructed word. Abutting runs
-        (`'it'"'"'s'`) earn no range either (LAB-4960 panel): a `"…"` run may hold an
+        (`'it'"'"'s'`) earn no range either: a `"…"` run may hold an
         empty expansion, and the reconstructed pass is the only check that reads a
         payload passed to `ssh`, `trap` or `builtin eval`.
         """

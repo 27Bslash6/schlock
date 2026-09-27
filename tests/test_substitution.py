@@ -3134,7 +3134,7 @@ class TestDangerousSedHelper:
 
 
 class TestSubstitutionInsideASingleQuoteWrappedWord:
-    """LAB-4960: bashlex took a word opening and closing with `'` for one single-quoted string.
+    """bashlex took a word opening and closing with `'` for one single-quoted string.
 
     So `'a'$(rm -rf /)'b'` came back with no substitution node at all, and nothing validated
     the command inside it: every row below was SAFE on `main` @ `394dd12` (ShellCheck off).

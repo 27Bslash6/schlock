@@ -165,7 +165,7 @@ class TestLookalikesStayArguments:
         [
             '{f"d"}<in',  # a quote in the NAME
             '{"fd"}<in',
-            "{$'fd'}<in",  # dollar-quoting is removed like any other quoting (LAB-4960)
+            "{$'fd'}<in",  # dollar-quoting is removed like any other quoting
             "{f$'d'}<in",
             '{$"fd"}<in',
             "{fd[]}<in",  # an empty subscript

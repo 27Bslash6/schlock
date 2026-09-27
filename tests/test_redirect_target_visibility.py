@@ -335,7 +335,7 @@ class TestDollarPrefixedQuoteForms:
     bashlex kept the `$` of each marker in the word, at any offset, and its quote
     removal broke on adjacent quoted runs, so the word matched no path rule. Found by
     adversarial review, then by CodeRabbit for markers past the first character. Every
-    quoted word is now decoded at parse time (`_expand_word_internal`, LAB-4960).
+    quoted word is now decoded at parse time (`_expand_word_internal`).
     """
 
     @pytest.mark.parametrize(
