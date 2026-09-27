@@ -1284,6 +1284,13 @@ def _is_bare_expansion(word: Any) -> bool:
 
 _EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
 
+# Wrapper flags whose operand is the NEXT word, data the wrapper never runs: `env -u NAME cmd`
+# unsets NAME and runs cmd. Only the common ones; any other takes the ponytail ceiling below.
+_WRAPPER_OPERAND_FLAGS = {
+    "env": ("-u", "--unset", "-C", "--chdir"),
+    "timeout": ("-s", "--signal", "-k", "--kill-after"),
+}
+
 
 def _is_env_assignment(word: str) -> bool:
     """`NAME=value` as a wrapper operand (`env NAME=value cmd`): assigned, never executed.
@@ -1380,25 +1387,36 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     `nice -n$(…)` word-splits into the wrapper's argv, and `env -S"$(…)"` splits the string itself.
     A wrapper name is glob-matched as a decoder is (`/usr/bin/en?`), and a word that may
     brace-expand (`{env,}`, `{,}`) is treated as one, since it may name a wrapper or vanish.
-    ponytail: a wrapper's literal operand ends the scan, so `flock /tmp/l $(base64 -d x)` and
-    `timeout -s KILL 5 $(…)` stay at the substitution floor (HIGH). Per-wrapper operand arity
-    would close that; nothing here models it yet.
+    A flag's detached operand (_WRAPPER_OPERAND_FLAGS) is data, so `env -u A $(base64 -d x)` runs
+    the decode and `env -u "$(base64 -d x)" cmd` does not; unquoted, it may word-split into argv,
+    so a bare expansion there is still read. `command -v`/`-V` only describes, and runs nothing.
+    ponytail: any other literal wrapper operand ends the scan, so `flock /tmp/l $(base64 -d x)`
+    and `stdbuf -o L $(…)` stay at the substitution floor (HIGH). Full per-wrapper operand arity
+    would close that; only the table above models it.
     """
-    in_wrapper = False
+    wrapper, operand = None, False
     words = _word_parts(getattr(node, "parts", None) or [])
     start = next((i for i, w in enumerate(words) if not _ASSIGNMENT_WORD.match(w.word)), len(words))
     if any(_assignment_runs_decode(word, seen) for word in words[:start]):
         return True
     for word in words[start:]:
         text = word.word
-        if in_wrapper and _is_env_assignment(text):
+        if operand:
+            operand = False
+            if not _is_bare_expansion(word):
+                continue
+        if wrapper is not None and _is_env_assignment(text):
             continue
         if _runs_decode(word, seen):
             return True
-        if in_wrapper and (text.startswith("-") or text[:1].isdigit()):
+        if wrapper is not None and (text.startswith("-") or text[:1].isdigit()):
+            if wrapper == "command" and text.startswith("-") and ("v" in text or "V" in text):
+                return False
+            operand = text in _WRAPPER_OPERAND_FLAGS.get(wrapper, ())
             continue
-        if _names_one_of(text.split("/")[-1], _EXEC_WRAPPERS) or _may_brace_expand(text):
-            in_wrapper = True
+        name = text.split("/")[-1]
+        if _names_one_of(name, _EXEC_WRAPPERS) or _may_brace_expand(text):
+            wrapper = name
             continue
         if not _is_bare_expansion(word):
             return False

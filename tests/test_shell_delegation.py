@@ -888,6 +888,12 @@ class TestBase64DecodeAtCommandPosition:
             'env --split-string="$(base64 -d p)"',
             "nice -n$(base64 -d p) true",
             "timeout -$(base64 -d p) 5 true",
+            # A flag's detached operand is data, so the next word is the command bash runs;
+            # unquoted, the operand word-splits and can carry the command itself.
+            "env -u A $(base64 -d x)",
+            "env -C /tmp $(base64 -d x)",
+            "timeout -s KILL 5 $(base64 -d x)",
+            "env -u $(base64 -d x)",
             # GNU env takes any operand with a non-leading `=` as an assignment.
             "env A-B=1 $(base64 -d x)",
             "env a[0]=1 $(base64 -d x)",
@@ -979,6 +985,10 @@ class TestBase64DecodeAtCommandPosition:
             'for f in *; do out[$(basename "$f")]=$(base64 -d "$f"); done',
             # A `]=` inside the value is not the subscript's close.
             "a[0]=$(base64 -d x | grep '[k]=v')",
+            # A flag's quoted operand is data, and `command -v` only describes its operands.
+            'env -u "$(base64 -d p)" /usr/bin/printf AFTER_ENV',
+            'command -v "$(base64 -d p)"',
+            "command -V $(base64 -d p)",
             # `--` ends the flags: no decode flag, so this encodes.
             "$(base64 -- x)",
         ],
