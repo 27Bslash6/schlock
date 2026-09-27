@@ -74,6 +74,17 @@
      widen the allowlist by modelling bash's subscript grammar: four review rounds of that
      never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
      must raise, never fall back to "argument". Every spelling is decided by real bash first.
+   - **Approved exception — the in-word quote scan** (`_quote_pairs` in
+     `src/schlock/core/parser.py`, LAB-4950). bashlex drops substitution nodes from words that
+     mix quoted runs with code (`'a'$(x)'b'`, `"a"<(x)"b"`). The scan reads one word bashlex
+     already delimited and only locates quote pairs and code openers. Bodies are still parsed by
+     bashlex. A body it cannot place raises `ParseError`, and a word it cannot read earns no
+     literal range. In a word holding a line continuation bashlex's part offsets are shifted, so
+     every code part there is rebuilt from the source and parameter parts are never skip targets.
+     When such a word's quoting cannot be followed after its code parts were dropped (a `"`
+     nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
+     shares the parse's CPU budget.
+     The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.

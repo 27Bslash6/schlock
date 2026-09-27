@@ -327,7 +327,9 @@ class TestEveryConsumerParsesThroughTheTag:
     def test_no_other_bashlex_parse_call(self):
         # _bounded_parse is the one call, so every parse is CPU-bounded (LAB-5659). Its callers are
         # parse_bashlex (the bashlex tier behind BashCommandParser.parse and TieredParser), which
-        # tags, and _parse_succeeds, which only asks whether a synthetic probe parses.
+        # tags, _parse_succeeds, which only asks whether a synthetic probe parses, and
+        # _recover_substitution, which parses a backquote body bashlex dropped (LAB-4950) - inside
+        # parse_bashlex's budget, into the tree parse_bashlex then tags.
         src = pathlib.Path(__file__).parent.parent / "src"
         found = {(path.relative_to(src).as_posix(), owner) for path in src.rglob("*.py") for owner in _bashlex_parse_calls(path)}
         assert found == {("schlock/core/parser.py", "_bounded_parse")}
@@ -336,7 +338,19 @@ class TestEveryConsumerParsesThroughTheTag:
             for path in src.rglob("*.py")
             for owner in _bashlex_parse_calls(path, targets=("_bounded_parse",))
         }
-        assert callers == {("schlock/core/parser.py", "parse_bashlex"), ("schlock/core/parser.py", "_parse_succeeds")}
+        assert callers == {
+            ("schlock/core/parser.py", "parse_bashlex"),
+            ("schlock/core/parser.py", "_parse_succeeds"),
+            ("schlock/core/parser.py", "_recover_substitution"),
+        }
+        # Recovery also enters bashlex's parser through its `$(…)` body parser, which no search
+        # above sees; parse_bashlex runs recovery inside its budget, so this is the only owner.
+        dolparen = {
+            (path.relative_to(src).as_posix(), owner)
+            for path in src.rglob("*.py")
+            for owner in _bashlex_parse_calls(path, targets=("bashlex.subst._parsedolparen",))
+        }
+        assert dolparen == {("schlock/core/parser.py", "_recover_substitution")}
 
 
 def _import_aliases(tree):
