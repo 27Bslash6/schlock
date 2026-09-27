@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "schlock"
-version = "0.9.2"
+version = "0.9.4"
 description = "Claude Code plugin for LLM command safety validation"
 readme = "README.md"
 license = { text = "WTFPL" }
@@ -43,9 +43,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/27Bslash6/schlock"
-Repository = "https://github.com/27Bslash6/schlock"
-Issues = "https://github.com/27Bslash6/schlock/issues"
+Homepage = "https://github.com/27b-io/schlock"
+Repository = "https://github.com/27b-io/schlock"
+Issues = "https://github.com/27b-io/schlock/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/schlock"]

@@ -3,8 +3,8 @@
 **A safety net for Claude Code** — Intercepts dangerous bash commands before they execute.
 
 
-[![Tests](https://github.com/27Bslash6/schlock/actions/workflows/test.yml/badge.svg)](https://github.com/27Bslash6/schlock/actions)
-[![codecov](https://codecov.io/github/27bslash6/schlock/graph/badge.svg?token=LWEX0I3SNE)](https://codecov.io/github/27bslash6/schlock)
+[![Tests](https://github.com/27b-io/schlock/actions/workflows/test.yml/badge.svg)](https://github.com/27b-io/schlock/actions)
+[![codecov](https://codecov.io/github/27b-io/schlock/graph/badge.svg)](https://codecov.io/github/27b-io/schlock)
 [![License](https://img.shields.io/badge/license-WTFPL-blue)](https://www.wtfpl.net/)
 
 **Features**: AST-based parsing (plus regex) · 60+ security rules · 3 risk presets · Audit logging · Commit ad-blocker
@@ -59,7 +59,7 @@ Claude sees the rejection and adjusts. Your filesystem survives. You sleep at ni
 
 ```bash
 # In Claude Code
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 /plugin install schlock@schlock
 
 # Optional
