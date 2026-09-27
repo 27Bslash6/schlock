@@ -1131,6 +1131,10 @@ class TestExternalRepoHeredoc:
         ("command", "expected"),
         [
             ("git -C /tmp/x commit -F - <<'EOF'\nmsg\nEOF", True),
+            ("git -C /tmp/x commit -F - <<'EOF'\ngit commit\nEOF", True),
+            # bash runs an unterminated heredoc to end-of-file; bashlex cannot parse it, so the
+            # lookup falls back to inspecting cwd.
+            ("git -C /tmp/x commit -F - <<'EOF'\nmsg", False),
             ("git --git-dir=/tmp/x/.git commit -F - <<'EOF'\nmsg\nEOF", True),
             ('git --work-tree /tmp/x commit -F - <<"EOF"\nmsg\nEOF', True),
             ("git -C /tmp/x commit -F - <<EOF\nmsg\nEOF", True),
