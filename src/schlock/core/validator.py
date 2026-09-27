@@ -1240,11 +1240,12 @@ _COMMENT_START_AFTER = _WORD_START_AFTER | frozenset("\n")
 _OPENER_SCAN_RE = re.compile(r"[(\\]")
 
 # What a `<<` inside an arithmetic command is rewritten to. It MUST NOT contain a
-# `<`: the rewrite recurses through validate_command, and a replacement that
-# still looks like a shift would never converge. Beyond that, any two characters
-# with no shell meaning do; `==` is the same width, so the offsets of everything
-# after it are undisturbed, and it still reads as arithmetic in the parse-error
-# messages where the rewritten text reaches a human.
+# `<<`: the rewrite recurses through validate_command, and a replacement that
+# still looks like a shift would never converge. It MUST be two characters, one
+# per character of the shift; the rewrite indexes it rather than zipping, so a
+# shorter one raises instead of leaving half the shift in place. `==` is the same
+# width, so the offsets of everything after it are undisturbed, and it still reads
+# as arithmetic in the parse-error messages where the rewritten text reaches a human.
 _ARITH_SHIFT = "=="
 
 
@@ -1324,7 +1325,7 @@ class _DoubleParen:
 
         Tracking quotes, expansions and comments here was tried and removed. It
         is the miss direction that fails open - a `((` not offered is a payload
-        left hidden - and three separate shapes reached it, each because bash
+        left hidden - and two separate shapes reached it, each because bash
         does not read the text the way a lexical scan does:
 
         - a `'` in a heredoc BODY is not a quote to bash, but it pairs with a
@@ -1332,9 +1333,7 @@ class _DoubleParen:
           without raising, so no fallback can notice;
         - bash does not splice `\\<newline>` inside a `#` comment, so removing
           splices first buries a real opener inside what a scan then reads as
-          one comment line;
-        - `# ((\n1<<b\n))` - the opener is on the comment line, the `))` is not,
-          and bash runs the arithmetic.
+          one comment line.
 
         Over-firing is NOT free on its own. An extra `((` that pairs up can
         rewrite a real heredoc opener, and a later heredoc then swallows lines
@@ -1574,8 +1573,8 @@ def _neuter_arithmetic_shifts(command: str) -> str:
                 continue
             if rewritten is None:
                 rewritten = list(command)
-            for at, placeholder in zip((shift, shift + 1), _ARITH_SHIFT):
-                rewritten[at + 2 * bisect.bisect_right(splices, at)] = placeholder
+            for i, at in enumerate((shift, shift + 1)):
+                rewritten[at + 2 * bisect.bisect_right(splices, at)] = _ARITH_SHIFT[i]
 
     return command if rewritten is None else "".join(rewritten)
 

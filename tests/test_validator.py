@@ -2371,8 +2371,7 @@ class TestHeredocSurroundings:
         survived. Asserted on the rewrite and the reason, not on `BLOCKED`
         alone, which this returned before the guard as well.
 
-        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
-        that keeps bashlex's reading - the full call reports the payload's own rule instead.
+        Judged `_as_written`, the half of Step 3b's join that keeps bashlex's reading.
         """
         command = f"ls <<{opener}\nz\n{terminator}\n(( 1<<b ))\nrm -rf /\nb"
         neutered, _ = val_module._neuter_heredocs(command)
@@ -3616,8 +3615,7 @@ class TestHeredocBoundariesOnTheNativePath:
         an end-based check passed it - BLOCKED on main, LOW here, until openers were matched
         by where they sit.
 
-        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
-        that keeps bashlex's reading - the full call reports the payload's own rule instead.
+        Judged `_as_written`, the half of Step 3b's join that keeps bashlex's reading.
         """
         result = validate_command(
             "git commit -m wip\ncat > /tmp/a.txt <<'EOF'; (( n = 1<<EOF ))\nhello\nEOF\n"
@@ -3679,8 +3677,7 @@ class TestHeredocBoundariesOnTheNativePath:
         no-match scan never runs, so the payload is suppressed outright: BLOCKED on main
         (via the fallback's guard), HIGH here before the guard was ported.
 
-        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
-        that keeps bashlex's reading - the full call reports the payload's own rule instead.
+        Judged `_as_written`, the half of Step 3b's join that keeps bashlex's reading.
         """
         result = validate_command(
             "git push --force <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb", config_path=safety_rules_path, _as_written=True
@@ -3747,8 +3744,7 @@ class TestBashlexHeredocsAreLocatedByTheirOpener:
         The phantom guard is switched off here so that the lookup itself is what is tested:
         with it on, the command is refused before bodies are ever read.
 
-        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
-        that keeps bashlex's reading - the full call reports the payload's own rule instead.
+        Judged `_as_written`, the half of Step 3b's join that keeps bashlex's reading.
         """
         monkeypatch.setattr(val_module, "_phantom_heredoc", lambda *args, **kwargs: None)
         result = validate_command(
@@ -3802,8 +3798,7 @@ class TestBashlexHeredocsAreLocatedByTheirOpener:
         substitution the substitution validator refuses it. That refusal is what covers this,
         so it is the refusal that is asserted.
 
-        Judged `_as_written`: Step 3b rewrites this shift first, and this is the half of its join
-        that keeps bashlex's reading - the full call reports the payload's own rule instead.
+        Judged `_as_written`, the half of Step 3b's join that keeps bashlex's reading.
         """
         result = validate_command(
             "git push --force <<'A'\nz\nA\nx=`(( 1<<b ))\nrm -rf /\nb`", config_path=safety_rules_path, _as_written=True
@@ -4150,10 +4145,6 @@ class TestArithmeticCommandShift:
         that leaves a payload hidden. So the `<<` in these IS rewritten, and
         what has to hold is that the verdict does not move: `==` and `<<` are
         the same width and neither is a rule's business inside a word.
-
-        Byte-identity was asserted here before and is the wrong bar - it made
-        the precision look load-bearing when the only thing it bought was this
-        assertion.
         """
         result = validate_command(command, config_path=safety_rules_path)
 
@@ -4408,8 +4399,7 @@ class TestArithmeticCommandShift:
         quadratic in the nesting depth on a hook that runs before every Bash
         call. The `collected_to` skip is the only thing preventing that, and
         this is the only shape that notices if it goes: no verdict differs
-        either way, because the Step 3b recursion re-runs the rewrite, so a
-        region missed on one pass is caught on the next.
+        either way, because nested regions are subsets of the outer one.
         """
         assert len(_regions("((" * 2000 + "1<<b " * 2000 + "))" * 2000)) == 1
 
@@ -4441,13 +4431,26 @@ class TestArithmeticCommandShift:
         assert ratio < 8.0, f"4x the command cost {ratio:.1f}x the CPU; linear is ~4, quadratic is ~16"
 
     @pytest.mark.parametrize(
-        "tail",
+        "command",
         # `${` opens a span only inside quotes: at the paren level it is text. The
         # `$(` row carries its shift outside, since a heredoc inside `$(` refuses.
-        [" 1<<b", ' "1<<b', ' "${1<<b', " 1<<b $(x", " '1<<b", " $'1<<b", " `1<<b"],
-        ids=["paren level", "double quote", "dollar brace", "command substitution", "single quote", "ansi-c", "backtick"],
+        ["((" * 2000 + tail for tail in (" 1<<b", ' "1<<b', ' "${1<<b', " 1<<b $(x", " '1<<b", " $'1<<b", " `1<<b")]
+        # A quote per opener: each opener's second `(` sits inside a span an
+        # earlier walk skipped, so only the span's own failure can memoise it.
+        + ['(( "' * 2000 + "<<x", "(('" * 2000 + " <<x"],
+        ids=[
+            "paren level",
+            "double quote",
+            "dollar brace",
+            "command substitution",
+            "single quote",
+            "ansi-c",
+            "backtick",
+            "double quote per opener",
+            "single quote per opener",
+        ],
     )
-    def test_parens_that_never_close_are_not_rescanned_per_opener(self, tail):
+    def test_parens_that_never_close_are_not_rescanned_per_opener(self, command):
         """`((((((…` with no closer at all: one scan, not one per opener.
 
         Every opener's `is_arithmetic` runs the paren scan to the end of the
@@ -4459,10 +4462,10 @@ class TestArithmeticCommandShift:
         why each span that can be left unclosed is a row.
 
         Counted rather than timed: the count separates one scan from n scans
-        exactly, on every machine and interpreter.
+        exactly, on every machine and interpreter. Linear here is ~3 scans per
+        opener; one scan per opener is ~750 on the quote-per-opener rows.
         """
         openers = 2000
-        command = "((" * openers + tail
         searches = 0
         real = val_module._PAREN_STOP_RE
 
@@ -4478,7 +4481,7 @@ class TestArithmeticCommandShift:
         finally:
             val_module._PAREN_STOP_RE = real
 
-        assert searches < 3 * openers, (
+        assert searches < 10 * openers, (
             f"{searches} paren scans over {openers} openers; one pass is ~{openers}, one scan per opener is ~{openers**2}"
         )
 

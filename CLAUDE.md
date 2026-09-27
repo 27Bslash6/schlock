@@ -21,8 +21,9 @@
      heredoc delimiter (`<< 'EOF'`) outright, so for those commands there is no AST to walk
      and the shell *around* the heredoc would otherwise never be validated (LAB-2765).
      `_neuter_heredocs` / `_rewrite_openers` in `src/schlock/core/validator.py` recover it
-     with a hand-written lexer. This is the only sanctioned non-AST path that decides command
-     structure, and it holds only while all four constraints do:
+     with a hand-written lexer. This is one of two sanctioned non-AST paths that decide
+     command structure (the other is the arithmetic-shift rewrite below), and it holds only
+     while all four constraints do:
      1. **Bounded reach** — two call sites. The fallback (`_neuter_heredocs`) runs only from
         `_validate_heredoc_command`, after bashlex has already raised a heredoc-shaped error.
         `_normalise_heredoc_delimiters` runs the same lexer *before* bashlex on any command
@@ -87,6 +88,26 @@
      nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
      shares the parse's CPU budget.
      The same bash-first rule applies.
+   - **Approved exception — the arithmetic-shift rewrite** (`_DoubleParen` /
+     `_neuter_arithmetic_shifts` in `src/schlock/core/validator.py`, Step 3b of
+     `_validate_command`). bashlex reads `(( 1<<b ))` as two subshells and the `<<` as a
+     heredoc opener, so the lines after it become an inert body while bash runs them. Before
+     bashlex, a hand-written matcher applies bash's matched-pair rule to every `((` in the text
+     and rewrites each `<<` inside a pair bash reads as arithmetic to the same-width `==`. It
+     holds only while all four constraints do:
+     1. **Never trusted alone** — the rewrite and the command as written are both validated
+        and the worse verdict wins. The as-written half is main's pipeline, so the join can
+        deny more than main and never less. The matcher over-approximates on purpose (every
+        `((` is a candidate, since a missed one is the bypass), and an over-fired rewrite can
+        re-parent a real heredoc; the join is what makes that deny-side.
+     2. **Cannot-follow fails closed** — a pair it cannot follow (`_UnfollowableParenError`:
+        nesting too deep, a `case` or heredoc inside `$(…)`) is BLOCKED with that reason. Only
+        a pair that provably never closes is skipped, because bash runs none of that text.
+     3. **No verdicts of its own** beyond that refusal: the rewritten text goes through the
+        same flow, so the payload is denied by the rule it matches.
+     4. **Linear** — every never-closes exit, including a quote or expansion that runs out of
+        text, is memoised, and the rewrite half shares the caller's parse budget.
+     Every reading is decided by running bash first.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
