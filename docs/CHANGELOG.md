@@ -5,6 +5,16 @@ All notable changes to schlock will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5](https://github.com/27b-io/schlock/compare/schlock-v0.9.4...schlock-v0.9.5) (2026-09-27)
+
+
+### Bug Fixes
+
+* **rules:** rate fd-prefixed truncating redirections as file_truncation (LAB-5502) ([#254](https://github.com/27b-io/schlock/issues/254)) ([579cb28](https://github.com/27b-io/schlock/commit/579cb28cacaafdc858444733d979082c20d29243))
+* **substitution:** walk a peeled group's read-redirect targets for nested substitutions (LAB-5648) ([#260](https://github.com/27b-io/schlock/issues/260)) ([9f947e9](https://github.com/27b-io/schlock/commit/9f947e976fce0177e8656d890ceac3199616f488))
+* **validator:** name the step 5b/5c rule in matched_rules on multi-segment commands (LAB-5003) ([#234](https://github.com/27b-io/schlock/issues/234)) ([148c419](https://github.com/27b-io/schlock/commit/148c4198c0b701256743b6aea014efde162ff3ef))
+* **validator:** refuse a heredoc delimiter that contains an expansion (LAB-5311) ([#243](https://github.com/27b-io/schlock/issues/243)) ([91d4cea](https://github.com/27b-io/schlock/commit/91d4ceae4424dc172acf293146ebbdb5373c2603))
+
 ## [0.9.4](https://github.com/27b-io/schlock/compare/schlock-v0.9.3...schlock-v0.9.4) (2026-09-27)
 
 

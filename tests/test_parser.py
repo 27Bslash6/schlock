@@ -143,6 +143,7 @@ class TestBashCommandParser:
             ("/bin/bash <<EOF | x\nrm -rf /\nEOF", ["/bin/bash <<EOF\nrm -rf /\nEOF", "x"]),
             # A wrapper runs its shell with the wrapper's stdin; wrapping cat keeps it inert.
             ("env bash <<EOF | x\nrm -rf /\nEOF", ["env bash <<EOF\nrm -rf /\nEOF", "x"]),
+            ("env bash <<EOF && x\nrm -rf /\nEOF", ["env bash <<EOF\nrm -rf /\nEOF", "x"]),
             ("timeout 5 cat <<EOF | x\nrm -rf /\nEOF", ["timeout 5 cat <<EOF\n\nEOF", "x"]),
             # Each heredoc is closed in opener order.
             ("cat <<A <<B | x\n1\nA\n2\nB", ["cat <<A <<B\n\nA\n\nB", "x"]),
@@ -655,6 +656,31 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [(seg.text, seg.string_literals) for seg in pairs] == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
     text, literals = pairs[0].text, pairs[0].string_literals
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
+
+
+@pytest.mark.parametrize(
+    ("command", "masked"),
+    [
+        # The outermost body is blanked whole, nested levels and separators with it.
+        ("cat $(a $(b $(c)) | d)/.env", "cat $(               )/.env"),
+        ("cat <(a | b) `c; d` .env", "cat <(     ) `    ` .env"),
+        # A quoted substitution is still code; a single-quoted one is text.
+        ('cat "$(a | b)/.env"', 'cat "$(     )/.env"'),
+        ("echo '$(a | b)' && ls", "echo '$(a | b)' && ls"),
+        # A redirect target is a word too; a `${...}` has no child nodes, so its interior goes.
+        ("cat < $(a | b)/.env", "cat < $(     )/.env"),
+        ("cat ${x:-$(a | b)}/.env ${y}", "cat ${           }/.env ${y}"),
+        # A `\<newline>` earlier in the word moves bashlex's offsets, but the substitution node is
+        # rebuilt at its source offsets (_recover_dropped_substitutions), so its body is blanked.
+        ('echo "x\\\ny $(echo $(a)x)"', 'echo "x\\\ny $(          )"'),
+        # Top-level separators survive, so the masked text is still two commands.
+        ("echo $(a; b) && git commit -m x", "echo $(    ) && git commit -m x"),
+    ],
+)
+def test_mask_substitution_bodies_blanks_bodies_in_place(command, masked):
+    """Absolute expected text: the caller reuses its literal ranges, so length is the contract."""
+    parser = parser_mod.BashCommandParser()
+    assert parser.mask_substitution_bodies(command, parser.parse(command)) == masked
 
 
 def _parse_hung(signum, frame):
