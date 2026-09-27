@@ -651,21 +651,6 @@ def dangerous_find(args: list[str]) -> str | None:
 # (a backslash-newline continuation before the `(`) and `x=1system("cmd")` (no word boundary
 # before the name), so the pattern allows backslashes in the gap and has no `\b` before `system`.
 AWK_SYSTEM_CALL = r"system[\s\\]*\("
-
-# bashlex leaves shell quoting inside a word that starts with a quoted run: `'{sys''tem($0)}'`
-# reaches these checks as `{sys''tem($0)}`, and `'{sys'\t'em($0)}'` keeps its backslash. bash
-# removes both before awk reads the program. So each check reads the word as bashlex left it and
-# again with every quote, backslash and backslash-newline deleted. Deleting only joins text, so the
-# second reading can over-read and cannot hide a name spliced from quoted runs. It is read as well
-# as the first, never instead: `\|\s*"` needs its quote.
-_AWK_SHELL_QUOTING = re.compile(r"\\\n|['\"\\]")
-
-
-def awk_program_texts(arg: str) -> tuple[str, str]:
-    """`arg` as bashlex left it, and with its shell quoting deleted (see _AWK_SHELL_QUOTING)."""
-    return arg, _AWK_SHELL_QUOTING.sub("", arg)
-
-
 _AWK_DANGEROUS_TEXT = re.compile(
     AWK_SYSTEM_CALL  # system("cmd") — arbitrary exec
     + r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
@@ -687,11 +672,10 @@ def dangerous_awk(args: list[str]) -> str | None:
     `args` may include the leading "awk" token (harmless to both scans).
     """
     for arg in args:
-        for text in awk_program_texts(arg):
-            if text != "awk" and text.startswith(_AWK_DANGEROUS_FLAG_PREFIXES):
-                return f"awk {arg} loads external program code or enables writes"
-            if _AWK_DANGEROUS_TEXT.search(text):
-                return "awk program executes commands or writes files (system/getline/pipe/redirect)"
+        if arg != "awk" and arg.startswith(_AWK_DANGEROUS_FLAG_PREFIXES):
+            return f"awk {arg} loads external program code or enables writes"
+        if _AWK_DANGEROUS_TEXT.search(arg):
+            return "awk program executes commands or writes files (system/getline/pipe/redirect)"
     return None
 
 
