@@ -96,7 +96,8 @@ class TestBinaryResolution:
 class TestBinaryIntegrity:
     """Spec §7: never exec a binary whose SHA-256 is not the one MANIFEST.json records."""
 
-    STAND_IN = b"#!/bin/sh\necho '{}'\n"
+    # Drains stdin before answering, like the real CLI and the `fake_binary` stand-ins.
+    STAND_IN = b"#!/bin/sh\ncat >/dev/null\necho '{}'\n"
 
     @needs_binary
     def test_bit_flipped_vendored_binary_raises(self, tmp_path):
