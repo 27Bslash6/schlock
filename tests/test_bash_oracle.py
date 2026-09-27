@@ -318,12 +318,12 @@ def _spawns_real_shell(call: ast.Call, imports: dict) -> bool:
     name = _call_name(call, imports)
     if name in _STRING_TO_SHELL or name.startswith(("os.exec", "os.spawn", "os.posix_spawn")):
         return True
-    if name == "asyncio.create_subprocess_exec":
-        return _argv_may_run_a_shell(list(call.args))
-    if name not in _SPAWNERS:
+    if name not in _SPAWNERS and name != "asyncio.create_subprocess_exec":
         return False
     if any(_keyword_may_run_a_shell(k) for k in call.keywords):
         return True
+    if name == "asyncio.create_subprocess_exec":
+        return _argv_may_run_a_shell(list(call.args))
     argv = call.args[0] if call.args else None
     # An argv the source does not spell out may be a shell.
     return not isinstance(argv, (ast.List, ast.Tuple)) or _argv_may_run_a_shell(argv.elts)
@@ -372,6 +372,9 @@ def test_no_real_shell_outside_the_oracle():
         ('from unittest.mock import call\ncall("bash", "-c")', False),
         ('asyncio.create_subprocess_exec("bash", "-c", c)', True),
         ("asyncio.create_subprocess_shell(c)", True),
+        ('asyncio.create_subprocess_exec("oracle", "-c", c, executable="/bin/bash")', True),
+        ('asyncio.create_subprocess_exec("oracle", "-c", c, **{"executable": "/bin/bash"})', True),
+        ('asyncio.create_subprocess_exec("git", "log", stdout=PIPE)', False),
         ("asyncio.run(main())", False),
         ('subprocess.run("x", shell=True)', True),
         ('subprocess.check_output(["git", "log"])', False),
