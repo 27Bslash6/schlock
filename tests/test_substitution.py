@@ -1848,7 +1848,7 @@ class TestQuotedSubstitutionBodies:
 
     def test_a_line_continuation_before_an_ansi_c_quote_in_a_body_fails_closed(self):
         """Each `\\<newline>` shifts every later inner offset by two, which `$'...'` decoding
-        cannot survive: the parse is refused (LAB-3005) before the body pass runs, and the
+        cannot survive: the parse is refused before the body pass runs, and the
         validator must report it BLOCKED rather than route it to a weaker path.
         """
         result = validate_command("echo \"$(echo \\\n hi; echo $'\\x72\\x6d')\"")

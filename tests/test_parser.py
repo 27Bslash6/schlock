@@ -659,7 +659,7 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
 
 
-# ANSI-C `$'...'` word decoding (LAB-3005). bashlex tokenizes `$'...'` boundaries correctly but
+# ANSI-C `$'...'` word decoding. bashlex tokenizes `$'...'` boundaries correctly but
 # dequotes it wrongly (`$'rm\t-rf\t/'` -> `$rmt-rft/`), so every check keyed on word text - the
 # `-c` / `watch` / `<<<` payloads, a pipe-to-shell interpreter name - judged a string bash never
 # runs. Each expected value below is what bash 5.3 produced (`printf '%s' WORD | od -c`); the

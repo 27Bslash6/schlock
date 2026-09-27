@@ -1368,8 +1368,6 @@ class TestHeredocSurroundings:
         `rm -rf ./build` matches `recursive_delete` at HIGH; only the (stubbed)
         ShellCheck finding raises it to BLOCKED. Behind `ls` no pass would
         spawn ShellCheck on its own, so this pins the escalation's own spawn.
-        (The tail was `rm -r$''f /` until LAB-3005 taught the parser to read
-        `$''` splices, which now blocks it without ShellCheck.)
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])

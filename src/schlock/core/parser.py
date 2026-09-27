@@ -1294,7 +1294,7 @@ class _DollarQuoteDecoder(bashlex.ast.nodevisitor):
     bashlex finds these words' boundaries correctly but dequotes them wrongly - `$'rm\\t-rf\\t/'`
     reads as `$rmt-rft/`, `$"bash"` as `$bash` - so every check keyed on word text judged a string
     bash never runs: the `-c` / `watch` / `<<<` payloads re-validated as code and the pipe-to-shell
-    interpreter name alike (LAB-3005). Fixing the text here, where every parse passes, keeps those
+    interpreter name alike. Fixing the text here, where every parse passes, keeps those
     surfaces from disagreeing about one payload. (`$"..."` is locale translation; with no message
     catalog, which is every shell an agent drives, bash reads it as plain `"..."`.)
 

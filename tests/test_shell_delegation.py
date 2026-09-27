@@ -817,7 +817,7 @@ class TestHereStringBenignUnchanged:
 
 
 class TestAnsiCDelegationEvasion:
-    """LAB-3005: an ANSI-C `$'...'` payload is judged on what bash runs, on every surface.
+    """An ANSI-C `$'...'` payload is judged on what bash runs, on every surface.
 
     bashlex dequoted `$'rm\\t-rf\\t/'` to `$rmt-rft/`, so the payload each surface re-validated
     was a string bash never runs. Pre-fix verdicts on `main` @ `74d4325` (ShellCheck off):
@@ -856,7 +856,7 @@ class TestAnsiCDelegationEvasion:
             # An escape the decoder does not model fails closed rather than guess.
             "bash <<< $'\\cA'",
             "bash -c $'\\x{72}\\x{6d} -rf ~'",
-            # A line continuation moves the spans of a word's children (panel, merge with main):
+            # A line continuation moves the spans of a word's children:
             # `$xy` was glued onto `rm` and the whole command scored SAFE.
             "$xy\\\n$'rm' -rf /",
             # Inside backticks bash reads `\\$'` as `$'`: `find / -delete`, a core.pager RCE.
