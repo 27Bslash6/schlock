@@ -823,12 +823,12 @@ class TestHereStringBenignUnchanged:
 
 
 class TestHereStringGuardSeams:
-    """LAB-4443: mutation-tested seams the parity/extraction tests above don't exercise.
+    """Mutation-tested seams the parity/extraction tests above don't exercise.
 
     Each assertion pins one guard, proven by mutating that guard away and observing a
     failure - reading the code is not evidence for these. AC-2/3/4 are sole pins: with the
     guard removed, every OTHER test in this module (measured) stays green. AC-1 is not a
-    sole pin - test_here_string_fan_out_past_the_ceiling_fails_closed below already kills the
+    sole pin - test_here_string_fan_out_past_the_ceiling_fails_closed above already kills the
     same mutant via its `;`-joined payloads, which walk the same list-node `.parts` recursion
     as `&&`. Kept anyway: that test is about the MAX_DELEGATOR_TOKENS ceiling, not this seam,
     and a joiner change there (e.g. `;` to a newline) would silently drop the only pin.
@@ -859,7 +859,7 @@ class TestHereStringGuardSeams:
     def test_assignment_only_command_with_here_string_is_not_a_sink(self):
         # AC-4: _classify_sink's empty-words guard must return None when a command has no words
         # at all (`FOO=1 <<< "x"` is an assignment plus a here-string, no interpreter word).
-        # Without the guard, `words[0]` raises IndexError (LAB-2756's fail-closed handler turns
+        # Without the guard, `words[0]` raises IndexError (_validate_command's catch-all turns
         # that into BLOCKED) - the false-positive direction, so pin the actual expected level
         # rather than "not BLOCKED".
         result = validate_command('FOO=1 <<< "x"')
