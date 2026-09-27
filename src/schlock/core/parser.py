@@ -819,6 +819,9 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
     (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
     Explicit stdin paths ('-', '/dev/stdin', ...) -> True. No unambiguous program -> True.
+    A `+`-prefixed token is an option too: sh-family shells take `+o NAME` / `+x` at invocation,
+    and reading `+x` as a script let `X | bash +x` through. For an interpreter with no `+`
+    options that token is a script file named `+x`; counting it as an option fails closed.
     """
     inline = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
     saw_option = False
@@ -829,7 +832,7 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
         # Explicit stdin designator -> reads stdin.
         if arg in _STDIN_PATHS:
             return True
-        if not arg.startswith("-"):
+        if not arg.startswith(("-", "+")):
             # A leading positional (before any option) is a script file -> runs it.
             # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
             if not saw_option:
@@ -1135,17 +1138,22 @@ def _stdin_here_string(parts: "list[Any]") -> Optional[str]:
     return by_fd.get(0)
 
 
-def _command_words(node: Any) -> "list[str]":
-    """Word tokens (command name + args) of a command node.
+def command_word_parts(node: Any) -> "list[Any]":
+    """Word nodes (command name + args) of a command node.
 
     Skips assignments, redirections and a redirection's `{varname}` prefix. Every argv
-    view in this module reads a command through here.
+    view reads a command through here, so they all agree on which word is the name.
     """
     return [
-        part.word
+        part
         for part in without_fd_variables(getattr(node, "parts", None) or [])
         if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
     ]
+
+
+def _command_words(node: Any) -> "list[str]":
+    """Word tokens (command name + args) of a command node; see `command_word_parts`."""
+    return [part.word for part in command_word_parts(node)]
 
 
 def heredoc_owner(node: Any) -> Optional[str]:

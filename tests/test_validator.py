@@ -3092,11 +3092,10 @@ class TestQuotedHeredocDelimiter:
         "command",
         [
             "bash < <(cat <<'EOF'\nrm -rf /\nEOF\n)",
-            "bash <(cat <<'EOF'\nrm -rf /\nEOF\n)",
-            "source <(cat <<'EOF'\nrm -rf /\nEOF\n)",
+            "source /dev/stdin < <(cat <<'EOF'\nrm -rf /\nEOF\n)",
             "bash < <(env cat <<'EOF'\nrm -rf /\nEOF\n)",
         ],
-        ids=["stdin", "script-operand", "sourced", "wrapped-inner"],
+        ids=["stdin", "sourced", "wrapped-inner"],
     )
     def test_a_heredoc_in_a_process_substitution_is_validated_as_code(self, safety_rules_path, command):
         """Whatever reads a process substitution may run what it prints, so its heredoc is code.
@@ -3104,6 +3103,9 @@ class TestQuotedHeredocDelimiter:
         The owner used to be the command inside the substitution: `cat`, not a shell, so the
         body was filed inert. `bash < <(cat <<'EOF' …)` then scored SAFE - BLOCKED on `main`
         before this branch - and bash runs the body.
+
+        The script-operand spellings (`bash <(…)`, `source <(…)`) are denied before the body
+        is scanned (LAB-4808); test_process_substitution_script.py pins them.
         """
         result = validate_command(command, config_path=safety_rules_path)
 

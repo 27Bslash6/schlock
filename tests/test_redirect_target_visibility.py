@@ -442,6 +442,11 @@ class TestProcessSubstitutionHeredocIsCode:
     Every template is one segment; they differ in which reconstruction form carries the
     body. Multi-segment spellings are left out on purpose: the unconditional
     whole-command scan already denied them, so a test built on one could not fail.
+
+    The shell reads the substitution on stdin here. As a script operand (`bash <(…)`,
+    `source <(…)`) it is denied before any body is scanned, whatever the body says
+    (LAB-4808, test_process_substitution_script.py), so those spellings no longer reach
+    the mechanism this class pins.
     """
 
     BODY = "cat <<EOF\nrm -rf /\nEOF\n"
@@ -450,12 +455,12 @@ class TestProcessSubstitutionHeredocIsCode:
     @pytest.mark.parametrize(
         "template",
         [
-            "bash <({b})",
-            "bash <({b}) > out.txt",
-            "{{ bash <({b}); }}",
-            "{{ bash <({b}); }} > out.txt",
-            "for i in 1; do source <({b}); done",
-            "source <({b}) > out.txt",
+            "bash < <({b})",
+            "bash < <({b}) > out.txt",
+            "{{ bash < <({b}); }}",
+            "{{ bash < <({b}); }} > out.txt",
+            "for i in 1; do source /dev/stdin < <({b}); done",
+            "source /dev/stdin < <({b}) > out.txt",
         ],
     )
     def test_a_shell_reading_the_substitution_is_blocked(self, template, safety_rules_path):

