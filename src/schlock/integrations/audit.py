@@ -22,7 +22,8 @@ Log Format (JSONL):
 
 Security:
     Secrets (passwords, tokens, API keys) are automatically redacted before logging.
-    Patterns like password=secret, --token VALUE, Authorization: Bearer TOKEN are scrubbed.
+    Patterns like password=secret, --token VALUE, Authorization: Bearer TOKEN are scrubbed,
+    as are HTTP credentials in curl -u/--user user:pass and URL userinfo (scheme://user:pass@host).
 
 Thread Safety:
     File writes are atomic (append mode with single write call).
@@ -113,7 +114,22 @@ class AuditLogger:
         (re.compile(r"(--(password|passwd|token|secret|api[-_]?key)\s+)\S+", re.I), r"\1***REDACTED***"),
         # -p PASSWORD (but not -p in other contexts like docker -p for ports)
         # Only match if followed by something that looks like a password (not a number/port)
-        (re.compile(r"(-p\s+)(?![0-9:]+\b)(\S+)", re.I), r"\1***REDACTED***"),
+        # `(?!-)` keeps it off a following flag: `curl -p -u user:pass` must leave `-u` for the pattern below.
+        (re.compile(r"(-p\s+)(?![0-9:]+\b)(?!-)(\S+)", re.I), r"\1***REDACTED***"),
+        # -u/-U/--user/--proxy-user user:pass, also bundled (`curl -sSu user:pass`) and `--user=user:pass` (curl HTTP auth).
+        # The value must contain a colon so `sort -u file`, `python -u x.py`, `useradd -u 1001 bob` pass through.
+        # A value holding `://` is a URL (`pip install -U git+https://…`): left for the userinfo pattern below.
+        # No numeric carve-out: `-u 12345:67890` is a credential shape too, so `docker run -u 1000:1000` over-redacts.
+        # ponytail: shape heuristic; `docker run -u node:node`, `date -u +%H:%M`, `rsync -u host:/p` over-redact.
+        # A shell-word tokeniser is the upgrade.
+        (
+            re.compile(r"(?<!\S)(-[a-z]*u|--user|--proxy-user)(\s+|=)(?!\S*://)[^\s:]*:\S+", re.I),
+            r"\1\2***REDACTED***",
+        ),
+        # scheme://user:pass@host and scheme://token@host (GitHub PATs ride as a bare username).
+        # Authority ends at `/`, `?` or `#` (RFC 3986), so `https://host/a:b` and `?x=a@b` never match;
+        # greedy up to the last `@` before that boundary keeps an unencoded `@` in the password redacted too.
+        (re.compile(r"(://)[^\s/?#]+@"), r"\1***REDACTED***@"),
     ]
 
     def __init__(self, log_file: Optional[Path] = None):

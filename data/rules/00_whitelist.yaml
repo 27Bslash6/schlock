@@ -9,18 +9,64 @@ whitelist:
   - ^ls\b
   - ^pwd$
 
-  # Safe directory cleanup operations (common developer workflows)
-  - ^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/.*)?$
-  - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)
+  # Safe directory cleanup operations (common developer workflows).
+  # "rm -rf <dir>" and AT MOST ONE component below it: either a single literal segment
+  # ("node_modules/.cache") or a bare glob directly on <dir> ("dist/*"). Never a deeper
+  # path.  The whitelist matches the raw string before the shell touches the filesystem,
+  # so it cannot tell a real directory from a symlink; a deeper path such as
+  # "node_modules/link/victim" (or "node_modules/link/*") traverses THROUGH "link", and if
+  # a malicious package planted "node_modules/link -> /" that walks out of <dir> (CWE-22,
+  # CodeRabbit #146). One component can only be removed or globbed, never traversed, so it
+  # is safe; anything deeper drops to the ordinary recursive-delete tier (HIGH → prompt).
+  # A single segment is [A-Za-z0-9._@+-]+ that is not "." and does not start with ".."
+  # (".cache" yes; "." / ".." / "./x" / braces / "~" / dot-globs no). No trailing slash:
+  # GNU rm follows a trailing-slash symlink and empties its target. A bare terminal "*" is
+  # allowed only directly on <dir> (glob on <dir> yields child NAMES, which rm removes
+  # without following); unlike ".*" it never expands to "." or "..".
+  - '^rm\s+-rf\s+(node_modules|\.next|dist|build|target|__pycache__|\.pytest_cache|\.venv|venv|coverage|\.cache|\.tox)(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*|/\*)?$'
+  # Exactly these three fixed leaf dirs, "$"-anchored. Without the anchor this was a bare
+  # prefix match with no depth cap — strictly worse than the artifact-dir entry above:
+  # "rm -rf .git/refs/../../../../tmp/x" needed no symlink at all, just literal "../", and
+  # "rm -rf .git/hooksXYZ/../etc" matched via the "hooks" prefix. No descendant is ever
+  # needed here, so anything below these three drops to the recursive-delete tier (HIGH).
+  - ^rm\s+-rf\s+\.git/(hooks|objects/pack|refs)$
 
-  # Safe /tmp operations (testing/temporary files)
-  - ^chmod\s+[0-7]{3}\s+/tmp/
-  - ^chmod\s+-R\s+[0-7]{3}\s+/tmp/
+  # Safe /tmp operations (testing/temporary files).
+  # "$"-anchored: without it this was a bare prefix, so every operand after the
+  # /tmp path rode along on the entry's authority -- "chmod 755 /tmp/x /etc/shadow"
+  # and "chmod -R 777 /tmp/a /" both matched, and the second is "chmod -R 777 /".
+  # Path segments use the same shape as the artifact-dir entry above: optional
+  # leading dot, then a non-dot character. That admits ".pytest_cache" and
+  # excludes a "." or ".." SEGMENT, which is what stops "/tmp/../.." -- literally
+  # "/", no symlink required -- from being spelled as a /tmp path. (Dots WITHIN a
+  # segment, "/tmp/a..b", are an ordinary filename and still match here; the
+  # engine's _WHITELIST_DISQUALIFIER is what declines those, not this pattern.)
+  # The operand group repeats, so several /tmp paths are one whitelisted command
+  # ("chmod -R 777 /tmp/build /tmp/dist") while a non-/tmp operand still refuses
+  # the whole entry -- which is the "chmod 755 /tmp/x /etc/shadow" hole this
+  # anchoring exists to close. A trailing "/" is admitted because "/tmp/build/"
+  # and "/tmp/build" are the same path, and refusing one while clearing the other
+  # only means mode 777 on a build dir starts prompting (denying, under the
+  # paranoid preset) for a command the entry exists to allow.
+  # Depth is NOT capped, unlike the rm entry: chmod(2) follows a symlink named on
+  # the command line, so "chmod -R 777 /tmp/link" is already the symlink residual
+  # this file documents above and a cap would buy nothing against it. Resolving
+  # symlinks is out of scope here -- the whitelist matches a raw string before the
+  # shell touches the filesystem. A terminal bare "*" is admitted on the same
+  # terms as the artifact-dir entry (a glob yields child NAMES, and unlike ".*"
+  # never expands to "." or ".."); a glob with a suffix, "/tmp/*.sh", is not, and
+  # simply drops to the ordinary rules.
+  - '^chmod\s+[0-7]{3}(\s+/tmp(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*)+(/|/\*)?)+$'
+  - '^chmod\s+-R\s+[0-7]{3}(\s+/tmp(/\.?[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*)+(/|/\*)?)+$'
 
   # Safe container registry authentication via gh CLI
   # Token is piped directly to docker's credential store, never exposed to stdout/logs.
   # GitHub's official docs recommend this pattern for ghcr.io authentication.
-  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+\S+\s+-u\s+\S+\s+--password-stdin$
+  # Registry is literally ghcr.io: a GitHub token is only meaningful there, and any other
+  # registry would just receive the caller's token. The user slot is spelled out rather
+  # than "\S+", which accepts ";" and "${IFS}" and smuggles a command into the middle of
+  # an otherwise end-anchored pattern.
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
 
 # Note: This file has no rules section, only whitelist patterns
 rules: []
