@@ -280,6 +280,11 @@ class CommitMessageFilter:
         """
         if len(command) > MAX_COMMAND_SIZE:
             return False
+        # bashlex rejects a quoted heredoc delimiter (`<<'EOF'`), so parse the validator's
+        # normalised text. Lookup only: the normaliser blanks quoted bodies, so message
+        # extraction must keep the raw command. Lazy import - validator imports this package.
+        from schlock.core.validator import _normalise_heredoc_delimiters  # noqa: PLC0415
+
         invocations_external: list[bool] = []
 
         def visit(node: Any) -> None:
@@ -302,7 +307,7 @@ class CommitMessageFilter:
                     visit(item)
 
         try:
-            for part in self._parse(command):
+            for part in self._parse(_normalise_heredoc_delimiters(command).text):
                 visit(part)
         except Exception:  # noqa: BLE001 - bashlex raises various types; fail toward inspecting
             return False
