@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from schlock.core import validator as validator_module
-from schlock.core.parser import BashCommandParser, BodyTextCeilingError
+from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
     DANGEROUS_SUBSTITUTION_COMMANDS,
@@ -24,6 +24,7 @@ from schlock.core.substitution import (
     dangerous_sed,
 )
 from schlock.core.validator import load_rules, validate_command
+from schlock.exceptions import QuotedSubstitutionCeilingError
 
 
 @pytest.fixture
@@ -1869,7 +1870,7 @@ class TestQuotedSubstitutionBodies:
         # Nine levels stay under the substitution depth limit, so only the budget can raise.
         parser = BashCommandParser()
         shallow = "echo " + '"$(echo ' * 9 + "x" + ')"' * 9
-        with pytest.raises(BodyTextCeilingError, match="exceed"):
+        with pytest.raises(QuotedSubstitutionCeilingError, match="exceed"):
             parser.extract_quoted_substitution_bodies(shallow, parser.parse(shallow))
         honest = 'echo "$(basename "$(dirname "$(readlink -f "$(which python)")")")"'
         assert validate_command(honest).risk_level == RiskLevel.SAFE
@@ -1878,10 +1879,10 @@ class TestQuotedSubstitutionBodies:
         """Past the budget the deny is purpose-built, not an internal error.
 
         It used to raise into validate_command's catch-all, which set `error`, emptied
-        `alternatives`, reported only `Unexpected validation error: ValueError`, and ran
-        `logger.exception(f"... {command!r}")`, writing the whole command to the log. The
-        command is benign on purpose: a dangerous body would match a rule and never be
-        what denies.
+        `alternatives`, set its message to `Unexpected validation error: ValueError`, and ran
+        `logger.exception(f"... {command!r}")`, writing the whole command and a traceback to
+        the log. The command is benign on purpose: a dangerous body is denied earlier by the
+        substitution check, so the budget would never be what this test exercises.
         """
         command = 'echo "$(' * 12 + "echo hi" + ')"' * 12
         # DEBUG, not ERROR: the property is level-independent. Capturing only ERROR would
@@ -1893,14 +1894,14 @@ class TestQuotedSubstitutionBodies:
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
 
-        # The catch-all sets `message` and `error` in the same return, so error=None also
-        # rules out its "Unexpected validation error: ..." message.
         assert result.error is None
         assert "Quoted substitution bodies exceed" in result.message
         assert result.alternatives
 
-        # Neither the traceback nor the command reaches the log.
-        assert not [r for r in caplog.records if command in r.getMessage() or command in (r.exc_text or "")]
+        # caplog.text includes formatted tracebacks. The catch-all logged `{command!r}`, which
+        # differs from the command once it holds a `'` or `\`, so check both spellings.
+        assert command not in caplog.text
+        assert repr(command) not in caplog.text
 
 
 class TestGroupedAndRedirectedSubstitutions:

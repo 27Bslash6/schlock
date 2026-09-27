@@ -16,7 +16,7 @@ from typing import Any, NamedTuple, Optional
 import yaml
 
 from schlock.core.native_bridge import MAX_COMMAND_SIZE
-from schlock.exceptions import ConfigurationError, ParseError
+from schlock.exceptions import ConfigurationError, ParseError, QuotedSubstitutionCeilingError
 from schlock.integrations.shellcheck import (
     get_security_findings,
     is_shellcheck_available,
@@ -24,15 +24,7 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import (
-    FD_VARIABLE,
-    WRAPPER_COMMANDS,
-    BashCommandParser,
-    BodyTextCeilingError,
-    has_compound_redirects,
-    heredoc_owner,
-    reset_parse_budget,
-)
+from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner, reset_parse_budget
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -3033,11 +3025,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # a whole list, and whitelist patterns are prefix matches.
             try:
                 bodies = parser.extract_quoted_substitution_bodies(command, ast)
-            except BodyTextCeilingError as e:
-                # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH and _over_size_ceiling.
-                # Reaching the catch-all denied with `error` set, no alternatives, a message
-                # naming no limit, and `logger.exception(f"... {command!r}")` writing the whole
-                # command to the log. `str(e)` so the limit is stated once, at the raise.
+            except QuotedSubstitutionCeilingError as e:
+                # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH and _over_size_ceiling. The
+                # catch-all would deny as an internal error, with no alternative, and log the
+                # command with its traceback.
                 return ValidationResult(
                     allowed=False,
                     risk_level=RiskLevel.BLOCKED,

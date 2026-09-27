@@ -29,7 +29,7 @@ import bashlex.subst
 
 from schlock.core.ast_view import UnmappedNodeError
 from schlock.core.native_bridge import NativeBridge, NativeBridgeError
-from schlock.exceptions import ParseBudgetError, ParseError
+from schlock.exceptions import ParseBudgetError, ParseError, QuotedSubstitutionCeilingError
 
 logger = logging.getLogger(__name__)
 
@@ -472,20 +472,6 @@ _QUOTED_RUN_OR_DOLLAR_MARKER = re.compile(r"""('[^']*'|"[^"]*"|\$\$)|\$(?=['"])"
 # before extract_quoted_substitution_bodies fails closed. Bodies nest, so text
 # is scanned once per enclosing body; an honest command stays under 3x.
 _MAX_BODY_TEXT_FACTOR = 4
-
-
-class BodyTextCeilingError(ValueError):
-    """Raised by extract_quoted_substitution_bodies past _MAX_BODY_TEXT_FACTOR.
-
-    Converted to a BLOCKED verdict only by the `try` around its one call in
-    `_validate_command`; raised anywhere else it reaches the catch-all.
-
-    A subclass rather than a bare `except ValueError` at the call site: today the
-    extractor raises nothing else, but a bare clause would silently convert a FUTURE
-    unrelated ValueError into this ceiling's verdict, with error=None, the traceback
-    dropped, and a confident wrong message on a deny path.
-    """
-
 
 _CODE_PART_KINDS = ("commandsubstitution", "processsubstitution")
 
@@ -2061,9 +2047,10 @@ class BashCommandParser:
         body and never a missed payload.
 
         Raises:
-            BodyTextCeilingError: past _MAX_BODY_TEXT_FACTOR times the command's
-                length in body text. Nested bodies are scanned once per enclosing
-                body, and a hook that outlives its timeout fails open (fail closed).
+            QuotedSubstitutionCeilingError: past _MAX_BODY_TEXT_FACTOR times the
+                command's length in body text. Nested bodies are scanned once per
+                enclosing body, and a hook that outlives its timeout fails open (fail
+                closed).
         """
         bodies: list[CommandSegment] = []
         whole_until = -1  # end of the last multi-line word, already one body
@@ -2105,7 +2092,7 @@ class BashCommandParser:
             for start, end, literals, heredocs in spans:
                 budget -= end - start
                 if budget < 0:
-                    raise BodyTextCeilingError(
+                    raise QuotedSubstitutionCeilingError(
                         f"Quoted substitution bodies exceed {_MAX_BODY_TEXT_FACTOR}x the command's length"
                     )
                 bodies.append(

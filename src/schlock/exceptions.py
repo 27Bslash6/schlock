@@ -3,6 +3,7 @@
 This module defines exception types for validation failures:
 - ParseError: Raised when bashlex fails to parse command syntax
 - ParseBudgetError: A ParseError raised when a parse runs past its CPU budget
+- QuotedSubstitutionCeilingError: A ValueError raised when quoted-substitution bodies outgrow the command
 - ConfigurationError: Raised when YAML/regex patterns are invalid
 """
 
@@ -46,6 +47,20 @@ class ParseBudgetError(ParseError):
 
     Some inputs make bashlex's parser loop forever, allocating as it goes. A parse
     that runs out of budget is treated like one that failed: the command is denied.
+    """
+
+
+class QuotedSubstitutionCeilingError(ValueError):
+    """Raised when quoted-substitution body text runs past its multiple of the command's length.
+
+    Raised only by BashCommandParser.extract_quoted_substitution_bodies, and converted to a
+    BLOCKED verdict by the `try` around its one call in `_validate_command`. A new call site
+    must catch it itself: an `except ValueError` upstream would turn it into a parse error.
+
+    A subclass rather than a bare `except ValueError` at the call site: today the extractor
+    raises nothing else, but a bare clause would silently convert a FUTURE unrelated
+    ValueError into this ceiling's verdict, with error=None, the traceback dropped, and a
+    confident wrong message on a deny path.
     """
 
 
