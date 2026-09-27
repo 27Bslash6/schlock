@@ -15,7 +15,7 @@ with "option requires an argument", so an attached payload is not a thing.
 import pytest
 
 from schlock.core import validator
-from schlock.core.parser import BashCommandParser, _parameter_runs_decode
+from schlock.core.parser import BashCommandParser, _assignment_runs_decode, _parameter_runs_decode, _subscript_parts
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
     MAX_DELEGATOR_TOKENS,
@@ -894,6 +894,18 @@ class TestBase64DecodeAtCommandPosition:
             "env -C /tmp $(base64 -d x)",
             "timeout -s KILL 5 $(base64 -d x)",
             "env -u $(base64 -d x)",
+            # Only `command -v`/`-V` describes: other flags of `command` and `env` still run it.
+            "command -p $(base64 -d x)",
+            "env -v $(base64 -d x)",
+            # base64 padding puts an `=` inside the substitution: it is the command, not `NAME=`.
+            "env $(echo aWQ= | base64 -d)",
+            "nohup $(echo aWQ= | base64 -d)",
+            "env -u A $(echo aWQ= | base64 -d)",
+            # A glob or brace word names the wrapper whose operand flags it takes; one that may
+            # name several takes any table flag's operand, and never the `command -v` exit.
+            "/usr/bin/en? -u A $(base64 -d x)",
+            "{env,} -u A $(base64 -d x)",
+            "{command,} -v $(base64 -d x)",
             # GNU env takes any operand with a non-leading `=` as an assignment.
             "env A-B=1 $(base64 -d x)",
             "env a[0]=1 $(base64 -d x)",
@@ -995,6 +1007,28 @@ class TestBase64DecodeAtCommandPosition:
     )
     def test_decode_as_data_is_not_escalated(self, command):
         assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    @staticmethod
+    def _first_word(command):
+        return BashCommandParser().parse(command)[0].parts[0]
+
+    def test_subscript_walk_stops_at_the_bracket_that_closes_it(self):
+        # A `]=` inside the value is not the close: only the subscript's own part is returned.
+        word = self._first_word("a[$(x)]=$(base64 -d x | grep '[k]=v') ls")
+        assert [part.pos for part in _subscript_parts(word)] == [word.parts[0].pos]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "a[0]x]=$(base64 -d x) ls",  # the close is not followed by `=`
+            "a[\\$]=$(base64 -d x) ls",  # an escaped `$` has no part: the walk runs out of parts
+        ],
+    )
+    def test_subscript_walk_refuses_what_it_cannot_delimit(self, command):
+        word = self._first_word(command)
+        assert _subscript_parts(word) is None
+        # ...and the whole word is then read, value included: the over-block side.
+        assert _assignment_runs_decode(word, {}) is True
 
     def test_a_body_that_will_not_parse_counts_as_a_decode(self):
         # Running out of stack inside bashlex is a ParseError too: under `{ ` nested ~243 deep the

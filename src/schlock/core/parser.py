@@ -19,7 +19,7 @@ import re
 import shlex
 import signal
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
@@ -1194,16 +1194,18 @@ def heredoc_owner(node: Any) -> Optional[str]:
 _DECODERS = ("base64", "base32", "basenc")
 
 
-def _names_one_of(name: str, names: "Iterable[str]") -> bool:
-    """`name` is one of `names`, or a glob that bash could expand to one (`/usr/bin/bas?64`)."""
+def _named(name: str, names: "Collection[str]") -> "list[str]":
+    """The `names` that `name` is, or that bash could expand it to as a glob (`/usr/bin/bas?64`)."""
     if name in names:
-        return True
-    return any(c in name for c in "*?[") and any(fnmatch.fnmatchcase(n, name) for n in names)
+        return [name]
+    if not any(c in name for c in "*?["):
+        return []
+    return [n for n in names if fnmatch.fnmatchcase(n, name)]
 
 
 def _is_decoder(name: str) -> bool:
     """A decoder's basename, or a glob that bash could expand to one."""
-    return _names_one_of(name, _DECODERS)
+    return bool(_named(name, _DECODERS))
 
 
 def _is_decode_flag(arg: str) -> bool:
@@ -1294,16 +1296,36 @@ _WRAPPER_OPERAND_FLAGS = {
     "env": ("-u", "--unset", "-C", "--chdir"),
     "timeout": ("-s", "--signal", "-k", "--kill-after"),
 }
+# A wrapper word that may name more than one wrapper (`{env,}`, a glob matching two) takes any
+# table flag's operand as data, and never the `command -v` exit.
+_ANY_WRAPPER = ""
+_ANY_WRAPPER_OPERAND_FLAGS = tuple(flag for flags in _WRAPPER_OPERAND_FLAGS.values() for flag in flags)
+
+
+def _wrapper_named(word: str) -> Optional[str]:
+    """The exec wrapper a word names; _ANY_WRAPPER when it may name several; None when none.
+
+    A glob is resolved to the one wrapper it matches (`/usr/bin/en?` is `env`). A word that may
+    brace-expand may expand to any wrapper, or vanish (`{env,}`, `{,}`).
+    """
+    matches = _named(word.split("/")[-1], _EXEC_WRAPPERS)
+    if len(matches) == 1:
+        return matches[0]
+    if matches or _may_brace_expand(word):
+        return _ANY_WRAPPER
+    return None
 
 
 def _is_env_assignment(word: str) -> bool:
     """`NAME=value` as a wrapper operand (`env NAME=value cmd`): assigned, never executed.
 
     GNU env takes any operand with a non-leading `=` as an assignment, so `A-B=1`, `a[0]=1` and
-    `é=1` all are; a leading `-` is a flag (`--split-string=…`), read as one by the caller.
+    `é=1` all are; a leading `-` is a flag (`--split-string=…`), read as one by the caller. The
+    name must be literal: base64 padding puts an `=` inside `$(echo aWQ= | base64 -d)`, and that
+    word is the command `env` runs.
     """
     name, eq, _ = word.partition("=")
-    return bool(eq and name) and not name.startswith("-")
+    return bool(eq and name) and not name.startswith("-") and not any(c in name for c in "$`")
 
 
 def _may_brace_expand(word: str) -> bool:
@@ -1320,10 +1342,14 @@ def _subscript_parts(word: Any) -> "Optional[list[Any]]":
 
     bashlex keeps a substitution's text verbatim in `.word` and lists the parts in order, so the
     walk steps over each part by its span length and matches `[`/`]` only in what is left. That
-    keeps a `]=` inside the value (`a[0]=$(… | grep '[k]=v')`) out of the subscript. It works on
-    `.word` rather than the source because the source is not at hand here, which bashlex's
-    quote removal makes lossy: `a["]"]=1` reads `a[]]=1`. So the walk refuses (None) whenever the
-    text it reaches is not what a part or a closing `]=` must look like.
+    keeps a `]=` inside the value (`a[0]=$(… | grep '[k]=v')`) out of the subscript. It returns
+    None when the parts run out, when a substitution's span does not end in `)` or a backtick,
+    or when the close is not followed by `=`/`+=`.
+    It works on `.word` rather than the source, which is not at hand here, and bashlex's quote
+    removal makes that lossy: a quoted `]` reads as a close (`a["]="$(…)]=1` closes after `a[`),
+    and a literal `$` can take a part that is not its own. Neither has been turned into a decode
+    that runs: for the early close, the subscript bash evaluates is `]=<decoded>`, an arithmetic
+    syntax error before any decoded `$(…)` is reached (bash 5.3 witness).
     """
     text, parts = word.word, iter(sorted(getattr(word, "parts", None) or [], key=lambda p: p.pos))
     inside: list[Any] = []
@@ -1377,7 +1403,7 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     "The command" is every word bash may execute, not just the first: a leading bare expansion
     can vanish, and a wrapper (`env`, `nohup`, `timeout 5`, `builtin`) executes an operand. So the
     scan walks words until the first literal one, the command that actually runs; past a wrapper
-    it also steps over flags, `NAME=value` and numeric operands. It deliberately does NOT scan
+    it also continues past flags, `NAME=value` and numeric operands. It deliberately does NOT scan
     every wrapper operand the way `_classify_sink` does: there a false hit only re-validates a
     payload, here it is an un-promptable BLOCKED, and `timeout 30 curl -H "$(… | base64 -d)"`
     or `sudo mysql -p"$(base64 -d pw)"` pass the decode as DATA to the command the wrapper runs.
@@ -1387,10 +1413,13 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     when subscripted: bash assigns it, or rejects it (`not a valid identifier`), and either way
     runs the next word, so `a[$(true)]=1 $(base64 -d x)` runs the decode. Only its subscript is
     read for a decode (_assignment_runs_decode); its value is data.
-    A wrapper's own flag is read for a decode before it is stepped over: an unquoted
+    A wrapper's own flag is read for a decode before the scan moves on: an unquoted
     `nice -n$(…)` word-splits into the wrapper's argv, and `env -S"$(…)"` splits the string itself.
-    A wrapper name is glob-matched as a decoder is (`/usr/bin/en?`), and a word that may
-    brace-expand (`{env,}`, `{,}`) is treated as one, since it may name a wrapper or vanish.
+    The cost: bashlex has dropped the quotes, so a quoted decode used only as a flag's value is
+    BLOCKED too, attached (`timeout -s"$(…)" 5 cmd`) or detached from a flag the table below
+    does not model (`nice -n "$(…)" true`, `sudo -u "$(…)" true`).
+    A wrapper name is resolved as _wrapper_named does (`/usr/bin/en?` is `env`; `{env,}` may be
+    any wrapper, or vanish).
     A flag's detached operand (_WRAPPER_OPERAND_FLAGS) is data, so `env -u A $(base64 -d x)` runs
     the decode and `env -u "$(base64 -d x)" cmd` does not; unquoted, it may word-split into argv,
     so a bare expansion there is still read. `command -v`/`-V` only describes, and runs nothing.
@@ -1416,11 +1445,12 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
         if wrapper is not None and (text.startswith("-") or text[:1].isdigit()):
             if wrapper == "command" and text.startswith("-") and ("v" in text or "V" in text):
                 return False
-            operand = text in _WRAPPER_OPERAND_FLAGS.get(wrapper, ())
+            flags = _ANY_WRAPPER_OPERAND_FLAGS if wrapper == _ANY_WRAPPER else _WRAPPER_OPERAND_FLAGS.get(wrapper, ())
+            operand = text in flags
             continue
-        name = text.split("/")[-1]
-        if _names_one_of(name, _EXEC_WRAPPERS) or _may_brace_expand(text):
-            wrapper = name
+        named = _wrapper_named(text)
+        if named is not None:
+            wrapper = named
             continue
         if not _is_bare_expansion(word):
             return False

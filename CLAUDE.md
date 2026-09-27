@@ -90,9 +90,13 @@
      the command as arithmetic, which runs a `$(…)` the subscript's decode prints, while the
      value after `=` is only stored. The walk reads one word bashlex already delimited, steps
      over each substitution part by its span length, and matches `[`/`]` in what is left. It
-     only narrows which parts the decode check reads. Anything it cannot place (a quoted `]`,
-     a `$` that is no part, no `]=` after the close) returns None, and the whole word is read:
-     the over-block side. The same bash-first rule applies.
+     only narrows which parts the decode check reads. When the parts run out, a substitution's
+     span does not end in `)` or a backtick, or the close is not followed by `=`, it returns None
+     and the whole word is read: the over-block side. bashlex's quote removal can still misread
+     it: a quoted `]` closes early, and a literal `$` can take a part that is not its own. Review
+     could not turn either into a decode that runs; for the early close, the subscript bash
+     evaluates is an arithmetic syntax error before the decoded `$(…)` is reached (bash 5.3
+     witness). The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
