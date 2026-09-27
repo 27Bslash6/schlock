@@ -125,7 +125,7 @@ class TestShellDelegatedPayloadExtraction:
 
     def test_runner_grammar_picks_the_dash_c(self):
         # A value option takes the rest of its cluster, or the next word, so a `c` there is not
-        # `-c`: reading `-s/bin/csh` as `-c` extracted `sh` and dropped the real payload (LAB-5180).
+        # `-c`: reading `-s/bin/csh` as `-c` extracted `sh` and dropped the real payload.
         assert self._p(("runuser", ["-s/bin/csh", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
         assert self._p(("runuser", ["-gcdrom", "root", "-c", "rm -rf /"])) == ["rm -rf /"]
         assert self._p(("runuser", ["-w", "-cfoo", "-c", "rm -rf /", "root"])) == ["rm -rf /"]

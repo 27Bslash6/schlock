@@ -609,7 +609,7 @@ def _dash_c_payload(  # noqa: PLR0912 - one branch per getopt case
     the rest of the cluster after `c` is the program: `script -q "-c'rm' -rf /" f` runs `'rm' -rf /`.
     Its own grammar decides which word is `-c`: `runuser -s/bin/csh root -c X` sets the shell
     `/bin/csh` and runs X, where reading the `c` in `csh` as `-c` took `sh` as the program and
-    dropped X; `runuser -w -cfoo -c X root` whitelists `-cfoo` and runs X (LAB-5180).
+    dropped X; `runuser -w -cfoo -c X root` whitelists `-cfoo` and runs X.
     """
     value_next = False
     for i, word in enumerate(words):
@@ -754,8 +754,7 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator kind
                 # missing a payload is a bypass. Terminates: each re-entry passes `args[i+1:]`.
                 #
                 # `env -S 'bash -c PROG'` hands env one word it re-splits into a command line, so
-                # expand it first (`env -Sbash`, `--split-string=`) to expose the `bash` delegator
-                # (LAB-5180).
+                # expand it first (`env -Sbash`, `--split-string=`) to expose the `bash` delegator.
                 scan_args = expand_env_split_string(base, args)
                 words = [a.rsplit("/", 1)[-1] for a in scan_args]
                 for i, word in enumerate(words):
@@ -766,8 +765,7 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator kind
                         # Fail closed: extract the `-c PROG` that DIRECTLY follows it, as a shell's
                         # own would. operand_ends_options=True stops at an intervening program, so
                         # `timeout $T python3 -c 'print(1)'` and `env DB=$X psql -c '…'` - where the
-                        # -c belongs to python3/psql, not to the unresolved word - are not extracted
-                        # (LAB-5180).
+                        # -c belongs to python3/psql, not to the unresolved word - are not extracted.
                         found.append(_dash_c_payload(scan_args[i + 1 :], operand_ends_options=True))
 
         payloads.extend(p for p in found if p and p.strip())
@@ -778,7 +776,7 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator kind
 
 # File-content flags that also read stdin when handed `-`. A process substitution feeding one
 # of these (`git commit -F <(…)`, `gh pr create --body-file <(…)`) is over-blocked when its body
-# is treated as code, so the refusal points at the stdin spelling, which stays allowed (LAB-5180).
+# is treated as code, so the refusal points at the stdin spelling, which stays allowed.
 # This is GUIDANCE only - the refusal itself does not change. Keying the workaround on the reader
 # was ruled out (it reopened 7 bypasses); precision here would be an allowlist of read-only
 # readers, tracked separately.
@@ -790,7 +788,7 @@ def _procsub_stdin_alternatives(commands_with_args: list[tuple[str, list[str]]])
 
     `git commit -F <(…)` -> `git commit -F -`; `gh pr create --body-file <(…)` -> `--body-file -`.
     Only a `<(…)` operand directly after a known stdin-capable flag qualifies, so a real shell
-    delegation (`bash <(…)`, `source <(…)`) is never handed a workaround (LAB-5180).
+    delegation (`bash <(…)`, `source <(…)`) is never handed a workaround.
     """
     hints: list[str] = []
     for _cmd, args in commands_with_args:
@@ -2095,8 +2093,8 @@ def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHered
 
     Owner is also None for a heredoc inside a command substitution in COMMAND POSITION
     (`$(cat <<'EOF' … )`), whose output is executed, and for one owned by a function that
-    wraps a shell (`f() { bash; }; f <<'EOF' … `, transitively) - both run the body as code
-    (LAB-5180). `body_is_code` carries "an enclosing construct runs this body as code" - a
+    wraps a shell (`f() { bash; }; f <<'EOF' … `, transitively) - both run the body as code.
+    `body_is_code` carries "an enclosing construct runs this body as code" - a
     process substitution's reader, or a command-position substitution's output - so it is not
     named for process substitution alone.
     """
@@ -3326,7 +3324,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # A process substitution feeding a file-content flag (`git commit -F <(…)`) is code to the
         # extractor above, so it lands here BLOCKED with no way forward. The block stands (keying on
         # the reader reopens bypasses); the refusal just points at the stdin spelling that stays
-        # allowed (LAB-5180 AC6).
+        # allowed.
         if match.risk_level == RiskLevel.BLOCKED and match.rule and match.rule.name == "shell_delegated_payload":
             stdin_hints = _procsub_stdin_alternatives(commands_with_args)
             if stdin_hints:

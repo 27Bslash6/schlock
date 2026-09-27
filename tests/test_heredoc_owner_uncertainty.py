@@ -1,4 +1,4 @@
-"""LAB-5180: heredoc/here-string owner uncertainty fails closed.
+"""Heredoc/here-string owner uncertainty fails closed.
 
 The heredoc owner is what decides whether a heredoc body is inert text or code a shell runs. It
 missed expansion-spelled shells (`$'bash'`, `{bash,}`, `${SHELL:-/bin/sh}`, `/bin/b?sh`),
@@ -17,7 +17,7 @@ command's own argument carrying `$` (`env FOO=$X cat`, `timeout $T cat`, `timeou
 is not over-blocked.
 
 Two layers are pinned: the STRUCTURAL owner/segment view (a verdict can be reached by the
-whole-command rule scan even when the segment view is wrong - LAB-4955), and the integration
+whole-command rule scan even when the segment view is wrong), and the integration
 verdict with ShellCheck off. The witness for the quoted rows is `'rm' -rf /`: quoting the command
 word means no body regex can carry the verdict, so a BLOCKED verdict there proves the body reached
 the validator as code (the `shell_delegated_payload` path the fixed `bash <<'EOF'` twin gets).
@@ -33,7 +33,6 @@ from schlock.core.parser import (
     BashCommandParser,
     _command_nodes,
     _scan_wrapper_operands,
-    _template_runs_code,
     command_position_substitution,
     expand_env_split_string,
     heredoc_owner,
@@ -65,7 +64,7 @@ def hd(head, body, delim="EOF", quoted=True):
 
 
 # ---------------------------------------------------------------------------------------------
-# Structural: heredoc_owner resolution (a mutant here can survive the verdict tests - LAB-4955)
+# Structural: heredoc_owner resolution (a mutant here can survive the verdict tests)
 # ---------------------------------------------------------------------------------------------
 
 
@@ -122,6 +121,9 @@ class TestHeredocOwnerResolvesUncertainToShell:
             "parallel 'sh -c'",  # the template is a shell snippet that runs the line
             "parallel -j4 'sh -c'",
             "parallel 'echo {} | sh'",
+            "parallel echo",  # its template and options are never classified as inert
+            "parallel 'echo {}'",
+            "parallel --filter 'system(1)' echo",  # --filter evaluates Perl before the echo
         ],
     )
     def test_owner_is_default_shell(self, command):
@@ -224,8 +226,6 @@ class TestHeredocOwnerInertReadersUnchanged:
             ('env --ignore-environment psql "$DB"', "env"),
             ('flock --nonblock /tmp/l psql "$DB"', "flock"),
             ('runuser --user=postgres -- psql "$DB"', "runuser"),  # --user= drops the USER positional
-            ("parallel echo", "parallel"),
-            ("parallel 'echo {}'", "parallel"),  # inert template: `{}` is echo's argument, not a command
             ("source ./env.sh", "source"),
             ("command . ./env.sh", "."),  # sources a file, not this stdin
             ("command git status", "command"),
@@ -272,11 +272,12 @@ class TestScanWrapperOperands:
             ("parallel", ["--frobnicate"], True),  # unknown option on a shell_exec wrapper
             ("parallel", ["-i", "echo"], True),  # optional-argument -i is unlisted -> unknown -> shell
             ("parallel", ["--max-lines", "$SH", "cat"], True),  # optional-argument --max-lines likewise
-            ("parallel", ["--jobs", "4", "gzip", "-9"], False),  # required-arg --jobs; gzip template inert
+            ("parallel", ["--jobs", "4", "gzip", "-9"], True),  # no template is inert
+            ("parallel", ["--filter", 'system("x")', "echo"], True),  # --filter's Perl runs first
             ("parallel", ["eval", "{}"], True),  # eval is not an inert reader
             ("parallel", ["{}"], True),  # the line itself is the command
             ("parallel", ["env"], True),  # the line becomes env's command
-            ("parallel", ["echo", ":::", "a"], False),  # arguments come from :::, not stdin
+            ("parallel", ["echo", ":::", "a"], True),
             ("parallel", [":::", "a"], True),  # no template: read as the shell
             ("parallel", ["parallel", "echo"], True),  # a nested runner is not an inert reader
         ],
@@ -363,7 +364,7 @@ class TestCommandPositionSubstitution:
 class TestProcsubHeredocRangesAreShell:
     """A heredoc under an unquoted process substitution is is_shell=True in extract_heredoc_ranges
     - the reader of `<( … )` may run what it prints. Pinned structurally: the whole-command scan
-    would block these anyway, masking a regression in the range view (LAB-4955)."""
+    would block these anyway, masking a regression in the range view."""
 
     @pytest.mark.parametrize(
         "command",
@@ -499,6 +500,9 @@ AC1_QUOTED_ROWS = [
     "parallel 'eval {}'",
     "parallel 'trap {} EXIT'",
     "parallel 'echo {} > >(sh)'",
+    "parallel echo",
+    "parallel 'echo {}'",
+    "parallel -j4 gzip -9",
     "${SHELL#)/}",
     "timeout 5 ${SHELL#)/}",
     "env ${SHELL#)/}",
@@ -638,9 +642,10 @@ class TestAc5CommandPosition:
         assert "shell_delegated_payload" in (result.matched_rules or [])
 
     def test_command_position_backtick_blocked(self, no_shellcheck):
+        # main refuses any heredoc opener inside a backtick before the owner is asked.
         result = validate_command("`cat <<'EOF'\n" + Q + "\nEOF\n`")
         assert result.risk_level == RiskLevel.BLOCKED
-        assert "shell_delegated_payload" in (result.matched_rules or [])
+        assert "backtick" in (result.error or "")
 
     def test_assignment_rhs_keeps_verdict(self, no_shellcheck):
         # Data, not a command: stays SAFE (its a72b45c verdict).
@@ -739,8 +744,6 @@ class TestOwnerDoesNotOverRead:
             hd('flock --nonblock /tmp/l psql "$DB"', SQL),
             hd('runuser --user=postgres -- psql "$DB"', SQL),
             hd('runuser -lu postgres -- psql "$DB"', SQL),
-            hd("parallel 'echo {}'", UNPARSEABLE),
-            hd("parallel -j4 echo", UNPARSEABLE),
             hd('"$(git rev-parse --show-toplevel)/.venv/bin/python" -', PY),
             hd("${VENV:-.venv}/bin/python -", PY),
             'script -q "-cls -la" /dev/null',
@@ -775,53 +778,19 @@ class TestOwnerDoesNotOverRead:
         assert "shell_delegated_payload" in (result.matched_rules or [])
 
 
-class TestTemplateRunsCode:
-    """GNU parallel's command template runs its appended input line through `$SHELL`. The
-    classifier is an allowlist, not a parse (a re-parse reopened an unfixed infinite loop): a
-    metacharacter, an unsplittable template, or a first word that is not a known inert reader is
-    code. Never put an executor (eval, awk, find, a shell) in the inert set."""
+class TestParallelTemplateIsCode:
+    """GNU parallel runs its template through `$SHELL` with each input line appended, and its own
+    options can evaluate Perl, so its heredoc is always code. A template that is not a valid shell
+    snippet fails closed; that over-block is the accepted cost."""
 
-    @pytest.mark.parametrize(
-        "template,runs_code",
-        [
-            (["eval {}"], True),
-            (['eval "$(cat)"'], True),
-            (["builtin eval {}"], True),
-            (["command eval {}"], True),
-            (["trap {} EXIT"], True),
-            (["echo {} > >(sh)"], True),
-            (["timeout 5 env"], True),
-            (["nohup xargs"], True),
-            (["awk {}"], True),
-            (["find . -exec {} ;"], True),
-            (["echo {}; ls"], True),  # compound inert template: fails closed
-            (["{}"], True),
-            (["env"], True),
-            (['read x; eval "$x"'], True),  # `--pipe` body
-            (["parallel", "echo"], True),  # a nested runner, resolved without a re-parse
-            ([":::", "a"], True),  # no template
-            (["echo {}"], False),
-            (["echo"], False),
-            (["gzip -9"], False),
-            (["sha256sum {}"], False),
-            (["grep foo {}"], False),
-            (["echo", ":::", "a"], False),  # `:::` args are not the template
-            # Members dropped for an option that runs a program (LAB-5180):
-            (["printf %s {}"], True),  # `printf -v arr[$(...)]` evaluates the subscript
-            (["sort -S16k"], True),  # `sort --compress-program=X` runs X
-            # parallel's own Perl replacement strings run code whatever the head:
-            (['echo {= system "id" =}'], True),
-            (["echo {= uq =}"], True),
-            (["--rpl", "{U} uq", "echo {U}"], True),
-        ],
-    )
-    def test_classifier(self, template, runs_code):
-        assert _template_runs_code(template) is runs_code
+    def test_unparseable_body_fails_closed(self, no_shellcheck):
+        result = validate_command(hd("parallel 'echo {}'", UNPARSEABLE))
+        assert result.risk_level == RiskLevel.BLOCKED
 
     def test_hang_template_does_not_reparse(self):
-        # A template that reopened bashlex's _paramexpand loop (LAB-4959) must finish and BLOCK. Run
+        # A template that reopened bashlex's _paramexpand loop must finish and BLOCK. Run
         # it in a subprocess with a timeout, so a regression fails the test instead of hanging the
-        # suite (there is no pytest-timeout, LAB-4572).
+        # suite (there is no pytest-timeout).
         command = "rm -rf / ; parallel 'echo \"$(cat <<X\\n${\\nX\\n)\"' ::: a"
         script = (
             "import sys; from schlock.core.validator import validate_command, is_shellcheck_available;\n"
@@ -853,7 +822,7 @@ class TestQuotedSubstitutionInProgramNameOverReads:
 
 class TestParallelPerlReplacement:
     """GNU parallel's `{= perl =}` and `--rpl 'X perl'` run arbitrary Perl in parallel itself,
-    regardless of the template head or whether a heredoc is present (LAB-5180)."""
+    regardless of the template head or whether a heredoc is present."""
 
     @pytest.mark.parametrize(
         "command",
@@ -870,6 +839,10 @@ class TestParallelPerlReplacement:
             "parallel echo '{= s:x:y:; system(\"id\") =}/' ::: a",  # trailing `/`: empty basename
             "parallel --rpl='{X} s/a/b/; system(\"id\")' 'echo {X}' ::: a",
             "parallel --rp='{X} s/a/b/; system(\"id\")' 'echo {X}' ::: a",
+            # --filter evaluates its Perl expression before the template runs
+            "parallel --filter 'system(\"touch m\")' echo <<'EOF'\nhello\nEOF",
+            "parallel --filter 'system(\"touch m\")' echo ::: a",
+            "parallel --filter='system(\"touch m\")' echo ::: a",
         ],
     )
     def test_perl_replacement_blocks(self, command, no_shellcheck):
@@ -881,6 +854,7 @@ class TestParallelPerlReplacement:
             "parallel echo {} ::: '{=a=}'",  # `:::` input is data, never a replacement string
             "parallel echo ::: '{=x}'",
             "parallel echo {} ::: 's/{=a=}/x'",
+            "parallel --filter-hosts echo ::: a",  # a flag, not --filter; no prefix is matched
         ],
     )
     def test_perl_replacement_in_input_is_safe(self, command, no_shellcheck):
