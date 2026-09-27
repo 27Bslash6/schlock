@@ -3277,6 +3277,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     message=f"ShellCheck did not complete, so the {subject} is unchecked",
                     alternatives=alternatives,
                 )
+                if all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
             security_findings = get_security_findings(findings or [])
             if security_findings:
                 # Elevate to BLOCKED if ShellCheck found security issues
