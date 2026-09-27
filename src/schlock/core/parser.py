@@ -12,6 +12,7 @@ CLAUDE.md lists them as approved exceptions and the constraints each must keep.
 
 import bisect
 import contextlib
+import functools
 import json
 import logging
 import re
@@ -234,10 +235,13 @@ def _refuse_unterminated_brace_expansion() -> None:
     timeout fails open, so the loop was an allow.
 
     Every input that reaches the -1 loops, so raising there changes no parse that ever finished.
-    Unreported upstream.
+    The parse budget (_parse_budget) now bounds that loop too, but only after PARSE_CPU_BUDGET of
+    CPU and only where it can arm (main thread, not Windows); this refuses in under a millisecond
+    everywhere. The hook's own wall-clock deadline is the last bound. Unreported upstream.
     """
     original = bashlex.subst._paramexpand
 
+    @functools.wraps(original)
     def paramexpand(parserobj: Any, string: str, sindex: int) -> Any:
         if string[sindex + 1 : sindex + 2] == "{" and string.find("}", sindex + 2) == -1:
             raise bashlex.errors.ParsingError("bad substitution: no closing '}'", string, sindex)

@@ -51,7 +51,10 @@ logger = logging.getLogger(__name__)
 
 # Claude Code lets a PreToolUse command hook that outlives its timeout (600 s by default) through
 # to the normal permission flow, so a validation that never returns is an allow (LAB-4959). The
-# deadline turns that into a denial, with headroom over the slowest legitimate input at the 64 KiB cap.
+# deadline turns that into a denial. The parser's budget (_bounded_parse) caps each parse at
+# PARSE_CPU_BUDGET seconds of CPU; this timer caps the whole validation by wall clock, the clock
+# Claude Code times, so it must stay well above that budget. It is not headroom over every
+# legitimate input: rule matching on a near-64 KiB command can still outrun it and be denied.
 VALIDATION_DEADLINE_S = 30
 # Backstop for a stall the soft deadline cannot interrupt (C code holding the GIL, a swallowed
 # timeout): faulthandler's watchdog thread exits 1 without the GIL, and the manifest's

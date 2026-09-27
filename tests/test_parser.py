@@ -657,10 +657,6 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
 
 
-def _parse_hung(signum, frame):
-    pytest.fail("parse did not return within 5 s")
-
-
 # A heredoc body the tokenizer never brace-matches, so an unclosed `${` reaches the expander.
 UNTERMINATED_BRACE = [
     'git commit -m "$(cat << EOF\n${\nEOF\n)"',
@@ -678,18 +674,11 @@ class TestUnterminatedBraceExpansion:
     """bashlex 0.18 loops forever on an unclosed `${` (LAB-4959); schlock makes it raise."""
 
     @pytest.fixture(autouse=True)
-    def _bounded(self):
-        # A regression hangs rather than fails; the alarm turns that into a failure where it exists.
-        # A timer already armed (pytest-timeout's signal method) bounds the hang itself, and re-arming
-        # ITIMER_REAL would silently cancel its deadline for the rest of the run.
-        if not hasattr(signal, "setitimer") or signal.getitimer(signal.ITIMER_REAL)[0]:
-            yield
-            return
-        previous = signal.signal(signal.SIGALRM, _parse_hung)
-        signal.setitimer(signal.ITIMER_REAL, 5)
+    def _fresh_budget(self):
+        # The parse budget bounds a wrap regression; the budget it spends must not then deny
+        # every later parse in the module.
         yield
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+        parser_mod.reset_parse_budget()
 
     @pytest.mark.parametrize("command", UNTERMINATED_BRACE)
     def test_unclosed_brace_raises(self, command):
@@ -759,18 +748,21 @@ class TestParseBudget:
 
     @staticmethod
     def _validate_in_capped_child(command, budget):
-        """(stdout words, wall seconds) of validate_command in a child capped at 1 GiB, so a regression cannot run away."""
+        """(stdout, wall seconds, stderr) of validate_command on vanilla bashlex, in a child capped at 1 GiB."""
 
         def cap_memory():
             resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
 
         probe = (
             "import sys\n"
+            "import bashlex.subst\n"
             "from schlock.core import parser\n"
             "from schlock.core.validator import validate_command\n"
+            # Undo the unterminated-`${` refusal: it denies these inputs before the budget arms.
+            "bashlex.subst._paramexpand = bashlex.subst._paramexpand.__wrapped__\n"
             "parser.PARSE_CPU_BUDGET = float(sys.argv[2])\n"
             "r = validate_command(sys.argv[1])\n"
-            "print(r.risk_level.name, r.allowed)\n"
+            "print(r.risk_level.name, r.allowed, r.message)\n"
         )
         started = time.monotonic()
         try:
@@ -784,18 +776,20 @@ class TestParseBudget:
             )
         except subprocess.TimeoutExpired:
             pytest.fail("validate_command did not return", pytrace=False)
-        return done.stdout.split(), time.monotonic() - started, done.stderr
+        return done.stdout, time.monotonic() - started, done.stderr
 
     def test_pathological_heredoc_is_denied_within_the_budget(self):
-        words, _, stderr = self._validate_in_capped_child(self.PATHOLOGICAL, 1.0)
-        assert words == ["BLOCKED", "False"], stderr
+        out, _, stderr = self._validate_in_capped_child(self.PATHOLOGICAL, 1.0)
+        assert out.startswith("BLOCKED False "), stderr
+        assert "too complex to analyse" in out, out
 
     def test_many_runaway_bodies_cost_one_budget(self):
         """Each git config payload is re-parsed by a caller that catches the failure and carries on."""
         body = "x=$(cat <<EOF\n$" + "{x\nEOF\n)"
         command = "".join(f"echo \"$(git config alias.a{n} '!{body}')\";" for n in range(20))
-        words, wall, stderr = self._validate_in_capped_child(command, 0.5)
-        assert words == ["BLOCKED", "False"], stderr
+        out, wall, stderr = self._validate_in_capped_child(command, 0.5)
+        assert out.startswith("BLOCKED False "), stderr
+        assert "too complex to analyse" in out, out
         assert wall < 8, f"{wall:.1f}s: the budget was spent once per body"  # 20 bodies x 0.5 s = 10 s
 
     def test_runaway_parse_raises_parse_budget_error(self, runaway_parse):
