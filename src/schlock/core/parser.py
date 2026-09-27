@@ -284,16 +284,18 @@ def parse_bashlex(command: str) -> list[Any]:
                 original_error=e,
             )
         _recover_dropped_substitutions(command, ast)
-    if _double_paren_misparse(ast):
-        # No "heredoc" in the message: the validator routes those to the heredoc fallback,
-        # which would parse this same tree again. This is a plain parse refusal.
-        raise ParseError(_MISPARSE_MESSAGE)
+        # A heredoc needs a `<` in the text, so most commands skip the walk. No "heredoc" in the
+        # message: the validator routes those to the heredoc fallback, which would parse this
+        # same tree again. This is a plain parse refusal.
+        if "<" in command and _double_paren_misparse(ast):
+            raise ParseError(_MISPARSE_MESSAGE)
     _mark_fd_variables(command, ast)
     return ast
 
 
 _MISPARSE_MESSAGE = (
-    "`(( … ))` arithmetic containing `<<` is misread as nested subshells; the lines after it would run without validation"
+    "`(( … ))` arithmetic containing `<<` is misread as nested subshells; the lines after it would run without validation."
+    " For nested subshells, write `( (`"
 )
 
 
@@ -328,38 +330,49 @@ def _double_paren_misparse(nodes: list[Any]) -> bool:
             return None
         return kids[0]
 
-    def children(node: Any) -> Iterator[Any]:
-        for value in vars(node).values():
-            for child in value if isinstance(value, list) else (value,):
-                if hasattr(child, "kind"):
-                    yield child
-
-    def has_heredoc(node: Any) -> bool:
-        # A heredoc inside a substitution belongs to that substitution's own command and hides
-        # nothing here: `(( 1 + $(cat <<E … E) ))` is ordinary arithmetic. A misparse nested
-        # inside one is found by the walk below, which does enter substitutions.
-        stack = [node]
-        while stack:
-            n = stack.pop()
-            kind = getattr(n, "kind", None)
-            if kind in ("commandsubstitution", "processsubstitution"):
-                continue
-            if kind == "redirect" and getattr(n, "type", None) in ("<<", "<<-"):
-                return True
-            stack.extend(children(n))
-        return False
-
-    stack = list(nodes)
+    # `owns[id(n)]`: does `n` hold a heredoc of its own? Settled once per node, children first
+    # (an iterative post-order, memoised), so the walk is linear. Asking it per compound instead
+    # re-walked each subtree once per level of `((((…` nesting - quadratic, 5 s of CPU at 25 KB.
+    owns: dict[int, bool] = {}
+    compounds: list[Any] = []
+    stack: list[tuple[Any, bool]] = [(node, False) for node in nodes]
     while stack:
-        node = stack.pop()
-        outer = opener(node) if getattr(node, "kind", None) == "compound" else None
-        if outer is not None:
-            for child in node.list:
-                inner = opener(child) if getattr(child, "kind", None) == "compound" else None
-                if inner is not None and inner.pos[0] == outer.pos[1] and has_heredoc(child):
-                    return True
-        stack.extend(children(node))
+        node, settled = stack.pop()
+        if id(node) in owns:
+            continue
+        if not settled:
+            stack.append((node, True))
+            stack.extend((child, False) for child in _misparse_children(node) if id(child) not in owns)
+            continue
+        kind = getattr(node, "kind", None)
+        if kind == "compound":
+            compounds.append(node)
+        # A heredoc inside a substitution belongs to that substitution's own command and hides
+        # nothing outside it: `(( 1 + $(cat <<E … E) ))` is ordinary arithmetic. A misparse
+        # inside one is still found, because the walk enters substitutions.
+        owns[id(node)] = (kind == "redirect" and getattr(node, "type", None) in ("<<", "<<-")) or any(
+            owns[id(child)]
+            for child in _misparse_children(node)
+            if getattr(child, "kind", None) not in ("commandsubstitution", "processsubstitution")
+        )
+
+    for node in compounds:
+        outer = opener(node)
+        if outer is None:
+            continue
+        for child in node.list:
+            inner = opener(child) if getattr(child, "kind", None) == "compound" else None
+            if inner is not None and inner.pos[0] == outer.pos[1] and owns[id(child)]:
+                return True
     return False
+
+
+def _misparse_children(node: Any) -> Iterator[Any]:
+    """The AST nodes directly under ``node``, from every attribute."""
+    for value in vars(node).values():
+        for child in value if isinstance(value, list) else (value,):
+            if hasattr(child, "kind"):
+                yield child
 
 
 # --- Parser tiers: `SCHLOCK_PARSER` switch + fail-closed state machine (spec §6, LAB-409 T5) ---

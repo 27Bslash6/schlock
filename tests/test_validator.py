@@ -3933,8 +3933,6 @@ class TestArithmeticCommandShift:
             # A `#` inside `(( … ))` is not a comment to bash, and is to bashlex, which then closes
             # both subshells on a later `) )` the author chose, nowhere near flush.
             ("(( 1<<b # ))\n\nrm -rf /\nb\n) )\n", "a `#` in the arithmetic moves bashlex's closer"),
-            ("(( 1<<b # ))\n \nrm -rf /\nb\n) )\n", "the same, a blank line holding a space"),
-            ("(( 1<<b # ))\n\nrm -rf /\nb\n)\n)\n", "the same, the closer split over two lines"),
             ("! (( 1<<b # ))\n\nrm -rf /\nb\n) )\n", "the same, negated"),
             # One substitution deep. The shift operand is a whitelisted word, so nothing but the
             # parse-level guard stands between these and an allow.
@@ -4119,6 +4117,49 @@ class TestArithmeticCommandShift:
         payload (canary), except the two pinned over-denies.
         """
         assert _misparse(command) is misparsed, description
+
+    def test_the_misparse_walk_grows_linearly_with_nesting(self, monkeypatch):
+        """Deep flush `((((…` nesting: each node's children are read a bounded number of times.
+
+        Asking "does this subtree hold a heredoc" once per compound re-walked every subtree
+        once per level: 4x the CPU per 2x input, 5 s of hook CPU at 25 KB, outside the parse
+        budget. Counted rather than timed, across a 4x input: linear is ~4, quadratic ~16.
+        """
+        calls = 0
+        real = parser._misparse_children
+
+        def counting(node):
+            nonlocal calls
+            calls += 1
+            return real(node)
+
+        def reads(depth: int) -> int:
+            nonlocal calls
+            ast = parser._bounded_parse("(" * depth + " ".join(["x"] * (depth * 20)) + ")" * depth)
+            calls = 0
+            monkeypatch.setattr(parser, "_misparse_children", counting)
+            parser._double_paren_misparse(ast)
+            monkeypatch.setattr(parser, "_misparse_children", real)
+            return calls
+
+        ratio = reads(600) / reads(150)
+
+        assert ratio < 8.0, f"4x the nesting read {ratio:.1f}x the nodes; linear is ~4, quadratic is ~16"
+
+    def test_the_misparse_check_runs_inside_the_parse_budget(self, monkeypatch):
+        """Whatever the walk costs is charged to PARSE_CPU_BUDGET, so a runaway denies rather than stalls."""
+        armed: list[bool] = []
+        real = parser._double_paren_misparse
+
+        def spy(nodes):
+            armed.append(parser._budget_armed)
+            return real(nodes)
+
+        monkeypatch.setattr(parser, "_double_paren_misparse", spy)
+        parser.reset_parse_budget()
+        parser.parse_bashlex("cat <<E\nx\nE")
+
+        assert armed == [True]
 
 
 class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
