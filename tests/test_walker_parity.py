@@ -15,10 +15,6 @@ sees *at least* as much danger as bashlex does. Two gates carry the weight:
    parses, which under the native tier is N+1 subprocess spawns. Segment string
    literals are now derived from the parent AST's sub-nodes, so the spawn count
    is 1 per command regardless of pipeline length.
-
-Unescape (`rm\\ -rf\\ /`), byte→char offsets, ANSI-C `$'…'` decoding and the
-full `validate_command` differential oracle stay with T3; the tests at the
-bottom pin those as still-fail-closed so a future widening cannot land silently.
 """
 
 import json
@@ -63,8 +59,7 @@ NATIVE_ONLY_CONSTRUCTS = [entry["name"] for entry in CORPUS if entry["bashlex_fa
 #: again would look identical to a documented ceiling, and the gate would go
 #: quiet exactly when it mattered.
 KNOWN_FALLBACK_CEILINGS = {
-    "escaped-space-word": "T3 — per-WordPart backslash unescape (spec §4a)",
-    "ansi-c-quoting": "T3 — ANSI-C decoding; bashlex under-decodes, so T3's oracle rules",
+    "ansi-c-quoting": "mvdan emits $'…' raw; decoding it is a follow-up, not a parity fix",
     "comments-and-blank-lines": "CLI parses comments off, so a trailing one reads as a prefix parse",
     "arith-command": "bashlex misreads `(( … ))` as a command named after the expression",
 }
@@ -187,19 +182,11 @@ class TestDangerousVariantsReachTheWalkers:
 
 @needs_binary
 class TestFailClosedCeilingsRemain:
-    """T3's ceilings must stay closed until T3 pins them with an oracle."""
+    """Ceilings still fail-closed after T3; the WHY lives at each raise site."""
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "rm\\ -rf\\ /",  # backslash unescape (spec §4a)
-            "echo $'a\\nb'",  # ANSI-C decoding (bashlex under-decodes; T3 oracle)
-            "echo café",  # byte→char offsets (spec §4b)
-        ],
-    )
-    def test_still_routes_to_fallback(self, command):
+    def test_ansi_c_quoting_still_routes_to_fallback(self):
         with pytest.raises(UnmappedNodeError):
-            NativeBridge().parse(command)
+            NativeBridge().parse("echo $'a\\nb'")
 
     def test_negation_stays_unmapped_to_preserve_a_deliberate_over_block(self):
         """The input that rejected mapping `!` — see convert_stmt for the why."""
@@ -398,9 +385,7 @@ class TestParameterExpansionSubstitutions:
 class TestDeepNestingRoutesToFallback:
     """A bridge-side stack overflow is a BRIDGE failure, not a verdict.
 
-    bashlex parses ~350 levels of nesting; the bridge blows the Python stack
-    first — in the recursive converter, or (3.9) already inside the json
-    decoder. Escaping as a bare RecursionError would skip T5's router and
+    Escaping as a bare RecursionError would skip T5's router and
     hard-deny input the fallback tier handles fine. The `__cause__` assertion
     pins the recursion path: without it a healthy bridge that merely rejects
     the input (any NativeBridgeError) would keep this test green without ever
@@ -410,8 +395,10 @@ class TestDeepNestingRoutesToFallback:
     @needs_binary
     def test_recursion_error_becomes_a_native_bridge_error(self):
         command = "if true; then " * 400 + "rm -rf /" + "; fi" * 400
+        # Generous deadline: a timeout NativeBridgeError has no RecursionError cause and
+        # would FAIL this on a slow runner, not pass it vacuously.
         with pytest.raises(NativeBridgeError) as excinfo:
-            NativeBridge().parse(command)
+            NativeBridge(timeout=5.0).parse(command)
         assert isinstance(excinfo.value.__cause__, RecursionError), excinfo.value
 
 

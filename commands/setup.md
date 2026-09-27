@@ -43,7 +43,7 @@ def _find_schlock():
         if mp.exists():
             for m in mp.iterdir():
                 if (m / "src" / "schlock").exists(): return m
-    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27b-io/schlock")
 
 _root = _find_schlock()
 sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
@@ -128,7 +128,7 @@ def _find_schlock():
         if mp.exists():
             for m in mp.iterdir():
                 if (m / "src" / "schlock").exists(): return m
-    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27b-io/schlock")
 
 _root = _find_schlock()
 sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
@@ -223,7 +223,7 @@ def _find_schlock():
         if mp.exists():
             for m in mp.iterdir():
                 if (m / "src" / "schlock").exists(): return m
-    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27b-io/schlock")
 
 _root = _find_schlock()
 sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
@@ -308,7 +308,7 @@ def _find_schlock():
         if mp.exists():
             for m in mp.iterdir():
                 if (m / "src" / "schlock").exists(): return m
-    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27Bslash6/schlock")
+    raise RuntimeError("schlock not found. Run: /plugin marketplace add 27b-io/schlock")
 
 _root = _find_schlock()
 sys.path.insert(0, str(_root / ".claude-plugin" / "vendor"))
