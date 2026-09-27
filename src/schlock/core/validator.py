@@ -2453,9 +2453,9 @@ def _unreadable_program(program: Optional[str]) -> ValidationResult:
     """
     runner = f"'{program}'" if program else "the command it feeds"
     # A denial is read by an agent that may act on it, so its advice must not be a route
-    # around the control that issued it. A plain-word delimiter is read and validated only
-    # when the body is shell code - a shell's, or one with no named command. An
-    # interpreter's readable body is never rule-scanned, so it gets no advice at all.
+    # around the control that issued it. The plain-word advice holds only where a readable
+    # body is checked as shell code - a shell's, or one with no named command - so any
+    # other program gets none.
     readable_is_validated = program is None or program in SHELL_COMMANDS
     return ValidationResult(
         allowed=False,

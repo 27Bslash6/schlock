@@ -2604,9 +2604,8 @@ class TestHeredocSurroundings:
         path lets by. `python3 <<'A;B'` scored LOW on the head alone before interpreters were
         refused, and bash runs its body through python3 (checked with a filesystem witness).
 
-        The advice to use a plain-word delimiter is offered to a shell only. An interpreter's
-        readable body is not rule-scanned, so following that advice would turn this refusal
-        into an allow.
+        The advice to use a plain-word delimiter is offered to a shell only, the one consumer
+        whose readable body is checked as shell code.
         """
         result = validate_command(f"{name} <<'A;B'\nrm -rf /\nA;B", config_path=safety_rules_path)
 
