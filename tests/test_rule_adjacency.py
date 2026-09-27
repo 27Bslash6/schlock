@@ -1080,8 +1080,9 @@ class TestDecoyPaddingIsScannedExactly:
         """
         decoy = "cat ~/.ssh/identity; "
         shape = "env -u '{}' head ~/.ssh/id_ed25519"
-        padded = shape.format(decoy * ((MAX_COMMAND_SIZE - len(shape.format(""))) // len(decoy)))
-        assert len(padded) <= MAX_COMMAND_SIZE
+        count, slack = divmod(MAX_COMMAND_SIZE - len(shape.format("")), len(decoy))
+        padded = shape.format(decoy * count + " " * slack)
+        assert len(padded) == MAX_COMMAND_SIZE
         result = verdict(padded, rules_dir_path)
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ssh_key_exfiltration" in result.matched_rules
