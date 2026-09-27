@@ -2004,8 +2004,12 @@ class _BashlexHeredoc(NamedTuple):
     """One heredoc as bashlex read it, located by its opener rather than its body."""
 
     opener: int  # offset of its `<<` in the text that was walked
-    owner: Optional[str]  # what runs the body (`heredoc_owner`); None when it has none
-    interpreter: Optional[str]  # what runs the body as a program (`stdin_interpreter`), if anything
+    # The command the heredoc feeds, seen past a wrapper to a shell (`heredoc_owner`); None
+    # when it has none. It decides whether a body is shell code to validate.
+    owner: Optional[str]
+    # The program that runs the body from stdin (`stdin_interpreter`), shell or not; None when
+    # the body is data to a named script or inline program. Only the fallback reads it.
+    interpreter: Optional[str]
     word: str  # the delimiter as bashlex took it: AS WRITTEN, quotes and all
     in_substitution: bool
 
@@ -2097,6 +2101,10 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     it does not see, or a compound's own redirect (`while …; done <<'EOF'`), counts as
     code: validating a body that is data costs a false positive, trusting one that is a
     program costs the control.
+
+    Each body is returned with the newline bash feeds after its last line. Without it a
+    CRLF body ends in a bare `\\r`, on which ShellCheck aborts its parse (SC1017, SC1072)
+    and reports nothing it counts, so the payload's only ShellCheck pass went silent.
     """
     owners = {heredoc.opener: heredoc.owner for heredoc in heredocs}
     bodies: list[str] = []
@@ -2105,7 +2113,7 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
         if owner is not None and owner not in SHELL_COMMANDS:
             continue
         if command[body_start:body_end].strip():
-            bodies.append(command[body_start:body_end])
+            bodies.append(command[body_start:body_end] + "\n")
     return bodies
 
 
@@ -2388,12 +2396,10 @@ def _validate_heredoc_command(
     still open at the end), together with every other quoted delimiter in the same
     command, since the rewrite is all or nothing; an opener the scan cannot see (inside
     a double-quoted `$( … )`); and a rewrite bashlex still rejects (an empty heredoc
-    inside a compound). It arrives
-    either because bashlex rejected it or because bashlex read a delimiter as written
-    (see `validate_command`). This
-    validates the command in front of the heredoc, then the shell the heredoc
-    does not swallow as the separate commands bash will run, taking the worse
-    of the two verdicts.
+    inside a compound). It arrives either because bashlex rejected it or because bashlex
+    read a delimiter as written (see `validate_command`). This validates the command in
+    front of the heredoc, then the shell the heredoc does not swallow as the separate
+    commands bash will run, taking the worse of the two verdicts.
 
     SECURITY: the heredoc head vouches only for itself. A whitelisted `ls` does
     not make `rm -rf /` after the terminator safe (LAB-2765).
@@ -2438,23 +2444,28 @@ def _validate_heredoc_command(
         return None
 
 
-def _unreadable_program(owner: Optional[str]) -> ValidationResult:
+def _unreadable_program(program: Optional[str]) -> ValidationResult:
     """Refuse a heredoc whose body was discarded when that body may run as a program.
 
-    ``owner`` is the shell or interpreter that runs it, or None when the heredoc has no
+    ``program`` is the shell or interpreter that runs it, or None when the heredoc has no
     named command - a compound's own redirect, whose body feeds a loop that may run it, a
     bare redirect, or one inside a process substitution, whose reader may run what it prints.
     """
-    runner = f"'{owner}'" if owner else "the command it feeds"
+    runner = f"'{program}'" if program else "the command it feeds"
+    # A denial is read by an agent that may act on it, so its advice must not be a route
+    # around the control that issued it. A plain-word delimiter is read and validated only
+    # when the body is shell code - a shell's, or one with no named command. An
+    # interpreter's readable body is never rule-scanned, so it gets no advice at all.
+    readable_is_validated = program is None or program in SHELL_COMMANDS
     return ValidationResult(
         allowed=False,
         risk_level=RiskLevel.BLOCKED,
         message=f"BLOCKED: Cannot read the program {runner} would run from this heredoc",
-        # One alternative, deliberately. A denial is read by an agent that may act on it,
-        # so its advice must not be a route around the control that issued it.
-        alternatives=["Use a plain-word heredoc delimiter (<<'EOF'), which is read and validated"],
+        alternatives=(
+            ["Use a plain-word heredoc delimiter (<<'EOF'), which is read and validated"] if readable_is_validated else []
+        ),
         exit_code=1,
-        error=f"Unreadable heredoc delimiter in front of {f'interpreter {runner}' if owner else runner}",
+        error=f"Unreadable heredoc delimiter in front of {f'interpreter {runner}' if program else runner}",
         matched_rules=[],
     )
 
@@ -2463,9 +2474,9 @@ def _heredoc_base_result(engine: "RuleEngine", base_command: str) -> ValidationR
     """Verdict for the heredoc's own command, ignoring everything around it."""
     first_word = base_command.split()[0]
 
-    # A heredoc whose body a shell executes is refused in `_escalate_past_heredoc`, for
-    # every heredoc and by the command bashlex attaches it to - not here, where only the
-    # first opener's head is known, as written.
+    # A heredoc whose body a shell or interpreter executes is refused in
+    # `_escalate_past_heredoc`, for every heredoc and by the command bashlex attaches it
+    # to - not here, where only the first opener's head is known, as written.
     if engine.is_whitelisted(first_word):
         return ValidationResult(
             allowed=True,
