@@ -329,8 +329,8 @@ DEEP_RESIDUALS = [
     ("recursive_permission_system_dirs", f'chown -R {D} "/home"'),
     ("recursive_permission_system_dirs", f'echo $(chown {D} -R "/etc")'),
     # A subshell whose output is redirected.
-    pytest.param("recursive_permission_system_dirs", f"(chown -R {D} /etc)>/dev/null", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f"(chown -R {D} /etc) 2>&1", marks=pytest.mark.xfail(strict=True)),
+    ("recursive_permission_system_dirs", f"(chown -R {D} /etc)>/dev/null"),
+    ("recursive_permission_system_dirs", f"(chown -R {D} /etc) 2>&1"),
     # A substitution inside an unquoted heredoc body runs when the heredoc is read.
     ("credential_exposure", f"cat <<EOF\n$(cat {D}/.env)\nEOF\necho ok"),
 ]
