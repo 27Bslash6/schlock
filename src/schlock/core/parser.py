@@ -479,10 +479,99 @@ def _part_offsets_may_shift(command: str, span: tuple) -> bool:
     the first one every part offset is short by two per continuation (`"a \<newline> $(x)"`
     puts the `$(` two characters early). Any backslash-newline counts, including the ones
     that are not continuations (inside `'…'`, or after an escaped backslash): the cost of
-    over-matching is a rebuild that fails closed, never a skip to a wrong end. Both
-    _recover_dropped_substitutions and _quote_pairs must ask this same question.
+    over-matching is a rebuild that fails closed, never a skip to a wrong end.
     """
     return "\\\n" in command[span[0] : span[1]]
+
+
+# A group's closer, keyed by its opener. Inside `${…}` bash counts no bare `{`, only a nested `${`.
+_GROUP_CLOSERS = {"${": "}", "$(": ")", "<(": ")", ">(": ")", "$[": "]", "'": "'", '"': '"', "`": "`"}
+# The openers bash reads inside each kind of group, longest spelling first. `$'` is its own case.
+_OPENERS_IN = {
+    "}": ("${", "$(", "<(", ">(", "$[", "'", '"', "`"),
+    ")": ("${", "$(", "$[", "'", '"', "`"),
+    "]": ("${", "$(", "$[", "'", '"', "`"),
+    '"': ("${", "$(", "$[", "`"),
+}
+_BARE_OPENERS = {")": "(", "]": "["}
+# A `#` or a `case` after one of these starts a comment or a case command.
+_WORD_BREAKS = " \t\n;&|()"
+# bash's operator characters after a `${` name; its dolbrace_state reads them.
+_PARAM_OPERATORS = "#%^,~:-=?+/"
+
+
+def _group_end(  # noqa: PLR0911, PLR0912 - one exit per bash rule
+    command: str, i: int, end: int, closer: str, quoted: bool = False, posix: bool = False
+) -> Optional[int]:
+    """Offset just past the ``closer`` ending the group whose body starts at ``i``, read as bash reads it.
+
+    LAB-5719: bashlex ends a `${…}` at its first `}`. bash does not: it skips a `}` inside
+    `'…'`, `"…"` or `$'…'`, after a `\\`, and inside a nested `${`, `$(`, `<(`, `>(` or
+    backquote, so `"${x#"}"}"` is one expansion. _quote_pairs resumes its scan where bash
+    ends the group. This follows bash's parse_matched_pair. ``quoted`` says the group sits
+    inside `"…"`, where the two modes differ: outside POSIX mode a `'` quotes in a `${…}`,
+    in POSIX mode (and zsh) only after a pattern operator (`#`, `%`, `/`, `^`, `,`).
+    ``posix`` picks that reading. In a `$(…)` it only counts parens, so it returns None
+    where a `)` may not close one: after a comment, heredoc or `case` starts. None also
+    means no end before ``end``. Either None leaves the word unreadable.
+    """
+    depth = 1
+    body = i
+    state = "param"  # bash's dolbrace_state, read only in a `${…}`
+    while i < end:
+        char = command[i]
+        if closer == "}" and state == "param":
+            state = "quote" if char in "#%/^," and i > body else "op" if char in _PARAM_OPERATORS else state
+        elif closer == "}" and state == "op" and char not in _PARAM_OPERATORS:
+            state = "word"
+        if char == "\\" and closer != "'":
+            i += 2
+            continue
+        if char == closer:
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+            continue
+        if closer in ("'", "`"):
+            i += 1
+            continue
+        if command.startswith("$$", i):
+            i += 2  # the PID: the `$` after it opens nothing (`$${y}` is `$$` then `{y}`)
+            continue
+        if closer == ")" and (i == body or command[i - 1] in _WORD_BREAKS):
+            if char == "#" or (command.startswith("case", i) and command[i + 4 : i + 5] in (" ", "\t", "\n")):
+                return None
+        if closer == ")" and command.startswith("<<", i):
+            return None
+        if char == _BARE_OPENERS.get(closer):
+            depth += 1
+            i += 1
+            continue
+        literal_quote = posix and quoted and closer == "}" and state != "quote"
+        if closer != '"' and command.startswith("$'", i) and not literal_quote:
+            found = _ansi_c_end(command, i + 2, end)
+        else:
+            opener = next((o for o in _OPENERS_IN[closer] if command.startswith(o, i)), None)
+            if opener is None or (opener == "'" and literal_quote):
+                i += 1
+                continue
+            inner = _GROUP_CLOSERS[opener]
+            inner_quoted = inner == '"' or (quoted and inner in "}]")
+            found = _group_end(command, i + len(opener), end, inner, inner_quoted, posix)
+        if found is None:
+            return None
+        i = found
+    return None
+
+
+def _ansi_c_end(command: str, i: int, end: int) -> Optional[int]:
+    """Offset just past the `'` closing the `$'…'` whose body starts at ``i``; a `\\` escapes the next character."""
+    while i < end:
+        if command[i] == "'":
+            return i + 1
+        i += 2 if command[i] == "\\" else 1
+    return None
 
 
 def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
@@ -507,18 +596,17 @@ def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
     start, end = span
     if end > len(command):
         return None  # a span from another string: nothing here can be read
-    # In a word with a continuation only the code parts are skipped, and only because
-    # _recover_dropped_substitutions rebuilt all of them at source offsets. A parameter's
-    # offsets are bashlex's, and a skip to a shifted end resumes the scan mid-word.
-    kinds = _CODE_PART_KINDS if _part_offsets_may_shift(command, span) else (*_CODE_PART_KINDS, "parameter")
-    skip = {p.pos[0]: p.pos[1] for p in parts if getattr(p, "pos", None) and p.kind in kinds}
+    # Code parts only, which _recover_dropped_substitutions rebuilt at source offsets wherever
+    # bashlex's may be shifted. A `${…}` is never a skip target: bashlex ends it early, and its
+    # offsets shift too, so _group_end finds its end from the source.
+    skip = {p.pos[0]: p.pos[1] for p in parts if getattr(p, "pos", None) and p.kind in _CODE_PART_KINDS}
     pairs: list[tuple[int, int]] = []
     opened: Optional[int] = None  # offset of an open `"`
     i = start
     while i < end:
         char = command[i]
-        if char == "\\":
-            i += 2
+        if char == "\\" or command.startswith("$$", i):
+            i += 2  # an escape, or the PID, whose second `$` opens nothing
         elif opened is None and char == "'":
             close = command.find("'", i + 1, end)
             if close < 0:
@@ -539,6 +627,14 @@ def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
             i += 1
         elif i in skip:
             i = skip[i]
+        elif command.startswith("${", i):
+            # Where a `'` makes bash's two modes disagree about the end, neither can be trusted.
+            close = _group_end(command, i + 2, end, "}", opened is not None)
+            if close is None or (
+                "'" in command[i:close] and _group_end(command, i + 2, end, "}", opened is not None, True) != close
+            ):
+                return None
+            i = close
         elif command.startswith("``", i):
             i += 2  # empty backquotes run nothing, and bashlex makes no node for them
         elif command.startswith(("$(", "`"), i) or (opened is None and command.startswith(("<(", ">("), i)):
@@ -595,15 +691,12 @@ def _recover_dropped_substitutions(command: str, nodes: "list[Any]") -> None:
                 # bashlex's offsets are shifted here: rebuild every code part from the source
                 # rather than skip to a wrong end.
                 node.parts = [part for part in node.parts if part.kind not in _CODE_PART_KINDS]
-            if _quote_pairs(command, node.pos, node.parts, recover=_recover_substitution) is None and dropped:
-                # We deleted bashlex's own code parts above, and now the scan cannot read the
-                # word's quoting (a `"` nested in `${x#"'"}`, or a skip its shifted offsets sent
-                # mid-word), so an opener it should have rebuilt may have gone unseen - the
-                # deleted node is lost. Fail closed. Only when we dropped: a None on an intact
-                # word means the scan found no ranges, and bashlex's own nodes (plus the
-                # `${…}` re-parse in substitution.py) still cover it, so raising there would
-                # over-block a benign `${A:-"${B}"}`. Fixed text: a message holding the command
-                # could route this to the heredoc fallback.
+            if _quote_pairs(command, node.pos, node.parts, recover=_recover_substitution) is None:
+                # The scan cannot follow this word's quoting (no end for a `${…}`, or a quote
+                # it cannot pair), so an opener it should have recovered may have gone unseen.
+                # Nothing else covers that: bashlex drops every `<(`/`>(` from a word holding
+                # a `"`. Fail closed. Fixed text: a message holding the command could route
+                # this to the heredoc fallback.
                 raise ParseError("Cannot read the quoting of a word that may hold a substitution")
             node.parts.sort(key=lambda part: part.pos[0])
         for value in vars(node).values():

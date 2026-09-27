@@ -887,3 +887,77 @@ class TestParseBudget:
         worker.start()
         worker.join()
         assert out and out[0]
+
+
+class TestGroupEnd:
+    """LAB-5719: _group_end ends a `${…}` where bash does. Each end is what bash 5.3 printed.
+
+    Kept out of the files test_superset_oracle.py harvests: these are scanner inputs, not commands.
+    """
+
+    @pytest.mark.parametrize(
+        ("text", "end"),
+        [
+            # bash output with x unset: each row printed its operand, then END
+            ("${x:-'}X'}END", 10),
+            ('${x:-"}X"}END', 10),
+            ("${x:-$'}X'}END", 11),
+            ("${x:-\\}X}END", 9),
+            ("${x:-\\\\}X}END", 8),
+            ("${x:-'\\'}X'}END", 9),
+            ("${x:-{}X}END", 7),
+            ("${x:-(}X)}END", 7),
+            ("${x:-${y:-}X}}END", 13),
+            ('${x:-${y:-"}X"}}END', 16),
+            ("${x:-$(echo '}X')}END", 18),
+            ('${x:-$(echo ")}X")}END', 19),
+            ("${x:-`echo }X`}END", 15),
+            ("${x:-<(echo }X)}END", 16),
+            ("${x:-$((1))}X}END", 12),
+            ("${x:-$[1+(2)]}X}END", 14),
+        ],
+    )
+    def test_group_end_matches_bash(self, text, end):
+        assert parser_mod._group_end(text, 2, len(text), "}") == end
+
+    @pytest.mark.parametrize(
+        ("text", "end"),
+        [
+            # printf '<%s>' "…" under bash --posix, x unset
+            ("${x:-'}X'}END", 7),  # <'X'}END>: a `'` is text after `:-`
+            ("${x:-$'}X'}END", 8),  # <$'X'}END>
+            ("${x#'}X'}END", 9),  # <END>: still a quote after a pattern operator
+            ("${x/'}X'/y}END", 11),
+            ("${x:-\"${y:-'}X'}\"}END", 18),  # <'X'}END>: the nested `${` sits inside "…"
+        ],
+    )
+    def test_group_end_posix_reading(self, text, end):
+        assert parser_mod._group_end(text, 2, len(text), "}", quoted=True, posix=True) == end
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "${x:-don't}",  # bash: unexpected EOF while looking for matching `'`
+            "${x:-$(# }X\n)}",  # a comment can hide the `)`
+            "${x:-$(case a in a) echo;; esac)}",  # so can a case pattern
+            "${x:-$(cat <<E\n)\nE\n)}",  # and a heredoc body
+            "${x:-",
+        ],
+    )
+    def test_group_end_fails_closed(self, text):
+        assert parser_mod._group_end(text, 2, len(text), "}") is None
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestPosixModeDisagreementFailsClosed:
+    """LAB-5719: text to bash outside POSIX mode, code to bash --posix and to zsh.
+
+    The two modes end this `${…}` in different places, so the word is unreadable.
+    Kept out of the files test_superset_oracle.py harvests: the native tier reads the
+    POSIX meaning, and that divergence is tracked on its own ticket.
+    """
+
+    @pytest.mark.parametrize("body", ["rm -rf /", "date"])
+    def test_denied(self, body):
+        result = validate_command('echo "${x:-\'}"<(' + body + ')"\'}"')
+        assert (result.allowed, result.risk_level.name) == (False, "BLOCKED")
