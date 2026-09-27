@@ -88,26 +88,14 @@
      shares the parse's CPU budget.
      The same bash-first rule applies.
    - **AST refusal — the arithmetic-`((` misparse** (`_double_paren_misparse`, called from
-     `parse_bashlex` in `src/schlock/core/parser.py`). bashlex reads `(( 1<<b ))` as two nested
-     subshells and the `<<` as a heredoc opener, so the lines after it become an inert body while
-     bash runs them. `parse_bashlex` raises `ParseError` on the tree bashlex builds for that
-     misread: a subshell whose inner subshell is flush against it on both sides, with a
-     `<<`/`<<-` redirect of its own inside (a heredoc inside a substitution hides nothing). It
-     holds only while:
-     1. **It keys on the tree, not the text.** A pre-parse text scan for `((` was tried and
-        bypassed by splices, comments and quotes around the opener. None of those survive into
-        the AST.
-     2. **It runs where every tree is built.** Substitution bodies, `${ … }` defaults and
-        unquoted heredoc bodies are re-parsed through `parse_bashlex` too; checking only the
-        top-level tree missed the same misread one `$( … )` deep. Every caller fails closed on
-        `ParseError`. The message carries no "heredoc", so the validator does not route it to
-        the heredoc fallback.
-     3. **Flush on both sides is necessary, not sufficient.** A separator on either side makes
-        real subshells (`( ( 1<<b ) )`, `((1<<b) )`), and those stay allowed. bashlex folds a
-        `\<newline>` splice into the opening reservedword, so a spliced `((` counts as flush. One
-        known over-deny: `((echo # )` then a heredoc, where bash ends the inner subshell at the
-        comment and bashlex does not. It is pinned in the tests.
-     Every row was decided by running bash first (a filesystem-witness canary).
+     `parse_bashlex` in `src/schlock/core/parser.py`, so every tree schlock builds is checked,
+     substitution bodies included). bashlex reads `(( 1<<b ))` as nested subshells whose `<<b`
+     opens a heredoc, hiding the lines bash runs after it. The parser raises `ParseError` on a
+     subshell whose inner `(` is flush with its own and holds a heredoc of its own; no caller
+     turns that into an allow. It keys on the tree, not the text (a text scan for `((` was
+     bypassed), and only on the opening side (a `#` inside arithmetic moves bashlex's closer).
+     Real subshells written `((…) )` with a heredoc are over-denied, by design. It covers this
+     one tree only: other constructs bashlex misreads as heredoc openers are separate issues.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
