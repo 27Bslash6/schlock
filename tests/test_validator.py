@@ -4030,3 +4030,105 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
         """bashlex joins the kept body's lines too, so this line ends its body at the placeholder."""
         with pytest.raises(ParseError, match="rewrite delimiter"):
             val_module._neuter_heredocs("cat <<'A;B'\nq\nA;B\ncat <<EOF\nSCHLOCK_\\\nHEREDOC\nEOF")
+
+
+# Opens an unquoted heredoc whose terminator bash forms by joining `EO\` onto `F`.
+_JOINED = "cat <<EOF\nhi\nEO\\\nF\n"
+_TMUX = "tmux new -d 'rm -rf $HOME'"
+_JOINED_TERMINATOR_ROWS = pytest.mark.parametrize(
+    "command",
+    [
+        _JOINED + _TMUX + "\nEOF",
+        _JOINED + "trap \"tmux new -d 'rm -rf \\$HOME'\" EXIT; trap EOF INT",
+        _JOINED + "trap \"rm -r\\$''f /\" EXIT; trap EOF INT",
+        _JOINED + "rm -r$''f /\nEOF",
+        _JOINED + _TMUX,
+        "cat <<-EOF\n\thi\n\tEO\\\nF\n" + _TMUX + "\nEOF",
+        "cat <<'Q'\nq\nQ\n" + _JOINED + _TMUX + "\nEOF",
+        "cat <<EOF\nhi\nE\\\nO\\\nF\n" + _TMUX + "\nEOF",
+        _JOINED + _TMUX + "\nEOF\ncat <<Q \\\n> /dev/null\nq\nQ",
+        _JOINED + "echo ok",
+    ],
+    ids=[
+        "decoy-terminator",
+        "trap-handler-decoy",
+        "trap-handler-split-flag",
+        "split-flag",
+        "no-decoy",
+        "tab-stripped",
+        "quoted-heredoc-first",
+        "three-physical-lines",
+        "rewrite-abandoned-later",
+        "benign-tail",
+    ],
+)
+
+
+class TestShellCheckNeverReadsABodyBashHasEnded:
+    """An unquoted terminator formed by a line join is refused (see `_Normalised.joined_terminator`).
+
+    bash ends `cat <<EOF` at `EO\\` + `F`, and runs the next line. ShellCheck does not join
+    them, so it reads every line up to a later literal `EOF` (or the end) as body and reports
+    nothing there. Each twin with the heredoc removed is denied by ShellCheck alone, and each
+    row here was SAFE or HIGH with ShellCheck on before the refusal.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self):
+        """Verdicts are cached by command text alone, whatever ShellCheck's state was."""
+        clear_caches()
+        yield
+        clear_caches()
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @_JOINED_TERMINATOR_ROWS
+    def test_a_joined_terminator_is_refused(self, safety_rules_path, command):
+        """Real ShellCheck: the refusal, not a finding, denies it - ShellCheck saw none of the tail.
+
+        `benign-tail` pins the cost: a harmless command behind such a terminator is refused too.
+        `rewrite-abandoned-later` is a later line the delimiter rewrite cannot read, so bashlex
+        and ShellCheck get the command as written: the flag must outlive that.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+        assert "backslash-newline" in (result.error or "")
+        assert "Write the heredoc terminator on one line" in result.alternatives
+
+    @_JOINED_TERMINATOR_ROWS
+    def test_the_refusal_does_not_depend_on_shellcheck(self, safety_rules_path, no_shellcheck, command):
+        """One verdict whether or not ShellCheck is installed, so a missing binary changes nothing."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "backslash-newline" in (result.error or "")
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<EOF\nhi\nEOF\necho ok",
+            "cat <<'EOF'\nhi $x\nEOF\necho ok",
+            "cat <<EOF\nhi\nEO\\\\\nF\nEOF\necho ok",
+            "cat <<'EOF'\nhi\nEO\\\nF\nEOF\necho ok",
+            "cat <<EOF > s.sh\na \\\n  b\nEOF",
+        ],
+        ids=["unquoted", "quoted", "escaped-backslash", "quoted-body-is-never-joined", "continued-body-line"],
+    )
+    def test_a_terminator_on_one_line_keeps_its_verdict(self, safety_rules_path, command):
+        """Real ShellCheck: bash ends each of these at a one-line terminator, or never joins its body."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.SAFE, result.message
+        assert result.allowed is True
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    def test_the_fallback_still_reads_the_join_itself(self, safety_rules_path):
+        """Real ShellCheck: a delimiter with no bare spelling sends this to the fallback, whose rewrite
+        puts its own terminator where bash ends the body - so ShellCheck reads the tail as shell.
+        """
+        result = validate_command("cat <<'A;B'\nx\nA;B\n" + _JOINED + _TMUX + "\nEOF", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "shellcheck:SC2016" in result.matched_rules

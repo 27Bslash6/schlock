@@ -2106,6 +2106,11 @@ class _Normalised(NamedTuple):
     blanked: list[tuple[int, int, int]]
     # Where each `<<` the scan found sits, quoted or not (see `_phantom_heredoc`).
     opener_starts: frozenset[int]
+    # An unquoted body ended at a terminator bash forms only by joining physical lines
+    # (`EO\` then `F`). ShellCheck does not join them, so it reads the shell after that
+    # terminator as body and never analyses it. Recorded even when the rewrite is
+    # abandoned, since the command then reaches ShellCheck as written.
+    joined_terminator: bool = False
 
 
 def _delimiter_is_quoted(line: str, delimiter: str, strips_tabs: bool, start: int, end: int) -> bool:
@@ -2179,12 +2184,12 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
 
     Only opener lines are scanned: a `<<` inside a body is data, not a heredoc.
 
-    Returns a `_Normalised`: the text, the body spans it blanked, and where each opener
-    it found sits. When it cannot read the command - a delimiter with no bare spelling,
-    a body with no terminator, an opener on a continued line, a frame still open at the
-    end - it returns the command unchanged and records nothing. Those keep exactly the
-    route they had: bashlex rejects them and the fallback decides, failing closed where
-    it cannot read them.
+    Returns a `_Normalised`: the text, the body spans it blanked, where each opener it
+    found sits, and whether a terminator was joined across lines. When it cannot read the
+    command - a delimiter with no bare spelling, a body with no terminator, an opener on a
+    continued line, a frame still open at the end - it returns the command unchanged and
+    records nothing but that last flag. Those keep exactly the route they had: bashlex
+    rejects them and the fallback decides, failing closed where it cannot read them.
     """
     if "<<" not in command:
         return _Normalised(command, [], frozenset())
@@ -2201,6 +2206,7 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
     changed = False
     blanked: list[tuple[int, int, int]] = []  # (opener_start, body_start, body_end) in command
     opener_starts: set[int] = set()
+    joined_terminator = False
 
     try:
         while index < len(lines):
@@ -2229,6 +2235,8 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
                     index += len(physical)
                     if _is_terminator(body, delimiter, strips_tabs):
                         out.extend(physical)  # terminator stays verbatim
+                        # Only an unquoted body joins, so only it can span more than one line here.
+                        joined_terminator = joined_terminator or len(physical) > 1
                         if quoted:
                             # The body runs up to the newline before the terminator; an
                             # empty one slices to "" and is never delegated.
@@ -2249,9 +2257,9 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
     except ParseError:
         # Every reading this cannot vouch for leaves the command as written. The
         # rewrite is an optimisation of the parse, never a decision about safety.
-        return _Normalised(command, [], frozenset())
+        return _Normalised(command, [], frozenset(), joined_terminator)
 
-    return _Normalised("\n".join(out) if changed else command, blanked, frozenset(opener_starts))
+    return _Normalised("\n".join(out) if changed else command, blanked, frozenset(opener_starts), joined_terminator)
 
 
 def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one refusal per uncertain body reading
@@ -2857,6 +2865,27 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     error=error,
                 )
                 # Not cached: a parse-level refusal, like the parse errors below.
+            if normalised.joined_terminator:
+                # bash and bashlex both end this body at the joined line, so the AST passes
+                # read the command right. ShellCheck is handed the text as written, does not
+                # join, and files everything up to some later literal terminator (or the end)
+                # as body: every finding only it makes there is lost. Refused rather than
+                # handed a joined copy, which would re-implement bash's parity-aware join for
+                # one consumer. No one spells a terminator across a backslash-newline on purpose.
+                # A command bashlex rejects never gets here; the fallback reads the join itself.
+                error = (
+                    "a heredoc terminator is spelled across a backslash-newline; bash joins the lines and "
+                    "ends the body there, but ShellCheck does not and would read the commands after it as body"
+                )
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: Cannot check the commands after this heredoc: {error}",
+                    alternatives=["Write the heredoc terminator on one line"],
+                    exit_code=1,
+                    error=error,
+                )
+                # Not cached, like the phantom refusal above.
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
