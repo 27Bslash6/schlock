@@ -4,7 +4,7 @@
 
 ```bash
 # Clone repository
-git clone https://github.com/27Bslash6/schlock.git
+git clone https://github.com/27b-io/schlock.git
 cd schlock
 
 # Install development dependencies (uv recommended)
@@ -234,7 +234,6 @@ Releases are automated by [release-please](https://github.com/googleapis/release
 ## Questions?
 
 - **GitHub Issues**: Bug reports, feature requests
-- **Discussions**: Design questions, usage help
 - **Security**: security@27b.io (for vulnerabilities)
 
 ## License

@@ -18,6 +18,77 @@ from schlock.exceptions import ConfigurationError
 
 logger = logging.getLogger(__name__)
 
+# A whitelist entry vouches for the command it DESCRIBES; the match is a prefix
+# by design (issue #66, so "^ls\b" keeps covering "ls -la"), which means whatever
+# the entry's tail never described rides along on its authority. Three constructs
+# turn that from a convenience into a hole, and none is visible to a pattern
+# that only describes the head of the command:
+#
+#   ".."  walks out of the directory the entry names. "chmod -R 777 /tmp/../.."
+#         is not LIKE "chmod -R 777 /", it IS it.
+#   "<>"  redirects. "ls -la > ~/.ssh/authorized_keys" is a whitelisted reader
+#         being used as an arbitrary-file writer; "ls <(curl ...|sh)" runs a
+#         second command the entry never mentioned.
+#   "\n"  separates commands. Every "\s" in a whitelist pattern matches a
+#         newline, so a "$"-anchored entry spans a string bash runs as SEVERAL
+#         commands: "chmod\n-R\n777\n/tmp/evil.sh" satisfies the /tmp chmod
+#         entry end to end, and the last line is an executable, not an operand.
+#         A bare newline like that is split by the parser before is_whitelisted()
+#         sees it, and is_whitelisted_whole() counts the pieces. This half is for
+#         text that still arrives as ONE command with a newline inside: a
+#         backslash continuation, a quoted string, a substitution body, and the
+#         quote-stripped reconstructions match_command() also tries, where a
+#         quoted newline becomes a bare one. Checked against command.rstrip() so
+#         one TRAILING newline still whitelists.
+#
+# Refusing the whitelist is NOT refusing the command. The whitelist is an
+# override that short-circuits to SAFE; declining it only sends the command to
+# the ordinary rules to be judged on its merits, so this guard can over-fire
+# (a filename containing ">", a harmless "ls ../src") without blocking anything
+# that was not already blocked. That asymmetry is what makes one coarse
+# string-level test the right size here: is_whitelisted() takes a bare str with
+# no AST, and a guard whose worst case is "evaluate normally" does not need one.
+#
+# Deliberately in the engine rather than in each YAML entry: the per-entry
+# version is this rule written once per pattern and re-written on every pattern
+# added, which is the failure this file has already had three tickets for.
+_WHITELIST_DISQUALIFIER = re.compile(r"\.\.|[<>\n\r]")
+# is_whitelisted_whole()'s share of it: the same two escapes, without the line breaks. That
+# gate counts the commands bash will find, so a newline that adds one is refused there
+# already, and a newline after a pipe -- a continuation, one pipeline to bash -- has to stay
+# legal. A bare \r is refused there by _NON_BASH_BLANK.
+_WHOLE_LINE_DISQUALIFIER = re.compile(r"\.\.|[<>]")
+
+# One token of a whitelist pattern's SOURCE: an escape, a bracket expression, or one character.
+_SOURCE_TOKEN = re.compile(r"\\.|\[\^?\]?(?:\\.|[^\]\\])*\]|.", re.DOTALL)
+# The tokens that write a command separator, so `is_whitelisted_whole` can ask how many commands
+# an entry claims to describe. A literal pipe is matched as a regex spells it (`\|` or `[|]`);
+# `&` and `;` are not metacharacters and mean themselves. A BARE `|` is deliberately absent: it
+# is alternation, which is what `(node_modules|dist)` uses and what must NOT count. A bracket
+# expression is one character SLOT, so `[^;]` or `[\w;]` mentions `;` without writing a boundary
+# -- only a class holding nothing but the separator writes one. Ceiling: a pipe spelled `\x7c` or
+# `\174` is not recognised, so such an entry is read as describing fewer commands and clears no
+# line -- the fail-closed direction, costing a false positive on an exotic spelling, never a
+# denial.
+_SEPARATOR_TOKENS = frozenset({"\\|", "[|]", ";", "\\;", "[;]", "&", "\\&", "[&]"})
+# Whitespace that `\s` and `str.strip` accept but bash does not treat as blank: \r, \v, \f,
+# \x1c-\x1f and the Unicode spaces are WORD characters to bash. Only space, tab and newline aren't.
+_NON_BASH_BLANK = re.compile(r"[^\S \t\n]")
+
+
+def _declared_separators(source: str) -> int:
+    """Count the command separators a whitelist pattern's source writes.
+
+    Adjacent separator tokens are one separator: `&&`, `\\|\\|` and `\\|&` each join two commands.
+    """
+    count, previous = 0, False
+    for token in _SOURCE_TOKEN.findall(source):
+        current = token in _SEPARATOR_TOKENS
+        if current and not previous:
+            count += 1
+        previous = current
+    return count
+
 
 class RiskLevel(Enum):
     """Risk levels for command validation.
@@ -488,6 +559,19 @@ class RuleEngine:
                 # No re.MULTILINE: whitelist uses match() which anchors at start.
                 # MULTILINE would change $ to match at line boundaries, not string end.
                 compiled = re.compile(pattern_str)
+                # Both whitelist checks refuse a command carrying ".." or a redirection
+                # before consulting a pattern, and is_whitelisted() a line break too, so
+                # an entry that describes one may never match and would otherwise fail
+                # silently - the user writes a whitelist
+                # rule for "psql db < schema.sql", sees it ignored, and has nothing to
+                # go on. Advisory, not fatal: the source is a regex, so "\.\." here is
+                # a literal ".." but a bare ".." is two wildcards and may be harmless.
+                if _WHITELIST_DISQUALIFIER.search(pattern_str):
+                    logger.warning(
+                        f"Whitelist pattern {pattern_str!r} describes '..', a redirection or a "
+                        f"newline; such commands are refused before patterns are consulted, so "
+                        f"this entry may never match."
+                    )
                 self.whitelist_patterns.append(compiled)
             except re.error as e:
                 raise ConfigurationError(
@@ -625,39 +709,89 @@ class RuleEngine:
         logger.info(f"Loaded {len(self.rules)} rules from {len(yaml_files)} files")
 
     def is_whitelisted(self, command: str) -> bool:
-        """Check if command matches whitelist patterns.
+        """Check if a whitelist pattern matches the START of one command.
 
         Whitelisted commands always return SAFE regardless of other rules.
 
+        This is a PREFIX test (`re.match`), which is what a single command needs — `^ls\\b`
+        has to clear `ls -la`. It is therefore the WRONG test for anything that may hold more
+        than one command: it would clear `ls && rm -rf /` on two characters. Use
+        `is_whitelisted_whole` for a full command line. Pass this one a single command, and
+        remember it reads only the front of it — a shipped entry with no trailing anchor also
+        clears whatever trails the part it matched.
+
         Args:
             command: Command string to check
 
         Returns:
-            True if command matches any whitelist pattern
+            True if command starts with any whitelist pattern and carries none of the
+            _WHITELIST_DISQUALIFIER constructs
         """
+        if _WHITELIST_DISQUALIFIER.search(command.rstrip()):
+            return False
         return any(pattern.match(command) for pattern in self.whitelist_patterns)
 
-    def is_fully_whitelisted(self, command: str) -> bool:
-        """Check if a whitelist pattern spans the ENTIRE command.
+    def is_whitelisted_whole(self, command: str, segment_count: int) -> bool:
+        """Check if a whitelist entry describes this command line, commands and all.
 
-        Whitelist patterns are deliberately prefix matches (issue #66: match(),
-        not fullmatch(), so "^ls\\b" keeps covering "ls -la" when a user adds
-        flags). For a chained command a prefix is not enough — it would let the
-        "ls" in "ls; rm -rf /" vouch for the rm. Only a pattern whose match
-        reaches the end of the command (in practice a "$"-anchored entry such
-        as the gh-auth-token/docker-login pipeline) may whitelist a whole chain.
+        `is_whitelisted` is a prefix test, which is what a single command needs: `^ls\\b` is
+        meant to clear `ls -la`. Applied to a line with several commands it clears the ones the
+        author never wrote down — `^ls\\b` matches `ls && rm -rf /` on its first two characters,
+        whitelisting the `rm`. So a line with several commands needs a different question.
+
+        The question is whether the entry describes THIS MANY commands. An entry declares its
+        count by writing separators: `^ls\\b` writes none and so speaks for one command and can
+        never clear a line; the gh/docker entry writes one `\\|` and so speaks for exactly two.
+        If bash finds more commands than the entry declared, the extra ones are not the author's
+        and the entry does not cover them.
+
+        Counting is what makes this hold for entries nobody has vetted -- a user's own included,
+        where the two weaker tests do not:
+
+        * Consuming the line is not sufficient. A pattern can be anchored AND open-ended -- an
+          entry ending `(/.*)?$` has a `.*` that eats `&& rm -rf /` quite legitimately. It
+          declares no separator, so it speaks for one command and clears no line.
+        * Writing a separator is not sufficient either. Had the gh/docker entry's user slot been
+          `\\S+`, which matches `;`, `docker login ghcr.io -u foo;sudo;true --password-stdin`
+          would satisfy it end to end while bash runs four commands. Declared two, found four:
+          refused.
+        * And a newline is a separator to bash while `\\s` matches one, so an entry's own
+          whitespace could span a line break its author never wrote. Counting sees through that
+          too -- and, unlike rejecting newlines outright, it still clears the LEGAL multi-line
+          spelling, `gh auth token |` + newline + `docker login ...`, which bash reads as one
+          two-command pipeline because the newline follows a pipe.
+
+        `\\s` also matches characters bash does NOT treat as blank (\\r, \\v, \\f, \\x1c-\\x1f,
+        Unicode spaces), and the parser drops a line made only of them without counting it, so
+        a line holding one is never cleared here. Refusing the whitelist is not refusing the
+        command: the line is then judged one command at a time.
+
+        A redirection is not a command, so it leaves the count unchanged, and a `\\S+` slot accepts
+        `>/path` as readily as a user name. So this gate also refuses a line carrying `..` or a
+        redirection (_WHOLE_LINE_DISQUALIFIER, for the reasons at _WHITELIST_DISQUALIFIER), but
+        not a line break, which the count already judges. Beyond those, how loose a single
+        command's arguments are is the entry's own shape to fix, not this gate's.
 
         Args:
-            command: Command string to check
+            command: Full command line being validated
+            segment_count: How many commands the parser found in it
 
         Returns:
-            True if a whitelist pattern matches from the start of the command
-            through to its end
+            True if a whitelist entry declares exactly this many commands and matches them all,
+            and the line carries neither `..` nor a redirection
         """
-        # >= not ==: a pattern ending in \s* consumes trailing whitespace that rstrip()
-        # already discounted, so a legitimate span can overshoot.
-        end = len(command.rstrip())
-        return any(m.end() >= end for p in self.whitelist_patterns if (m := p.match(command)))
+        if _NON_BASH_BLANK.search(command) or _WHOLE_LINE_DISQUALIFIER.search(command):
+            return False
+        # Surrounding blank space is not executable content, and `$` matches BEFORE a trailing
+        # newline while `fullmatch` would have to consume it -- without this, a trailing "\n"
+        # unseats the anchored entry and lands the pipeline on BLOCKED. After the guard above,
+        # only space, tab and newline are left for this to strip.
+        command = command.strip()
+        for pattern in self.whitelist_patterns:
+            declared = _declared_separators(pattern.pattern)
+            if declared and declared + 1 == segment_count and pattern.fullmatch(command):
+                return True
+        return False
 
     def match_command(
         self,
@@ -687,8 +821,8 @@ class RuleEngine:
                           Matches inside non-shell heredocs are ignored (just text).
             use_whitelist: Consult the whitelist before matching rules. Pass False when
                           the caller has already settled the whitelist question — the
-                          multi-segment path does, with the full-span
-                          is_fully_whitelisted() where this check is prefix-based.
+                          multi-segment path does, with the whole-line
+                          is_whitelisted_whole() where this check is prefix-based.
 
         Returns:
             RuleMatch with highest risk level from all matching rules
