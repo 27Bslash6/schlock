@@ -84,11 +84,15 @@
      literal range. In a word holding a line continuation bashlex's part offsets are shifted, so
      every code part there is rebuilt from the source. A `${…}` is never skipped by bashlex's
      span, which ends at the first `}` even when quoted: `_group_end` finds where bash ends it,
-     following bash's `parse_matched_pair` (non-POSIX mode) through quotes, escapes, `$$` and
-     nested groups (LAB-5719). Inside a nested `$(…)` it only counts parens, so it gives up on a
-     comment, heredoc or `case`. Any word whose quoting the scan cannot follow makes recovery
-     raise `ParseError`, whether or not bashlex's offsets moved. Recovery shares the parse's
-     CPU budget.
+     following bash's `parse_matched_pair` through quotes, escapes, `$$` and nested `${`/`$[`
+     groups (LAB-5719). A `'` inside a double-quoted `${…}` is read differently by bash, bash
+     `--posix` and zsh, so the scan computes the end under all three readings and fails closed
+     unless they agree. A `$(…)`/backquote inside is measured by bashlex (which knows where a
+     command sub ends past a comment, heredoc or `case`); one it cannot place fails closed. A
+     `<(`/`>(` in a `${…}` operand is a process substitution bash may run, and pinning its owner
+     is a separate change, so the scan fails closed on it rather than skip it. Any word whose
+     quoting the scan cannot follow makes recovery raise `ParseError`, whether or not bashlex's
+     offsets moved. Recovery shares the parse's CPU budget.
      The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.

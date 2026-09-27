@@ -890,7 +890,7 @@ class TestParseBudget:
 
 
 class TestGroupEnd:
-    """LAB-5719: _group_end ends a `${…}` where bash does. Each end is what bash 5.3 printed.
+    """_group_end ends a `${…}` where bash does. Each end is what bash 5.3 printed.
 
     Kept out of the files test_superset_oracle.py harvests: these are scanner inputs, not commands.
     """
@@ -902,18 +902,19 @@ class TestGroupEnd:
             ("${x:-'}X'}END", 10),
             ('${x:-"}X"}END', 10),
             ("${x:-$'}X'}END", 11),
+            ("${x:-$'}'}END", 10),  # a `$'…'` string hides a `}`
             ("${x:-\\}X}END", 9),
             ("${x:-\\\\}X}END", 8),
             ("${x:-'\\'}X'}END", 9),
             ("${x:-{}X}END", 7),
             ("${x:-(}X)}END", 7),
+            ("${x:-a$$}b}END", 9),  # `$$` is the PID; the first `}` closes the group
             ("${x:-${y:-}X}}END", 13),
             ('${x:-${y:-"}X"}}END', 16),
             ("${x:-$(echo '}X')}END", 18),
             ('${x:-$(echo ")}X")}END', 19),
             ("${x:-`echo }X`}END", 15),
-            ("${x:-<(echo }X)}END", 16),
-            ("${x:-$((1))}X}END", 12),
+            ("${x:-$(cat <<E\n)\nE\n)}END", 21),  # bashlex measures the sub past its heredoc body
             ("${x:-$[1+(2)]}X}END", 14),
         ],
     )
@@ -932,15 +933,27 @@ class TestGroupEnd:
         ],
     )
     def test_group_end_posix_reading(self, text, end):
-        assert parser_mod._group_end(text, 2, len(text), "}", quoted=True, posix=True) == end
+        assert parser_mod._group_end(text, 2, len(text), "}", quoted=True, squote="posix") == end
+
+    @pytest.mark.parametrize(
+        ("text", "end"),
+        [
+            # zsh -f: a `'` in a double-quoted `${…}` is always literal, even after a pattern op
+            ("${x#'}X'}END", 6),
+            ("${x:-'}X'}END", 7),
+        ],
+    )
+    def test_group_end_literal_reading(self, text, end):
+        assert parser_mod._group_end(text, 2, len(text), "}", quoted=True, squote="literal") == end
 
     @pytest.mark.parametrize(
         "text",
         [
             "${x:-don't}",  # bash: unexpected EOF while looking for matching `'`
-            "${x:-$(# }X\n)}",  # a comment can hide the `)`
-            "${x:-$(case a in a) echo;; esac)}",  # so can a case pattern
-            "${x:-$(cat <<E\n)\nE\n)}",  # and a heredoc body
+            "${x:-<(echo }X)}",  # a process substitution in the operand: fail closed
+            "${x:-$((1))}X}",  # arithmetic bashlex cannot place: fail closed
+            "${x:-$(# }X\n)}",  # bashlex will not place a comment-only command sub
+            "${x:-$(case a in a) echo;; esac)}",  # nor this `case` sub
             "${x:-",
         ],
     )
@@ -949,15 +962,66 @@ class TestGroupEnd:
 
 
 @pytest.mark.usefixtures("no_shellcheck")
-class TestPosixModeDisagreementFailsClosed:
-    """LAB-5719: text to bash outside POSIX mode, code to bash --posix and to zsh.
+class TestQuotingModeDisagreementFailsClosed:
+    """A `'` in a double-quoted `${…}` that bash, bash --posix and zsh read differently.
 
-    The two modes end this `${…}` in different places, so the word is unreadable.
-    Kept out of the files test_superset_oracle.py harvests: the native tier reads the
-    POSIX meaning, and that divergence is tracked on its own ticket.
+    Where the three readings end the group in different places the word is unreadable, so it
+    is denied. Kept out of the files test_superset_oracle.py harvests: the native tier reads
+    one such meaning, so these would read as native under-blocks; that divergence is handled
+    separately.
     """
 
-    @pytest.mark.parametrize("body", ["rm -rf /", "date"])
-    def test_denied(self, body):
-        result = validate_command('echo "${x:-\'}"<(' + body + ')"\'}"')
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # a `:-` operand; a `date` body proves the deny is the disagreement, not the payload
+            'echo "${x:-\'}"<(date)"\'}"',
+            'echo "${x:-\'}"<(rm -rf /)"\'}"',
+            # a `%` pattern operand: text to bash, but zsh runs the `<(`
+            'echo "${x%\'}"<(rm -rf /)"\'}"',
+            'echo "${x%\'}"<(date)"\'}"',
+            # a benign body, but the three readings disagree on the end (`'` moves it), so denied
+            "echo \"${x#'}'}\"<(date)",
+            "echo \"${x/'}'/y}\"<(date)",
+        ],
+    )
+    def test_denied(self, command):
+        result = validate_command(command)
         assert (result.allowed, result.risk_level.name) == (False, "BLOCKED")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestProcessSubstitutionInOperandDenied:
+    """A `<(`/`>(` directly in a `${…}` operand: bash may run it when it expands the operand.
+
+    Finding its true owner belongs to a separate change, so the word fails closed rather than
+    skip the substitution. Every row was denied on the pre-change tree too (via a scan that
+    recovered the opener by accident); the change keeps them denied on purpose. Kept out of the
+    files test_superset_oracle.py harvests: the native tier skips the whole `${…}` and so reads
+    these as under-blocks, a divergence tracked separately.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "${x/"}"<(rm -rf /)}"',
+            'echo "${x#$"(}"<(rm -rf /)${x%%}]}"',
+            'echo "${x#$"$$]q }">(rm -rf /)"${x%}\\$"}"',
+            "echo '$'${y:-<(rm -rf /)}\\'",
+            "echo '\"$'${y:-<(rm -rf /)}\\'",
+            # bash never runs this one, but its neighbour `${x/"}"<(…)}` does; one operator
+            # apart, so the quoted-operand `<(` fails closed rather than be told apart
+            'echo "${x:-"}"<(rm -rf /)}"',
+            # `$$` is the PID; without that the `$` before `{y}` reads as a nested `${`, and
+            # the operand's `<(eval …)` is lost
+            'echo "a"${x:-$${y}<(eval $z)}',
+        ],
+    )
+    def test_denied(self, command):
+        result = validate_command(command)
+        assert (result.allowed, result.risk_level.name) == (False, "BLOCKED")
+
+    def test_fails_closed_at_parse(self):
+        # the plain shape raises at parse rather than skip the operand's `<(`
+        with pytest.raises(ParseError):
+            parser_mod.BashCommandParser().parse('echo "${x:-<(rm -rf /)}"')

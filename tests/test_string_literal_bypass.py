@@ -599,7 +599,7 @@ class TestSubstitutionBetweenQuotedRuns:
             'echo "a\\\\\nb $(date)"',
             # a `${…}` follows a continuation, so its bashlex offset is shifted; the scan must
             # not skip to that wrong end (it would over-block this literal `<(date)` inside
-            # `"…"`). Kept SAFE because the scan finds a `${…}`'s end from the source (LAB-5719).
+            # `"…"`). Kept SAFE because the scan finds a `${…}`'s end from the source.
             'echo "a \\\n b${x#"q"}<(date)"',
             # empty backquotes run nothing
             'echo "``"',
@@ -729,7 +729,7 @@ _QUOTED_BRACES = ('"}"', "'}'", "\\}")
 
 @pytest.mark.usefixtures("no_shellcheck")
 class TestParameterEndsWhereBashEndsIt:
-    """LAB-5719: the in-word scan resumes after a `${…}` where bash ends it, not where bashlex does.
+    """The in-word scan resumes after a `${…}` where bash ends it, not where bashlex does.
 
     bashlex ends a `${…}` at its first `}`; bash skips one that is quoted, escaped or nested.
     Every ``runs`` row ran its process substitution in a bash 5.3 sweep (marker body,
@@ -739,18 +739,17 @@ class TestParameterEndsWhereBashEndsIt:
     @pytest.mark.parametrize(
         "command",
         [
+            # a `<(`/`>(` after the `${…}`, at top level: bash runs it, so it is recovered
             'echo "${x#"}"}"<(eval "$y")',
             'echo "${x#"}"}">(eval "$y")',
             'cat "${x#"}"}"<(eval "$y")',
             'echo "${x%"}"}"<(eval "$y")',
             'echo "${x:+"}"}"<(eval "$y")',
             'echo "${x#"}"}"<(eval "$y")"${z#"}"}"',
-            'echo "${x#"}"}"<(rm -rf /)',
             'echo "${x/"}"/y}"<(rm -rf /)',
-            'echo "${x:-"}"}"<(rm -rf /)',
             # a continuation shifts bashlex's offsets; the end still comes from the source
             'echo "a \\\n ${x#"}"}"<(eval "$y")"${z#"}"}"',
-            # already denied before LAB-5719, and must stay so
+            # already denied before this change, and must stay so
             'echo "${x#"q"}"<(eval "$y")',
             "echo \"${x#'}'}\"<(rm -rf /)",
             'echo "${x#\\}}"<(eval "$y")',
@@ -770,14 +769,14 @@ class TestParameterEndsWhereBashEndsIt:
     @pytest.mark.parametrize("quoted", [True, False])
     @pytest.mark.parametrize("second", [False, True])
     def test_every_operator_and_spelling_runs(self, operator, brace, opener, quoted, second):
-        """The AC5 cross: bash ran the body of every one of these."""
+        """The operator x quoted-} spelling cross: bash ran the body of every one of these."""
 
         def param(name):
             text = "${" + name + operator + brace + "}"
             return f'"{text}"' if quoted else text
 
         command = "echo " + param("x") + opener + "rm -rf /)" + (param("z") if second else "")
-        clear_caches()
+        # No clear_caches: every command differs, so nothing is served stale.
         result = validate_command(command)
         assert (result.allowed, result.risk_level) == (False, RiskLevel.BLOCKED)
 
@@ -789,12 +788,12 @@ class TestParameterEndsWhereBashEndsIt:
             'echo "${x#"q"}"<(date)',
             'echo "${x#"}"}"<(date)',
             'diff "${a#"}"}" <(sort b)',
-            # bash, bash --posix and zsh all read this `<(` as text inside the operand
-            'echo "${x:-"}"<(rm -rf /)}"',
-            # a `'` both modes read alike: around no `}`, or after a pattern operator
+            # a `'` that wraps no `}`: all three readings end the group at the same place
             "echo \"${x:-'default'}\"",
-            "echo \"${x#'}'}\"<(date)",
-            "echo \"${x/'}'/y}\"<(date)",
+            # a `$(…)` inside the operand is measured by bashlex (past a here-string or `case`),
+            # so a benign one is not confused with a hidden `)` and stays SAFE
+            'echo "${x:-$(cat <<<hi)}"',
+            'echo "${x:-$(echo case in)}"',
         ],
     )
     def test_benign_or_literal(self, command):
@@ -802,7 +801,7 @@ class TestParameterEndsWhereBashEndsIt:
         assert validate_command(command).risk_level == RiskLevel.SAFE
 
     def test_no_quoted_run_covers_the_opener(self):
-        """AC2: a second quoted-`}` expansion used to restore parity and report `"<(eval "` as quoted."""
+        """A second quoted-`}` expansion used to restore parity and report `"<(eval "` as quoted."""
         command = 'echo "${x#"}"}"<(eval "$y")"${z#"}"}"'
         (node,) = BashCommandParser().parse(command)
         word = node.parts[1]
@@ -811,6 +810,9 @@ class TestParameterEndsWhereBashEndsIt:
         assert pairs == [(5, 14), (27, 36)]
         assert not any(low <= opener <= high for low, high in pairs)
 
-    def test_an_unreadable_word_fails_closed(self):
-        with pytest.raises(ParseError):
-            BashCommandParser().parse('echo "${x:-$(case a in a) echo;; esac)}"<(rm -rf /)')
+    def test_deep_nesting_fails_closed_not_recursion_error(self):
+        # a pathological depth of nested `${…}` must deny, never raise RecursionError out of parse
+        command = 'echo "' + '${a:-"' * 2000 + "x" + '"}' * 2000 + '"<(rm -rf /)'
+        clear_caches()
+        result = validate_command(command)
+        assert result.allowed is False
