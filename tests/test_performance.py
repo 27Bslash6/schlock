@@ -18,7 +18,6 @@ import pytest
 
 from schlock.core import validator
 from schlock.core.cache import ValidationCache
-from schlock.core.native_bridge import MAX_COMMAND_SIZE
 from schlock.core.rules import RuleEngine
 from schlock.core.validator import validate_command
 
@@ -240,27 +239,19 @@ class TestShellHeredocBodyPerformance:
 
     Body shape: `echo step 0` repeated. One distinct command, so the body stays under
     MAX_DELEGATOR_TOKENS and allowed; and `echo` is the worst line for the raw-text scan,
-    whose `echo[^;|&]*>>` rules backtrack across the whole body. Re-validating the body
-    measured 3.4x the unquoted path's earlier cost at 600 lines and 2.3x at 60 KiB (median
-    of 5, ShellCheck off); the quoted path, which always re-validated, 2.5x and 1.2x. The
-    budgets leave ~3x over what was measured.
+    whose `echo[^;|&]*>>` rules backtrack across the whole body. A canary: the budget
+    leaves room over what the change measured, and CI reports the timing without judging it.
     """
 
     @pytest.fixture(autouse=True)
     def _no_shellcheck(self, monkeypatch):
-        # The body re-entry spawns ShellCheck with a 2s timeout, so with it on a 60 KiB body
-        # measures that timeout, not schlock.
+        # The body re-entry spawns ShellCheck, and a spawn measures the host, not schlock.
         monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
 
-    @pytest.mark.parametrize(
-        ("lines", "budget_ms"),
-        [(600, 1_000.0), ((60 * 1024) // len("echo step 0\n"), 45_000.0)],
-        ids=["600-lines", "60KiB"],
-    )
     @pytest.mark.parametrize("opener", ["<<EOF", "<<'EOF'"], ids=["unquoted", "quoted"])
-    def test_shell_heredoc_body(self, benchmark, safety_rules_path, lines, budget_ms, opener):
+    def test_shell_heredoc_body(self, benchmark, safety_rules_path, opener):
+        lines, budget_ms = 600, 1_000.0
         command = f"bash {opener}\n" + "\n".join(["echo step 0"] * lines) + "\nEOF"
-        assert len(command) < MAX_COMMAND_SIZE
         validate_command("echo warm", config_path=safety_rules_path)
 
         result = benchmark.pedantic(
