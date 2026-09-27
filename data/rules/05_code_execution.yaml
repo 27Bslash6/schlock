@@ -143,7 +143,13 @@ rules:
       # pass password manager (\b anchors 'pass' as its own word so it does not
       # match inside bypass/compass/surpass - see #100)
       - '\bpass\b\s+show'
-      - '\bpass\b\s+[^;|&]*-c'
+      # The clip flag must be a whole word: -c, -c<line>, or --clip[=<line>] and
+      # the --c/--cl/--cli abbreviations GNU getopt accepts. A bare '-c' substring
+      # also hit UUID groups ('-cdf8') and flags like --cleanup. A quote, backslash
+      # or '$' next to the flag can still leave a clip flag after expansion. The
+      # literal '-' is matched before the lookbehind so the walk costs no more
+      # than the old '[^;|&]*-c' did.
+      - '\bpass\b\s+[^;|&]*-(?<=[\s''"\\]-)(?:c\d*|-c(?:l(?:ip?)?)?)(?=[\s;|&()<>`''"$\\=]|$)'
       # GPG private keys
       - '(cat|less|strings|cp|tar)\s+[^;|&]*\.gnupg/private-keys'
       - 'gpg\s+[^;|&]*--export-secret-keys'
