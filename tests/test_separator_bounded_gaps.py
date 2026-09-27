@@ -277,3 +277,80 @@ class TestADeepSubstitutionIsOneWord:
     )
     def test_keeps_the_whitelist_and_heredoc_suppression(self, command, level, rules_dir_path):
         assert verdict(command, rules_dir_path).risk_level == level, command
+
+
+# `D` is three levels deep with a bare `|` in the outer body, every inner command whitelisted.
+D = "$(printf %s $(dirname $(pwd)) | head -1)"
+DEEP3 = "$(a $(b $(c)) | d)"
+
+# (rule, command): each reaches its target past a deep substitution some way the
+# blanked-body pass above does not, and each was BLOCKED before that pass landed.
+DEEP_RESIDUALS = [
+    # The reader and its target are both inside an outer body, which the pass blanks.
+    ("credential_exposure", f"echo $(cat {D}/.env)"),
+    ("credential_exposure", f'echo "$(cat {D}/id_rsa)"'),
+    ("privilege_escalation_variants", f"echo $(chroot {D} /bin/bash)"),
+    ("credential_exposure", f'echo "$(cat {DEEP3}/.env)"'),
+    ("credential_exposure", f'x="$(cat {DEEP3}/.env)"'),
+    ("credential_exposure", f"diff <(cat {DEEP3}/.env) /dev/null"),
+    # A line continuation, and a plain newline, before a body's closer.
+    ("credential_exposure", f"cat \\\n{D}/.env"),
+    ("credential_exposure", "cat $(pwd\n)/.ssh/id_rsa"),
+    ("credential_exposure", "cat $(printf %s $(dirname $(pwd)) | head -1\n)/.env"),
+    # A target the rule ends with `(\s|$)`, followed straight by a separator.
+    ("recursive_permission_system_dirs", f"chown -R {D} /etc; true"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /etc&&true"),
+    # A substitution inside an unquoted heredoc body runs when the heredoc is read.
+    ("credential_exposure", f"cat <<EOF\n$(cat {D}/.env)\nEOF\necho ok"),
+]
+
+
+class TestADeepSubstitutionResidual:
+    @pytest.mark.xfail(strict=True, reason="not reached yet")
+    @pytest.mark.parametrize(("rule", "command"), DEEP_RESIDUALS)
+    def test_is_blocked_by_its_rule(self, rule, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED, command
+        assert rule in result.matched_rules, (rule, result.matched_rules)
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("cat $(printf %s $(dirname $(pwd)) | head -1\\\n)/.env", "credential_exposure"),
+            # BLOCKED only because bashlex cannot parse the arithmetic: the rule itself
+            # misses this, so a bashlex that parses `$((…))` would make it SAFE.
+            ("cat $(ls; echo $((1)))/.env", None),
+        ],
+    )
+    def test_stays_blocked(self, command, rule, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED, command
+        if rule:
+            assert rule in result.matched_rules, (rule, result.matched_rules)
+
+
+# Not reached yet: the payloads above whose wrapped spelling under-blocks.
+_WRAPPED_RESIDUALS = {
+    "cat $(printf %s $(dirname $(pwd)) | head -1)/.env",
+    "cat $(printf %s $(dirname $(pwd)) ; true)/.env",
+    "cat $(a $(b $(c)) | d)/id_rsa",
+    "echo $(a $(b $(c)) | d) password",
+    "true; cat $(a $(b $(c $(d)) | e) | f)/.env",
+    "cat < $(printf %s $(dirname $(pwd)) | head -1)/.env",
+    "cat ${x:-$(printf %s $(dirname $(pwd)) | head -1)}/.env",
+    "echo $(a $(b $(c)) | d) $GITHUB_TOKEN",
+    "export A=$(a $(b $(c)) | d) MY_KEY=x",
+    "chroot $(a $(b $(c)) | d) /bin/bash",
+}
+
+# Every one-command payload, run inside a substitution instead of on its own.
+WRAPPED = [
+    pytest.param(wrapper % command, marks=pytest.mark.xfail(strict=True) if command in _WRAPPED_RESIDUALS else ())
+    for _, command in PAYLOADS + DEEP_PAYLOADS
+    for wrapper in ("echo $(%s)", 'ls "$(%s)"')
+]
+
+
+@pytest.mark.parametrize("command", WRAPPED)
+def test_a_wrapped_payload_still_blocks(command, rules_dir_path):
+    assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
