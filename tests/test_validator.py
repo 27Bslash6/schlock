@@ -4046,7 +4046,14 @@ _JOINED_TERMINATOR_ROWS = pytest.mark.parametrize(
         "cat <<-EOF\n\thi\n\tEO\\\nF\n" + _TMUX + "\nEOF",
         "cat <<'Q'\nq\nQ\n" + _JOINED + _TMUX + "\nEOF",
         "cat <<EOF\nhi\nE\\\nO\\\nF\n" + _TMUX + "\nEOF",
+        _JOINED + _TMUX + "\nEOF\ncat <<Q\nq\nQ",
+        "while read l; do :; done <<EOF\nhi\nEO\\\nF\n" + _TMUX + "\nEOF",
+        "cat <<Q \\\n> /dev/null\nq\nQ\n" + _JOINED + _TMUX + "\nEOF",
+        'cat <<Q; echo "a\nb"\nq\nQ\n' + _JOINED + _TMUX + "\nEOF",
+        "cat <<${X}\nq\n${X}\n" + _JOINED + _TMUX + "\nEOF",
+        "x=`cat <<A\nq\nA\n`\n" + _JOINED + "tmux new -d 'touch $HOME/x'\nEOF",
         _JOINED + _TMUX + "\nEOF\ncat <<Q \\\n> /dev/null\nq\nQ",
+        "cat <<EOF # note \\\nEO\\\nF\n" + _TMUX + "\nEOF",
         _JOINED + "echo ok",
     ],
     ids=[
@@ -4058,19 +4065,32 @@ _JOINED_TERMINATOR_ROWS = pytest.mark.parametrize(
         "tab-stripped",
         "quoted-heredoc-first",
         "three-physical-lines",
-        "rewrite-abandoned-later",
+        "not-the-last-heredoc",
+        "compound-redirect",
+        "continued-opener-first",
+        "multi-line-quote-first",
+        "expansion-delimiter-first",
+        "backtick-heredoc-first",
+        "continued-opener-after",
+        "comment-ends-the-opener-line",
         "benign-tail",
     ],
+)
+_SHELLCHECK_ON_AND_OFF = pytest.mark.parametrize(
+    "shellcheck",
+    [pytest.param(True, marks=pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")), False],
+    ids=["shellcheck-on", "shellcheck-off"],
 )
 
 
 class TestShellCheckNeverReadsABodyBashHasEnded:
-    """An unquoted terminator formed by a line join is refused (see `_Normalised.joined_terminator`).
+    """An unquoted terminator formed by a line join is refused (see `_joins_into_a_delimiter`).
 
     bash ends `cat <<EOF` at `EO\\` + `F`, and runs the next line. ShellCheck does not join
     them, so it reads every line up to a later literal `EOF` (or the end) as body and reports
-    nothing there. Each twin with the heredoc removed is denied by ShellCheck alone, and each
-    row here was SAFE or HIGH with ShellCheck on before the refusal.
+    nothing there. Each attack row ran its payload in bash 5.3, and was SAFE or HIGH-and-allowed
+    with ShellCheck on before the refusal. For most of them the twin without the heredoc is
+    denied by ShellCheck; a trap handler's twin is not, because trap text is not re-validated.
     """
 
     @pytest.fixture(autouse=True)
@@ -4080,15 +4100,20 @@ class TestShellCheckNeverReadsABodyBashHasEnded:
         yield
         clear_caches()
 
-    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    @_SHELLCHECK_ON_AND_OFF
     @_JOINED_TERMINATOR_ROWS
-    def test_a_joined_terminator_is_refused(self, safety_rules_path, command):
-        """Real ShellCheck: the refusal, not a finding, denies it - ShellCheck saw none of the tail.
+    def test_a_joined_terminator_is_refused(self, safety_rules_path, monkeypatch, shellcheck, command):
+        """The refusal, not a finding, denies it - ShellCheck saw none of the tail - either way.
 
+        The `-first` rows open with a line the heredoc readers cannot vouch for, so neither
+        one reaches the joined terminator: the refusal must not depend on their walk.
+        In `comment-ends-the-opener-line` the comment ends at the newline, so the body starts on
+        the line after one ending in a backslash, mid-run.
         `benign-tail` pins the cost: a harmless command behind such a terminator is refused too.
-        `rewrite-abandoned-later` is a later line the delimiter rewrite cannot read, so bashlex
-        and ShellCheck get the command as written: the flag must outlive that.
         """
+        if not shellcheck:
+            monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+
         result = validate_command(command, config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
@@ -4096,31 +4121,39 @@ class TestShellCheckNeverReadsABodyBashHasEnded:
         assert "backslash-newline" in (result.error or "")
         assert "Write the heredoc terminator on one line" in result.alternatives
 
-    @_JOINED_TERMINATOR_ROWS
-    def test_the_refusal_does_not_depend_on_shellcheck(self, safety_rules_path, no_shellcheck, command):
-        """One verdict whether or not ShellCheck is installed, so a missing binary changes nothing."""
-        result = validate_command(command, config_path=safety_rules_path)
-
-        assert result.risk_level == RiskLevel.BLOCKED
-        assert "backslash-newline" in (result.error or "")
-
     @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
     @pytest.mark.parametrize(
-        "command",
+        "command,risk",
         [
-            "cat <<EOF\nhi\nEOF\necho ok",
-            "cat <<'EOF'\nhi $x\nEOF\necho ok",
-            "cat <<EOF\nhi\nEO\\\\\nF\nEOF\necho ok",
-            "cat <<'EOF'\nhi\nEO\\\nF\nEOF\necho ok",
-            "cat <<EOF > s.sh\na \\\n  b\nEOF",
+            ("cat <<EOF\nhi\nEOF\necho ok", RiskLevel.SAFE),
+            ("cat <<'EOF'\nhi $x\nEOF\necho ok", RiskLevel.SAFE),
+            ("cat <<EOF\nhi\nEO\\\\\nF\nEOF\necho ok", RiskLevel.SAFE),
+            ("cat <<'EOF'\nhi\nEO\\\nF\nEOF\necho ok", RiskLevel.SAFE),
+            ("cat <<-EOF\n\thi\n\tEO\\\n\tF\nEOF\necho ok", RiskLevel.SAFE),
+            ("cat <<EOF > s.sh\na \\\n  b\nEOF", RiskLevel.SAFE),
+            ("cat <<EOF \\\n  > s.sh\nhi\nEOF", RiskLevel.HIGH),
+            ("docker run \\\n  --rm \\\n  img <<EOF\nhi\nEOF", RiskLevel.LOW),
         ],
-        ids=["unquoted", "quoted", "escaped-backslash", "quoted-body-is-never-joined", "continued-body-line"],
+        ids=[
+            "unquoted",
+            "quoted",
+            "escaped-backslash",
+            "quoted-body-is-never-joined",
+            "tab-after-the-join",
+            "continued-body-line",
+            "continued-opener",
+            "continued-command",
+        ],
     )
-    def test_a_terminator_on_one_line_keeps_its_verdict(self, safety_rules_path, command):
-        """Real ShellCheck: bash ends each of these at a one-line terminator, or never joins its body."""
+    def test_a_terminator_on_one_line_keeps_its_verdict(self, safety_rules_path, command, risk):
+        """Real ShellCheck: bash ends each at a one-line terminator, so each keeps its verdict.
+
+        A join elsewhere - in the opener, the command before it, a body line - forms no
+        delimiter, and `<<-` strips tabs from the front of the joined line only.
+        """
         result = validate_command(command, config_path=safety_rules_path)
 
-        assert result.risk_level == RiskLevel.SAFE, result.message
+        assert result.risk_level == risk, result.message
         assert result.allowed is True
 
     @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
@@ -4132,3 +4165,24 @@ class TestShellCheckNeverReadsABodyBashHasEnded:
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert "shellcheck:SC2016" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "cat <<W\n" + "\\\n" * (val_module.MAX_DERIVED_COMMAND_SIZE // 2) + "x",
+            "cat <<" + "W" * 100_000 + "\n" + "\t\\\n" * 100_000 + "X" * 100_000,
+        ],
+        ids=["one-long-run", "tabs-leave-the-suffix-unchanged"],
+    )
+    def test_the_scan_is_linear_at_the_derived_size_ceiling(self, text):
+        """Hook time is a bypass, so a long run of continued lines must not cost seconds.
+
+        Measured at about 0.01s. Each row is quadratic under one wrong implementation: trying
+        every start with `_body_line` (the first, minutes) and re-comparing a suffix that a line
+        of tabs left unchanged (the second, over a second).
+        """
+        start = time.perf_counter()
+
+        assert not val_module._joins_into_a_delimiter(text, {"W", "W" * 100_000})
+
+        assert time.perf_counter() - start < 1.0

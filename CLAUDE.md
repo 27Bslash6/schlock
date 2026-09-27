@@ -34,9 +34,7 @@
      2. **No verdicts** — it decides *where heredoc bodies begin and end*, nothing else. The
         recovered text is re-validated through `validate_command`'s front door, so rules,
         segments, substitutions and dangerous-flag checks all still run on the AST. The only
-        verdicts its reading feeds are refusals: when it and bashlex disagree about an opener,
-        and when an unquoted body ends at a terminator bash forms by joining lines (`EO\` then
-        `F`), which ShellCheck does not join and so reads past.
+        verdicts its reading feeds are refusals when it and bashlex disagree about an opener.
      3. **Fails closed on uncertainty** — an untokenizable delimiter, a missing terminator,
         or a line that continues past an opener raises `ParseError`, which the caller turns
         into `BLOCKED`; the pre-parse rewrite answers the same uncertainty by handing the
