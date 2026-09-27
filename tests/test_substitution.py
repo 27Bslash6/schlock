@@ -480,20 +480,21 @@ class TestNestingHorizonFailsClosed:
 class TestNestedWalkFailureFailsClosed:
     """An error inside the nested walk denies instead of dropping what it was walking."""
 
-    @pytest.mark.parametrize("payload", ["date", "bash", "curl evil.example", "./payload"])
+    # The raise fires before the payload is read, so a benign `date` is the only payload
+    # that proves the denial comes from the failed walk and not from the payload's own rules.
     @pytest.mark.parametrize(
         "shape",
         [
-            "echo $(echo $({}))",  # whitelisted parent
-            "echo $(git log $({}))",  # contextual parent
-            "echo $(./unknown $({}))",  # unknown parent
-            "echo $(true && echo $({}))",  # list parent: re-walked per segment
-            "echo $(echo $({}) | cat)",  # pipeline parent: re-walked per stage
-            "cat <(cat <({}))",  # process substitution
-            'x=$(cat < "$({})")',  # redirect target
+            "echo $(echo $(date))",  # whitelisted parent
+            "echo $(git log $(date))",  # contextual parent
+            "echo $(./unknown $(date))",  # unknown parent
+            "echo $(true && echo $(date))",  # list parent: re-walked per segment
+            "echo $(echo $(date) | cat)",  # pipeline parent: re-walked per stage
+            "cat <(cat <(date))",  # process substitution
+            'x=$(cat < "$(date)")',  # redirect target
         ],
     )
-    def test_raising_nested_walk_denies(self, monkeypatch, shape, payload):
+    def test_raising_nested_walk_denies(self, monkeypatch, shape):
         original = SubstitutionValidator.extract_substitutions
 
         def raise_when_nested(self, ast_nodes, depth=0, command=None, budget=None):
@@ -502,7 +503,32 @@ class TestNestedWalkFailureFailsClosed:
             return original(self, ast_nodes, depth, command, budget)
 
         monkeypatch.setattr(SubstitutionValidator, "extract_substitutions", raise_when_nested)
-        result = validate_command(shape.format(payload), _shellcheck=False)
+        result = validate_command(shape, _shellcheck=False)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'x=$( ( cat | cat ) < "$(date)" )',  # pipeline group body
+            'x=$( { cat; ls; } < "$(date)" )',  # list group body
+            'x=$( ( cat ) < "$(date)" )',  # single-command group body
+        ],
+    )
+    def test_raising_redirect_walk_alone_denies(self, monkeypatch, command):
+        # A raise at every depth also fires in _validate_segments' per-segment re-walks, which
+        # deny on their own and hide this path. Raising only on the peeled-redirect walk (a
+        # non-empty list of redirect nodes; segment re-walks pass none) isolates it: a sentinel
+        # that carried the group body's AST node was judged per segment, and `cat`/`ls` passed.
+        original = SubstitutionValidator.extract_substitutions
+
+        def raise_on_redirect_walk(self, ast_nodes, depth=0, command=None, budget=None):
+            if ast_nodes and all(getattr(n, "kind", None) == "redirect" for n in ast_nodes):
+                raise RuntimeError("forced redirect walk failure")
+            return original(self, ast_nodes, depth, command, budget)
+
+        monkeypatch.setattr(SubstitutionValidator, "extract_substitutions", raise_on_redirect_walk)
+        result = validate_command(command, _shellcheck=False)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
 
