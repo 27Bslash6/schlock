@@ -1311,10 +1311,19 @@ class _DollarQuoteDecoder(bashlex.ast.nodevisitor):
     def __init__(self, command: str):
         self.command = command
         self.backticks: list[tuple[int, int]] = []
+        self.delimiters: set[int] = set()
 
     def visitcommandsubstitution(self, n: Any, command: Any) -> None:
         if self.command[n.pos[0]] == "`":
             self.backticks.append(n.pos)
+
+    def visitredirect(self, n: Any, input: Any, type: str, output: Any, heredoc: Any) -> None:
+        # A heredoc delimiter keeps bashlex's reading, quotes and all: the validator reads a quote
+        # left in it as bashlex misreading where the body ends, and sends the command to the
+        # heredoc fallback. Decoded, `<<$'EOF'` would look bare and hide the lines bash runs.
+        # bashlex calls this before it visits `output`, the delimiter word node itself.
+        if type in ("<<", "<<-"):
+            self.delimiters.add(id(output))
 
     def visitword(self, n: Any, word: str) -> None:
         self._decode(n)
@@ -1325,7 +1334,7 @@ class _DollarQuoteDecoder(bashlex.ast.nodevisitor):
     def _decode(self, n: Any) -> None:
         start, end = n.pos
         span = self.command[start:end]
-        if not _holds_dollar_quote(span):
+        if id(n) in self.delimiters or not _holds_dollar_quote(span):
             return
         # Inside backticks bash strips the backslash from `\$`, `\``, `\\` (and `\"` within "...")
         # before parsing, so `\$'\x2d...'` there is an ANSI-C quote this reading takes for a `$`.

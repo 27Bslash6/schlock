@@ -59,11 +59,12 @@
      boundaries but dequotes them wrongly (`$'rm\t-rf\t/'` reads as `$rmt-rft/`), so
      `_DollarQuoteDecoder` in `src/schlock/core/parser.py` re-reads each such word's source span
      with bash's quoting rules (`_dequote`, `_ansi_c_quote`, `_ansi_c_escape`) and rewrites its
-     text on every parse. It holds only while: bashlex has already fixed the word's boundaries and
-     built its expansion nodes, whose spans are copied raw; it decides no structure and no verdict
-     (the decoded word still goes through every rule); and any escape, quote or expansion it does
-     not model raises `ParseError` rather than guess. Every change is decided by running real bash
-     first.
+     text on every bashlex-tier parse. It holds only while: bashlex has already fixed the word's
+     boundaries and built its expansion nodes, whose spans are copied raw; it decides no structure
+     and no verdict (the decoded word still goes through every rule); it leaves every heredoc
+     delimiter as bashlex read it, because a quote left there is what routes a misread heredoc to
+     the fallback; and any escape, quote or expansion it does not model raises `ParseError` rather
+     than guess. Every change is decided by running real bash first.
    - **Approved exception — re-reading one redirect target.** bashlex mis-dequotes some
      targets (`/dev/$'sda'`, `""'/dev/sda'`), so `_redirect_words` in
      `src/schlock/core/parser.py` re-reads the target's own source span with a quote-run regex

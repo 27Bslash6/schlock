@@ -869,6 +869,18 @@ class TestAnsiCWordDecoding:
     def test_locale_quotes_read_as_double_quotes(self, word, expected):
         assert _echo_arg(f"echo {word}") == expected
 
+    @pytest.mark.parametrize(
+        "command",
+        # Terminated as written, the only spelling bashlex accepts, so both parses succeed.
+        ["cat <<$'EOF'\nhi\n$'EOF'", 'cat <<$"EOF"\nhi\n$"EOF"', "cat <<-$'E\\x4fF'\n\thi\n\t$'E\\x4fF'"],
+    )
+    def test_heredoc_delimiters_keep_bashlex_reading(self, command):
+        # The validator reads a quote left in a delimiter as bashlex misreading the heredoc and
+        # sends it to the fallback. Decoding the delimiter would hide that, so it stays as written.
+        [raw] = bashlex.parse(command)
+        [decoded] = parser_mod.BashCommandParser().parse(command)
+        assert decoded.parts[-1].output.word == raw.parts[-1].output.word
+
     def test_commands_without_ansi_c_quotes_are_untouched(self):
         # Without a `$'` or `$"` opener (`_holds_dollar_quote`) bashlex's own dequoting stands,
         # quirks included (bash prints a\qb here; changing that is not this decoder's business).
