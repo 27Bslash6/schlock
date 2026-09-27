@@ -1384,7 +1384,7 @@ def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str
     popping the `${…}` on it re-arms the very phantom opener this exists to
     prevent. At the top level both re-lex as shell and a heredoc inside them is
     real (`x=$(cat <<'E' … E)`), so they stay untracked and their openers are
-    found.
+    found - and, inside a backtick, refused (see `_rewrite_openers`).
     """
     for opener, owed in _EXPANSION_FRAMES:
         if line.startswith(opener, pos):
@@ -1717,10 +1717,10 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             if char == "`":
                 # A top-level backtick is shell again, exactly like `$(…)`, and
                 # `_expansion_frame_at` deliberately does not frame it so the
-                # heredocs inside it stay findable. It had no context of its
-                # own, so its contents were read against the *enclosing* one and
-                # an operator inside it reset the outer command position that
-                # was not its to reset. That invents an opener:
+                # heredocs inside it stay findable - to be refused at `<<`. It
+                # had no context of its own, so its contents were read against
+                # the *enclosing* one and an operator inside it reset the outer
+                # command position that was not its to reset. That invents an opener:
                 # `x=`ls | sort` y[1<<b]=1` is one assignment word to bash, which
                 # runs the line and opens no heredoc, while this read `b]=1` as a
                 # delimiter and deleted the next line as its body. One character
@@ -1874,6 +1874,14 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
         elif line.startswith("<<", pos) and not frames:
+            if any(context.backtick for context in scan.contexts):
+                # Bash ends a backtick at the first unescaped `` ` `` in the raw
+                # text, quotes included, and takes a heredoc body from inside
+                # it: `echo ` <<b `` then `rm -rf /` then `b` runs the `rm`
+                # (canary), while reading the body from the lines below deleted
+                # it. Where the backtick really ends is not something this scan
+                # can vouch for, so refuse rather than guess.
+                raise ParseError("Heredoc opener inside a backtick; bash reads its body from the substitution alone")
             opener_at = pos
             pos += 2
             strips_tabs = line.startswith("-", pos)
@@ -1954,6 +1962,32 @@ def _blank_body_line(line: str) -> str:
     have suppressed from matching anyway.
     """
     return "x" * len(line)
+
+
+def _body_line(lines: list[str], index: int, quoted: bool) -> tuple[str, list[str]]:
+    """The heredoc body line bash reads from ``lines[index]``, and the physical lines it spans.
+
+    Bash tests the delimiter against this line, not against a physical one. In an UNQUOTED
+    body its `read_secondary_line` deletes each unescaped backslash-newline as it reads, so
+    `EO\\` followed by `F` is one line, `EOF`, and it ends an `<<EOF` body (LAB-5272). Compare
+    physical lines instead and the body runs on to some later `EOF`, filing every command in
+    between as inert body text.
+
+    A physical line with an odd run of trailing backslashes joins; an even run is escaped
+    backslashes and does not. bashlex is not so careful - it deletes EVERY backslash-newline,
+    escaped or not - which `_neuter_heredocs` has to answer for. A QUOTED body is literal:
+    bash's heredoc reader never joins it, so neither does this.
+    """
+    end = index + 1
+    while not quoted and end < len(lines) and (len(lines[end - 1]) - len(lines[end - 1].rstrip("\\"))) % 2:
+        end += 1
+    physical = lines[index:end]
+    return "".join(part[:-1] for part in physical[:-1]) + physical[-1], physical
+
+
+def _is_terminator(line: str, delimiter: str, strips_tabs: bool) -> bool:
+    """Whether body line ``line`` ends the heredoc: `<<-` strips its leading tabs first, as bash does."""
+    return (line.lstrip("\t") if strips_tabs else line) == delimiter
 
 
 class _BashlexHeredoc(NamedTuple):
@@ -2178,24 +2212,25 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
 
             out.append(line)
 
-            # Bodies are consumed in opener order, exactly as _neuter_heredocs does it,
-            # and for the same reason: the delimiter comparison has to match bash's or a
-            # body line gets mistaken for the terminator.
+            # Bodies are consumed in opener order, and read line by line (`_body_line`),
+            # exactly as _neuter_heredocs does it, and for the same reason: the delimiter
+            # comparison has to match bash's or a body line gets mistaken for the
+            # terminator, or the terminator for a body line.
             for (delimiter, strips_tabs, start, _), quoted in zip(openers, was_quoted):
                 body_start = at
                 while index < len(lines):
-                    body = lines[index]
+                    body, physical = _body_line(lines, index, quoted)
                     line_at = at
-                    at += len(body) + 1
-                    index += 1
-                    if (body.lstrip("\t") if strips_tabs else body) == delimiter:
-                        out.append(body)  # terminator stays verbatim; bashlex ends here
+                    at += sum(len(part) + 1 for part in physical)
+                    index += len(physical)
+                    if _is_terminator(body, delimiter, strips_tabs):
+                        out.extend(physical)  # terminator stays verbatim
                         if quoted:
                             # The body runs up to the newline before the terminator; an
                             # empty one slices to "" and is never delegated.
                             blanked.append((line_start + start, body_start, line_at - 1))
                         break
-                    out.append(_blank_body_line(body) if quoted else body)
+                    out.extend(_blank_body_line(part) if quoted else part for part in physical)
                 else:
                     # No terminator: where the body ends is unknown, so which text is
                     # shell is unknown. Hand it back untouched and let the fallback deny.
@@ -2262,8 +2297,10 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
             base_command = lines[index - 1][: openers[0][2]].strip()
 
         # Bodies are consumed in opener order. `<<-` strips leading tabs from the
-        # terminator line as well as the body, so the comparison has to match
-        # bash's or a body line would be mistaken for the terminator.
+        # terminator line as well as the body, and an unquoted body's lines are
+        # joined across backslash-newlines first (`_body_line`), so the comparison
+        # has to match bash's or a body line would be mistaken for the terminator -
+        # or the terminator for a body line, swallowing the shell after it.
         opener_line = lines[index - 1]
         for delimiter, strips_tabs, start, end in openers:
             # A dropped (or empty) body still leaves one blank line: bashlex rejects
@@ -2272,19 +2309,21 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
             quoted = _delimiter_is_quoted(opener_line, delimiter, strips_tabs, start, end)
             body_lines: list[str] = []
             while index < len(lines):
-                body = lines[index]
-                at += len(body) + 1
-                index += 1
-                if (body.lstrip("\t") if strips_tabs else body) == delimiter:
+                body, physical = _body_line(lines, index, quoted)
+                at += sum(len(part) + 1 for part in physical)
+                index += len(physical)
+                if _is_terminator(body, delimiter, strips_tabs):
                     if quoted or not body_lines:
                         rewritten.append("")
-                    elif (len(body_lines[-1]) - len(body_lines[-1].rstrip("\\"))) % 2:
-                        # The last line ends in an unescaped `\`, which bash joins onto the
-                        # terminator - so bash does not end the body here - and so would
-                        # bashlex, reading on past the placeholder. Where the body ends is
-                        # unknown. (A `\` on any earlier line only joins two body lines.)
+                    elif body_lines[-1].endswith("\\"):
+                        # The run of backslashes is even - an odd one would have joined this
+                        # line onto the terminator - so bash reads escaped backslashes and ends
+                        # the body here. bashlex deletes every backslash-newline, escaped or
+                        # not, so it would join this line onto the placeholder and read the
+                        # command after it as body.
                         raise ParseError(
-                            "An unquoted heredoc's last body line ends in a backslash; where the body ends is unknown"
+                            "An unquoted heredoc's last body line ends in a backslash, which bashlex "
+                            "joins onto the rewrite delimiter; where the body ends is unknown"
                         )
                     else:
                         # The leading blank line absorbs a bashlex quirk: inside a compound
@@ -2296,10 +2335,12 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
                 if not quoted and _HEREDOC_PLACEHOLDER in body:
                     # bashlex ends the kept body at a line equal to the placeholder (after the
                     # `<<-` tab strip), and bash does not, so the command behind it would be
-                    # read as body. Containment is a strict superset of that line test, and
-                    # needs no copy of bashlex's strip. (A quoted body is dropped, so it cannot.)
+                    # read as body. The placeholder holds no backslash, so any line bashlex
+                    # joins into it is one bash joins too: containment in the joined line is a
+                    # strict superset of that line test, and needs no copy of bashlex's strip.
+                    # (A quoted body is dropped, so it cannot.)
                     raise ParseError("An unquoted heredoc body contains the rewrite delimiter")
-                body_lines.append(body)
+                body_lines.extend(physical)
             else:
                 raise ParseError(f"Heredoc {delimiter!r} has no terminator; its body has no end")
 
@@ -2624,7 +2665,7 @@ def validate_command(
     """Validate a command for safety — the main validation API.
 
     Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
-    verdict above SAFE too weak to have short-circuited it. The join lives HERE, outside the
+    verdict above SAFE that did not short-circuit it (all but a rule-named BLOCKED). The join lives HERE, outside the
     passes, because a join made at any one pass is a join the passes added after it will miss:
     that is precisely how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked
     back down to HIGH merely by having a substitution appended. Whatever returns first, the
@@ -2670,15 +2711,16 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
     config_path: Optional[str] = None,
     *,
     _depth: int = 0,
-    _deferred: Optional[list[SubstitutionValidationResult]] = None,
+    _deferred: list[SubstitutionValidationResult],
     _shellcheck: bool = True,
     _derived: bool = False,
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution verdict above SAFE and below BLOCKED is placed
-    there for the caller to join. It is a list rather than a return value so that every one of
-    this function's returns carries it without having to remember to.
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE, other than a rule-named
+    BLOCKED, is placed there for the caller to join. It is a list rather than a return value so
+    that every one of this function's returns carries it without having to remember to. It is
+    required: a caller that passed none would silently drop every deferred verdict.
 
     Validate command for safety.
 
@@ -2842,16 +2884,20 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # a blocked segment). A weaker substitution verdict returned here therefore DOWNGRADED
             # commands those passes deny outright. Consulting match_command() from here does not
             # fix it: that helper is whitelist-gated, so a whitelisted first word makes it report
-            # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
-            # weaker is handed to the caller, which joins it against the completed verdict.
+            # SAFE for the whole command. Only a BLOCKED verdict that names its rule short-circuits;
+            # anything else is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
                 # An allowed verdict above SAFE is a rule match that decides the level (LAB-4223):
                 # it is owed the join too, and deferring it also keeps the pre-join verdict uncached.
                 if sub_result.allowed and sub_result.risk_level == RiskLevel.SAFE:
                     continue
-                if sub_result.risk_level == RiskLevel.BLOCKED:
+                # A BLOCKED verdict that names no rule (the non-simple-command guard, a blacklist
+                # hit, a depth or topology refusal) is deferred too, so a later pass can name one:
+                # returned here, `echo "$(:(){ :|:& };:)"` stayed BLOCKED but lost `fork_bomb` from
+                # the audit log. It still wins the join, since nothing outranks BLOCKED.
+                if sub_result.risk_level == RiskLevel.BLOCKED and sub_result.matched_rules:
                     return _substitution_verdict(sub_result)
-                if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
+                if not _deferred or sub_result.risk_level > _deferred[0].risk_level:
                     _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection
@@ -3036,6 +3082,27 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     quote_source=parse_target,
                     heredoc_ranges=heredoc_ranges,
                 )
+
+            # Match again with each substitution body blanked (mask_substitution_bodies says
+            # why). Every top-level separator survives the blanking, so this pass cannot pair
+            # two commands, and it only ever raises the verdict. Whitelist as the pass it
+            # shadows: a single segment's own prefix check, or none once is_fully_whitelisted
+            # has ruled. heredoc_ranges ARE passed, unlike the unsuppressed multi-segment
+            # scan above: that scan still runs, so they cost this pass nothing it must catch,
+            # and without them a single segment's heredoc text denies.
+            if match.risk_level < RiskLevel.BLOCKED:
+                masked = parser.mask_substitution_bodies(parse_target, ast)
+                if masked != parse_target:
+                    masked_match = engine.match_command(
+                        masked,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        use_whitelist=len(segments) <= 1,
+                    )
+                    if masked_match.risk_level > match.risk_level:
+                        match = masked_match
+                        if all_matched_rules and masked_match.rule:
+                            all_matched_rules.append(masked_match.rule.name)
 
             # A `"$(…)"` body is code, which the passes above suppressed with its quoted
             # word. Matched once, over the whole AST, after the segments are rated: a `for`
