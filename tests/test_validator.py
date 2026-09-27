@@ -1086,6 +1086,32 @@ class TestSelfProtectionArchiveExtraction:
             "tar -xf evil.tar --exclude-vcs .claude/hooks",
             "TAR_OPTIONS=-x tar --suffix -X .claude/hooks -f evil.tar",
             "TAR_OPTIONS=-x tar --suffix --exclude .claude/hooks -f evil.tar",
+            # unzip reads a `--`-prefixed word as cancelling the mode after it, so any `--` word
+            # makes the mode unknown and the command fails closed to an extraction
+            "unzip -l --l -o evil.zip -d .claude/hooks",
+            "unzip --x -o evil.zip -d .claude/hooks",
+            # unzip -I CHARSET takes a value, so its cluster is not read as a mode
+            "unzip -Iutf8 a.zip -d .claude/hooks",
+            "unzip -I UTF-8 a.zip -d .claude/hooks",
+            # bsdtar -W carries a long option; -s is a member rewrite whose value is not a mode
+            "bsdtar -xf a.tar -Wdirectory=.claude/hooks",
+            "bsdtar -xf a.tar -W directory=.config/schlock",
+            "bsdtar -xf a.tar -s,^,.claude/hooks/,",
+            "bsdtar -W extract -s/t/t/ -f a.tar -C .claude/hooks",
+            # An archive option carried in TAR_OPTIONS/UNZIP is folded into the extractor's argv
+            "TAR_OPTIONS=-C.claude/hooks tar -xf a.tar",
+            "env TAR_OPTIONS=-C.claude/hooks tar -xf a.tar",
+            "UNZIP=-d.config/schlock unzip a.zip",
+            "TAR_OPTIONS=--transform=s,^,.claude/hooks/, tar -xf a.tar",
+            'TAR_OPTIONS="-C .claude/hooks" tar -xf a.tar',
+            # Any non-reader command is a possible runner, so a runner allowlist cannot be evaded
+            "fakeroot tar -xf a.tar -C .claude/hooks",
+            "eatmydata tar -xf a.tar -C .claude/hooks",
+            "faketime now tar -xf a.tar -C .claude/hooks",
+            "builtin exec tar -xf a.tar -C .claude/hooks",
+            # Cumulative -C also folds into the vendored parser directories, not just config
+            "tar -xf a.tar -C .claude-plugin -C bin",
+            "tar -xf a.tar -C .claude-plugin -C vendor",
         ],
     )
     def test_extraction_into_config_dir_is_blocked(self, command):
@@ -1126,6 +1152,11 @@ class TestSelfProtectionArchiveExtraction:
             # A certain option value is not read as a mode
             "tar -C .claude/hooks -czf backup.tgz .",
             "tar --exclude '*.log' -czf backup.tgz .claude/hooks",
+            # A known value-less long option before the mode does not swallow it, so a backup
+            # naming a config dir as a source stays a create, not a misread extraction
+            "tar --gzip --create --file b.tgz .claude/hooks",
+            "tar --numeric-owner --dereference -cf b.tar .config/schlock",
+            "tar --exclude-vcs -cf b.tar .claude/hooks",
         ],
     )
     def test_read_only_operation_stays_safe(self, command):
@@ -1137,33 +1168,89 @@ class TestSelfProtectionArchiveExtraction:
     @pytest.mark.parametrize(
         "command",
         [
-            # A config dir named as an argument to a NON-extractor must not hit the block:
-            # the extractor name appearing anywhere is not enough.
+            # `-O`/`--to-stdout` writes members to stdout, not the -C dir, so it is not a
+            # non-overridable self-protection block; the general archive_operations rule still rates it.
+            "tar -xOf a.tar .claude/hooks/y",
+            "tar --to-stdout -xf a.tar .config/schlock/x",
+        ],
+    )
+    def test_extraction_to_stdout_is_not_self_protection_blocked(self, command):
+        """A read to stdout naming a config path is not the hard-coded block."""
+        result = validate_command(command)
+        assert result.risk_level != RiskLevel.BLOCKED
+        assert result.matched_rules != ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A bare reader that names an extractor and a config dir is not a runner: allowed.
             "grep -rn tar .claude/hooks",
-            "rg unzip .claude/hooks",
-            'git commit -m "Add unzip step for .claude/hooks"',
-            # An extraction ELSEWHERE that merely mentions the config dir (redirect target, or a
-            # following unrelated statement) is not an extraction INTO it.
-            "tar -xf a.tar -C /opt > .claude/hooks/extract.log",
-            "tar -xzf tool.tgz -C /opt\nchmod +x .claude/hooks/pre.sh",
-            # An extraction quoted as text is one argument to another command, not a command
+            "cat .claude/hooks/schlock-config.yaml",
+            # The extractor name inside a quoted argument is not a command word.
             "printf '%s\\n' 'example; tar -xf a.tar -C .claude/hooks'",
-            'git commit -m "docs: note that; tar -xf a.tar -C .claude/hooks is blocked"',
             "cat <<'EOF'\nnote; tar -xf a.tar -C .claude/hooks\nEOF",
-            # Excluding the config dir protects it
+            # Installing a skill archive under ~/.claude/skills is not a config-dir write.
+            "unzip skill.zip -d ~/.claude/skills/foo",
+            # -x excludes the config dir, so the extraction targets only /opt.
+            "unzip a.zip -x '.claude/hooks/*' -d /opt",
+        ],
+    )
+    def test_config_dir_mention_stays_safe(self, command):
+        """AC-2: readers and quoted text naming a config dir stay SAFE, not blocked."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"Should stay SAFE: {command}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An extraction ELSEWHERE that merely mentions the config dir (redirect target) keeps
+            # its normal archive verdict, and excluding the config dir targets only /opt.
+            "tar -xf a.tar -C /opt > .claude/hooks/extract.log",
             "tar --exclude=.claude/hooks -xf a.tar -C /opt",
             "tar -xf a.tar --exclude .claude/hooks -C /opt",
-            "unzip a.zip -x '.claude/hooks/*' -d /opt",
-            "7z x a.7z -o/opt '-x!.claude/hooks'",
-            # A glob that cannot match a config dir
+            # A glob that cannot match a config dir.
             "tar -xzf schlock-*.tgz -C /tmp/out",
         ],
     )
-    def test_config_dir_mention_does_not_falsely_block(self, command):
-        """AC-2: the non-overridable block does not fire on ordinary commands naming a config dir."""
+    def test_config_dir_mention_stays_medium(self, command):
+        """AC-2: an extraction elsewhere that only names the dir keeps MEDIUM archive_operations."""
         result = validate_command(command)
-        assert result.matched_rules != ["self_protection:config_write"], f"False block: {command}"
-        assert result.risk_level != RiskLevel.BLOCKED
+        assert result.risk_level == RiskLevel.MEDIUM
+        assert result.matched_rules == ["archive_operations"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The extractor name inside a commit message is one quoted arg, not a command word,
+            # so the message keeps its own verdict and is never a self-protection block.
+            'git commit -m "Add unzip step for .claude/hooks"',
+            'git commit -m "docs: note that; tar -xf a.tar -C .claude/hooks is blocked"',
+            # An unrelated later statement that names the dir is not part of the extraction.
+            "tar -xzf tool.tgz -C /opt\nchmod +x .claude/hooks/pre.sh",
+        ],
+    )
+    def test_config_dir_mention_is_not_self_protection_blocked(self, command):
+        """AC-2: the hard-coded block never fires on a config dir that only appears as text."""
+        result = validate_command(command)
+        assert result.risk_level != RiskLevel.BLOCKED, f"False block: {command}"
+        assert result.matched_rules != ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A non-reader that names an extractor before a config dir is a possible runner, so it
+            # is over-blocked on purpose — a runner allowlist can never be complete (LAB-4907's
+            # lesson), and the same line through a bare reader is allowed above.
+            "rg unzip .claude/hooks",
+            "git grep unzip .claude/hooks",
+            "echo tar -xf a.tar -C .claude/hooks",
+        ],
+    )
+    def test_runner_naming_extractor_is_over_blocked(self, command):
+        """The look-through's accepted cost: a non-reader naming an extractor + config dir blocks."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
 
     @pytest.mark.parametrize(
         "command",
