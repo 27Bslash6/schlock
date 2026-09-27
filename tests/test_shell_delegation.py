@@ -15,7 +15,7 @@ with "option requires an argument", so an attached payload is not a thing.
 import pytest
 
 from schlock.core import validator
-from schlock.core.parser import BashCommandParser
+from schlock.core.parser import _EXEC_BYPASS_SCAN_WRAPPERS, _LAUNCHER_COMMANDS, WRAPPER_COMMANDS, BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
     MAX_DELEGATOR_TOKENS,
@@ -68,6 +68,13 @@ class TestDashCPayload:
     def test_leading_script_operand_ends_the_scan(self):
         # `bash deploy.sh -c production` passes -c to the SCRIPT, not to bash.
         assert _dash_c_payload(["deploy.sh", "-c", "production"]) is None
+
+    def test_plus_option_is_an_option_not_an_operand(self):
+        # `bash +o pipefail -c PROG` runs PROG (set(1) syntax, verified against
+        # bash/dash). Pre-fix `+o` was read as the script operand and the scan ended: None.
+        assert _dash_c_payload(["+o", "pipefail", "-c", "rm -rf /"]) == "rm -rf /"
+        assert _dash_c_payload(["+x", "-c", "rm -rf /"]) == "rm -rf /"
+        assert _dash_c_payload(["+x", "script.sh"]) is None
 
     def test_dangling_flag_has_no_payload(self):
         assert _dash_c_payload(["-c"]) is None
@@ -179,7 +186,7 @@ class TestShellDelegatedPayloadExtraction:
         # `strace -o bash sg root -c PROG`: the `-o FILE` value basenames to `bash`.
         assert "rm -rf /" in self._p(("strace", ["-o", "bash", "sg", "root", "-c", "rm -rf /"]))
 
-    @pytest.mark.parametrize("wrapper", ["sudo", "su"])
+    @pytest.mark.parametrize("wrapper", ["sudo", "su", "uv"])
     def test_repeated_wrappers_extract_each_suffix_once(self, wrapper, monkeypatch):
         # CodeRabbit on #153 (CWE-400): `sudo sudo ... bash -c PROG` visited every subset of
         # wrapper positions - pre-fix 2^n extractor calls and 2^(n-1) copies of PROG (n=18:
@@ -658,11 +665,11 @@ class TestHereStringPayloadExtraction:
         assert self._extract('( timeout 5 bash ) <<< "rm -rf /"') == [("bash", "rm -rf /")]
 
     def test_rbash_reads_stdin_as_program(self):
-        # rbash is in _SHELL_COMMANDS (the `-c` path caught it); the here-string surface must agree.
+        # rbash is in SHELL_COMMANDS (the `-c` path caught it); the here-string surface must agree.
         assert self._extract('rbash <<< "rm -rf /"') == [("rbash", "rm -rf /")]
 
     def test_csh_and_tcsh_read_stdin_as_program(self):
-        # LAB-4442: csh/tcsh are in _SHELL_COMMANDS (the `-c` path caught them); the here-string
+        # LAB-4442: csh/tcsh are in SHELL_COMMANDS (the `-c` path caught them); the here-string
         # surface must agree, the same drift rbash had.
         assert self._extract('csh <<< "rm -rf /"') == [("csh", "rm -rf /")]
         assert self._extract('tcsh <<< "rm -rf /"') == [("tcsh", "rm -rf /")]
@@ -757,6 +764,12 @@ class TestHereStringDelegationEvasion:
             'bash 3<<< "rm -rf /" <&3',
             'flock ./bash sh <<< "rm -rf /"',
             'strace -o bash sh <<< "rm -rf /"',
+            # Explicit stdin designators (_STDIN_PATHS, LAB-4696): bash/sh treat these path
+            # spellings of stdin as the program to run, same as no operand at all - untested
+            # pre-fix (verified against real bash).
+            'bash /dev/stdin <<< "rm -rf /"',
+            'sh /dev/fd/0 <<< "rm -rf /"',
+            'bash /proc/self/fd/0 <<< "rm -rf /"',
         ],
     )
     def test_here_string_payload_is_blocked(self, command):
@@ -814,3 +827,423 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+class TestLauncherDelegation:
+    """`<shell> … -c PROG` behind a launcher gets the bare payload's verdict.
+
+    Pre-fix (`main` @ `65afe74`, ShellCheck unavailable) none of these launchers was in
+    WRAPPER_COMMANDS, so nothing re-entered validation on the payload and its own rule match sat
+    inside the launcher's quote, suppressed as text. The gap was exactly an unrecognized launcher
+    in front of a *multi-flag* `-c` (`bash -euo pipefail -c`, `bash --norc -c`): every one of the
+    `_LAUNCHERS` below was **SAFE / allowed=True** on `L bash -euo pipefail -c 'rm -rf /'`, and
+    `L bash <<< 'rm -rf /'` was **HIGH / allowed=True**. The single-flag `L bash -c 'rm -rf /'`
+    was already BLOCKED by the `nested_shell_execution` regex, so the gap is the
+    non-first-flag `-c`. Known wrappers (`timeout`, `sudo`, `env`) re-entered on every
+    form and stayed BLOCKED.
+
+    The fix is membership: the wrapper branch of `_shell_delegated_payloads` re-enters the full
+    extractor on every arg position whose basename is a delegator, so `uv run bash -euo pipefail
+    -c PROG` needs only `uv` in the set. The `exec`/`eval` bypass scan in the parser keys on
+    `_EXEC_BYPASS_SCAN_WRAPPERS` (main's set, frozen) instead, so a launcher whose own subcommand
+    is `exec` (`pnpm exec vitest`, `direnv exec . make`, `screen -X eval`) is not read as the
+    shell builtin.
+
+    A sibling gap sat in the shared `-c` extractor: a `+`-prefixed option
+    (`bash +o pipefail -c PROG`, set(1) syntax) was read as the leading script operand, so the
+    scan ended and the bare AND every wrapped spelling were SAFE. Fixed in `_dash_c_payload` and
+    `_reads_stdin_as_program`; pinned below.
+    """
+
+    # Every launcher in `_LAUNCHER_COMMANDS`, as a literal: a member dropped from the set fails
+    # here rather than silently shrinking the parametrisation, and a member ADDED to the set
+    # without a SAFE-side pin below fails `test_set_shapes`.
+    _LAUNCHERS = [
+        "uv",
+        "poetry",
+        "pipenv",
+        "pdm",
+        "hatch",
+        "rye",
+        "conda",
+        "npx",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bunx",
+        "bundle",
+        "direnv",
+        "devbox",
+        "nix",
+        "mise",
+        "asdf",
+        "pyenv",
+        "rbenv",
+        "nvm",
+        "volta",
+        "screen",
+        "tmux",
+        "xvfb-run",
+        "faketime",
+        "firejail",
+        "bwrap",
+        "caffeinate",
+        "entr",
+        "watchexec",
+        "dbus-run-session",
+        "daemonize",
+        "chpst",
+        "proot",
+    ]
+
+    # `WRAPPER_COMMANDS` on `main` @ `65afe74`, verbatim. The exec/eval bypass scan keys on exactly
+    # this set; a name dropped from it silently turns `doas exec bash` SAFE, a launcher added to
+    # it turns `pnpm exec vitest` BLOCKED.
+    _MAIN_WRAPPERS = frozenset(
+        {
+            "busybox", "chroot", "chrt", "command", "doas", "env", "flock", "ionice", "linux32",
+            "linux64", "ltrace", "nice", "nohup", "nsenter", "parallel", "pkexec", "runuser",
+            "setarch", "setpriv", "setsid", "sg", "stdbuf", "strace", "su", "sudo", "systemd-run",
+            "taskset", "time", "timeout", "toybox", "unbuffer", "unshare", "xargs",
+        }
+    )  # fmt: skip
+
+    # One realistic multi-flag spelling per launcher: its real subcommand/option grammar in front
+    # of the shell. Pre-fix every one of these was SAFE / allowed=True.
+    _REALISTIC = {
+        "uv": "uv run bash -euo pipefail -c 'rm -rf /'",
+        "poetry": "poetry run bash -euo pipefail -c 'rm -rf /'",
+        "pipenv": "pipenv run bash -euo pipefail -c 'rm -rf /'",
+        "pdm": "pdm run bash -euo pipefail -c 'rm -rf /'",
+        "hatch": "hatch run bash -euo pipefail -c 'rm -rf /'",
+        "rye": "rye run bash -euo pipefail -c 'rm -rf /'",
+        "conda": "conda run -n env bash -euo pipefail -c 'rm -rf /'",
+        "npx": "npx bash --norc -c 'rm -rf /'",
+        "npm": "npm exec -- bash -euo pipefail -c 'rm -rf /'",
+        "pnpm": "pnpm exec bash -euo pipefail -c 'rm -rf /'",
+        "yarn": "yarn exec bash -euo pipefail -c 'rm -rf /'",
+        "bunx": "bunx bash --norc -c 'rm -rf /'",
+        "bundle": "bundle exec bash -euo pipefail -c 'rm -rf /'",
+        "direnv": "direnv exec . bash -euo pipefail -c 'rm -rf /'",
+        "devbox": "devbox run -- bash -euo pipefail -c 'rm -rf /'",
+        "nix": "nix develop -c bash -euo pipefail -c 'rm -rf /'",
+        "mise": "mise exec -- bash -euo pipefail -c 'rm -rf /'",
+        "asdf": "asdf exec bash -euo pipefail -c 'rm -rf /'",
+        "pyenv": "pyenv exec bash -euo pipefail -c 'rm -rf /'",
+        "rbenv": "rbenv exec bash -euo pipefail -c 'rm -rf /'",
+        "nvm": "nvm exec 20 bash -euo pipefail -c 'rm -rf /'",
+        "volta": "volta run --node 20 bash -euo pipefail -c 'rm -rf /'",
+        "screen": "screen -dmS job bash --norc -c 'rm -rf /'",
+        "tmux": "tmux new-session -d bash --norc -c 'rm -rf /'",
+        "xvfb-run": "xvfb-run -a bash -euo pipefail -c 'rm -rf /'",
+        "faketime": "faketime '2020-01-01 00:00:00' bash -euo pipefail -c 'rm -rf /'",
+        "firejail": "firejail --net=none bash --norc -c 'rm -rf /'",
+        "bwrap": "bwrap --ro-bind / / bash -euo pipefail -c 'rm -rf /'",
+        "caffeinate": "caffeinate -i bash -euo pipefail -c 'rm -rf /'",
+        "entr": "ls *.py | entr -r bash -euo pipefail -c 'rm -rf /'",
+        "watchexec": "watchexec -e py -- bash -euo pipefail -c 'rm -rf /'",
+        "dbus-run-session": "dbus-run-session -- bash -euo pipefail -c 'rm -rf /'",
+        "daemonize": "daemonize /bin/bash -euo pipefail -c 'rm -rf /'",
+        "chpst": "chpst -u nobody bash -euo pipefail -c 'rm -rf /'",
+        "proot": "proot -r rootfs bash -euo pipefail -c 'rm -rf /'",
+    }
+
+    def test_set_shapes(self):
+        assert _EXEC_BYPASS_SCAN_WRAPPERS == self._MAIN_WRAPPERS
+        assert set(self._LAUNCHERS) == _LAUNCHER_COMMANDS
+        assert _EXEC_BYPASS_SCAN_WRAPPERS.isdisjoint(_LAUNCHER_COMMANDS)
+        assert WRAPPER_COMMANDS == _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMANDS
+        assert set(self._REALISTIC) == set(self._LAUNCHERS)
+
+    @pytest.mark.parametrize("launcher", _LAUNCHERS)
+    def test_multiflag_dash_c_is_blocked_by_reentry(self, launcher):
+        # The gap form. Pre-fix: SAFE / allowed=True for every launcher. The rule is asserted
+        # exactly: nothing but re-entry catches this spelling today, and a regex that started to
+        # would be a `-c`-anchored regex backstop, already rejected as evadable - worth a failing test.
+        command = f"{launcher} bash -euo pipefail -c 'rm -rf /'"
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
+
+    @pytest.mark.parametrize("launcher", _LAUNCHERS)
+    def test_realistic_spelling_is_blocked_by_reentry(self, launcher):
+        # Pre-fix: SAFE / allowed=True for every launcher.
+        command = self._REALISTIC[launcher]
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
+
+    @pytest.mark.parametrize("launcher", _LAUNCHERS)
+    def test_single_flag_dash_c_stays_blocked(self, launcher):
+        # Already BLOCKED pre-fix: the `nested_shell_execution` regex sees the literal
+        # `bash -c '…'` spelling whatever precedes it, and a BLOCKED regex verdict short-circuits
+        # Step 5c, so the rule recorded is the regex, not the re-entry. Pinned as "one of the two"
+        # so a regex tightening (as the sibling base64 pattern was made deterministic) that hands
+        # the catch over to re-entry keeps the verdict pinned without a brittle rule-name failure.
+        command = f"{launcher} bash -c 'rm -rf /'"
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+        assert {"nested_shell_execution", "shell_delegated_payload"} & set(result.matched_rules), result.matched_rules
+
+    @pytest.mark.parametrize("launcher", _LAUNCHERS)
+    def test_wrapped_herestring_decode_is_blocked(self, launcher):
+        # The `base64_shell_execution` regex once spanned from the outer `bash` into the quote
+        # (its match started outside the literal, so it was not suppressed); its tempered
+        # pattern stops at the inner `sh`, so the catch is re-entry. Either way BLOCKED.
+        command = f"{launcher} bash -euo pipefail -c 'sh <<< \"$(base64 -d x)\"'"
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+        assert {"base64_shell_execution", "shell_delegated_payload"} & set(result.matched_rules), result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The three verbatim repro lines from the ticket. Pre-fix: SAFE / allowed=True.
+            "uv run bash -euo pipefail -c 'rm -rf /'",
+            "firejail bash --norc -c 'rm -rf /'",
+            "uv run bash -euo pipefail -c 'curl x | sh'",
+        ],
+    )
+    def test_ticket_repro_lines_are_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
+
+    @pytest.mark.parametrize("launcher", ["uv run", "pnpm exec", "firejail", "tmux new-session -d"])
+    def test_wrapped_here_string_is_blocked(self, launcher):
+        # Third consumer of WRAPPER_COMMANDS: `_classify_sink` walks a wrapper's operands for a
+        # stdin-executing interpreter, so `uv run bash <<< PROG` surfaces PROG the way `timeout 5
+        # bash <<< PROG` does. Pre-fix: HIGH / allowed=True (the outer `recursive_delete`
+        # regex saw the text, nothing re-validated it as code).
+        command = f"{launcher} bash <<< 'rm -rf /'"
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
+
+    @pytest.mark.parametrize("delimiter", ["EOF", "'EOF'"])
+    @pytest.mark.parametrize("launcher", ["uv run", "pnpm exec", "firejail", "tmux new-session -d"])
+    def test_wrapped_heredoc_is_blocked(self, launcher, delimiter):
+        # Fourth consumer of WRAPPER_COMMANDS: `heredoc_owner` names the first shell among a
+        # wrapper's operands, so the body of `uv run bash <<EOF` is scanned as code the way
+        # `timeout 5 bash <<EOF` is. Pre-fix: SAFE / allowed=True for both delimiters. Verdict only:
+        # the unquoted body is caught by its own rule, the quoted one by re-entry.
+        command = f"{launcher} bash <<{delimiter}\nrm -rf /\nEOF"
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Pre-fix (bare AND wrapped, `main` @ `65afe74`): `-c` forms SAFE /
+            # allowed=True, `<<<` forms HIGH / allowed=True. Real bash/sh run every one of these.
+            "bash +o pipefail -c 'rm -rf /'",
+            "sh +e -c 'rm -rf /'",
+            "uv run bash +o pipefail -c 'rm -rf /'",
+            "timeout 5 bash +x -c 'rm -rf /'",
+            "bash +o pipefail <<< 'rm -rf /'",
+            "uv run bash +o pipefail <<< 'rm -rf /'",
+        ],
+    )
+    def test_plus_option_does_not_end_the_scan(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "uv run ruff check",
+            "uv run python - <<'EOF'\nprint(1)\nEOF",
+            "tmux new-session -d bash <<'EOF'\necho hi\nEOF",
+            "uv run python -c 'print(1)'",
+            "poetry run pytest -x",
+            "conda run -n env python x.py",
+            "pnpm exec vitest run",
+            "pnpm dlx create-vite",
+            "npx eslint .",
+            "tmux new-session -d htop",
+            "screen -dmS job make",
+            "firejail --net=none firefox",
+            # The launchers whose own subcommand vocabulary is `exec`/`eval`: had they joined the
+            # exec/eval bypass scan these would have become an unappealable BLOCKED.
+            "direnv exec . make",
+            "npm exec -- vitest run",
+            "yarn exec vitest",
+            "bundle exec rspec",
+            "mise exec -- node -v",
+            "asdf exec node -v",
+            "pyenv exec python -V",
+            "rbenv exec ruby -v",
+            "nvm exec 20 node -v",
+            "screen -X eval 'stuff' 'other'",
+            # One benign tail per remaining launcher.
+            "pipenv run pytest",
+            "pdm run pytest",
+            "hatch run test",
+            "rye run pytest",
+            "npm run build",
+            "bunx create-vite",
+            "bundle install",
+            "devbox run build",
+            "nix develop -c make",
+            "nix build .#default",
+            "volta run --node 20 node -v",
+            "bwrap --ro-bind / / ls",
+            "xvfb-run -a pytest",
+            "faketime '2020-01-01 00:00:00' date",
+            "caffeinate -i make",
+            "ls *.py | entr -r make",
+            "watchexec -e py -- make",
+            "dbus-run-session -- make",
+            "daemonize /usr/bin/make",
+            "chpst -u nobody make",
+            "proot -r rootfs ls",
+            # A launcher's OWN `-c` (tmux start-directory, screen rc file, nix command) is not a
+            # shell's `-c`, and a bare shell operand with no `-c` carries no payload.
+            "tmux new-session -d -c /tmp bash",
+            "screen -c ~/.screenrc",
+            # `+x` is an option, so the script operand behind it is still a script: no `-c`, no payload.
+            "bash +x script.sh",
+        ],
+    )
+    def test_benign_launcher_tail_stays_safe(self, command):
+        # absolute verdicts pinned against `main` @ `65afe74` (SAFE / allowed=True, unchanged).
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}: {result.message}"
+        assert result.allowed is True
+
+
+# A heredoc body is code when its consumer is a shell - the consumer as bash resolves it, past
+# assignment prefixes and wrappers, not the first word. `heredoc_owner` does that resolving.
+# These rows pin the shapes test_validator.py's TestQuotedHeredocDelimiter does not; each one
+# scored SAFE (or HIGH/allowed beside a matching sibling) before `heredoc_owner` existed.
+_HEREDOC_BODY = "\nrm -rf /\nEOF"
+
+
+class TestWrappedShellHeredoc:
+    """A wrapped or assignment-prefixed shell heredoc scores as its bare `bash <<EOF` twin."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "nohup bash <<EOF" + _HEREDOC_BODY,
+            "command bash <<EOF" + _HEREDOC_BODY,
+            "nice bash <<EOF" + _HEREDOC_BODY,
+            "env FOO=1 bash <<EOF" + _HEREDOC_BODY,
+            "/usr/bin/env bash <<EOF" + _HEREDOC_BODY,
+            "timeout -k 1 5 bash <<EOF" + _HEREDOC_BODY,
+            # ANY shell operand, and only a shell: flock locks a file named python3 and runs bash.
+            # Resolving against STDIN_EXEC_INTERPRETERS instead would stop at python3.
+            "flock ./python3 bash <<EOF" + _HEREDOC_BODY,
+            # A sibling segment that matches its own rule must not stand in for the body.
+            "env bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "FOO=1 bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "timeout 5 sh <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "nohup bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "flock ./python3 bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+        ],
+    )
+    def test_wrapped_shell_heredoc_blocks(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # No sibling match: these once blocked only via the raw whole-command rescan. Pinned
+            # so a change to that rescan cannot reopen them.
+            "env bash <<EOF && true" + _HEREDOC_BODY,
+            "env bash <<EOF | cat" + _HEREDOC_BODY,
+            # Controls that block on their own: the bare twin, and sudo's privilege rule.
+            "bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "sudo bash <<EOF" + _HEREDOC_BODY,
+            # Not gated on `-c`: that program can itself read the heredoc (`bash -c bash`).
+            "bash -c bash <<EOF" + _HEREDOC_BODY,
+            "bash -c bash <<EOF && chmod 777 f" + _HEREDOC_BODY,
+            "bash -c 'echo hi' <<EOF" + _HEREDOC_BODY,
+        ],
+    )
+    def test_shell_heredoc_stays_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+
+class TestHeredocBenignUnchanged:
+    """Non-shell heredoc consumers keep their verdicts, wrapped or not."""
+
+    @pytest.mark.parametrize(
+        ("command", "risk"),
+        [
+            ("kubectl apply -f - <<EOF\napiVersion: v1\nkind: Pod\nEOF", RiskLevel.HIGH),
+            # A Python body is not bash: text a bash rule would match stays unscanned.
+            ("python3 <<EOF\nprint('chmod 777 f')\nEOF", RiskLevel.SAFE),
+            ("env python3 <<EOF\nprint('chmod 777 f')\nEOF", RiskLevel.SAFE),
+            # A wrapper around a non-shell consumer leaves the body inert text.
+            ("env cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
+            # test_validator.py pins only `allowed` for this one; the risk level is pinned here.
+            ("timeout 5 cat <<EOF" + _HEREDOC_BODY, RiskLevel.SAFE),
+        ],
+    )
+    def test_benign_heredoc_verdict_unchanged(self, command, risk):
+        result = validate_command(command)
+        assert result.risk_level == risk, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+
+class TestSyntheticRuleNamedInMatchedRules:
+    """LAB-5003: Steps 5b/5c name the rule that set the verdict, even on multi-segment commands.
+
+    On `main` @ `4ca7af0` the two `chmod +x x; ...` cases reported only `['chmod_exec']`: the
+    segment loop filled `all_matched_rules` and the join preferred it, dropping the synthetic
+    rule. Verdicts were already right; this pins the audit trail.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "risk", "rules"),
+        [
+            ('chmod +x x; watch "rm -rf /"', RiskLevel.BLOCKED, ["chmod_exec", "shell_delegated_payload"]),
+            ("chmod +x x; kubectl apply -f x.yaml", RiskLevel.HIGH, ["chmod_exec", "ast_contextual_high:kubectl"]),
+            # Single segment: the list stays empty and the join falls back to the synthetic rule.
+            ('watch "rm -rf /"', RiskLevel.BLOCKED, ["shell_delegated_payload"]),
+            ("kubectl apply -f x.yaml", RiskLevel.HIGH, ["ast_contextual_high:kubectl"]),
+        ],
+    )
+    def test_verdict_rule_is_named(self, command, risk, rules):
+        result = validate_command(command)
+        assert (result.risk_level, result.matched_rules) == (risk, rules)
+
+    @pytest.mark.parametrize(
+        ("command", "rules"),
+        [
+            ("chmod +x x; cat <<'E'OF\nhi\nEOF", ["chmod_exec", "shellcheck:incomplete"]),
+            ("cat <<'E'OF\nhi\nEOF", ["shellcheck:incomplete"]),
+        ],
+    )
+    def test_shellcheck_without_a_verdict_is_named(self, monkeypatch, command, rules):
+        """Step 6 names `shellcheck:incomplete` when a segment rule filled the list first.
+
+        A normalised quoted delimiter fails closed when ShellCheck returns no verdict. The
+        multi-segment case used to report only `['chmod_exec']`.
+        """
+        # The autouse fixture turns ShellCheck off; this case needs a run that returns None.
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(validator, "run_shellcheck", lambda _target: None)
+        result = validate_command(command)
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.BLOCKED, rules)
+
+    def test_compound_redirect_segment_keeps_the_payload_rule(self):
+        # Passes on main, where no segment rule matches here. A compound-redirect pass that
+        # fills the segment list (#180) must not push the payload rule out of it.
+        result = validate_command('{ echo a; } > "$HOME/.bashrc"; watch "rm -rf /"')
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "shell_delegated_payload" in result.matched_rules

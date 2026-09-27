@@ -60,7 +60,7 @@ Claude sees the rejection and adjusts. Your filesystem survives. You sleep at ni
 ```bash
 # In Claude Code
 /plugin marketplace add 27b-io/schlock
-/plugin install schlock@schlock
+/plugin install schlock@27b
 
 # Optional
 /schlock:setup
