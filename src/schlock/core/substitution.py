@@ -638,67 +638,23 @@ def dangerous_find(args: list[str]) -> str | None:
     `find -exec grep` and `find -fprint files.txt` are still allowed there.) Order-independent and
     indifferent to a leading "find" token. See #97.
 
-    Each arg is judged as the words bash will hand find, not as bashlex spells it: brace lists and
-    sequences are expanded (`{-fprint,out}`, `-ex{e,e}c`, `-ex{e..e}c`), and `$` is dropped, because
-    bashlex reports the ANSI-C word `$'-fprint'` as `$-fprint`. Dropping every `$` can only
-    over-block.
+    An arg that bash may still expand is judged as a conservative superset, not emulated: one that
+    holds a `-` next to a brace, `$` or backtick is denied, because brace, parameter, ANSI-C and
+    command expansion can all turn it into a flag (`-fp{r,}int`, `$'-fprint'`, `-fprint${x}`).
+    None of them can create a `-` the word does not already hold (a brace sequence yields one only
+    before digits), so `find {src,lib}` and `find dir{1..3}` stay allowed. The cost is over-blocking
+    rarer args such as `-name '*-{a,b}'` or `${SRC:-.}`, which this tier accepts.
     """
     for arg in args:
-        words = _brace_words(arg)
-        if words is None:
-            return f"find argument {arg!r} brace-expands past {_MAX_BRACE_WORDS} words"
-        for word in words:
-            flag = word.replace("$", "")
-            if flag in _DANGEROUS_FIND_FLAGS:
-                return f"find {flag} executes commands or modifies files"
+        if arg.replace("$", "") in _DANGEROUS_FIND_FLAGS:
+            return f"find {arg} executes commands or modifies files"
+        if "-" in arg and _FIND_EXPANSION_CHARS.search(arg):
+            return f"find argument {arg!r} may expand to a flag that executes commands or modifies files"
     return None
 
 
-# The innermost comma brace list in a word: `{a,b}` with no brace inside it. `{}` (find's own
-# placeholder) has no comma, so it stays literal, as it does in bash.
-_BRACE_LIST = re.compile(r"\{([^{}]*,[^{}]*)\}")
-# A brace sequence, `{1..9}` or `{a..z}`, with an optional step. Mixed ends (`{a..3}`) do not match
-# because bash leaves them literal too.
-_BRACE_SEQUENCE = re.compile(r"\{(?:(-?\d+)\.\.(-?\d+)|([A-Za-z])\.\.([A-Za-z]))(?:\.\.(-?\d+))?\}")
-# Brace expansion multiplies: n lists make 2**n words. Past this cap, fail closed.
-_MAX_BRACE_WORDS = 64
-
-
-def _brace_sequence(match: re.Match[str]) -> list[str] | None:
-    """Return the items of a `_BRACE_SEQUENCE` match, or None if it has more than the cap."""
-    numeric = match.group(1) is not None
-    first = int(match.group(1)) if numeric else ord(match.group(3))
-    last = int(match.group(2)) if numeric else ord(match.group(4))
-    step = abs(int(match.group(5) or 1)) or 1
-    if abs(last - first) // step >= _MAX_BRACE_WORDS:
-        return None
-    direction = 1 if last >= first else -1
-    values = range(first, last + direction, step * direction)
-    return [str(v) for v in values] if numeric else [chr(v) for v in values]
-
-
-def _brace_words(word: str) -> set[str] | None:
-    """Return the words bash's brace expansion makes of `word`, or None past the cap.
-
-    Innermost list first, so nesting (`{a,{b,c}}`) expands correctly. Zero-padded sequences
-    (`{01..10}`) expand unpadded, which no find flag can tell apart.
-    """
-    words: set[str] = set()
-    pending = [word]
-    while pending:
-        current = pending.pop()
-        match = _BRACE_SEQUENCE.search(current) or _BRACE_LIST.search(current)
-        if match is None:
-            words.add(current)
-        else:
-            items = _brace_sequence(match) if match.re is _BRACE_SEQUENCE else match.group(1).split(",")
-            if items is None:
-                return None
-            head, tail = current[: match.start()], current[match.end() :]
-            pending.extend(head + item + tail for item in items)
-        if len(words) + len(pending) > _MAX_BRACE_WORDS:
-            return None
-    return words
+# Characters that let bash turn a find arg into a different word before find sees it.
+_FIND_EXPANSION_CHARS = re.compile(r"[{$`]")
 
 
 # awk constructs that execute commands or write files from inside the program text. Blunt regex

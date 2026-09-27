@@ -296,6 +296,18 @@ class TestFindDangerousFlags:
             "echo $(find . -ex{e..e}c id \\;)",
             "echo $(find . -fprin{s..u} /tmp/l)",
             "echo $(find . -fprint{0..0} /tmp/l)",
+            # Spellings a partial brace emulator missed: a `}` before the comma, escaped or quoted
+            # braces, `${...}` in a list, a signed step, and an empty-expansion splice.
+            "echo $(find . -name {x},-fprint} /tmp/l)",
+            "echo $(find . -name {x\\},-o,-fprint} /tmp/l)",
+            'echo $(find . {-fls,"/tmp/{l"})',
+            "echo $(find . {-fprint,${x}} /tmp/l)",
+            "echo $(find . -maxdepth 0 -ex{e..e..+1}c echo \\;)",
+            "echo $(find . -fprint{+0..0} /tmp/l)",
+            "echo $(find . -fprint${x} /tmp/l)",
+            "echo $(find . -fp${x:-r}int /tmp/l)",
+            "echo $(find . -del${x}ete)",
+            "echo $(find . -ex`echo e`c id \\;)",
         ],
     )
     def test_dangerous_flag_in_substitution_blocked(self, command):
@@ -318,22 +330,13 @@ class TestFindDangerousFlags:
     def test_helper_flags_write_flag(self, flag):
         assert dangerous_find([".", flag, "out.txt"]) is not None
 
-    def test_helper_expands_nested_brace_list(self):
-        assert dangerous_find([".", "{-name,{-fls,x}}"]) is not None
-
     def test_helper_leaves_exec_placeholder_literal(self):
-        # `{}` has no comma: find's placeholder, not a brace list.
+        # `{}` holds no `-`: find's placeholder expands to nothing bash could turn into a flag.
         assert dangerous_find(["-name", "{}", "-print"]) is None
 
-    def test_helper_fails_closed_past_brace_cap(self):
-        assert dangerous_find([".", "{a,b}" * 7]) is not None
-        assert dangerous_find([".", "{a,b}" * 5]) is None
-        assert dangerous_find([".", "{1..100000}"]) is not None
-
-    def test_helper_expands_descending_stepped_sequence(self):
-        # z x v t ...: step 2 lands on `t` (-fprint); step 5 (z u p ...) never does.
-        assert dangerous_find([".", "-fprin{z..a..2}"]) is not None
-        assert dangerous_find([".", "-fprin{z..a..5}"]) is None
+    def test_expandable_arg_with_a_dash_over_blocks_by_design(self):
+        # The check is a superset, not an emulation of bash: this reads nothing but is denied.
+        assert validate_command("echo $(find . -name '*-{a,b}')").risk_level == RiskLevel.BLOCKED
 
 
 class TestGitConfigBypass:

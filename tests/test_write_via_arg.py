@@ -163,6 +163,16 @@ class TestFindWriteFlagsTopLevel:
             # The same walk serves sort: a quoted separator before -o.
             "sort -t '|' -o /etc/cron.d/x in.txt",
             "sort -t ';' -o/etc/cron.d/x in.txt",
+            # ANSI-C quoting: `\'` does not close `$'...'`.
+            "sort -t $'\\'' -o /etc/cron.d/x f",
+            "find . -name $'\\'' -fprint /etc/cron.d/x",
+            "find . -name $'a\\'b' -fprint /etc/cron.d/x",
+            # A quote opens mid-word too.
+            "sort -t'|' -o /etc/cron.d/x f",
+            "find . -name a'|'b -fprint /etc/cron.d/x",
+            "find . -name a';'b -fprint /etc/cron.d/x",
+            # Intentional over-match: the quote-stripped view reads a -fprint flag here.
+            "find . -name '-fprint /etc/cron.d/x'",
         ],
     )
     def test_write_flag_to_sensitive_path_is_high(self, command):
@@ -185,6 +195,7 @@ class TestFindWriteFlagsTopLevel:
             "find . -name x -exec true \\; ; echo -fprint /etc/cron.d/x",
             "find . -name x; echo -fprint /etc/cron.d/x",
             "find . -name x | tee -a log -fprint /etc/cron.d/x",
+            "sort -t $';' in.txt; echo -o /etc/cron.d/x",
         ],
     )
     def test_benign_find_stays_safe(self, command):
