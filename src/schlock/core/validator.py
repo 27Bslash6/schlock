@@ -444,10 +444,14 @@ def _check_dangerous_command_flags(
                     allowed=False,
                     risk_level=RiskLevel.BLOCKED,
                     message=f"BLOCKED: {git_reason}",
-                    alternatives=[
-                        "Remove the -c config override",
-                        "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, etc.)",
-                    ],
+                    alternatives=(
+                        ["Remove the --exec-path=DIR override and use git's own exec path"]
+                        if "--exec-path" in git_reason
+                        else [
+                            "Remove the -c config override",
+                            "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, etc.)",
+                        ]
+                    ),
                     exit_code=1,
                     error=None,
                     matched_rules=["ast_dangerous_combo:git"],

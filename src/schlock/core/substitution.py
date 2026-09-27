@@ -504,13 +504,50 @@ _DANGEROUS_GIT_CONFIGS = frozenset(
 )
 
 
+# git global options whose value is the NEXT word, so the exec-path walk below must step over it
+# rather than read it as the subcommand (`git -C --exec-path=x status` is a directory named that).
+_GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
+)
+
+
+def _git_exec_path_override(args: list[str]) -> str | None:
+    """Return a reason if a git global option `--exec-path=DIR` precedes the subcommand.
+
+    git runs non-builtin subcommands as DIR/git-<name> and puts DIR first on PATH for every
+    child it spawns (helpers, hooks, nested git), so DIR supplies the code whatever the
+    subcommand. Only the global-option position counts: after the subcommand the same word is
+    an operand (`git grep -e --exec-path=x`). `--exec-path` alone is git's query form — it
+    prints the path and exits, even with a word after it — so the walk stops there.
+    """
+    i = 0
+    # SubstitutionValidator passes every word, command name included; the top level does not.
+    if args and args[0].rsplit("/", 1)[-1] == "git":
+        i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--exec-path="):
+            return "git --exec-path=DIR runs git's subcommands and helpers from DIR"
+        if arg in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            i += 2
+        elif arg.startswith("-") and arg not in ("-", "--exec-path"):
+            i += 1
+        else:
+            return None
+    return None
+
+
 def dangerous_git_config(args: list[str]) -> str | None:
     """Return a reason string if `args` (a git command's word-args) sets a -c config that
     executes arbitrary commands, else None. Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
     `alias.` is dangerous only when the alias VALUE starts with `!` (shell-command alias);
     a `!` elsewhere (e.g. a `--grep` pattern) is an ordinary git alias. Pure; the single
-    source of truth shared by SubstitutionValidator and top-level validation.
+    source of truth shared by SubstitutionValidator and top-level validation. Also covers
+    `--exec-path=DIR`, the same kind of global setting that arms a later exec.
     """
+    exec_path_reason = _git_exec_path_override(args)
+    if exec_path_reason:
+        return exec_path_reason
     for i, arg in enumerate(args):
         config_val = None
         if arg == "-c" and i + 1 < len(args):
