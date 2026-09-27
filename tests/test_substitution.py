@@ -296,7 +296,7 @@ class TestFindDangerousFlags:
             "echo $(find . -ex{e..e}c id \\;)",
             "echo $(find . -fprin{s..u} /tmp/l)",
             "echo $(find . -fprint{0..0} /tmp/l)",
-            # Spellings a partial brace emulator missed: a `}` before the comma, escaped or quoted
+            # Spellings bash still turns into a flag: a `}` before the comma, escaped or quoted
             # braces, `${...}` in a list, a signed step, and an empty-expansion splice.
             "echo $(find . -name {x},-fprint} /tmp/l)",
             "echo $(find . -name {x\\},-o,-fprint} /tmp/l)",
