@@ -1112,6 +1112,22 @@ class TestSelfProtectionArchiveExtraction:
             # Cumulative -C also folds into the vendored parser directories, not just config
             "tar -xf a.tar -C .claude-plugin -C bin",
             "tar -xf a.tar -C .claude-plugin -C vendor",
+            # An extractor inside a redirect's process-substitution target is still reached
+            # (the check walks the parser's full child set, redirects included)
+            "cat a.tar > >(tar -x -C .claude/hooks)",
+            "echo ok > >(7z x e.7z -o.claude/hooks)",
+            'wc < "$(tar -xf a.tar -C .claude/hooks)"',
+            # GNU tar's `-s` (value-less --same-order) must not swallow the following -C; the
+            # ambiguous GNU-vs-bsdtar arity fails closed instead of guessing
+            "tar -xs -C .claude -C hooks -f e.tar",
+            "tar -sC .claude -C hooks -xf a.tar",
+            # `-O`/`--to-command` no longer downgrades an extraction that still writes the dir
+            "tar -xf e.tar -C .claude/hooks --exclude -O",
+            "tar -xf e.tar -C .claude/hooks --suffix -O",
+            # Env carriers set in a separate statement still reach the extractor's environment
+            "export TAR_OPTIONS=-C.claude/hooks; tar -xf e.tar",
+            "declare -x UNZIP=-d.config/schlock; unzip a.zip",
+            "printf -v TAR_OPTIONS %s -C.claude/hooks; export TAR_OPTIONS; tar -xf e.tar",
         ],
     )
     def test_extraction_into_config_dir_is_blocked(self, command):
@@ -1164,21 +1180,6 @@ class TestSelfProtectionArchiveExtraction:
         result = validate_command(command)
         assert result.allowed, f"Should allow: {command}"
         assert result.risk_level == RiskLevel.SAFE
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            # `-O`/`--to-stdout` writes members to stdout, not the -C dir, so it is not a
-            # non-overridable self-protection block; the general archive_operations rule still rates it.
-            "tar -xOf a.tar .claude/hooks/y",
-            "tar --to-stdout -xf a.tar .config/schlock/x",
-        ],
-    )
-    def test_extraction_to_stdout_is_not_self_protection_blocked(self, command):
-        """A read to stdout naming a config path is not the hard-coded block."""
-        result = validate_command(command)
-        assert result.risk_level != RiskLevel.BLOCKED
-        assert result.matched_rules != ["self_protection:config_write"]
 
     @pytest.mark.parametrize(
         "command",
@@ -1239,11 +1240,14 @@ class TestSelfProtectionArchiveExtraction:
         "command",
         [
             # A non-reader that names an extractor before a config dir is a possible runner, so it
-            # is over-blocked on purpose — a runner allowlist can never be complete (LAB-4907's
-            # lesson), and the same line through a bare reader is allowed above.
+            # is over-blocked on purpose — a runner allowlist can never be complete, and the same
+            # line through a bare reader is allowed above. git's search/format flags carry an
+            # extractor word as data, so they land here too.
             "rg unzip .claude/hooks",
             "git grep unzip .claude/hooks",
             "echo tar -xf a.tar -C .claude/hooks",
+            "git log -G tar -- .claude/hooks",
+            "git archive --format tar -o hooks.tar HEAD .claude/hooks",
         ],
     )
     def test_runner_naming_extractor_is_over_blocked(self, command):

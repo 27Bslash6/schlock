@@ -854,18 +854,21 @@ _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
 _PROJECT_CONFIG_DIR = ".claude/hooks"  # holds schlock-config.yaml
 
 
+# Which SELF_PROTECTION_PATHS entries are files (protect their directory) and which are whole
+# directory subtrees (protect as-is). Split explicitly, not by a `.yaml`/extension guess, so a
+# future non-YAML config file cannot be silently misclassified as a directory. The assert makes
+# adding a path there without classifying it here fail loudly.
+_CONFIG_FILE_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
+_CONFIG_TREE_PATHS = (".claude-plugin/bin", ".claude-plugin/vendor")
+if set(_CONFIG_FILE_PATHS) | set(_CONFIG_TREE_PATHS) != set(SELF_PROTECTION_PATHS):
+    raise RuntimeError("SELF_PROTECTION_DIRS is out of sync with SELF_PROTECTION_PATHS")
+
+
 def _self_protection_dirs() -> tuple[str, ...]:
-    dirs = {_PROJECT_CONFIG_DIR}
-    for path in SELF_PROTECTION_PATHS:
-        # A ".../x.yaml" entry names a config file, so protect its directory; a bare filename
-        # (schlock-config.yaml) lives in the project config dir already. Every other entry is
-        # itself a directory to protect (.claude-plugin/bin, .claude-plugin/vendor).
-        if path.endswith(".yaml"):
-            parent = posixpath.dirname(path)
-            if parent:
-                dirs.add(parent)
-        else:
-            dirs.add(path)
+    dirs = {_PROJECT_CONFIG_DIR, *_CONFIG_TREE_PATHS}
+    for path in _CONFIG_FILE_PATHS:
+        # A bare filename (schlock-config.yaml) lives in the project config dir already.
+        dirs.add(posixpath.dirname(path) or _PROJECT_CONFIG_DIR)
     return tuple(sorted(dirs))
 
 
@@ -886,14 +889,15 @@ _MAX_BRACE_ALTERNATIVES = 64
 _MAX_WRAPPED_EXTRACTORS = 16
 _TAR_NAMES = frozenset({"tar", "gtar", "bsdtar"})
 _7Z_NAMES = frozenset({"7z", "7za", "7zr", "7zz"})
-# Env variables that carry archive options; their value is re-split into option words. Names are
-# case-sensitive, as the shell's environment is.
-_ARCHIVE_ENV_VARS = frozenset({"TAR_OPTIONS", "UNZIP", "UNZIPOPT"})
 # tar short options that take a value: the rest of the cluster ("-Cdir"), else the next word.
-# GNU's full set, plus bsdtar's `-s` (substitution) and `-W` (long-option carrier); both take a
-# value there, and a shared entry can only over-consume on the other tar, never miss an extraction
-# (_names_tar_extract runs on every word, and no visible mode counts as an extraction).
-_TAR_ARG_OPTS = frozenset("bCfFgHIKLNTVXsW")
+_TAR_ARG_OPTS = frozenset("bCfFgHIKLNTVX")
+# `-s` and `-W` are value-taking in bsdtar (substitution, long-option carrier) but value-LESS in
+# GNU tar (--same-order, --verify). We cannot tell which tar runs, and the two readings disagree
+# about whether the next word is consumed — so an extraction naming one of these fails closed
+# (destinations unknown, treated as a config write) rather than guessing (an earlier version read
+# them as always-consuming, which let GNU `tar -xs -C .claude -C hooks` drop the folded -C).
+_TAR_AMBIGUOUS_OPTS = frozenset("sW")
+_TAR_VALUE_OPTS = _TAR_ARG_OPTS | _TAR_AMBIGUOUS_OPTS
 # A cumulative -C chain is refolded at each -C, so its cost grows with the square of its length.
 # Past this many the destination is unknown and the extraction fails closed.
 _MAX_TAR_DIRS = 64
@@ -941,6 +945,7 @@ class _TarWord(NamedTuple):
     maybe_value: bool  # may consume the next word as its value
     roles: list[str]  # roles of the next words it consumes ("dir"/"exclude"/"arg")
     inline: list[tuple[str, str]]  # (role, value) pairs carried inside the word
+    ambiguous: bool = False  # carries a -s/-W whose arity differs between GNU tar and bsdtar
 
 
 def _short_flags(args: list[str], arg_opts: frozenset[str]) -> set[str]:
@@ -976,7 +981,7 @@ def _names_tar_extract(word: str) -> bool:
         for ch in word[1:]:
             if ch == "x":
                 return True
-            if ch in _TAR_ARG_OPTS:
+            if ch in _TAR_VALUE_OPTS:
                 return False  # the rest of the cluster is this option's value
     return False
 
@@ -1007,36 +1012,25 @@ def _tar_options(word: str, first: bool) -> Optional[_TarWord]:
         return _tar_long_option(word)
     if word.startswith("-") and len(word) > 1:
         # A cluster ends at its first value letter; the value is the rest, else the next word.
-        j = next((j for j, ch in enumerate(word) if j and ch in _TAR_ARG_OPTS), len(word))
+        j = next((j for j, ch in enumerate(word) if j and ch in _TAR_VALUE_OPTS), len(word))
         reads = bool(set(word[1:j]) & _TAR_READ_MODES)
         if j == len(word):
             return _TarWord(reads, False, [], [])
+        ambiguous = word[j] in _TAR_AMBIGUOUS_OPTS
         kind = _tar_value_kind(word[j])
-        return _TarWord(reads, False, [], [(kind, word[j + 1 :])]) if word[j + 1 :] else _TarWord(reads, False, [kind], [])
+        rest = word[j + 1 :]
+        return _TarWord(reads, False, [], [(kind, rest)], ambiguous) if rest else _TarWord(reads, False, [kind], [], ambiguous)
     if first and word[:1].isalpha():
         # Old-style keys: "tar xf a.tar", "tar Cxf dir a.tar". Each value letter takes the next
         # word, in key order.
         return _TarWord(
-            bool(set(word) & _TAR_READ_MODES), False, [_tar_value_kind(ch) for ch in word if ch in _TAR_ARG_OPTS], []
+            bool(set(word) & _TAR_READ_MODES),
+            False,
+            [_tar_value_kind(ch) for ch in word if ch in _TAR_VALUE_OPTS],
+            [],
+            bool(set(word) & _TAR_AMBIGUOUS_OPTS),
         )
     return None
-
-
-def _tar_to_stdout(args: list[str]) -> bool:
-    """True if tar writes members to stdout or a command (`-O`, `--to-stdout`, `--to-command`),
-    so it never writes into its -C directory."""
-    for word in args:
-        if word.startswith("--"):
-            name = word[2:].split("=", 1)[0]
-            if name.startswith("to-s") or name.startswith("to-c"):  # to-stdout / to-command
-                return True
-        elif word.startswith("-") and len(word) > 1:
-            for ch in word[1:]:
-                if ch == "O":
-                    return True
-                if ch in _TAR_ARG_OPTS:
-                    break  # the rest is this option's value
-    return False
 
 
 def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
@@ -1047,7 +1041,7 @@ def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
     A read-only mode counts only in a word no option can be taking as its value, so a mode-looking
     value (`--suffix -t`, old-style `tar f -t`, bsdtar `-s/t/t/`) cannot hide an extraction that
     TAR_OPTIONS supplies. A valid tar always names a mode, so no visible mode at all counts as an
-    extraction. `-O`/`--to-stdout` writes to stdout, not the dir, so it is not an extraction here.
+    extraction.
 
     Which long options take a value is not enumerated, because a missing required-value entry
     would be a bypass. A word-less long option not known to be a flag (`_TAR_FLAG_LONG`) may or
@@ -1057,9 +1051,11 @@ def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
 
     The destinations are every word except a certain --exclude/-X value, which keeps members out,
     plus each cumulative -C directory: `-C .claude -C hooks` lands in `.claude/hooks` though no
-    single word says so. None means the -C chain is too long to fold.
+    single word says so. None (destinations unreadable) is returned when the -C chain is too long
+    to fold or a `-s`/`-W` of ambiguous GNU-vs-bsdtar arity is present, so an extraction fails
+    closed rather than being scanned with a guessed word boundary.
     """
-    extracts = read = False
+    extracts = read = ambiguous = False
     destinations: list[str] = []
     cwd = ""
     dirs = 0
@@ -1090,6 +1086,7 @@ def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
             continue
         maybe_value = options.maybe_value
         read = read or (certain and options.reads)
+        ambiguous = ambiguous or options.ambiguous
         kinds, inline = options.roles, options.inline
         if not certain:
             destinations.append(word)
@@ -1098,8 +1095,9 @@ def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
         for kind, value in inline:
             take(kind, value)
         roles.extend(kinds)
-    extraction = (extracts or not read) and not _tar_to_stdout(args)
-    return extraction, destinations if dirs <= _MAX_TAR_DIRS else None
+    extraction = extracts or not read
+    readable = destinations if dirs <= _MAX_TAR_DIRS and not ambiguous else None
+    return extraction, readable
 
 
 def _unzip_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
@@ -1189,51 +1187,11 @@ def _names_config_dir(arg: str) -> bool:
     return alternatives is None or any(_path_names_config_dir(alt) for alt in alternatives)
 
 
-def _env_option_words(token: str) -> list[str]:
-    """Option words an env assignment `NAME=value` carries into an extractor, else []."""
-    name, eq, value = token.partition("=")
-    return value.split() if eq and name in _ARCHIVE_ENV_VARS else []
+_TAR_ENV_RE = re.compile(r"\bTAR_OPTIONS\b")
+_UNZIP_ENV_RE = re.compile(r"\b(?:UNZIP|UNZIPOPT)\b")
 
 
-def _archive_commands(ast_nodes: list) -> list[tuple[str, list[str]]]:
-    """(name, args) per command node, with option words from a prefix `TAR_OPTIONS=`/`UNZIP=`/
-    `UNZIPOPT=` assignment folded onto the end of that command's args.
-
-    `TAR_OPTIONS=-C.claude/hooks tar -xf a.tar` sets the option in tar's environment, and
-    extract_commands_with_args drops the assignment, so the `-C` would otherwise be invisible.
-    """
-    results: list[tuple[str, list[str]]] = []
-
-    def visit(node) -> None:
-        if not hasattr(node, "kind"):
-            return
-        if node.kind == "command" and getattr(node, "parts", None):
-            words: list[str] = []
-            env_words: list[str] = []
-            for part in node.parts:
-                word = getattr(part, "word", None)
-                if word is None:
-                    continue
-                if getattr(part, "kind", None) == "assignment":
-                    env_words.extend(_env_option_words(word))
-                elif getattr(part, "kind", None) == "word":
-                    words.append(word)
-            if words:
-                results.append((words[0], words[1:] + env_words))
-        for attr in ("parts", "command", "list", "pipe", "compound"):
-            child = getattr(node, attr, None)
-            if isinstance(child, list):
-                for item in child:
-                    visit(item)
-            elif child is not None:
-                visit(child)
-
-    for node in ast_nodes or []:
-        visit(node)
-    return results
-
-
-def _extracts_into_config_dir(commands_with_args: list[tuple[str, list[str]]]) -> bool:
+def _extracts_into_config_dir(commands_with_args: list[tuple[str, list[str]]], command: str = "") -> bool:
     """True if a command extracts an archive (tar/bsdtar, unzip, 7z) into a config directory.
 
     Reads the parser's argv, never the raw text, so quoting, redirections, grouping and line
@@ -1242,17 +1200,24 @@ def _extracts_into_config_dir(commands_with_args: list[tuple[str, list[str]]]) -
 
     Any command that is neither an extractor nor a bare reader (`_SELF_PROTECTION_READ_ALLOWLIST`)
     is treated as a possible runner and looked through at EVERY word that names an extractor, the
-    way `_shell_delegated_payloads` re-enters wrappers: a runner allowlist is never complete
-    (LAB-4907), so gating a fail-closed check on one is the bypass. `env NAME=value` operands
-    before the extractor are folded in too. The price is an over-block when a non-reader names an
-    extractor before a config dir (`rg tar .claude/hooks`, `sudo grep -rn tar .claude/hooks`); the
-    same line through a bare reader (`grep`, `cat`) is not blocked, and a program handed to a
+    way `_shell_delegated_payloads` re-enters wrappers: a runner allowlist is never complete, so
+    gating a fail-closed check on one is the bypass. The price is an over-block when a non-reader
+    names an extractor before a config dir (`rg tar .claude/hooks`, `git log -G tar -- .claude/hooks`);
+    the same line through a bare reader (`grep`, `cat`) is not blocked, and a program handed to a
     shell (`bash -c`, a shell heredoc) is re-validated by Step 5c, which runs this check again.
+
+    `TAR_OPTIONS`/`UNZIP`/`UNZIPOPT` inject option words (a `-C`/`-d` we cannot see) into an
+    extractor's environment. They reach it from an `export`, a `declare`, a `printf -v`, a prefix
+    assignment or an `env NAME=value` operand — all invisible to a single command's argv — so an
+    extraction is failed closed on the mere presence of the variable name in the raw command. The
+    cost is an over-block of a genuinely-elsewhere extraction that also sets `TAR_OPTIONS`.
 
     Any of the extractor's own words naming the dir counts: the target option ("-C dir",
     "--directory=dir", "-d dir", "-odir"), a member filter ("tar -xf a.tar .claude/hooks"
     recreates the dir under the cwd) and a member rewrite (--transform, bsdtar -s) alike.
     """
+    tar_env = bool(_TAR_ENV_RE.search(command))
+    unzip_env = bool(_UNZIP_ENV_RE.search(command))
     for name, args in commands_with_args:
         base = name.rsplit("/", 1)[-1].lower()
         if base in _EXTRACTOR_SCANS:
@@ -1264,11 +1229,15 @@ def _extracts_into_config_dir(commands_with_args: list[tuple[str, list[str]]]) -
             positions = [i for i, word in enumerate(names) if word in _EXTRACTOR_SCANS]
             if len(positions) > _MAX_WRAPPED_EXTRACTORS:
                 return True
-            env_words = [w for arg in args for w in _env_option_words(arg)]
-            wrapped = [(names[i], args[i + 1 :] + env_words) for i in positions]
+            wrapped = [(names[i], args[i + 1 :]) for i in positions]
         for extractor, extractor_args in wrapped:
             extracts, destinations = _EXTRACTOR_SCANS[extractor](extractor_args)
-            if extracts and (destinations is None or any(_names_config_dir(word) for word in destinations)):
+            if not extracts:
+                continue
+            if destinations is None or any(_names_config_dir(word) for word in destinations):
+                return True
+            # An env carrier could supply the -C/-d that names the dir; we cannot see the value.
+            if (extractor in _TAR_NAMES and tar_env) or (extractor == "unzip" and unzip_env):
                 return True
     return False
 
@@ -1302,9 +1271,12 @@ def _check_self_protection(command: str, parsed_segments: Optional[list[str]] = 
     extraction names only a config *directory*, so validate_command checks it on the parsed
     argv instead (`_extracts_into_config_dir`), with the same hard-coded result.
 
-    Known limitation: Variable indirection (e.g., f=config.yaml; rm "$f") can bypass
-    this check because the expanded path doesn't appear in the command string. Mitigated
-    by YAML rule matching and hook-level file_path checks.
+    Known limitation: indirection that removes the path or the command name from the text
+    bypasses this check. Variable indirection on the path (f=config.yaml; rm "$f") hides the
+    path; command-name indirection on the extractor check (a renamed binary ./tar, an alias, a
+    shell function, hash -p, or $var) hides the verb. Both are mitigated by YAML rule matching
+    and hook-level file_path checks, and closed only by an at-rest integrity control on the
+    config files, not by more command grammar.
 
     Args:
         command: Command string to check
@@ -3292,9 +3264,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 
             # SELF-PROTECTION: an archive extraction into a config directory, read from the
             # parsed argv. Hard-coded like Step 3, and ahead of the substitution pass so a
-            # `$(tar …)` is refused by this rule rather than by whatever that pass matches.
+            # `$(tar …)` is refused by this rule rather than by whatever that pass matches. The
+            # raw command is passed for the env-carrier check, which cannot be seen in one argv.
             commands_with_args = parser.extract_commands_with_args(ast)
-            if _extracts_into_config_dir(_archive_commands(ast)):
+            if _extracts_into_config_dir(commands_with_args, command):
                 return _make_self_protection_result(command)
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
@@ -3783,6 +3756,7 @@ def clear_caches() -> None:
         - Validation result cache
         - RuleEngine cache
         - Parser cache
+        - The config-dir path memo
     """
     global _global_rule_engine, _global_rule_engine_path, _global_parser, _global_substitution_validator  # noqa: PLW0603
     global _global_cache_path  # noqa: PLW0603
@@ -3792,3 +3766,4 @@ def clear_caches() -> None:
     _global_rule_engine_path = None
     _global_parser = None
     _global_substitution_validator = None
+    _names_config_dir.cache_clear()
