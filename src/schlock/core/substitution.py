@@ -585,23 +585,35 @@ def _split_git_alias(value: str) -> list[str] | None:
     return None if quote else words
 
 
-def _alias_exec_path_override(alias_value: str) -> str | None:
-    """git feeds a non-! alias back through its global-option parser, so
-    `alias.x=--exec-path=DIR gc` redirects the exec path. An alias git itself cannot split
-    fails in git too; refuse it rather than guess at its words."""
-    alias_words = _split_git_alias(alias_value)
-    if alias_words is None:
+def _git_alias_reason(alias_value: str) -> str | None:
+    """Return a reason if a non-! alias VALUE arms an exec, else None.
+
+    git feeds the alias's words back through its global-option parser, so the value can carry
+    `--exec-path=DIR`, an RCE `-c` key, or a nested alias. An alias git itself cannot split
+    fails in git too; refuse it rather than guess at its words.
+
+    Nothing here trusts word position: bashlex has already dropped the quotes inside the value,
+    so a nested `-c 'alias.y=... --exec-path=DIR'` arrives split at the wrong places. So any
+    word containing `--exec-path=` is refused, and every word is judged as if it were a `-c`
+    value. Each word is a strict substring of the value, so the recursion ends.
+    """
+    words = _split_git_alias(alias_value)
+    if words is None or any("--exec-path=" in word for word in words):
         return GIT_EXEC_PATH_REASON
-    return _git_exec_path_override(alias_words)
+    for word in words:
+        reason = dangerous_git_config(["-c", word])
+        if reason:
+            return reason
+    return None
 
 
 def dangerous_git_config(args: list[str]) -> str | None:
     """Return a reason string if `args` (a git command's word-args) sets a -c config that
     executes arbitrary commands or redirects git's exec path (`--exec-path=DIR`), else None.
     Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
-    `alias.` is dangerous when the alias VALUE starts with `!` (shell-command alias) or sets
-    `--exec-path=`; a `!` elsewhere (e.g. a `--grep` pattern) is an ordinary git alias. Pure; the single
-    source of truth shared by SubstitutionValidator and top-level validation.
+    `alias.` is dangerous when the alias VALUE starts with `!` (shell-command alias) or its
+    words arm an exec (see `_git_alias_reason`); a `!` elsewhere (e.g. a `--grep` pattern) is an
+    ordinary git alias. Pure; the single source of truth shared by SubstitutionValidator and top-level validation.
     """
     exec_path_reason = _git_exec_path_override(args)
     if exec_path_reason:
@@ -622,7 +634,7 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     # (alias.<name>=!cmd). A '!' elsewhere is a normal git-subcommand alias.
                     _, _, alias_value = config_val.partition("=")
                     if not alias_value.lstrip().startswith("!"):
-                        alias_reason = _alias_exec_path_override(alias_value)
+                        alias_reason = _git_alias_reason(alias_value)
                         if alias_reason:
                             return alias_reason
                         continue

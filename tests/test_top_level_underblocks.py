@@ -206,9 +206,39 @@ class TestGitExecPathOverride:
         # An alias git cannot split is refused rather than guessed at.
         assert dangerous_git_config(["-c", "alias.x=log 'unclosed", "x"]) is not None
         assert dangerous_git_config(["-c", "alias.x=log x\\", "x"]) is not None
-        # A plain alias, and one whose operand merely mentions the option, stay allowed.
+        # A plain alias stays allowed.
         assert dangerous_git_config(["-c", "alias.x=log --oneline", "x"]) is None
-        assert dangerous_git_config(["-c", "alias.x=grep -e --exec-path=x", "x"]) is None
+        # By design an alias word shaped like the option blocks even as an operand: bashlex has
+        # dropped the quotes inside the value, so word positions there cannot be trusted.
+        assert dangerous_git_config(["-c", "alias.x=grep -e --exec-path=x", "x"]) is not None
+        # A nested ! alias is caught by the same recursion.
+        assert dangerous_git_config(["-c", "alias.x=-c alias.y=!sh y", "x"]) is not None
+        # Words split off their -c are still judged as -c values.
+        assert dangerous_git_config(["-c", "alias.x=-c alias.y=-c core.pager=/tmp/p log y", "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x=-c alias.y=-c alias.z=--exec-path=/tmp/e z y", "x"]) is not None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A nested alias carries the override one or more levels down.
+            """git -c alias.x='-c alias.y="--exec-path=/tmp/evil gc" y' x""",
+            """git -c alias.x='-calias.y="--exec-path=/tmp/evil gc" y' x""",
+            r"""git -c alias.x='-c alias.y="-c alias.z=\"--exec-path=/tmp/evil gc\" z" y' x""",
+            'echo "$(git -c alias.x=\'-c alias.y="--exec-path=/tmp/evil gc" y\' x)"',
+            # An alias carries an RCE -c key, like the one the top-level -c check blocks.
+            "git -c alias.x='-c core.pager=/tmp/evil/p log' x",
+            "echo \"$(git -c alias.x='-c core.pager=/tmp/evil/p log' x)\"",
+            "git -c alias.x='-c core.fsmonitor=/tmp/evil/p status' x",
+            # ...or one nested a level down, where bashlex's lost quotes split it off its -c.
+            """git -c alias.x='-c alias.y="-c core.pager=/tmp/evil/p log" y' x""",
+            # Quotes inside the value are lost before the split, so position cannot hide it.
+            """git -c alias.x='-c "k=a b" --exec-path=/tmp/evil gc' x""",
+            'echo "$(git -c alias.x=\'-c "k=a b" --exec-path=/tmp/evil gc\' x)"',
+        ],
+    )
+    def test_alias_nesting_keys_and_lossy_words_block(self, command):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False), command
 
 
 class TestReadsStdinAsProgram:
