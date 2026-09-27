@@ -456,6 +456,9 @@ Override with `SCHLOCK_AUDIT_LOG` in the `env` block of your own `~/.claude/sett
 - A value ending in `.jsonl` is used as a single file.
 - Any other value is a directory, and schlock writes `audit-YYYY-MM-DD.jsonl` inside it.
 - `/dev/null` (`NUL` on Windows) disables logging.
+- Keep the path outside any repository you open. schlock appends to whatever the path resolves
+  to, so a file or directory inside a repository can be replaced by a link that repository
+  commits, and the audit line then lands wherever that link points.
 
 schlock reads this value from `~/.claude/settings.json` only. It ignores `SCHLOCK_AUDIT_LOG` in the
 process environment, so a shell `export` is not honoured. Claude Code passes every settings file's
