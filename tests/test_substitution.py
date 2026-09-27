@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from schlock.core import validator as validator_module
-from schlock.core.parser import BashCommandParser
+from schlock.core.parser import _INLINE_CODE_FLAGS, SHELL_COMMANDS, BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
     DANGEROUS_SUBSTITUTION_COMMANDS,
@@ -58,6 +58,51 @@ class TestSubstitutionConstants:
         """No command should be in both lists."""
         overlap = SAFE_SUBSTITUTION_COMMANDS & DANGEROUS_SUBSTITUTION_COMMANDS
         assert len(overlap) == 0, f"Commands in both lists: {overlap}"
+
+    def test_every_shell_is_dangerous_in_a_substitution(self):
+        """The substitution set takes its shells from the one shell set, so none can be missing."""
+        assert SHELL_COMMANDS <= DANGEROUS_SUBSTITUTION_COMMANDS
+
+    def test_inline_code_flags_shell_rows_unchanged(self):
+        """Deriving the shell rows from SHELL_COMMANDS gives every shell exactly `-c`, as the literal rows did."""
+        shell_rows = {name: flags for name, flags in _INLINE_CODE_FLAGS.items() if name in SHELL_COMMANDS}
+        assert shell_rows == {
+            "bash": frozenset({"-c"}),
+            "sh": frozenset({"-c"}),
+            "zsh": frozenset({"-c"}),
+            "dash": frozenset({"-c"}),
+            "ksh": frozenset({"-c"}),
+            "ash": frozenset({"-c"}),
+            "fish": frozenset({"-c"}),
+            "rbash": frozenset({"-c"}),
+            "csh": frozenset({"-c"}),
+            "tcsh": frozenset({"-c"}),
+        }
+
+
+class TestEveryShellBlockedInSubstitution:
+    """A shell run inside a substitution is BLOCKED whichever shell it is.
+
+    ash, rbash, csh and tcsh used to fall through to "Unknown command in substitution" (HIGH),
+    which asks under balanced and allows under permissive, while bash was BLOCKED. The
+    substitution is quoted so ShellCheck's SC2046 (unquoted substitution) cannot block the
+    command on its own and hide the substitution verdict.
+    """
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            "echo \"$({shell} -c 'echo hi')\"",
+            "echo \"`{shell} -c 'echo hi'`\"",
+            "cat <({shell} -c 'echo hi')",
+        ],
+        ids=["dollar-paren", "backtick", "process-input"],
+    )
+    @pytest.mark.parametrize("shell", sorted(SHELL_COMMANDS))
+    def test_shell_in_substitution_blocked(self, shell, shape):
+        result = validate_command(shape.format(shell=shell))
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert not result.allowed
 
 
 class TestSubstitutionDataClasses:

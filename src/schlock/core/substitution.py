@@ -26,7 +26,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
-from .parser import EXEC_CHILD_ATTRS, _resolve_multicall, without_fd_variables
+from .parser import EXEC_CHILD_ATTRS, SHELL_COMMANDS, _resolve_multicall, without_fd_variables
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -369,13 +369,7 @@ DANGEROUS_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         "netcat",
         "ncat",
         "socat",
-        # Shell interpreters (RCE via process substitution)
-        "bash",
-        "sh",
-        "zsh",
-        "dash",
-        "ksh",
-        "fish",
+        # Interpreters (RCE via process substitution); the shells are added below
         "python",
         "python3",
         "perl",
@@ -383,6 +377,9 @@ DANGEROUS_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
         "node",
         "php",
     }
+    # Shells come from the parser's one shell set, not a copy: a separate list here is how
+    # ash, rbash, csh and tcsh once rated HIGH in a substitution while bash was BLOCKED.
+    | SHELL_COMMANDS
 )
 
 
@@ -2463,11 +2460,6 @@ class SubstitutionValidator:
 
         if outer_cmd in DANGEROUS_SUBSTITUTION_COMMANDS:
             return True, f"Process substitution to shell interpreter: {outer_cmd}"
-
-        # Specifically check for shell interpreters
-        shell_interpreters = {"bash", "sh", "zsh", "dash", "ksh", "fish", "python", "python3", "perl", "ruby", "node"}
-        if outer_cmd in shell_interpreters:
-            return True, f"Process substitution to {outer_cmd} is arbitrary code execution"
 
         return False, ""
 

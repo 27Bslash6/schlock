@@ -404,11 +404,12 @@ class TieredParser:
 # segment has to carry it (extract_command_segments). One set, so the two answers
 # cannot drift apart. Both ask `heredoc_owner`, which sees past a wrapper.
 #
-# It is also the shell subset of STDIN_EXEC_INTERPRETERS below - that set is built FROM
-# it - and the validator's `-c` and heredoc-owner shell set, so a shell can never sit in
-# one surface and not the others. `python3 <<EOF` does execute its body, but as Python:
-# scanning it with bash rules is nonsense, for the reason the `-c` and `<<<` payload
-# rechecks cover shells only.
+# It is also the shell subset of STDIN_EXEC_INTERPRETERS and the shell rows of
+# _INLINE_CODE_FLAGS below, the shells of the substitution module's
+# DANGEROUS_SUBSTITUTION_COMMANDS, and the validator's `-c` and heredoc-owner shell set -
+# each built FROM it - so a shell can never sit in one surface and not the others.
+# `python3 <<EOF` does execute its body, but as Python: scanning it with bash rules is
+# nonsense, for the reason the `-c` and `<<<` payload rechecks cover shells only.
 #
 # `rbash`, `csh` and `tcsh` belong for the reason every shell here does: invoked with
 # no program source (no `-c`, no script operand) each reads and executes its stdin, a
@@ -649,16 +650,7 @@ STDIN_EXEC_INTERPRETERS = SHELL_COMMANDS | frozenset(
 # executing piped stdin). Interpreter-specific on purpose: bash -e/-m are NOT code flags
 # (errexit/monitor) and must stay dangerous, whereas perl/ruby -e and python -m ARE code.
 _INLINE_CODE_FLAGS = {
-    "bash": frozenset({"-c"}),
-    "sh": frozenset({"-c"}),
-    "zsh": frozenset({"-c"}),
-    "dash": frozenset({"-c"}),
-    "ksh": frozenset({"-c"}),
-    "ash": frozenset({"-c"}),
-    "fish": frozenset({"-c"}),
-    "rbash": frozenset({"-c"}),
-    "csh": frozenset({"-c"}),
-    "tcsh": frozenset({"-c"}),
+    **dict.fromkeys(SHELL_COMMANDS, frozenset({"-c"})),
     "python": frozenset({"-c", "-m"}),
     "python2": frozenset({"-c", "-m"}),
     "python3": frozenset({"-c", "-m"}),
