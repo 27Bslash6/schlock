@@ -632,6 +632,10 @@ class TestSubstitutionBetweenQuotedRuns:
         (sub,) = node.parts[1].parts
         assert command[sub.pos[0] : sub.pos[1]] == "$(x)"
 
+    @pytest.mark.skipif(
+        not hasattr(signal, "setitimer") or not hasattr(signal, "SIGALRM"),
+        reason="the budget and this test's wall-clock guard both need POSIX interval timers",
+    )
     def test_substitution_recovery_is_cpu_bounded(self, monkeypatch):
         """Recovery re-enters bashlex's parser, so it runs under the same budget as the parse (LAB-5659).
 
@@ -682,9 +686,9 @@ class TestSubstitutionBetweenQuotedRuns:
         seconds, and a hook that outlives its timeout fails open.
         """
         command = "echo " + "'a'`x`'b' " * 3200
-        started = time.perf_counter()
+        started = time.process_time()  # CPU, not wall: a loaded runner slows it without making it quadratic
         BashCommandParser().parse(command)
-        assert time.perf_counter() - started < 2.0
+        assert time.process_time() - started < 2.0
 
     @pytest.mark.parametrize(
         ("command", "expected"),
