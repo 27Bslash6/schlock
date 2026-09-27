@@ -399,26 +399,22 @@ class TieredParser:
         logger.warning(f"native parser tier failed{contract}: {exc}; {action}", exc_info=not in_contract)
 
 
-# Interpreters that EXECUTE their standard input as a program when given no program source.
-# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
-# those run a *named* command, not stdin-as-program, and are covered by the download->shell
-# and wrapper-command checks.
 # A heredoc body is inert text to `cat` and source code to `bash`, which decides
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
 # segment has to carry it (extract_command_segments). One set, so the two answers
 # cannot drift apart. Both ask `heredoc_owner`, which sees past a wrapper.
 #
-# `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
-# bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
-# one disagree about one interpreter - `rbash <<< X` blocks while `rbash <<EOF` does
-# not - which is exactly the drift the paragraph above says cannot happen.
+# It is also the shell subset of STDIN_EXEC_INTERPRETERS below - that set is built FROM
+# it - and the validator's `-c` and heredoc-owner shell set, so a shell can never sit in
+# one surface and not the others. `python3 <<EOF` does execute its body, but as Python:
+# scanning it with bash rules is nonsense, for the reason the `-c` and `<<<` payload
+# rechecks cover shells only.
 #
-# `csh`/`tcsh` are here for the same reason: like every Bourne-family shell, invoking
-# either with no program source (no `-c`, no script operand) makes it read and execute
-# its stdin as a command script - a heredoc or here-string included. LAB-2754 already
-# put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
-# the rbash drift with a different interpreter.
-_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
+# `rbash`, `csh` and `tcsh` belong for the reason every shell here does: invoked with
+# no program source (no `-c`, no script operand) each reads and executes its stdin, a
+# heredoc or here-string included. Separate copies of this list are how `rbash <<< X`
+# once blocked while `rbash <<EOF` did not, and how csh/tcsh repeated that drift.
+SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
 
 # Redirection operators whose operand is DATA rather than a path, and so must stay
 # out of the reconstruction that _redirect_words feeds (LAB-2760).
@@ -615,18 +611,12 @@ def _recover_dropped_substitutions(command: str, nodes: "list[Any]") -> None:
             stack.extend(child for child in children if isinstance(child, bashlex.ast.node))
 
 
-STDIN_EXEC_INTERPRETERS = frozenset(
+# Interpreters that EXECUTE their standard input as a program when given no program source.
+# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
+# those run a *named* command, not stdin-as-program, and are covered by the download->shell
+# and wrapper-command checks.
+STDIN_EXEC_INTERPRETERS = SHELL_COMMANDS | frozenset(
     {
-        "bash",
-        "sh",
-        "zsh",
-        "dash",
-        "ksh",
-        "ash",
-        "fish",
-        "rbash",  # restricted bash still execs its stdin; `rbash -c` is already in _SHELL_COMMANDS
-        "csh",  # execs stdin as a script like every other shell here; `csh -c` is in _SHELL_COMMANDS
-        "tcsh",  # same as csh - tcsh is its interactive superset, not a different stdin model
         "python",
         "python2",
         "python3",
@@ -752,6 +742,12 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
+# Child attributes a walker descends to find commands in argument words AND redirection targets:
+# "redirects"/"output" reach `wc <<< "$(cat x | sh)"` and `( : ) < "$(…)"` (LAB-4838).
+# Deliberately NOT used by the string-literal, heredoc-range and segment walkers: their ranges
+# suppress rule matches, so widening them can lower a verdict.
+EXEC_CHILD_ATTRS = ("parts", "command", "list", "pipe", "compound", "redirects", "output")
+
 
 def resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     """Resolve a multicall binary to its effective applet and that applet's args.
@@ -802,8 +798,9 @@ def _first_command_node(node: Any) -> Optional[Any]:
     handled separately by the recursive walk, so first-command is the right target here (#97) -
     unlike a here-string's shared fd, which any command in the group may read (`_command_nodes`).
 
-    Expressed via `_command_nodes` so the two security-critical traversals share ONE walk skeleton:
-    a future bashlex child-attr change cannot leave one of them silently under-scanning (LAB-2768).
+    Expressed via `_command_nodes`, as is `BashCommandParser._segment_nodes`, so every
+    security-critical command-node traversal shares ONE walk skeleton: a bashlex child-attr
+    change is one edit there and cannot leave one of them silently under-scanning (LAB-2768, LAB-4687).
     """
     return next(iter(_command_nodes(node)), None)
 
@@ -1002,7 +999,10 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
        substitution) raises: bashlex folded the operator into the word
        (`{fd}>\<newline>o`) and split the command where bash runs it whole.
     2. Only a word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection
-       other than `&>`/`&>>`, is looked at further.
+       other than `&>`/`&>>`, is looked at further. `{$v}` is an argument: an
+       expansion in the name, so bashlex never spells it `{name}`, which is how bash
+       reads it. `{$'fd'}` and `{$"fd"}` are arguments only because bashlex leaves
+       their quoting on the word.
     3. A line continuation anywhere in its enclosing top-level word raises: inside a
        word that holds one, bashlex's offsets stop tracking the source. This comes
        before rule 4, so a continuation is refused even around a quoted word.
@@ -1166,7 +1166,7 @@ def heredoc_owner(node: Any) -> Optional[str]:
     if not words:
         return None
     if words[0] in WRAPPER_COMMANDS:
-        return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), words[0])
+        return next((word for word in words[1:] if word in SHELL_COMMANDS), words[0])
     return words[0]
 
 
@@ -1411,7 +1411,7 @@ class BashCommandParser:
                         results.append((words[0], words[1:]))
 
                 # Recursively visit child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                for attr in EXEC_CHILD_ATTRS:
                     if hasattr(node, attr):
                         child = getattr(node, attr)
                         if isinstance(child, list):
@@ -1430,8 +1430,8 @@ class BashCommandParser:
 
         SECURITY CRITICAL (LAB-2768): `bash <<< "rm -rf /"` feeds the here-string to bash's
         stdin, and a bare shell runs its stdin as a program - the same "argument is code, not
-        data" sink as `bash -c PROG`, but the here-string hangs off a *redirect* node that
-        `extract_commands_with_args` skips. So `_shell_delegated_payloads` sees `('bash', [])`,
+        data" sink as `bash -c PROG`, but the here-string is a *redirect* word that
+        `extract_commands_with_args` never reads as a payload. So `_shell_delegated_payloads` sees `('bash', [])`,
         no payload, no recursion, and the delegated `rm -rf /` degrades to HIGH (allowed by the
         permissive preset).
 
@@ -1454,7 +1454,7 @@ class BashCommandParser:
                 found = _here_string_program(node)
                 if found is not None:
                     results.append(found)
-            for attr in ["parts", "command", "list", "pipe", "compound"]:
+            for attr in EXEC_CHILD_ATTRS:
                 child = getattr(node, attr, None)
                 if isinstance(child, list):
                     for item in child:
@@ -1487,7 +1487,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        executes_body = heredoc_owner(node) in _HEREDOC_SHELL_COMMANDS
+        executes_body = heredoc_owner(node) in SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -1500,51 +1500,11 @@ class BashCommandParser:
         return segment
 
     def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
-        """Collect the AST nodes that each form one independently-validated segment."""
-        nodes: list[Any] = []
+        """Collect the AST nodes that each form one independently-validated segment.
 
-        def visit(node):  # noqa: PLR0912 - AST traversal requires multiple branches
-            """Recursively visit AST nodes to collect command nodes."""
-            if hasattr(node, "kind"):
-                # Command nodes contain individual commands
-                if node.kind == "command" and hasattr(node, "pos"):
-                    nodes.append(node)
-                    return  # Don't recurse into command parts
-
-                # Pipeline nodes - visit each command in the pipeline
-                if node.kind == "pipeline" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind != "pipe":
-                            visit(part)
-                    return
-
-                # List nodes (;, &&, ||) - visit each command
-                if node.kind == "list" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind not in ("operator",):
-                            visit(part)
-                    return
-
-                # Compound commands (if, for, while, etc.) - recurse into body
-                if node.kind == "compound" and hasattr(node, "list"):
-                    for item in node.list if isinstance(node.list, list) else [node.list]:
-                        visit(item)
-                    return
-
-                # Recursively visit other child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
-
-        for node in ast_nodes or []:
-            visit(node)
-
-        return nodes
+        Delegates to `_command_nodes` so segment extraction shares the one walk skeleton (LAB-4687).
+        """
+        return [n for node in ast_nodes or [] for n in _command_nodes(node)]
 
     @staticmethod
     def _rebase(ranges: list[tuple], base: int, end: int) -> list[tuple]:
@@ -1963,7 +1923,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = in_process or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
+                        is_shell = in_process or parent_cmd in SHELL_COMMANDS
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -2141,6 +2101,73 @@ class BashCommandParser:
                 )
         return bodies
 
+    def mask_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> str:
+        """`command` with each outermost substitution body blanked, every offset kept.
+
+        SECURITY: a rule's gap stops at `;`, `|`, `&` and newlines so the
+        whole-command scan cannot pair one command's reader with the next command's
+        word. A separator inside a substitution is data, but a regex can only
+        balance so many paren levels, so a separator in a body nested deeper than
+        the gap balances ends it: `cat $(printf %s $(dirname $(pwd)) | head -1)/.env`
+        reads a `.env` and rated SAFE. bashlex already knows where each body ends,
+        at any depth. Blanking the bodies turns each substitution into one opaque
+        word and leaves every top-level separator in place, so a rule matched
+        against this text reaches past a substitution and still cannot cross into
+        another command.
+
+        Redirect targets are walked too (`cat < $(…)/.env`). A `parameter` node
+        has no children, so a `${…}` holding a substitution has its whole
+        interior blanked from the node's own span.
+
+        This reaches a target OUTSIDE every body. A target inside one is blanked
+        with it, so reaching that stays the rule's own gap's job.
+
+        Length-preserving, so the caller's literal and heredoc ranges still index
+        it. A span is blanked only when its opener is at the node's start and its
+        closer where _body_end looks: a `\\<newline>` earlier in the word moves
+        bashlex's offsets, and a span left as written only costs this pass a match.
+        """
+        from schlock.core.substitution import _SUBSTITUTION_INTRODUCERS  # noqa: PLC0415 - avoids an import cycle
+
+        spans: list[tuple[int, int]] = []
+
+        def visit(node: Any) -> None:
+            if not hasattr(node, "kind"):
+                return
+            pos = getattr(node, "pos", None)
+            if node.kind in ("commandsubstitution", "processsubstitution") and pos:
+                end = self._body_end(command, pos)
+                if end is not None and command.startswith(_SUBSTITUTION_INTRODUCERS, pos[0]):
+                    spans.append((self._body_start(command, pos[0]), end))
+                return  # An inner body is inside this one, blanked with it.
+            if node.kind == "parameter" and pos:
+                interior = command[pos[0] + 2 : pos[1] - 1]
+                if (
+                    command.startswith("${", pos[0])
+                    and command[pos[1] - 1 : pos[1]] == "}"
+                    and any(opener in interior for opener in _SUBSTITUTION_INTRODUCERS)
+                ):
+                    spans.append((pos[0] + 2, pos[1] - 1))
+                return
+            for attr in ("parts", "command", "list", "pipe", "compound", "redirects", "output"):
+                child = getattr(node, attr, None)
+                if isinstance(child, list):
+                    for item in child:
+                        visit(item)
+                elif child:
+                    visit(child)
+
+        for node in ast_nodes or []:
+            visit(node)
+        # One join, not a splice per body: 64 KB of `$(x)` is thousands of bodies.
+        pieces: list[str] = []
+        done = 0
+        for start, end in sorted(spans):  # Outermost bodies never overlap.
+            pieces += (command[done:start], " " * (end - start))
+            done = end
+        pieces.append(command[done:])
+        return "".join(pieces)
+
     @staticmethod
     def _body_start(command: str, part_start: int) -> int:
         """Where a substitution's body begins: past a backtick, or past `$(`, `<(` or `>(`."""
@@ -2227,7 +2254,7 @@ class BashCommandParser:
 
         def visit_children(node, visitor):
             """Recursively visit child nodes of an AST node."""
-            for attr in ("parts", "command", "list", "pipe", "compound"):
+            for attr in EXEC_CHILD_ATTRS:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -2396,7 +2423,7 @@ class BashCommandParser:
                     check_pipeline(node)
 
                 # Recurse into child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                for attr in EXEC_CHILD_ATTRS:
                     if hasattr(node, attr):
                         child = getattr(node, attr)
                         if isinstance(child, list):
