@@ -21,9 +21,9 @@
      heredoc delimiter (`<< 'EOF'`) outright, so for those commands there is no AST to walk
      and the shell *around* the heredoc would otherwise never be validated (LAB-2765).
      `_neuter_heredocs` / `_rewrite_openers` in `src/schlock/core/validator.py` recover it
-     with a hand-written lexer. This is one of two sanctioned non-AST paths that decide
-     command structure (the other is the arithmetic-shift rewrite below), and it holds only
-     while all four constraints do:
+     with a hand-written lexer. This is the only sanctioned non-AST path that decides
+     command structure (the arithmetic-`((` misparse below keys on bashlex's own AST), and it
+     holds only while all four constraints do:
      1. **Bounded reach** — two call sites. The fallback (`_neuter_heredocs`) runs only from
         `_validate_heredoc_command`, after bashlex has already raised a heredoc-shaped error.
         `_normalise_heredoc_delimiters` runs the same lexer *before* bashlex on any command
@@ -88,36 +88,30 @@
      nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
      shares the parse's CPU budget.
      The same bash-first rule applies.
-   - **Approved exception — the arithmetic-shift rewrite** (`_DoubleParen` /
-     `_neuter_arithmetic_shifts` in `src/schlock/core/validator.py`, Step 3b of
-     `_validate_command`). bashlex reads `(( 1<<b ))` as two subshells and the `<<` as a
-     heredoc opener, so the lines after it become an inert body while bash runs them. Before
-     bashlex, a hand-written matcher applies bash's matched-pair rule to every `((` in the text
-     and rewrites each `<<` inside a pair bash reads as arithmetic to the same-width `==`. It
-     holds only while all four constraints do:
-     1. **Never trusted alone** — the rewrite and the command as written are both validated
-        and the worse verdict wins. The as-written half is the pipeline without Step 3b, so
-        the join can deny more than that pipeline and never less. The matcher over-approximates
-        on purpose (every `((` is a candidate, since a missed one is the bypass), and an
-        over-fired rewrite can re-parent a real heredoc; the join is what makes that deny-side.
-        The join cannot recover a MISSED opener, so every opener is asked and dropped as
-        nested only when its own pair closes inside a region already collected - never by its
-        offset, since a decoy `((` whose quote bash never reads can swallow a real one. For the
-        same reason the command is scanned both with every `\<newline>` spliced and as
-        written, and the shifts either scan finds are rewritten: bash splices neither after an
-        escaped backslash nor inside a comment.
-     2. **Cannot-follow fails closed** — a pair it cannot follow (`_UnfollowableParenError`:
-        nesting too deep, a `case` or heredoc inside `$(…)`) is BLOCKED with that reason. Only
-        a pair that provably never closes is skipped, because bash runs none of that text.
-     3. **No verdicts of its own** beyond that refusal: the rewritten text goes through the
-        same flow, so the payload is denied by the rule it matches.
-     4. **Bounded** — the matcher does not run under the parse CPU budget. Its memos (every
-        pair it follows, every never-closes exit) keep ordinary shapes linear, but they cannot
-        cover an opener every earlier walk skipped inside a span, so each `_DoubleParen`
-        carries its own scan budget, `_PAREN_SCAN_BUDGET` characters read per character of
-        text. Running out raises `_UnfollowableParenError`, which denies. The two halves'
-        bashlex parses share one parse budget, because the as-written half skips the reset.
-     Every reading is decided by running bash first.
+   - **Approved exception — the arithmetic-`((` misparse guard** (`_double_paren_misparse` in
+     `src/schlock/core/validator.py`, in Step 4 after the bashlex parse). bashlex reads
+     `(( 1<<b ))` as two nested subshells and the `<<` as a heredoc opener, so the lines after
+     it become an inert body while bash runs them. This does NOT re-lex the text - four rounds
+     of a hand-written pre-parse scanner (a splice, a decoy `((` in a comment, an escaped
+     backslash, a mixed splice) each disagreed with bash's lexer at one point and re-opened the
+     bypass. Instead it keys on the tree bashlex itself builds for the misread and denies:
+     1. **Reads the AST, not the text** — the guard walks bashlex's own nodes. So where the
+        `((` sits and what splices, comments or quotes surround it - each of which broke the
+        scanner - never arise. It is the ONLY non-AST-driven structural decision this replaces.
+     2. **Keys on a shape bash cannot produce** — an outer subshell whose inner subshell child
+        has its opening `(` adjacent to the outer's (bashlex folds a `\<newline>` splice into
+        the opening reservedword, so this holds exactly when bash would splice `((`), AND the
+        closing `))` adjacent, AND a `<<`/`<<-` heredoc inside. bash reads `((` as arithmetic
+        only with both parens doubled and never leaves a real subshell's parens adjacent, so
+        the shape means bashlex-misread-arithmetic and nothing else. `(( i++ ))`, `while`, `if`
+        carry no heredoc and stay SAFE; `( ( 1<<b ) )` with a separator is real subshells.
+     3. **Runs after the phantom/misread checks and skips substitutions** — the quoted-delimiter
+        phantom refusals above already deny their inputs on their own reason, and a misparse
+        inside `$( … )` is the substitution validator's, which re-validates the body and reaches
+        this guard at that level. So this only names the deny where nothing else did.
+     4. **Bounded** — one AST walk, O(nodes); the bashlex parse it reads is already under
+        `PARSE_CPU_BUDGET`, so there is no separate scan to bound.
+     Every row of the shape was decided by running bash first (a filesystem-witness canary).
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.

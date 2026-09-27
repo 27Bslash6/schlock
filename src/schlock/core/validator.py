@@ -5,7 +5,6 @@ rule engine, and cache. It provides the main validate_command() API and
 handles configuration layering (plugin defaults → user → project).
 """
 
-import bisect
 import logging
 import re
 import subprocess
@@ -1237,20 +1236,6 @@ _OPAQUE_SPANS = {
 # Where `#` opens a comment and `case` is a keyword inside a `$(…)`: the same
 # places a word can start, plus the newline a comment ends on.
 _COMMENT_START_AFTER = _WORD_START_AFTER | frozenset("\n")
-# Where a `((` can start, for the candidate scan. Deliberately NOT a lexer: only
-# a backslash is honoured, so a `((` inside a quote, an expansion or a comment is
-# a candidate too. `_DoubleParen.is_arithmetic` decides each one on bash's real
-# rules, and this scan only chooses who gets asked.
-_OPENER_SCAN_RE = re.compile(r"[(\\]")
-
-# What a `<<` inside an arithmetic command is rewritten to. It MUST NOT contain a
-# `<<`: the rewrite recurses through validate_command, and a replacement that
-# still looks like a shift would never converge. It MUST be two characters, one
-# per character of the shift; the rewrite indexes it rather than zipping, so a
-# shorter one raises instead of leaving half the shift in place. `==` is the same
-# width, so the offsets of everything after it are undisturbed, and it still reads
-# as arithmetic in the parse-error messages where the rewritten text reaches a human.
-_ARITH_SHIFT = "=="
 
 # `_DoubleParen`'s scan budget, in characters read per character of text, plus a
 # floor for short commands. Every shape measured linear reads under 4x its length;
@@ -1331,54 +1316,6 @@ class _DoubleParen:
             except RecursionError:
                 raise _UnfollowableParenError("Quoting nested too deep inside `((` to follow") from None
         return self.text.startswith(")", close + 1)
-
-    def command_level_openers(self) -> list[int]:
-        """Offsets of every `((` that could be a command, ascending.
-
-        `is_arithmetic` answers *which reading* a `((` gets; it cannot be asked
-        *where a `((` is one*, because handed the inside of `echo '(( 1<<b ))'`
-        it reads bare parens and says arithmetic. This answers that, and it
-        answers it by OVER-APPROXIMATING on purpose: every `((` in the text is a
-        candidate, wherever it sits.
-
-        Tracking quotes, expansions and comments here was tried and removed. It
-        is the miss direction that fails open - a `((` not offered is a payload
-        left hidden - and two separate shapes reached it, each because bash
-        does not read the text the way a lexical scan does:
-
-        - a `'` in a heredoc BODY is not a quote to bash, but it pairs with a
-          later one and the span swallows the `((` between them, silently and
-          without raising, so no fallback can notice;
-        - bash does not splice `\\<newline>` inside a `#` comment, so removing
-          splices first buries a real opener inside what a scan then reads as
-          one comment line.
-
-        Over-firing is NOT free on its own. An extra `((` that pairs up can
-        rewrite a real heredoc opener, and a later heredoc then swallows lines
-        bash runs (`: # ((` ... `# ))` straddling `cat <<'X'`). It is safe because
-        Step 3b joins the rewrite's verdict with the unrewritten one, so an
-        over-fire can only deny more.
-
-        A `$((` is excluded because it is an expansion, not an arithmetic
-        command, and its over-block is tracked separately (27b-io/schlock#112).
-        The backslash IS honoured, so `\\((` - an escaped backslash, then a real
-        opener - is still found; a `(?<![$\\])` lookbehind loses that one.
-
-        No word-start gate either: bash accepts `then((`, `{((`, `!((` and
-        `time((`, and what a gate would exclude (`x=((`, `echo a((`) is a syntax
-        error it runs nothing of.
-        """
-        openers: list[int] = []
-        pos = 0
-        while True:
-            found = _OPENER_SCAN_RE.search(self.text, pos)
-            if found is None:
-                return openers
-            pos = found.end()
-            if found.group() == "\\":
-                pos += 1  # whatever follows is literal, `\\(` included
-            elif self.text.startswith("(", pos) and (found.start() == 0 or self.text[found.start() - 1] != "$"):
-                openers.append(found.start())
 
     def _paren(self, opening: int) -> int:
         """Offset of the `)` balancing the paren-level `(` at ``opening``, recording every pair passed.
@@ -1504,131 +1441,6 @@ class _DoubleParen:
         if found is None:
             raise ParseError(f"{what} never closes; bash reads no command from this text")
         return found
-
-
-def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tuple[int, int]]:
-    """The outermost arithmetic regions among ``openers``, as ``(first offset inside, offset of the `)`)``.
-
-    Every opener is asked, and one whose pair closes inside the region already
-    collected is dropped: its shifts are that region's. Asking a nested opener
-    whose pair an outer walk followed is a memo lookup, so `(( (( (( … )) )) ))`
-    costs one walk, not one per level.
-
-    Deciding the drop by the opener's OFFSET instead - before the last closer,
-    so nested - was a bypass. The walk that passed it may have skipped it inside
-    a quote or expansion bash never reads as one: in `# (( "` / `(( a" ))"+1<<b ))`
-    the comment's `"` swallows the real `((` and the decoy closes on the `))`
-    in its quote, before the `<<`. Only the opener's own answer says where its
-    pair closes.
-
-    Only an opener whose pair provably NEVER CLOSES is skipped: that is a bash
-    syntax error, bash runs none of the text, so nothing is hidden behind it.
-    An opener `_DoubleParen` cannot FOLLOW is a different answer and propagates
-    as `_UnfollowableParenError` - bash may evaluate that arithmetic and run the
-    lines after it, so dropping it is a bypass rather than a conservative skip.
-    Do not collapse the two arms back together.
-    """
-    regions: list[tuple[int, int]] = []
-    collected_to = -1
-    for opener in openers:
-        try:
-            if not dparen.is_arithmetic(opener):
-                continue
-        except _UnfollowableParenError:
-            raise  # not knowing is not the same as knowing bash runs nothing
-        except ParseError:
-            continue
-        closer = dparen.partners[opener + 1]
-        if closer < collected_to:
-            continue  # inside a region already collected, so its shifts are that region's
-        collected_to = closer
-        regions.append((opener + 2, closer))
-    return regions
-
-
-def _neuter_arithmetic_shifts(command: str) -> str:
-    """Rewrite a `<<` that bash reads as a left shift, not as a heredoc opener.
-
-    Bash reads `(( … ))` as one arithmetic command, so the `<<` in `(( 1<<b ))`
-    is a shift. bashlex reads the same bytes as two nested subshells, where
-    `1 <<b` is a command owning a heredoc delimited by `b` - and every line up to
-    a lone `b`, `rm -rf /` included, becomes a body that `extract_heredoc_ranges`
-    marks inert and no rule ever sees, while bash runs it.
-
-    The two readings are told apart by `_DoubleParen`, which already models
-    bash's matched-pair rule for the heredoc-fallback tier: the construct is
-    arithmetic iff the partner of the second `(` is immediately followed by
-    another `)`. That test is not decoration - `( ( 1<<b ) )` really is two
-    subshells and its `<<` really does open a heredoc, so a guard that fired on
-    both would start deleting genuine heredoc bodies.
-
-    Only the shift is rewritten, not the arithmetic around it: an arithmetic
-    subscript can carry a command substitution (`(( a[$(id)] ))`), and blanking
-    the region would hide it from the substitution validator - trading this
-    fail-open for another one. `<<<` is the exception: it is a here-string, and
-    mangling it would corrupt a command bash runs correctly.
-
-    Inside a vouched region almost every `<<` is a shift, because the shell
-    context that could hold a real heredoc - a `$(…)` - is one `_DoubleParen`
-    refuses to vouch for. A BACKTICK is not: it re-lexes as shell and can hold a
-    real heredoc, but `_paren` skips it opaquely rather than refusing, so
-    `(( 1 + `cat <<Z … Z` ))` has its opener rewritten to `cat ==Z`. Removing a
-    real opener is not deny-side by itself - a later heredoc can then swallow
-    what followed the body - which is why the caller never trusts this rewrite
-    over the unrewritten text (Step 3b's join).
-    """
-    # Bash removes `\<newline>` before it tokenizes the shell, so `(\<newline>(`
-    # is the same opener as `((`, and the scan reads the splice-free text. The
-    # rewrite does NOT: bash leaves a splice alone inside a quoted heredoc body,
-    # so handing the spliced text on joined `body \` to its terminator line and
-    # filed the commands after it as body (`SAFE` while bash ran them). Each
-    # shift is written back where it sits in ``command``, found through
-    # ``splices`` - where each removed splice sits in the scanned text.
-    #
-    # Splicing every `\<newline>` is itself a reading bash does not always make:
-    # it leaves one alone after an escaped backslash and inside a comment, and
-    # `# note \\` then `(( 1<<b ))` splices to `\((`, whose backslash hides the
-    # real opener. So the text as written is scanned too, and the shifts either
-    # scan finds are all rewritten: an extra one is deny-side under the join, a
-    # missed one is the bypass.
-    splices = [match.start() - 2 * k for k, match in enumerate(re.finditer(r"\\\n", command))]
-    spliced = command.replace("\\\n", "") if splices else command
-    if "((" not in spliced or "<<" not in spliced:
-        return command
-
-    shifts = _shift_offsets(spliced, splices)
-    if splices:
-        shifts |= _shift_offsets(command, [])
-    if not shifts:
-        return command
-    rewritten = list(command)
-    for first, second in shifts:
-        rewritten[first] = _ARITH_SHIFT[0]
-        rewritten[second] = _ARITH_SHIFT[1]
-    return "".join(rewritten)
-
-
-def _shift_offsets(text: str, splices: list[int]) -> set[tuple[int, int]]:
-    """Where each shift `_DoubleParen` vouches for in ``text`` sits in the command, one offset per `<`.
-
-    ``splices`` are where the removed `\\<newline>` pairs sat in ``text``; each
-    offset is mapped back past them, so a splice between the two `<` is honoured.
-    """
-    dparen = _DoubleParen(text)
-    shifts: set[tuple[int, int]] = set()
-    for start, closer in _arithmetic_regions(dparen, dparen.command_level_openers()):
-        pos = start
-        while True:
-            shift = text.find("<<", pos, closer)
-            if shift < 0:
-                break
-            pos = shift + 2
-            if text.startswith("<", pos):
-                pos += 1  # `<<<` is a here-string, not a shift
-                continue
-            first, second = (at + 2 * bisect.bisect_right(splices, at) for at in (shift, shift + 1))
-            shifts.add((first, second))
-    return shifts
 
 
 def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str, str]]:
@@ -2254,6 +2066,74 @@ class _BashlexHeredoc(NamedTuple):
     owner: Optional[str]  # what runs the body (`heredoc_owner`); None when it has none
     word: str  # the delimiter as bashlex took it: AS WRITTEN, quotes and all
     in_substitution: bool
+
+
+def _double_paren_misparse(nodes: list[Any]) -> bool:
+    """True when bashlex parsed a `(( … ))` arithmetic command as adjacent nested subshells
+    with a `<<` heredoc inside - the exact tree it builds for a shift it misreads as a
+    heredoc opener.
+
+    bash reads `((` as one arithmetic command, so a `<<` in it is a left shift; bashlex reads
+    it as `( ( … ) )`, where the `<<` opens a heredoc whose body swallows the lines after it -
+    inert to every rule, run by bash. The signature cannot be forged. bash reads arithmetic
+    only when BOTH the opening `((` and the closing `))` are adjacent - a real nested subshell
+    needs a separator on each side (`( ( … ) )`), so `((1<<b) )` with a spaced close is two
+    subshells to bash and its heredoc is real. bashlex folds a `\\<newline>` splice into the
+    opening reservedword, so whenever bash would splice `(\\<newline>(` into `((` the inner `(`
+    starts exactly where the outer one ends. Keyed on both adjacencies in bashlex's own AST,
+    the splice, comment and quote questions this used to scan for never arise.
+    """
+
+    def parens(compound: Any) -> Optional[tuple[Any, Any]]:
+        kids = getattr(compound, "list", None)
+        if not kids or getattr(kids[0], "kind", None) != "reservedword" or kids[0].word != "(":
+            return None
+        if getattr(kids[-1], "kind", None) != "reservedword" or kids[-1].word != ")":
+            return None
+        return kids[0], kids[-1]
+
+    def has_heredoc(node: Any) -> bool:
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if getattr(n, "kind", None) == "redirect" and getattr(n, "type", None) in ("<<", "<<-"):
+                return True
+            for value in vars(n).values():
+                for child in value if isinstance(value, list) else (value,):
+                    if hasattr(child, "kind"):
+                        stack.append(child)
+        return False
+
+    found = False
+
+    def visit(node: Any) -> None:
+        nonlocal found
+        kind = getattr(node, "kind", None)
+        # A misparse inside a `$( … )` or `` ` … ` `` is the substitution validator's to catch,
+        # which re-validates the body and reaches this guard at that level; walking in here too
+        # would only change which check names the deny, as the phantom guard also avoids.
+        if kind in ("commandsubstitution", "processsubstitution"):
+            return
+        outer = parens(node) if kind == "compound" else None
+        if outer is not None:
+            for child in node.list:
+                inner = parens(child) if getattr(child, "kind", None) == "compound" else None
+                if (
+                    inner is not None
+                    and inner[0].pos[0] == outer[0].pos[1]  # `((` adjacent
+                    and inner[1].pos[1] == outer[1].pos[0]  # `))` adjacent
+                    and has_heredoc(child)
+                ):
+                    found = True
+                    return
+        for value in vars(node).values():
+            for child in value if isinstance(value, list) else (value,):
+                if hasattr(child, "kind"):
+                    visit(child)
+
+    for node in nodes:
+        visit(node)
+    return found
 
 
 def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHeredoc]:
@@ -2913,7 +2793,6 @@ def validate_command(
     _depth: int = 0,
     _shellcheck: bool = True,
     _derived: bool = False,
-    _as_written: bool = False,
 ) -> ValidationResult:
     """Validate a command for safety — the main validation API.
 
@@ -2924,12 +2803,12 @@ def validate_command(
     back down to HIGH merely by having a substitution appended. Whatever returns first, the
     worse verdict wins.
 
-    ``_depth``, ``_shellcheck``, ``_derived`` and ``_as_written`` are internal, keyword-only; see
+    ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
     :func:`_validate_command`.
     """
-    if _depth == 0 and not _derived and not _as_written:
-        # A new command gets a fresh parse budget; re-entries for its payloads, heredoc
-        # rewrites and Step 3b's two halves share the one it is spending (LAB-5659).
+    if _depth == 0 and not _derived:
+        # A new command gets a fresh parse budget; re-entries for its payloads and heredoc
+        # rewrites share the one it is spending (LAB-5659).
         reset_parse_budget()
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
@@ -2939,7 +2818,6 @@ def validate_command(
         _deferred=deferred,
         _shellcheck=_shellcheck,
         _derived=_derived,
-        _as_written=_as_written,
     )
     if not deferred:
         return result
@@ -2973,7 +2851,6 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
     _deferred: list[SubstitutionValidationResult],
     _shellcheck: bool = True,
     _derived: bool = False,
-    _as_written: bool = False,
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
@@ -3011,13 +2888,9 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             with ShellCheck on, deliberately - ShellCheck never reads inside a `-c` string, so that
             re-entry is the payload's only check.
         _derived: Internal, keyword-only. True when ``command`` is text schlock produced from an
-            admitted command (a heredoc rewrite or one of its segments, or Step 3b's shift
-            rewrite), so the derived-text ceiling applies, not the caller's, and the parse budget
-            is the caller's too. Callers leave it False.
-        _as_written: Internal, keyword-only. True skips the Step 3b shift rewrite and judges
-            ``command`` as bashlex reads it - the other half of Step 3b's join - and leaves the
-            verdict out of the cache, since a fresh call would join it. Keeps the parse budget
-            it was called under. Callers leave it False.
+            admitted command (a heredoc rewrite or one of its segments), so the derived-text
+            ceiling applies, not the caller's, and the parse budget is the caller's too. Callers
+            leave it False.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -3070,69 +2943,6 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # Special case triggered, return result (don't cache, state may change)
             return special_check
 
-        # Step 3b: a `<<` inside `(( … ))` is a left shift to bash and a heredoc
-        # opener to bashlex, and the phantom body hides every line after it from
-        # the rules while bash runs them. Rewriting the shift hands
-        # those lines back to the flow below, which validates them on their
-        # merits - so the verdict comes from the rule the payload matches. Only
-        # the arithmetic command is handled here; `$(( … ))` is an expansion and
-        # is tracked separately (27b-io/schlock#112).
-        #
-        # The rewrite is judged ALONGSIDE the command as written, never instead
-        # of it, and the worse verdict wins. `command_level_openers` offers every
-        # `((` in the text, and one bash reads as a comment, a quote or a heredoc
-        # body can still pair up and rewrite a REAL opener - which re-parents the
-        # body after it: `: # ((` over `cat <<'X'` ... `# ))` let a later heredoc
-        # swallow the lines bash ran, and the rewrite alone said SAFE. Joined, an
-        # over-fired rewrite can deny more than the unrewritten reading, never less.
-        # The price is measured and pinned: a benign shift keeps the deny bashlex's
-        # own reading gives it.
-        #
-        # Rewriting a shift creates no parens and no new `<<`, so the regions are
-        # the same on a second pass and this recurses exactly once. That is the
-        # whole of it: the recursion is gated on the rewrite having CHANGED
-        # something, so a shift missed on the first pass gets no second pass and
-        # stays hidden. Under-firing here is a live bypass, which is why
-        # `command_level_openers` over-approximates rather than lexes.
-        neutered = command
-        if not _as_written:
-            try:
-                neutered = _neuter_arithmetic_shifts(command)
-            except _UnfollowableParenError as unfollowable:
-                # The `((` reading could not be followed, so whether the lines after
-                # it are a heredoc body or commands bash runs is unknown - and the
-                # bashlex reading below, which would decide it, is the one that is
-                # wrong about `((`. Deny, naming the construct: this is the one exit
-                # here that is a schlock decision rather than a rule match, and it
-                # says so.
-                return ValidationResult(
-                    allowed=False,
-                    risk_level=RiskLevel.BLOCKED,
-                    message=f"BLOCKED: {unfollowable}",
-                    alternatives=[
-                        "Simplify the arithmetic command so its `))` can be located",
-                        "Run the commands after the arithmetic separately",
-                    ],
-                    exit_code=1,
-                    error=str(unfollowable),
-                )
-        if neutered != command:
-            # ShellCheck runs once, on the half that is the text the user typed.
-            rewritten = validate_command(neutered, config_path, _depth=_depth, _shellcheck=False, _derived=True)
-            as_written = validate_command(
-                command, config_path, _depth=_depth, _shellcheck=_shellcheck, _derived=_derived, _as_written=True
-            )
-
-            # A tie goes to the half that names a rule, then to the rewrite: a deny should say why.
-            def rank(result: ValidationResult) -> tuple[RiskLevel, bool, bool]:
-                return result.risk_level, not result.allowed, bool(result.matched_rules)
-
-            arithmetic_result = as_written if rank(as_written) > rank(rewritten) else rewritten
-            if _depth == 0 and _shellcheck and not _deferred and not _as_written:
-                # Cached under what the user typed, with Step 7's guard; neither half cached itself.
-                _global_cache.set(command, arithmetic_result)
-            return arithmetic_result
-
         # Step 4: Parse command and extract AST context
         parser = _get_parser()
         # bashlex ends a heredoc at the delimiter as written, bash at the delimiter with
@@ -3181,6 +2991,30 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     error=error,
                 )
                 # Not cached: a parse-level refusal, like the parse errors below.
+
+            # A `<<` inside `(( … ))` is a left shift to bash and a heredoc opener to bashlex,
+            # so the phantom body hides every line after it from the rules while bash runs them.
+            # bashlex builds one unforgeable tree for that misread - two adjacent nested subshells
+            # with a `<<` inside - and this denies on it. It runs after the phantom/misread checks
+            # above, which already refuse the quoted-delimiter misreads on their own reason; this
+            # catches the rest, keyed on the AST so where the `((` sits and what quotes, splices or
+            # comments surround it - each of which defeated the pre-parse text scans this replaces -
+            # never arise.
+            if _double_paren_misparse(ast):
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=(
+                        "BLOCKED: `(( … ))` arithmetic containing `<<` is read as a subshell heredoc; "
+                        "the lines after it would run without validation"
+                    ),
+                    alternatives=[
+                        "Write the shift as `$(( a << b ))` if you meant arithmetic",
+                        "Run the commands after the arithmetic on their own lines",
+                    ],
+                    exit_code=1,
+                    error="bashlex parses `(( … ))` with a `<<` as nested subshells with a heredoc",
+                )
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
@@ -3316,7 +3150,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         error=None,
                         matched_rules=[],
                     )
-                    if _depth == 0 and _shellcheck and not _deferred and not _as_written:
+                    if _depth == 0 and _shellcheck and not _deferred:
                         _global_cache.set(command, result)
                     return result
 
@@ -3641,7 +3475,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # Nor when a substitution verdict is still owed a join: the cached entry would be the
         # pre-join verdict, and the next identical command would hit it and skip the join. Nor
         # the as-written half of Step 3b's join, for the same reason.
-        if _depth == 0 and _shellcheck and not _deferred and not _as_written:
+        if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)
 
         # Step 8: Return
