@@ -226,9 +226,8 @@ class TestSystemCredentialPathAnchorDensity:
 
     The `/etc/` branch carries an optional prefix run, and a run behind a
     walker is exactly the shape that went quadratic before. Measured at
-    authoring time: ~2.0x per doubling of anchor count (linear), against ~3.9x
-    for the pre-existing `.kube/` anchor, which is quadratic in base and head
-    alike and is tracked separately.
+    authoring time: ~2.0x per doubling of anchor count (linear) for the
+    reader, grep and redirect patterns alike.
 
     Mutation-checked rather than assumed: unbinding the prefix run takes the
     ratio to 4.07 and fails this test, so the guard can actually fail. A perf
@@ -238,30 +237,35 @@ class TestSystemCredentialPathAnchorDensity:
     other patterns already cost far more on the same input.
     """
 
-    def test_etc_anchor_density_is_linear(self, safety_rules_path):
+    @pytest.mark.parametrize(
+        ("marker", "lead"),
+        [
+            ("hexdump", "cat "),
+            ("rgrep", "grep "),
+            ("(?<!<)<>?", "nc x 1 < "),
+        ],
+    )
+    def test_etc_anchor_density_is_linear(self, safety_rules_path, marker, lead):
         # Take the compiled object the ENGINE built, not a local re.compile of
         # the YAML string: the engine compiles with re.MULTILINE, so a
         # hand-compile measures a regex that is not the one that ships. Select
         # it by content -- a positional index silently measures the wrong
         # pattern the day one is inserted above it.
         engine = RuleEngine(safety_rules_path)
-        # `hexdump` appears only in the 30-verb reader alternation, and `/etc/`
-        # only in the branches this ticket added -- together they name exactly
-        # one pattern. An earlier selector here used `"<" not in p.pattern` and
-        # silently picked the grep pattern instead, because the reader carries a
-        # `(?<![A-Za-z0-9])` lookbehind; the test still passed, measuring the
-        # wrong regex. Assert the match is unique rather than taking the first.
+        # Each marker appears in exactly one of the three `/etc/` patterns:
+        # `hexdump` in the reader alternation, `rgrep` in the grep family, the
+        # `<>?` anchor in the redirect. An earlier selector here silently picked
+        # the wrong pattern and still passed, so assert the match is unique
+        # rather than taking the first.
         candidates = [
-            p
-            for p in engine.compiled_patterns["extended_credential_exposure"]
-            if "hexdump" in p.pattern and "/etc/" in p.pattern
+            p for p in engine.compiled_patterns["extended_credential_exposure"] if marker in p.pattern and "/etc/" in p.pattern
         ]
         assert len(candidates) == 1, f"selector matched {len(candidates)} patterns"
         pattern = candidates[0]
 
-        small = "cat " + "/etc/" * 800
-        large = "cat " + "/etc/" * 1600
-        pattern.search("cat " + "/etc/" * 200)  # warm
+        small = lead + "/etc/" * 800
+        large = lead + "/etc/" * 1600
+        pattern.search(lead + "/etc/" * 200)  # warm
 
         # INTERLEAVED min-of-seven. Measuring all of one size and then all of
         # the other lets load drift between the two halves land entirely in the
