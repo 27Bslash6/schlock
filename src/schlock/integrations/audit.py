@@ -49,7 +49,7 @@ from typing import Any, Optional
 
 from platformdirs import user_data_dir
 
-from schlock.core.bounded_read import nonblocking_opener
+from schlock.core.bounded_read import open_regular
 
 
 def get_null_device() -> str:
@@ -216,9 +216,9 @@ class AuditLogger:
         Writes single line of JSON to audit log (append mode).
         Fails silently on I/O errors (audit logging is non-critical).
         """
-        # Fail silently - audit logging shouldn't break the hook. SCHLOCK_AUDIT_LOG can name a FIFO,
-        # so neither the open nor the write waits on a reader: one that falls behind loses lines.
-        with suppress(Exception), open(self.log_file, "a", opener=nonblocking_opener) as f:
+        # Fail silently - audit logging shouldn't break the hook. SCHLOCK_AUDIT_LOG can name a FIFO
+        # or a device: nothing waits on one, and nothing is written to anything but a regular file.
+        with suppress(Exception), open_regular(self.log_file, "a") as f:
             f.write(event.to_json() + "\n")
 
     def log_validation(

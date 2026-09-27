@@ -12,8 +12,9 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
-from schlock.core.bounded_read import MAX_CONFIG_BYTES, MAX_READ_BYTES, load_config, read_bounded
+from schlock.core.bounded_read import MAX_CONFIG_BYTES, MAX_FLOW_DEPTH, MAX_READ_BYTES, load_config, read_bounded
 
 HOOKS_DIR = Path(__file__).resolve().parent.parent / "hooks"
 
@@ -121,12 +122,18 @@ def test_unreadable_project_config_is_skipped(tmp_path, make_config, refusal):
     assert audit_log.stat().st_mode & 0o111 == 0, "the audit log is created with builtin open()'s mode"
 
 
-@linux_only
-def test_audit_log_fifo_does_not_stall_the_hook(tmp_path):
-    """SCHLOCK_AUDIT_LOG naming a FIFO with no reader loses the audit line, not the decision."""
-    audit_log = tmp_path / "audit.jsonl"
-    os.mkfifo(audit_log)
+def _stdout(path: Path) -> None:
+    path.symlink_to("/dev/stdout")
 
+
+@linux_only
+@pytest.mark.parametrize("make_audit_log", [os.mkfifo, _stdout], ids=["fifo-without-reader", "symlink-to-stdout"])
+def test_audit_log_that_is_not_a_regular_file_is_not_written(tmp_path, make_audit_log):
+    """SCHLOCK_AUDIT_LOG naming a FIFO or a device loses the audit line, never the decision."""
+    audit_log = tmp_path / "audit.jsonl"
+    make_audit_log(audit_log)
+
+    # _run_hook parses stdout as one JSON document, so an audit line written there fails it.
     proc, decision = _run_hook(tmp_path, audit_log)
 
     assert proc.returncode == 0, proc.stderr
@@ -167,3 +174,13 @@ def test_cap_is_inclusive(tmp_path, read, cap):
     read(at_cap)
     with pytest.raises(OSError, match="larger than"):
         read(over_cap)
+
+
+def test_flow_depth_cap_is_inclusive(tmp_path):
+    at_cap, over_cap = tmp_path / "at", tmp_path / "over"
+    at_cap.write_text("k: " + "[" * MAX_FLOW_DEPTH + "]" * MAX_FLOW_DEPTH + "\n")
+    over_cap.write_text("k: " + "[" * (MAX_FLOW_DEPTH + 1) + "]" * (MAX_FLOW_DEPTH + 1) + "\n")
+
+    load_config(at_cap)
+    with pytest.raises(yaml.YAMLError, match="nested more than"):
+        load_config(over_cap)
