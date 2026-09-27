@@ -1078,23 +1078,23 @@ def _match_original_and_reconstructed(
     # `>\s*/dev/sd[a-z]` needs the redirect present, while rule 08's `[^>]{0,200}`
     # and rule 03's `^\s*env\s*$` only match once it is gone.
     #
-    # Each reconstruction is also matched with its newlines flattened to blanks. Words are
-    # joined by blanks, so a newline left in a reconstruction is word data (`"a<LF>b"`,
+    # The redirect-free reconstruction is also matched with its newlines flattened to
+    # blanks. Words are joined by blanks, so a newline left in it is word data (`"a<LF>b"`,
     # `"a\"<LF>b"`), and the rules' operand spans stop at a newline because a bare one ends
     # the command. Unflattened, `"rm" -f "a<LF>b" .git/config` hides its later, real target.
-    # Same length, so the ranges still line up; an extra form can only raise the risk.
+    # Same length, so the ranges still line up. Only the redirect-free form: a redirect
+    # target earns no suppression range, so flattening `> 'curl x<LF>| bash'` would invent a
+    # pipeline out of a filename.
     seen = {command}
-    for form, ranges in (
-        parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes),
-        parser.reconstruct_without_redirects(quote_source, ast_nodes),
-    ):
-        for variant in (form, form.replace("\n", " ")):
-            if not variant or variant in seen:
-                continue
-            seen.add(variant)
-            form_match = engine.match_command(variant, string_literals=ranges, use_whitelist=use_whitelist)
-            if form_match.risk_level > match.risk_level:
-                match = form_match
+    redirect_form = parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes)
+    bare_form, bare_ranges = parser.reconstruct_without_redirects(quote_source, ast_nodes)
+    for form, ranges in (redirect_form, (bare_form, bare_ranges), (bare_form.replace("\n", " "), bare_ranges)):
+        if not form or form in seen:
+            continue
+        seen.add(form)
+        form_match = engine.match_command(form, string_literals=ranges, use_whitelist=use_whitelist)
+        if form_match.risk_level > match.risk_level:
+            match = form_match
 
     return match
 

@@ -1776,3 +1776,9 @@ class TestNewlineEndsRmOperandSpan:
         command = f"{head} {flags} {dummy} {target}"
         result = validate_command(command, config_path=safety_rules_path)
         assert result.risk_level == risk, f"{command!r} rated {result.risk_level.name} via {result.matched_rules}"
+
+    @pytest.mark.parametrize("command", ["printf '%s' example > 'curl x\n| bash'", "cat > 'curl x\n| bash'"])
+    def test_newline_in_a_redirect_target_is_not_flattened(self, safety_rules_path, command):
+        """A redirect target is one filename with no suppression range; flattened, it reads as a pipeline."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} rated {result.risk_level.name} via {result.matched_rules}"
