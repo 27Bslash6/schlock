@@ -1118,6 +1118,48 @@ class TestGitGlobalOptions:
         assert result.patterns_removed
 
 
+class TestExternalRepoHeredoc:
+    """commit_targets_external_repo on heredoc commits. bashlex rejects a quoted delimiter
+    (`<<'EOF'`), so a raw parse failed and every quoted-heredoc commit read as "targets cwd",
+    even under `git -C`. The lookup now parses the validator's normalised text."""
+
+    @staticmethod
+    def _filter():
+        return CommitMessageFilter({"enabled": True, "rules": {}})
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("git -C /tmp/x commit -F - <<'EOF'\nmsg\nEOF", True),
+            ("git --git-dir=/tmp/x/.git commit -F - <<'EOF'\nmsg\nEOF", True),
+            ('git --work-tree /tmp/x commit -F - <<"EOF"\nmsg\nEOF', True),
+            ("git -C /tmp/x commit -F - <<EOF\nmsg\nEOF", True),
+            ("git commit -F - <<'EOF'\nmsg\nEOF", False),
+            ("git -C /tmp/x commit -F - <<'EOF'\nmsg\nEOF\ngit commit -m y", False),
+        ],
+    )
+    def test_heredoc_commit_target(self, command, expected):
+        assert self._filter().commit_targets_external_repo(command) is expected
+
+    def test_normalised_text_does_not_reach_extraction(self):
+        """The normaliser blanks a quoted body to filler; extraction must still see `msg`,
+        on the same filter instance after the lookup has populated the parse cache."""
+        command = "git -C /tmp/x commit -F - <<'EOF'\nmsg\nEOF"
+        f = self._filter()
+        assert f.commit_targets_external_repo(command) is True
+        assert f.extract_commit_message(command) == "msg"
+
+    @pytest.mark.parametrize("module", ["schlock", "schlock.core.validator", "schlock.integrations.commit_filter"])
+    def test_import_has_no_cycle(self, module):
+        """The validator import in commit_filter must stay lazy: at module level it closes a
+        cycle (validator -> integrations.shellcheck -> integrations/__init__ -> commit_filter)."""
+        import subprocess  # noqa: PLC0415 - Test isolation
+        import sys  # noqa: PLC0415 - Test isolation
+
+        result = subprocess.run([sys.executable, "-c", f"import {module}"], check=False, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+
 class TestLongMessageFlag:
     """Issue #77: ``git commit --message`` / ``--message=`` deliver the message in argv, but
     the extractor only recognized ``-m`` - so advertising trailers supplied via the long flag
