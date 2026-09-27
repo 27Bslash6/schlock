@@ -113,6 +113,9 @@ class TestEverySpellingBashConsumes:
             # a newline in the subscript: the shape regex's DOTALL is what refuses these
             '{fd["\n"]}>o',
             "{fd['\n']}>o",
+            # bash consumes these as prefixes (fa[1] is set); bashlex's arithmetic ParseError refuses, not _mark_fd_variables
+            "{fd[$((1))]}<in",
+            "{fd[$((i+1))]}>out",
         ],
     )
     def test_spelling_outside_the_allowlist_fails_closed(self, redirect, safety_rules_path):
@@ -147,6 +150,12 @@ class TestLookalikesStayArguments:
             "{fd[0]]<in",  # no closing brace
             "{a\u00e9}<in",  # a non-ASCII name
             "{f$(echo)d}<in",  # an expansion in the NAME
+            "{$v}<in",
+            # bash passes `{fd}` for these, as for `{"fd"}` below; they read as arguments
+            # only because bashlex leaves the dollar-quoting on the word
+            "{$'fd'}<in",
+            "{f$'d'}<in",
+            '{$"fd"}<in',
         ],
     )
     def test_lookalike_is_an_argument(self, redirect, safety_rules_path):
@@ -327,7 +336,9 @@ class TestEveryConsumerParsesThroughTheTag:
     def test_no_other_bashlex_parse_call(self):
         # _bounded_parse is the one call, so every parse is CPU-bounded (LAB-5659). Its callers are
         # parse_bashlex (the bashlex tier behind BashCommandParser.parse and TieredParser), which
-        # tags, and _parse_succeeds, which only asks whether a synthetic probe parses.
+        # tags, _parse_succeeds, which only asks whether a synthetic probe parses, and
+        # _recover_substitution, which parses a backquote body bashlex dropped (LAB-4950) - inside
+        # parse_bashlex's budget, into the tree parse_bashlex then tags.
         src = pathlib.Path(__file__).parent.parent / "src"
         found = {(path.relative_to(src).as_posix(), owner) for path in src.rglob("*.py") for owner in _bashlex_parse_calls(path)}
         assert found == {("schlock/core/parser.py", "_bounded_parse")}
@@ -336,7 +347,19 @@ class TestEveryConsumerParsesThroughTheTag:
             for path in src.rglob("*.py")
             for owner in _bashlex_parse_calls(path, targets=("_bounded_parse",))
         }
-        assert callers == {("schlock/core/parser.py", "parse_bashlex"), ("schlock/core/parser.py", "_parse_succeeds")}
+        assert callers == {
+            ("schlock/core/parser.py", "parse_bashlex"),
+            ("schlock/core/parser.py", "_parse_succeeds"),
+            ("schlock/core/parser.py", "_recover_substitution"),
+        }
+        # Recovery also enters bashlex's parser through its `$(…)` body parser, which no search
+        # above sees; parse_bashlex runs recovery inside its budget, so this is the only owner.
+        dolparen = {
+            (path.relative_to(src).as_posix(), owner)
+            for path in src.rglob("*.py")
+            for owner in _bashlex_parse_calls(path, targets=("bashlex.subst._parsedolparen",))
+        }
+        assert dolparen == {("schlock/core/parser.py", "_recover_substitution")}
 
 
 def _import_aliases(tree):

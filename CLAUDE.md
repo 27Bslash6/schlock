@@ -42,15 +42,17 @@
         *not* cover: the dangerous failure is not the uncertain reading that raises, it is
         the confident wrong one that does not. The pre-parse rewrite shares that exposure on
         the same inputs - it blanks what it reads as a quoted body - which is why its body
-        spans are pinned against an independent bash parser, not against bashlex.
+        spans are pinned against an independent bash parser, not against bashlex (and against
+        bash itself where mvdan/sh differs: it does not end a body at a backslash-joined
+        terminator).
      4. **Escalation is monotonic, which is not the same as safe** —
         `_escalate_past_heredoc` can worsen a verdict and never improve one, so a misread
         body *end* is bounded to a false positive. A misread body *start* is not: the
         swallowed text is deleted from the rewrite before escalation ever sees it, leaving
         the verdict pinned at the heredoc head's own floor. That asymmetry is why every
         uncertain body-*start* reading must raise, and why changes here are pinned by
-        asserting the rewritten text still contains the payload rather than by asserting a
-        verdict.
+        asserting the rewritten text still contains the payload - outside every heredoc body
+        bashlex reads when it re-parses the rewrite - rather than by asserting a verdict.
      Bash's tokenization is what it must match, so every behavioural change here is decided by
      running real bash first and pinned by a test that names what bash did.
    - **Approved exception — re-reading one redirect target.** bashlex mis-dequotes some
@@ -74,6 +76,17 @@
      widen the allowlist by modelling bash's subscript grammar: four review rounds of that
      never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
      must raise, never fall back to "argument". Every spelling is decided by real bash first.
+   - **Approved exception — the in-word quote scan** (`_quote_pairs` in
+     `src/schlock/core/parser.py`, LAB-4950). bashlex drops substitution nodes from words that
+     mix quoted runs with code (`'a'$(x)'b'`, `"a"<(x)"b"`). The scan reads one word bashlex
+     already delimited and only locates quote pairs and code openers. Bodies are still parsed by
+     bashlex. A body it cannot place raises `ParseError`, and a word it cannot read earns no
+     literal range. In a word holding a line continuation bashlex's part offsets are shifted, so
+     every code part there is rebuilt from the source and parameter parts are never skip targets.
+     When such a word's quoting cannot be followed after its code parts were dropped (a `"`
+     nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
+     shares the parse's CPU budget.
+     The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
@@ -143,7 +156,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 
 ```bash
 /plugin marketplace add 27b-io/schlock
-/plugin install schlock@schlock
+/plugin install schlock@27b
 /schlock:setup   # Optional - configure preferences
 ```
 
