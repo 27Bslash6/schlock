@@ -11,6 +11,8 @@ and counts the calls; nothing is inherited from the checkout the suite runs in. 
 pinned absolutely, never "same as the control".
 """
 
+import os
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -146,3 +148,24 @@ def test_cached_clean_verdict_does_not_answer_for_a_dirty_tree(safety_rules_path
     # The denial itself is not cached: a later clean tree gets the rule verdict back.
     with patch("subprocess.run", side_effect=_Tree(dirty=False)):
         assert validate_command(command, config_path=safety_rules_path).risk_level == RiskLevel.HIGH
+
+
+def test_undecodable_status_output_is_still_dirty(tmp_path, monkeypatch, safety_rules_path):
+    """A tree whose `git status` bytes are not UTF-8 is still dirty.
+
+    Under `core.quotePath=false` git prints a non-UTF-8 path raw. Decoding that output raised, the
+    catch-all swallowed it as "not a repository", and a tracked edit beside such a file was lost to
+    an allowed reset. A real repository, because a spy that answers with `str` cannot fail to decode.
+    """
+    try:
+        (tmp_path / os.fsdecode(b"caf\xe9.txt")).write_text("x\n")
+    except OSError:
+        pytest.skip("filesystem refuses a non-UTF-8 name")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], check=True)
+    subprocess.run(["git", "config", "core.quotePath", "false"], check=True)
+    clear_caches()
+    result = validate_command("git reset --hard HEAD~1", config_path=safety_rules_path)
+    assert (result.risk_level, result.message) == (RiskLevel.BLOCKED, UNCOMMITTED)

@@ -950,11 +950,12 @@ def _check_uncommitted_changes() -> Optional[ValidationResult]:
     is not a repository (normal validation stands), a BLOCKED verdict otherwise.
     """
     try:
-        # Run git status --porcelain to check for uncommitted changes
+        # Run git status --porcelain to check for uncommitted changes. Bytes, not text: only
+        # emptiness is tested, and under core.quotePath=false git prints a non-UTF-8 path raw, so
+        # decoding raised and the catch-all below let a dirty tree through.
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             capture_output=True,
-            text=True,
             timeout=5,
             check=False,
         )
