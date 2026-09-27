@@ -530,3 +530,15 @@ class TestCommandLength:
         assert entry["command_truncated"] is False
         assert entry["command"].endswith(tail)
         assert " p " not in entry["command"]
+
+    @pytest.mark.parametrize(
+        "command",
+        ['echo "a"token": "; echo CHAINED; echo "b"', 'echo "x"Authorization: Basic y; echo CHAINED; echo "z"'],
+        ids=["json-field", "authorization"],
+    )
+    def test_shell_quote_read_as_a_credential_quote_hides_nothing(self, tmp_path, command):
+        """A regex cannot tell a shell quote from a JSON or header quote. Read as a credential quote, the `"` in
+        front of `; echo CHAINED;` let a redacted value run over the chained command, in an entry marked whole."""
+        entry = self._log_and_read(tmp_path / "audit.jsonl", command)
+        assert "; echo CHAINED;" in entry["command"]
+        assert entry["command_truncated"] is False

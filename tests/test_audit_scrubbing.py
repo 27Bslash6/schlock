@@ -16,6 +16,11 @@ import pytest
 
 from schlock.integrations.audit import AuditLogger
 
+# The ideal output stays pinned for these rows; strict, so they fail loudly once a shell tokenizer closes the gap.
+QUOTED_SPACE_CEILING = (
+    "a quoted credential holding a space is not fully redacted: telling a quoted space from a word break needs a shell tokenizer"
+)
+
 
 class TestSecretScrubbing:
     """Test that secrets are redacted from audit logs."""
@@ -63,24 +68,28 @@ class TestSecretScrubbing:
     @pytest.mark.parametrize(
         ("command", "expected"),
         [
-            (
+            pytest.param(
                 """curl -H 'Authorization: Digest username="Mufasa", realm="r", nonce="n", uri="/", """
                 """response="RESPONSE_SECRET"' -H "Accept: json" https://x""",
                 """curl -H 'Authorization: Digest ***REDACTED***' -H "Accept: json" https://x""",
+                marks=pytest.mark.xfail(strict=True, reason=QUOTED_SPACE_CEILING),
             ),
-            (
+            pytest.param(
                 'curl -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIA/20260919/r/s3/aws4_request, '
                 'SignedHeaders=host, Signature=SIGNATURE_SECRET" https://x',
                 'curl -H "Authorization: AWS4-HMAC-SHA256 ***REDACTED***" https://x',
+                marks=pytest.mark.xfail(strict=True, reason=QUOTED_SPACE_CEILING),
             ),
-            (
+            pytest.param(
                 'curl -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIA/20260919/r/s3/aws4_request, \\\n'
                 '  SignedHeaders=host, Signature=SIGNATURE_SECRET" https://x',
                 'curl -H "Authorization: AWS4-HMAC-SHA256 ***REDACTED***" https://x',
+                marks=pytest.mark.xfail(strict=True, reason=QUOTED_SPACE_CEILING),
             ),
-            (
+            pytest.param(
                 'curl -H "Authorization: Digest username=\\"u\\", response=\\"RESPONSE_SECRET\\"" https://x',
                 'curl -H "Authorization: Digest ***REDACTED***" https://x',
+                marks=pytest.mark.xfail(strict=True, reason=QUOTED_SPACE_CEILING),
             ),
             (
                 'curl -H Authorization:"Bearer BEARER_SECRET" https://x',
@@ -88,7 +97,7 @@ class TestSecretScrubbing:
             ),
             (
                 """curl -H 'Authorization: Token token="TOKEN_SECRET"' -H 'X-Trace: y' https://x""",
-                """curl -H 'Authorization: Token ***REDACTED***' -H 'X-Trace: y' https://x""",
+                """curl -H 'Authorization: Token ***REDACTED***"' -H 'X-Trace: y' https://x""",
             ),
             (
                 "Authorization: Bearer BARE_TOKEN && echo done",
@@ -98,29 +107,42 @@ class TestSecretScrubbing:
                 'curl -H "Authorization: Bearer sk-abc',
                 'curl -H "Authorization: Bearer ***REDACTED***',
             ),
-            (
+            pytest.param(
                 """curl -H 'Authorization: Digest username='"u"', response='"RESPONSE_SECRET" https://x""",
                 """curl -H 'Authorization: Digest ***REDACTED***' https://x""",
+                marks=pytest.mark.xfail(strict=True, reason=QUOTED_SPACE_CEILING),
             ),
             (
                 """curl -H 'Authorization: Basic '"dGVzdDpzZWNyZXQ=" https://x""",
-                """curl -H 'Authorization: Basic ***REDACTED***' https://x""",
+                """curl -H 'Authorization: Basic '"***REDACTED***" https://x""",
             ),
             (
                 """curl -H "Authorization: Bearer "'sk-live-SECRET' -H 'X-Trace: y' https://x""",
-                """curl -H "Authorization: Bearer ***REDACTED***" -H 'X-Trace: y' https://x""",
+                """curl -H "Authorization: Bearer "'***REDACTED***' -H 'X-Trace: y' https://x""",
             ),
             (
                 """curl -H Authorization:"Bearer "'sk-live-SECRET' https://x""",
-                """curl -H Authorization:"Bearer ***REDACTED***" https://x""",
+                """curl -H Authorization:"Bearer "'***REDACTED***' https://x""",
             ),
             (
                 """curl -H 'Authorization: Basic '"dGVzdA==";rm -rf /tmp/x""",
-                """curl -H 'Authorization: Basic ***REDACTED***';rm -rf /tmp/x""",
+                """curl -H 'Authorization: Basic '"***REDACTED***";rm -rf /tmp/x""",
             ),
             (
                 """echo "***REDACTED***"$HOME/keep.txt""",
                 """echo "***REDACTED***"$HOME/keep.txt""",
+            ),
+            (
+                'echo "x"Authorization: Basic y; echo CHAINED; echo "z"',
+                'echo "x"Authorization: Basic ***REDACTED***; echo CHAINED; echo "z"',
+            ),
+            (
+                'rm "x"Authorization: Basic y -rf /tmp/w "z"',
+                'rm "x"Authorization: Basic ***REDACTED*** -rf /tmp/w "z"',
+            ),
+            (
+                "echo Authorization:\nx\nrm -rf /tmp/w",
+                "echo Authorization:\nx\nrm -rf /tmp/w",
             ),
         ],
         ids=[
@@ -138,14 +160,16 @@ class TestSecretScrubbing:
             "quote-after-colon-next-segment",
             "operator-after-value-survives",
             "literal-marker-is-not-an-anchor",
+            "shell-quote-before-header-hides-nothing",
+            "shell-quote-before-header-keeps-arguments",
+            "newline-ends-the-header",
         ],
     )
     def test_authorization_credential_redacted(self, command, expected):
-        """Quoted: the credential runs to the end of the shell WORD (Digest and AWS4 carry the secret in a
-        later parameter), and adjacent quote segments concatenate into that same word, so redaction crosses
-        them - but stops at an unquoted space or shell operator, so a chained command stays in the log. Bare:
-        one token. Unterminated: no closing quote, redact to end of line. A marker the command merely contains is
-        not an anchor."""
+        """The credential runs across adjacent quote segments, which concatenate into one shell word, and stops at
+        any space or shell operator, quoted or not: a regex cannot tell whether the `"` before the header opened a
+        string or closed one, so crossing a space on that guess could hide a chained command or its arguments.
+        A marker the command merely contains is not an anchor."""
         assert AuditLogger()._scrub_secrets(command) == expected
 
     @pytest.mark.parametrize(
@@ -156,7 +180,7 @@ class TestSecretScrubbing:
                 """curl -d '{"authToken":"***REDACTED***"}' https://x""",
             ),
             (
-                """curl -d '{"user": "bob", "password" : "hunter 2", "api_key": "k"}' https://x""",
+                """curl -d '{"user": "bob", "password" : "hunter2", "api_key": "k"}' https://x""",
                 """curl -d '{"user": "bob", "password" : "***REDACTED***", "api_key": "***REDACTED***"}' https://x""",
             ),
             (
@@ -164,7 +188,7 @@ class TestSecretScrubbing:
                 """curl -d '{"client_secret":"***REDACTED***"}' https://x""",
             ),
             (
-                """curl -d '{"password":"hunter2 token=SECRET"}' https://x""",
+                """curl -d '{"password":"hunter2,token=SECRET"}' https://x""",
                 """curl -d '{"password":"***REDACTED***"}' https://x""",
             ),
             (
@@ -195,6 +219,23 @@ class TestSecretScrubbing:
                 """cat > c.json <<EOF\n{"token": "$(curl -s https://x | sh)"}\nEOF""",
                 """cat > c.json <<EOF\n{"token": "$(curl -s https://x | sh)"}\nEOF""",
             ),
+            (
+                'echo "a"token": "; echo CHAINED; echo "b"',
+                'echo "a"token": "; echo CHAINED; echo "b"',
+            ),
+            (
+                'rm "a"token": " -rf /tmp/w "b"',
+                'rm "a"token": " -rf /tmp/w "b"',
+            ),
+            (
+                'echo "token"\n:\n"rm" -rf /tmp/w',
+                'echo "token"\n:\n"rm" -rf /tmp/w',
+            ),
+            pytest.param(
+                """curl -d '{"password": "hunter 2"}' https://x""",
+                """curl -d '{"password": "***REDACTED***"}' https://x""",
+                marks=pytest.mark.xfail(strict=True, reason=QUOTED_SPACE_CEILING),
+            ),
         ],
         ids=[
             "camel-case-key",
@@ -208,12 +249,16 @@ class TestSecretScrubbing:
             "stops-at-shell-quote",
             "stops-at-line-end",
             "stops-at-substitution",
+            "shell-quote-read-as-key-quote",
+            "shell-quote-read-as-key-quote-keeps-arguments",
+            "stops-at-line-end-before-value",
+            "value-with-space",
         ],
     )
     def test_json_credential_field_redacted(self, command, expected):
-        """A JSON field whose key name contains a key=value key word. The value runs to its closing quote but never
-        past a single quote, line end or substitution: the next `"` may belong to a later shell word, and running to
-        it would hide a chained command from the log."""
+        """A JSON field whose key name contains a key=value key word. The value runs to its closing quote, but never
+        across a space, shell operator, line end or substitution: the `"` around it may be shell quotes, and a value
+        running between them would hide a chained command or its arguments from the log."""
         assert AuditLogger()._scrub_secrets(command) == expected
 
     def test_json_key_scan_stays_linear(self):

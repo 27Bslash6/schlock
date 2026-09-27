@@ -62,6 +62,13 @@ COMMAND_LOG_LIMIT = 500
 # Key names that mark the following value as a secret, shared by the key=value and JSON-field scrub rules.
 _CREDENTIAL_KEY_NAMES = r"(?:password|passwd|pwd|token|secret|api[-_]?key)"
 
+# One character of a value the Authorization and JSON-field rules redact: never whitespace, a shell operator
+# (; | & < > ( )), a backtick or the `$` of `$(`, even escaped. Whitespace and operators split shell words only
+# outside quotes, and a regex cannot tell whether a `"` opens a string or closes one; quotes themselves never split
+# a word. So a run of these stays inside the one word it starts in however the quotes pair up, and redacting it
+# cannot hide a chained command - `echo "a"token": "; rm -rf ~; echo "b"` reads as a JSON field to a regex.
+_WORD_CHAR = r"""(?:\\[^\s;|&<>()`$]|\$(?!\()|[^\s'"\\;|&<>()`$])"""
+
 
 def get_null_device() -> str:
     """Get platform-specific null device.
@@ -120,47 +127,26 @@ class AuditLogger:
 
     # Secret patterns to redact (compiled once for performance)
     SECRET_PATTERNS = [
-        # Authorization: <scheme> <credential>. Digest and AWS4-HMAC-SHA256 carry the secret in a later parameter
-        # (response=, Signature=), not the first token, so a quoted header is redacted to its closing quote, through
-        # escaped characters and backslash-newline continuations. These run before the token=/secret= rule, whose
-        # \S+ would otherwise eat a closing quote and shift the boundary onto the next argument.
-        # Quote before the header - the curl form, -H "Authorization: Bearer x".
-        (re.compile(r"""(["'])(Authorization:\s*[\w-]+\s+)(?:\\[\s\S]|(?!\1|\\).)*""", re.I), r"\1\2***REDACTED***"),
-        # Quote after the colon - bash word concatenation and YAML in heredocs, Authorization:"Bearer x".
-        (re.compile(r"""(Authorization:\s*)(["'])([\w-]+\s+)(?:\\[\s\S]|(?!\2|\\).)*""", re.I), r"\1\2\3***REDACTED***"),
-        # Bare header, no value boundary - one token. The lookbehind skips headers the quoted rules handled.
-        (re.compile(r"""(?<!["'])(Authorization:\s*[\w-]+\s+)\S+""", re.I), r"\1***REDACTED***"),
-        # A quote ends a shell SEGMENT, not the value: adjacent segments concatenate into one argument, so
-        # `-H 'Authorization: Basic '"$SECRET"` carries the credential past the quote the rules above stop at.
-        # Consume whole segments after a header those rules already redacted, stopping at an unquoted space
-        # OR shell operator - an operator ends the word too, and eating it would hide `;rm -rf /` from the log.
-        # Anchored on the redacted header, never the marker alone, so a command that merely CONTAINS the
-        # marker keeps its text. Alternatives stay disjoint on their first character, so the scan is linear.
-        # ponytail: this now tracks quoting state in a regex. The next shape wants the bashlex word split the
-        # commit filter already does, not a fifth rule - see the redaction ceiling recorded on the ticket.
+        # Authorization: <scheme> <credential>, bare or quoted: -H "Authorization: Bearer x", Authorization:"Bearer x".
+        # The credential is a _WORD_CHAR run, so it crosses adjacent quote segments - `'Authorization: Basic '"$S"`
+        # is one shell word - and the quotes that open and close it stay in the log. Runs before the token=/secret=
+        # rule, whose \S+ would eat a closing quote. Each piece starts on a different character, so the scan is
+        # linear. ponytail: a quoted value holding a space (Digest's response=, AWS4's Signature=) keeps what follows
+        # its first space; telling a quoted space from a word break takes a shell tokenizer, not another regex.
         (
-            re.compile(
-                r"""(Authorization:\s*["']?[\w-]+\s+\*{3}REDACTED\*{3}["'])"""
-                r"""(?:'[^']*'?|"(?:\\[\s\S]|[^"\\])*"?|\\[\s\S]|[^\s'"\\;|&<>()])+""",
-                re.I,
-            ),
-            r"\1",
+            re.compile(rf"""(Authorization:[ \t]*["']?[\w-]+[ \t]+["']*){_WORD_CHAR}(?:["']*{_WORD_CHAR})*""", re.I),
+            r"\1***REDACTED***",
         ),
         # "password": "VALUE", "authToken":"VALUE" - a JSON field whose key name contains a key=value key word
         # anywhere: single-quoted request bodies and JSON written through a heredoc (JSON escaped inside a
         # double-quoted shell string waits for the tokenizer). Runs before the key=value rule, whose \S+ would eat
-        # the closing quote. The value ends at its closing quote and the rule never fires without one - and never
-        # crosses a single quote, a line end, `$(` or a backtick. In `grep '"token": "' f; rm -rf ~/w; echo "x"` the
-        # next `"` belongs to a later shell word, and running to it would hide the chained command from the log;
-        # a substitution is executed code, not a secret. The key word is found by a lookahead: Python does not
-        # backtrack into one, whereas [\w.-]* on both sides of the key word re-scans the key once per repeat
-        # and goes quadratic on a long run of repeated key words.
+        # the closing quote. The value is a _WORD_CHAR run that must reach its closing quote, so a value holding a
+        # space, an operator or a substitution is left whole: in `grep '"token": "' f; rm -rf ~/w; echo "x"` the next
+        # `"` belongs to a later shell word. The key word is found by a lookahead: Python does not backtrack into
+        # one, whereas [\w.-]* on both sides of the key word re-scans the key once per repeat and goes quadratic on
+        # a long run of repeated key words.
         (
-            re.compile(
-                rf"""("(?=[\w.-]*{_CREDENTIAL_KEY_NAMES})[\w.-]+"\s*:\s*")"""
-                r"""(?:\\[^'\n]|\$(?!\()|[^"'\\\n$`])*(?=")""",
-                re.I,
-            ),
+            re.compile(rf"""("(?=[\w.-]*{_CREDENTIAL_KEY_NAMES})[\w.-]+"[ \t]*:[ \t]*"){_WORD_CHAR}*(?=")""", re.I),
             r"\1***REDACTED***",
         ),
         # password=VALUE, token=VALUE, api-key=VALUE, secret=VALUE
