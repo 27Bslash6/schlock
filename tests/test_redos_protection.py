@@ -11,7 +11,25 @@ import time
 
 import pytest
 
+from schlock.core.rules import RuleEngine
 from schlock.core.validator import validate_command
+
+
+def _one_command_gap_patterns(rules_path):
+    """Every pattern that uses credential_exposure's one-command gap."""
+    engine = RuleEngine(rules_path)
+    rules = [
+        "credential_exposure",
+        "hardcoded_secrets",
+        "privilege_escalation_variants",
+        "partition_manipulation",
+        "filesystem_wipe",
+        "source_remote_script",
+        "recursive_permission_system_dirs",
+    ]
+    patterns = [p for r in rules for p in engine.compiled_patterns[r]]
+    extended = engine.compiled_patterns["extended_credential_exposure"]
+    return patterns + [p for p in extended if p.pattern.startswith(("echo", "printf"))]
 
 
 class TestReDoSProtection:
@@ -118,6 +136,107 @@ class TestReDoSProtection:
         elapsed = time.time() - start
 
         assert elapsed < self.MAX_VALIDATION_TIME, f"ReDoS detected: {elapsed:.3f}s for input: {pathological_input[:50]}..."
+
+    @pytest.mark.parametrize("head", ["tee", "> ", "rm"])
+    def test_blank_run_after_a_truncation_head_is_linear(self, safety_rules_path, head):
+        r"""A long blank run after `tee`, `>` or `rm` is scanned once, not once per backtrack.
+
+        The blank-operand guard is `(?=\s+\S)` in FRONT of the quantifier
+        (LAB-4360). Written as `\s+(?!\s*$)` it re-scans the run on every
+        backtracking step: 20,000 blanks cost 500ms at the regex layer against
+        2ms for the base pattern, on a hook that runs before every bash call.
+        Measured at the regex layer because the whole validator already spends
+        over a second on this input in other patterns, which would hide it.
+        """
+        engine = RuleEngine(safety_rules_path)
+        patterns = engine.compiled_patterns["file_truncation"] + engine.compiled_patterns["single_delete"]
+        text = head + " " * 50_000
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.5, f"blank run after {head!r} took {elapsed:.3f}s"
+
+    @pytest.mark.parametrize("text", ["IFS=" + " " * 50_000 + "read", "IFS=" + "x" * 50_000, "I" + "\\\n" * 25_000])
+    def test_ifs_override_pattern_is_linear(self, safety_rules_path, text):
+        """The IFS-override pattern scans a blank run or a `\\<newline>` run once, not once per backtrack."""
+        engine = RuleEngine(safety_rules_path)
+
+        start = time.perf_counter()
+        for pattern in engine.compiled_patterns["ifs_obfuscation"]:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.5, f"ifs_obfuscation took {elapsed:.3f}s on {text[:12]!r}..."
+
+    @pytest.mark.parametrize(
+        "unit",
+        [
+            'echo "',
+            "echo '",
+            "echo \\",
+            "echo `",
+            "echo 2>&1 ",
+            "echo $((1)) ",
+            "echo $(a $(b) | c) ",
+            "cat $(a (b ",
+            "echo$($(",
+            "echo $(",
+            "echo $(x",
+            "echo ${",
+            "echo $(${",
+            'echo $("',
+            "echo $(a ('",
+            "cat '",
+            "export ",
+            "chroot ",
+            "source /tmp/",
+        ],
+    )
+    def test_one_command_gap_is_linear_in_anchor_density(self, safety_rules_path, unit):
+        """The shell-word gap restarts at every anchor, so vary ANCHOR DENSITY, not length.
+
+        Every anchor re-runs a bounded gap plus its open-quote tail. That is linear
+        in input size with a large constant (~0.8s at 64 KB, 4x the time for 4x
+        the input), not quadratic. The `.{0,200}` it replaced took ~0.1s here.
+        Measured at the regex layer because the whole validator hides it.
+        """
+        patterns = _one_command_gap_patterns(safety_rules_path)
+        text = (unit * (64 * 1024 // len(unit) + 1))[: 64 * 1024]
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 3.0, f"{unit!r} x density took {elapsed:.3f}s"
+
+    @pytest.mark.parametrize(
+        ("piece", "count"), [(" >&11111111", 7), (" &>>f", 20), (" $(x)", 20), (" ${x}", 20), (" $(" + "${x}" * 7, 1)]
+    )
+    def test_one_command_gap_has_one_parse(self, safety_rules_path, piece, count):
+        """A piece that can end in two places multiplies the parses of a failed match.
+
+        `[<>]&[0-9-]+` gave `>&11111111` eight parses, `&>>?` gave `&>>` two, and a
+        walk-on `$(` without its lookahead gives `$(x)` two, as does a bare `$` that
+        can also start `${x}`, at the gap and inside a `$(` that never closes. Each took
+        1.5s to 2.6s that way, and one more repetition multiplies it. With one
+        parse each, it takes well under a millisecond. Each rule's gap has its own
+        copy of the pieces, so every anchor gets a command.
+        """
+        anchors = ["cat", "echo", "echo 'key'", "printf", "export", "chroot", "parted", "shred", "chown", "chown -R"]
+        anchors += ["source /tmp/", ". /tmp/"]
+        text = "; ".join(anchor + piece * count + " x" for anchor in anchors)
+        patterns = _one_command_gap_patterns(safety_rules_path)
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.25, f"{piece!r} x {count} took {elapsed:.3f}s"
 
 
 class TestBoundedQuantifierEdgeCases:

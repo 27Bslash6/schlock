@@ -6,7 +6,7 @@ including disk destruction, filesystem manipulation, and permission attacks.
 
 import pytest
 
-from schlock.core.rules import RiskLevel
+from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import validate_command
 
 
@@ -541,6 +541,16 @@ class TestP0FileTruncation:
             "echo -n > file.log",
             "printf '' > data.log",
             "cat input | tee output.log",
+            # Several blanks before the operand are still one operand.
+            "tee   output.log",
+            # A disposable first operand must not hide the real victim behind it.
+            # Quoting the head keeps the raw text from matching; reconstructed, the
+            # operand `' ;'` begins with a blank and a metacharacter (LAB-4360).
+            "\"tee\" ' ;' important.db </dev/null",
+            "\"tee\" ' |' important.db",
+            # An operand may begin with a literal newline; `$` under MULTILINE would
+            # end the line there and call the operand blank.
+            '"tee" "\\n;" important.db </dev/null',
         ],
     )
     def test_file_truncation_blocked(self, safety_rules_path, command):
@@ -548,6 +558,85 @@ class TestP0FileTruncation:
         result = validate_command(command, config_path=safety_rules_path)
         assert result.risk_level == RiskLevel.HIGH, f"Expected HIGH risk for: {command}, got {result.risk_level}"
         assert "file_truncation" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "true > ~/.aws/credentials",
+            "true 3> ~/.aws/credentials",
+            "true 2> ~/.aws/credentials",
+            "true {fd}> ~/.aws/credentials",
+            "true 1> ~/.aws/credentials",
+            "true &> ~/.aws/credentials",
+            "true 2>| ~/.aws/credentials",
+            ": 2> important.db",
+            "echo -n 2> important.db",
+            # A quoted target is still a target.
+            'true 2> "my file"',
+            "true > 'my file'",
+            # Starting with `/dev/null` does not make a path `/dev/null`.
+            "true 2> /dev/null.bak",
+            "foo | tee /dev/null.bak",
+            # A quoted operand can start with a blank: `"true" 2> ' ;'` reconstructs to
+            # `true 2>  ;`, and only a target that may be a blank reaches it.
+            "\"true\" 2> ' ;'",
+            "'true' > ' |'",
+            # A quoted target of blanks then `/dev/null` names a file under a directory called
+            # " ", not the null device. Reconstructed it reads as the discard `true >  /dev/null`,
+            # so the raw text has to catch it: a quoted producer word, and `>|`, both count.
+            "\"true\" 2> ' /dev/null'",
+            "'true' > ' /dev/null'",
+            "':' > ' /dev/null'",
+            "'echo' -n > ' /dev/null'",
+            "true >| ' /dev/null'",
+            "printf '' >| f",
+        ],
+    )
+    def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
+        """A write redirection truncates its target whatever descriptor it names."""
+        result = validate_command(command, config_path=safety_rules_path, _shellcheck=False)
+
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.HIGH, ["file_truncation"])
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "true 2>/dev/null",
+            "true 2> /dev/null",
+            "true 2>&1",
+            "true >&2",
+            ": 2> /dev/null",
+            # A shell metacharacter ends the `/dev/null` word as a blank does.
+            "(true 2> /dev/null)",
+            "echo `true 2> /dev/null`",
+            "true 2> /dev/null; ls",
+            # Repeated blanks before `/dev/null` are still a discard.
+            ">  /dev/null",
+            ": 2>  /dev/null",
+            "true 2>  /dev/null",
+            "echo -n 2>  /dev/null",
+            "printf '' 2>\t /dev/null",
+            "'true' > /dev/null",
+            "true >| /dev/null",
+            # Appending is not truncating.
+            "true >> ~/.aws/credentials",
+            "true 2>> ~/.aws/credentials",
+            # `30` belongs to the argument `10:30`; it is not a descriptor on `:`.
+            "echo 10:30> out.txt",
+            "cmd 2> err.log",
+            # Quoted examples are data: bash prints them and creates no file.
+            "echo ': > f'",
+            "echo ': 2> f'",
+            "echo ': &> f'",
+            "echo ': 2> f' x",
+            'printf "%s" "true 2> f"',
+        ],
+    )
+    def test_fd_prefixed_non_truncation_allowed(self, safety_rules_path, command):
+        """Discards, fd duplications, appends and ordinary stderr capture stay SAFE."""
+        result = validate_command(command, config_path=safety_rules_path, _shellcheck=False)
+
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.SAFE, [])
 
     def test_dev_null_truncation_allowed(self, safety_rules_path):
         """/dev/null truncation should be allowed."""
@@ -558,6 +647,24 @@ class TestP0FileTruncation:
         """Append operations should be allowed."""
         result = validate_command("echo 'data' >> file.log", config_path=safety_rules_path)
         assert result.allowed
+
+    @pytest.mark.parametrize("reconstructed", ["tee  ", ">  ", ": >  ", "true >  ", "echo -n >  ", "printf '' >  "])
+    def test_blank_operand_is_not_a_filename(self, safety_rules_path, reconstructed):
+        r"""No operand in this rule is blank to the end of the text.
+
+        A one-blank argument reconstructs to bare whitespace (`tee \ ` becomes
+        `tee  `), which the rule read as the filename (LAB-4360). The guard is
+        `(?=\s+\S)` in front of the blank run, not a non-blank first-character
+        class: that class also refused an operand such as `' ;'`, and
+        `"tee" ' ;' important.db` then hid an ordinary later victim behind a
+        disposable first operand. It sits before the quantifier so the run is
+        scanned once, and it asks for a non-blank character anywhere after the
+        run - `$` would stop at the newline a quoted operand may begin with.
+        The end-to-end shape is pinned in test_validator.py; this pins the rule.
+        """
+        match = RuleEngine(safety_rules_path).match_command(reconstructed)
+
+        assert match.risk_level == RiskLevel.SAFE, match.message
 
 
 class TestP0NetworkServiceExposure:

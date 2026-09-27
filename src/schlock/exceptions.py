@@ -2,6 +2,7 @@
 
 This module defines exception types for validation failures:
 - ParseError: Raised when bashlex fails to parse command syntax
+- ParseBudgetError: A ParseError raised when a parse runs past its CPU budget
 - ConfigurationError: Raised when YAML/regex patterns are invalid
 """
 
@@ -38,6 +39,14 @@ class ParseError(Exception):
         if self.original_error:
             return f"{self.message} (original: {self.original_error})"
         return self.message
+
+
+class ParseBudgetError(ParseError):
+    """Raised when one bashlex parse uses more CPU time than it is allowed.
+
+    Some inputs make bashlex's parser loop forever, allocating as it goes. A parse
+    that runs out of budget is treated like one that failed: the command is denied.
+    """
 
 
 class ConfigurationError(Exception):
