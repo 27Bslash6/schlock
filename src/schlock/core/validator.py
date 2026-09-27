@@ -1077,17 +1077,24 @@ def _match_original_and_reconstructed(
     # pair - each is the only form a whole family of rules can match (LAB-2760):
     # `>\s*/dev/sd[a-z]` needs the redirect present, while rule 08's `[^>]{0,200}`
     # and rule 03's `^\s*env\s*$` only match once it is gone.
+    #
+    # Each reconstruction is also matched with its newlines flattened to blanks. Words are
+    # joined by blanks, so a newline left in a reconstruction is word data (`"a<LF>b"`,
+    # `"a\"<LF>b"`), and the rules' operand spans stop at a newline because a bare one ends
+    # the command. Unflattened, `"rm" -f "a<LF>b" .git/config` hides its later, real target.
+    # Same length, so the ranges still line up; an extra form can only raise the risk.
     seen = {command}
     for form, ranges in (
         parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes),
         parser.reconstruct_without_redirects(quote_source, ast_nodes),
     ):
-        if not form or form in seen:
-            continue
-        seen.add(form)
-        form_match = engine.match_command(form, string_literals=ranges, use_whitelist=use_whitelist)
-        if form_match.risk_level > match.risk_level:
-            match = form_match
+        for variant in (form, form.replace("\n", " ")):
+            if not variant or variant in seen:
+                continue
+            seen.add(variant)
+            form_match = engine.match_command(variant, string_literals=ranges, use_whitelist=use_whitelist)
+            if form_match.risk_level > match.risk_level:
+                match = form_match
 
     return match
 

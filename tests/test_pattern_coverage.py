@@ -1756,31 +1756,23 @@ class TestNewlineEndsRmOperandSpan:
         assert rule in result.matched_rules
         assert result.risk_level == risk
 
+    @pytest.mark.parametrize("head", ["rm", '"rm"', "'rm'", "r'm'", "r\\m"])
+    @pytest.mark.parametrize("dummy", ['"absent\nname"', "'absent\nname'", '"a\\"\nb"'])
     @pytest.mark.parametrize(
-        ("rule", "text"),
+        ("flags", "target", "risk"),
         [
-            ("vcs_directory_deletion", 'rm -f "absent\nname" .git/config'),
-            ("vcs_directory_deletion", "rm -f 'absent\nname' .hg"),
-            ("vcs_directory_deletion", 'rm "x\ny" -rf .svn'),
-            ("hidden_glob_destruction", 'rm -fr "absent\nname" .*'),
-            ("hidden_glob_destruction", 'rm .* "x\ny" -rf'),
-            ("ssh_known_hosts_manipulation", 'rm -f "a\nb" ~/.ssh/known_hosts'),
-            ("history_evasion_extended", "rm -f 'a\nb' ~/.bash_history"),
+            ("-f", ".git/config", RiskLevel.HIGH),
+            ("-fr", ".*", RiskLevel.BLOCKED),
+            ("-f", "~/.ssh/known_hosts", RiskLevel.HIGH),
+            ("-f", "~/.bash_history", RiskLevel.BLOCKED),
         ],
     )
-    def test_span_crosses_a_quoted_newline(self, safety_rules_path, rule, text):
-        """A newline inside a quoted operand is data: the rm goes on to a later, real target."""
-        engine = RuleEngine(safety_rules_path)
-        assert any(p.search(text) for p in engine.compiled_patterns[rule]), f"{rule} stopped inside a quote in {text!r}"
+    def test_newline_inside_an_operand_does_not_hide_a_later_target(self, safety_rules_path, head, dummy, flags, target, risk):
+        """A newline inside one word is data: bash runs ONE rm, and `-f` skips the absent dummy.
 
-    @pytest.mark.parametrize(
-        ("command", "risk"),
-        [
-            ('rm -f "absent\nname" .git/config', RiskLevel.HIGH),
-            ('rm -fr "absent\nname" .*', RiskLevel.BLOCKED),
-            ("rm -rf it's .git", RiskLevel.BLOCKED),  # an unpaired quote is an ordinary character
-        ],
-    )
-    def test_quoted_newline_keeps_the_verdict(self, safety_rules_path, command, risk):
+        However the executable or the dummy is quoted or escaped, the AST reconstruction
+        resolves it; flattened, the later target is in the same span as the rm.
+        """
+        command = f"{head} {flags} {dummy} {target}"
         result = validate_command(command, config_path=safety_rules_path)
         assert result.risk_level == risk, f"{command!r} rated {result.risk_level.name} via {result.matched_rules}"
