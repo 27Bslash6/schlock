@@ -239,7 +239,7 @@ Rule names appear in audit log entries under the `matched_rules` field. Check yo
 
 ```bash
 TODAY=$(date +%Y-%m-%d)
-jq '.matched_rules' ~/.config/schlock/audit-$TODAY.jsonl
+jq '.matched_rules' ~/.local/share/schlock/audit-$TODAY.jsonl
 ```
 
 ### Current Workarounds
@@ -437,19 +437,30 @@ Every command validation creates an audit entry with:
 
 ### Log Location
 
-Default: `~/.config/schlock/audit-YYYY-MM-DD.jsonl` (daily timestamped files)
+Default (daily timestamped files, from `platformdirs`):
+- Linux: `~/.local/share/schlock/audit-YYYY-MM-DD.jsonl` (or `$XDG_DATA_HOME/schlock/`)
+- macOS: `~/Library/Application Support/schlock/audit-YYYY-MM-DD.jsonl`
+- Windows: `%LOCALAPPDATA%\27b.io\schlock\audit-YYYY-MM-DD.jsonl`
 
-Override via `SCHLOCK_AUDIT_LOG` environment variable:
-```bash
-# Single file (ends in .jsonl)
-export SCHLOCK_AUDIT_LOG=~/my-logs/audit.jsonl
-
-# Timestamped files in custom directory
-export SCHLOCK_AUDIT_LOG=~/my-logs
-
-# Disable logging
-export SCHLOCK_AUDIT_LOG=/dev/null
+Override with `SCHLOCK_AUDIT_LOG` in the `env` block of your own `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "SCHLOCK_AUDIT_LOG": "~/my-logs/audit.jsonl"
+  }
+}
 ```
+
+- A value ending in `.jsonl` is used as a single file.
+- Any other value is a directory, and schlock writes `audit-YYYY-MM-DD.jsonl` inside it.
+- `/dev/null` (`NUL` on Windows) disables logging.
+
+schlock reads this value from `~/.claude/settings.json` only. It ignores `SCHLOCK_AUDIT_LOG` in the
+process environment, so a shell `export` is not honoured. Claude Code passes every settings file's
+`env` block to hooks, including a project's `.claude/settings.json`, and an environment variable
+does not say which file set it. Your user settings file is the one place a repository you open
+cannot write. A missing, unreadable or malformed settings file, or a value that is not a string,
+falls back to the default location. `SCHLOCK_PARSER` is read the same way.
 
 ### Log Format (JSONL)
 
@@ -479,18 +490,18 @@ Each line is a complete JSON object:
 ```bash
 # Today's file
 TODAY=$(date +%Y-%m-%d)
-grep '"decision":"block"' ~/.config/schlock/audit-$TODAY.jsonl | wc -l
+grep '"decision":"block"' ~/.local/share/schlock/audit-$TODAY.jsonl | wc -l
 ```
 
 **Find all HIGH-risk commands (today):**
 ```bash
 TODAY=$(date +%Y-%m-%d)
-jq 'select(.risk_level == "HIGH")' ~/.config/schlock/audit-$TODAY.jsonl
+jq 'select(.risk_level == "HIGH")' ~/.local/share/schlock/audit-$TODAY.jsonl
 ```
 
 **Commands in specific project (last 7 days):**
 ```bash
-cat ~/.config/schlock/audit-*.jsonl | \
+cat ~/.local/share/schlock/audit-*.jsonl | \
   jq 'select(.context.project_root == "/home/user/myproject")'
 ```
 
@@ -504,16 +515,16 @@ Daily timestamped files prevent unbounded growth. Each file contains one day's l
 find ~/.config/schlock -name "audit-*.jsonl" -mtime +90 -delete
 
 # Delete specific year
-rm ~/.config/schlock/audit-2024-*.jsonl
+rm ~/.local/share/schlock/audit-2024-*.jsonl
 
 # Keep only last 30 days
-ls -t ~/.config/schlock/audit-*.jsonl | tail -n +31 | xargs rm
+ls -t ~/.local/share/schlock/audit-*.jsonl | tail -n +31 | xargs rm
 ```
 
 **Logrotate (optional, for compression):**
 ```
 # /etc/logrotate.d/schlock
-/home/USER/.config/schlock/audit-*.jsonl {
+/home/USER/.local/share/schlock/audit-*.jsonl {
     weekly
     rotate 12
     compress
@@ -531,9 +542,13 @@ Audit logging is **always enabled** and cannot be disabled. This is intentional:
 - **Minimal overhead** - Single append write per command (<1ms)
 - **Non-intrusive** - No user-facing impact
 
-If you need to disable it, set log path to `/dev/null`:
-```bash
-export SCHLOCK_AUDIT_LOG=/dev/null
+If you need to disable it, set the log path to `/dev/null` in `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "SCHLOCK_AUDIT_LOG": "/dev/null"
+  }
+}
 ```
 
 ### Thread Safety
@@ -766,5 +781,5 @@ export SCHLOCK_DEBUG=1
 
 1. **Check logs:** stderr output from hooks
 2. **Enable debug mode:** `export SCHLOCK_DEBUG=1`
-3. **Review audit log:** `~/.config/schlock/audit.jsonl`
+3. **Review audit log:** `~/.local/share/schlock/audit-YYYY-MM-DD.jsonl`
 4. **File issue:** https://github.com/27b-io/schlock/issues

@@ -5,9 +5,12 @@ Logs are written in JSONL (JSON Lines) format for easy parsing and analysis.
 
 Log Location:
     Default (daily timestamped files):
-        Unix/Linux/macOS: ~/.local/share/27b.io/schlock/audit-YYYY-MM-DD.jsonl
+        Linux: ~/.local/share/schlock/audit-YYYY-MM-DD.jsonl
+        macOS: ~/Library/Application Support/schlock/audit-YYYY-MM-DD.jsonl
         Windows: %LOCALAPPDATA%/27b.io/schlock/audit-YYYY-MM-DD.jsonl
-    Can be overridden via SCHLOCK_AUDIT_LOG environment variable (single file)
+    Can be overridden by SCHLOCK_AUDIT_LOG in the `env` block of the user's own
+    ~/.claude/settings.json. The process environment is not consulted (see
+    schlock.core.user_settings), so a shell `export` or a project settings file has no effect.
 
 Log Format (JSONL):
     Each line is a JSON object with:
@@ -32,12 +35,11 @@ Thread Safety:
 Retention:
     Daily timestamped files prevent unbounded growth.
     No automatic cleanup (user responsibility).
-    Cleanup example (Unix): rm ~/.local/share/27b.io/schlock/audit-2024-*.jsonl
+    Cleanup example (Linux): rm ~/.local/share/schlock/audit-2024-*.jsonl
     Cleanup example (Windows): Remove-Item "$env:LOCALAPPDATA/27b.io/schlock/audit-2024-*.jsonl"
 """
 
 import json
-import os
 import re
 import sys
 import threading
@@ -48,6 +50,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from platformdirs import user_data_dir
+
+from schlock.core.user_settings import user_settings_env
+
+AUDIT_LOG_ENV = "SCHLOCK_AUDIT_LOG"
 
 
 def get_null_device() -> str:
@@ -169,17 +175,28 @@ class AuditLogger:
             Path to audit log file.
 
         Logic:
-        - If SCHLOCK_AUDIT_LOG is set and ends in .jsonl: use as-is (single file)
-        - If SCHLOCK_AUDIT_LOG is set but is a directory: append timestamped filename
+        - SCHLOCK_AUDIT_LOG is read from the `env` block of ~/.claude/settings.json only. The
+          process environment is ignored: a checkout's .claude/settings.json `env` block reaches
+          it, and a value there would let the checkout choose which file the audit line is
+          appended to. A missing, unreadable or non-string value falls back to the default.
+        - If the value is the null device: use it (logging disabled)
+        - If the value ends in .jsonl: use as-is (single file)
+        - Any other value: treat as a directory and append a timestamped filename
         - Otherwise: Platform-specific data dir with timestamped filename
 
-        Platform-specific defaults:
-        - Unix/Linux/macOS: ~/.local/share/27b.io/schlock/audit-YYYY-MM-DD.jsonl
+        Platform-specific defaults (platformdirs user_data_dir):
+        - Linux: ~/.local/share/schlock/audit-YYYY-MM-DD.jsonl
+        - macOS: ~/Library/Application Support/schlock/audit-YYYY-MM-DD.jsonl
         - Windows: %LOCALAPPDATA%/27b.io/schlock/audit-YYYY-MM-DD.jsonl
         """
-        env_path = os.environ.get("SCHLOCK_AUDIT_LOG")
-        if env_path:
-            path = Path(env_path).expanduser()
+        today = datetime.now().strftime("%Y-%m-%d")
+        configured = user_settings_env(AUDIT_LOG_ENV)
+        path = None
+        if isinstance(configured, str) and configured:
+            # "~unknown-user/..." raises; this runs before the hook's try, so fall back instead.
+            with suppress(RuntimeError):
+                path = Path(configured).expanduser()
+        if path is not None:
             # Special case: null device is always a file (platform-specific)
             null_dev = get_null_device()
             if str(path) == null_dev or str(path).upper() == "NUL":
@@ -188,15 +205,9 @@ class AuditLogger:
             if path.suffix == ".jsonl":
                 return path
             # Otherwise treat as directory and append timestamped filename
-            today = datetime.now().strftime("%Y-%m-%d")
             return path / f"audit-{today}.jsonl"
 
-        # Default: Platform-specific data directory with timestamped filename
-        # Unix/macOS: ~/.local/share/27b.io/schlock
-        # Windows: %LOCALAPPDATA%\27b.io\schlock
-        data_dir = Path(user_data_dir("schlock", "27b.io"))
-        today = datetime.now().strftime("%Y-%m-%d")
-        return data_dir / f"audit-{today}.jsonl"
+        return Path(user_data_dir("schlock", "27b.io")) / f"audit-{today}.jsonl"
 
     def _ensure_log_directory(self):
         """Create log directory if it doesn't exist."""

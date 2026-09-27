@@ -12,7 +12,6 @@ CLAUDE.md lists them as approved exceptions and the constraints each must keep.
 
 import bisect
 import contextlib
-import json
 import logging
 import re
 import shlex
@@ -29,6 +28,7 @@ import bashlex.subst
 
 from schlock.core.ast_view import UnmappedNodeError
 from schlock.core.native_bridge import NativeBridge, NativeBridgeError
+from schlock.core.user_settings import user_settings_env
 from schlock.exceptions import ParseBudgetError, ParseError
 
 logger = logging.getLogger(__name__)
@@ -294,10 +294,6 @@ PARSER_TIERS = frozenset({"auto", "native", "bashlex"})
 DEFAULT_PARSER_TIER = "auto"
 
 
-def _user_settings_path() -> Path:
-    return Path.home() / ".claude" / "settings.json"
-
-
 def resolve_parser_tier(user_settings: Optional[Path] = None) -> str:
     """Resolve the forced parser tier from `SCHLOCK_PARSER` (spec §6).
 
@@ -316,25 +312,13 @@ def resolve_parser_tier(user_settings: Optional[Path] = None) -> str:
     project-scope whitelist ban. CI pins a tier by writing that file. Anything unreadable or
     outside the allowlist resolves to `auto` with one warning. Never raises.
     """
-    try:
-        path = _user_settings_path() if user_settings is None else user_settings
-        if not path.is_file():
-            return DEFAULT_PARSER_TIER
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 - HOME unresolvable, unreadable or malformed: the switch is unknowable
-        logger.warning(f"Cannot read {PARSER_TIER_ENV} from user settings ({exc}); using {DEFAULT_PARSER_TIER}")
-        return DEFAULT_PARSER_TIER
-    env_block = data.get("env") if isinstance(data, dict) else None
-    if not isinstance(env_block, dict):
-        return DEFAULT_PARSER_TIER
-    # Case-insensitive key: Windows environments are, and a user's own typo is not a threat.
-    raw = next((v for k, v in env_block.items() if str(k).upper() == PARSER_TIER_ENV), None)
+    raw = user_settings_env(PARSER_TIER_ENV, user_settings)
     if raw is None:
         return DEFAULT_PARSER_TIER
     tier = str(raw).strip().lower()
     if tier not in PARSER_TIERS:
         logger.warning(
-            f"Ignoring {PARSER_TIER_ENV}={raw!r} in {path} (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}"
+            f"Ignoring {PARSER_TIER_ENV}={raw!r} in user settings (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}"
         )
         return DEFAULT_PARSER_TIER
     return tier
