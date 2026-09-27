@@ -1142,8 +1142,7 @@ def _command_words(node: Any) -> "list[str]":
     view in this module reads a command through here.
 
     A leading `builtin` (and its `--`) is dropped too: `builtin NAME ARGS` runs exactly
-    `NAME ARGS`, and only NAME is ever run. As a wrapper, whose every operand is scanned
-    for a command, it read `builtin echo eval` as running eval.
+    `NAME ARGS`, and only NAME is ever run.
     """
     words = [
         part.word
@@ -1153,21 +1152,6 @@ def _command_words(node: Any) -> "list[str]":
     while words[:1] == ["builtin"]:
         words = words[2:] if words[1:2] == ["--"] else words[1:]
     return words
-
-
-def expanding_words(ast_nodes: "list[Any]") -> "set[str]":
-    """Text of every command word bash expands before the command receives it (`"$x"`, `$(…)`).
-
-    bashlex keeps such a word as written and records each expansion as a part, so the text
-    here is not what the command gets: `trap "rm -f '$tmp'" EXIT` stores `rm -f '/tmp/…'`.
-    """
-    return {
-        part.word
-        for node in ast_nodes or []
-        for command in _command_nodes(node)
-        for part in getattr(command, "parts", None) or []
-        if getattr(part, "kind", None) == "word" and getattr(part, "parts", None)
-    }
 
 
 def heredoc_owner(node: Any) -> Optional[str]:

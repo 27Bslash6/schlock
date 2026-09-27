@@ -734,50 +734,45 @@ class TestTrapHandlerShellCheck:
     while `tmp=$(mktemp); rm -f "$tmp"` is not.
     """
 
-    def _spy(self, monkeypatch, result):
+    def _spy(self, monkeypatch, result, *, reached=True):
+        """Stub ShellCheck; `reached` adds the SC2034 a run that read to the end reports on the sentinel."""
         inputs: list[str] = []
+
+        def run(text):
+            inputs.append(text)
+            if result is None:
+                return None
+            last = text.count("\n") + 1
+            end = [ShellCheckFinding(2034, ShellCheckSeverity.WARNING, "appears unused", last, 1, last, 4)]
+            return result + (end if reached else [])
+
         monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
-        monkeypatch.setattr(validator, "run_shellcheck", lambda text: inputs.append(text) or result)
+        monkeypatch.setattr(validator, "run_shellcheck", run)
         return inputs
 
     def test_handler_is_checked_appended_to_its_command_not_alone(self, monkeypatch):
         inputs = self._spy(monkeypatch, [])
         command = "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT"
         validate_command(command)
-        assert f'{command}\nrm -f "$tmp"' in inputs
+        assert f'{command}\nrm -f "$tmp"\n{validator._TRAP_SENTINEL}=1' in inputs
         assert 'rm -f "$tmp"' not in inputs
+
+    def test_a_run_that_read_to_the_end_is_a_verdict(self, monkeypatch):
+        self._spy(monkeypatch, [])
+        assert validate_command("trap 'echo done' EXIT").risk_level == RiskLevel.SAFE
 
     def test_no_verdict_on_a_command_with_a_handler_fails_closed(self, monkeypatch):
         # This run is the handler's only ShellCheck, so an unfinished one is not a clean one.
         self._spy(monkeypatch, None)
         assert validate_command("trap 'echo done' EXIT").risk_level == RiskLevel.BLOCKED
 
-    def test_a_parse_error_on_a_command_with_a_handler_fails_closed(self, monkeypatch):
-        # ShellCheck abandons a file it cannot parse. With a handler appended, a handler it cannot
-        # parse (`[ a`) would otherwise silence every finding on the command around it.
-        parse_error = ShellCheckFinding(1073, ShellCheckSeverity.ERROR, "Couldn't parse", 2, 1, 2, 4)
-        self._spy(monkeypatch, [parse_error])
-        assert validate_command("trap '[ a' USR2; ls").risk_level == RiskLevel.BLOCKED
-
-    def test_the_unparsed_handler_is_named_as_such(self, monkeypatch):
-        parse_error = ShellCheckFinding(1073, ShellCheckSeverity.ERROR, "Couldn't parse", 2, 1, 2, 4)
-        self._spy(monkeypatch, [parse_error])
-        result = validate_command("trap '[ a' USR2; ls")
+    def test_a_run_that_stopped_short_of_the_sentinel_fails_closed(self, monkeypatch):
+        # Whatever code ShellCheck stopped on, and wherever: it never read what came after.
+        self._spy(monkeypatch, [], reached=False)
+        result = validate_command("trap 'echo bye' EXIT; ls")
+        assert result.risk_level == RiskLevel.BLOCKED
         assert result.matched_rules == ["shellcheck:unparseable"]
-        assert "could not parse a trap handler" in result.message
-
-    def test_a_parse_error_in_the_command_itself_is_not_the_handlers(self, monkeypatch):
-        # SC1037 (`echo "$10"`) is an error on line 1, the command's own; the handler on line 2
-        # parsed. Scored the same with or without the trap, it is not a refusal.
-        own_error = ShellCheckFinding(1037, ShellCheckSeverity.ERROR, "Braces are required", 1, 1, 1, 4)
-        self._spy(monkeypatch, [own_error])
-        assert validate_command("echo \"$10\"; trap 'echo bye' EXIT").risk_level == RiskLevel.SAFE
-
-    @pytest.mark.parametrize("code", [1072, 1089])
-    def test_a_parse_that_ended_anywhere_left_the_handler_unchecked(self, monkeypatch, code):
-        ended = ShellCheckFinding(code, ShellCheckSeverity.ERROR, "Parsing stopped here", 1, 1, 1, 4)
-        self._spy(monkeypatch, [ended])
-        assert validate_command("echo hi; trap 'echo bye' EXIT").risk_level == RiskLevel.BLOCKED
+        assert "stopped before the command ended" in result.message
 
     def test_a_handler_of_a_handler_gets_its_own_shellcheck(self, monkeypatch):
         # The outer handler re-enters without ShellCheck, so the inner one has no run to join.
@@ -809,10 +804,9 @@ class TestTrapHandlerShellCheck:
             ("tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; echo hi", 'tmp=$(mktemp); echo hi; rm -f "$tmp"'),
             ("npm run dev & pid=$!; trap 'kill $pid' EXIT; sleep 5", "npm run dev & pid=$!; sleep 5; kill $pid"),
             ("old=$(pwd); trap 'cd \"$old\"' EXIT; cd /tmp", 'old=$(pwd); cd /tmp; cd "$old"'),
-            # bash expands a double-quoted handler when `trap` runs and stores `rm -f '/tmp/x.<pid>'`.
-            ("tmp=/tmp/x.$$; trap \"rm -f '$tmp'\" EXIT", "rm -f '/tmp/x.1'"),
-            # SC1xxx errors in the command itself, not in the handler.
+            # SC1xxx errors that do not stop ShellCheck's parse, in the command or the handler.
             ("trap 'echo bye' EXIT; echo \"$10\"", 'echo "$10"'),
+            ("trap 'echo \"$10\"' EXIT", 'echo "$10"'),
             ("foo=a; trap 'echo bye' EXIT; echo \"$foo[1]\"", 'foo=a; echo "$foo[1]"'),
         ],
     )
@@ -824,10 +818,28 @@ class TestTrapHandlerShellCheck:
         assert result.risk_level == validate_command(inline).risk_level
 
     @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
-    def test_an_expanding_handler_keeps_its_destruction_codes(self, monkeypatch):
-        # Only SC2016 is dropped for a handler bash expands; SC2114/SC2115 still read it.
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=ok; trap \"rm -r\\$''f / $x\" EXIT",
+            # One expansion elsewhere in the handler; the escaped `\$HOME` is stored literally
+            # and expanded later by tmux's own shell. SC2016 is the only code that sees it.
+            'trap "cd \\"$PWD\\"; tmux new -d \'rm -rf \\$HOME\'" EXIT',
+            # ShellCheck stops on the command's own line (SC1070/SC1140) and never reads the handler.
+            "[ a ] b; trap \"rm -r\\$''f /\" EXIT",
+            "[ a ] ]; trap '[ a' USR2",
+            "trap '[ a' USR2",
+            # Using the sentinel hides the end of the run, so it fails closed.
+            f"trap 'echo ${validator._TRAP_SENTINEL}' EXIT",
+            # Fail-closed limit, accepted: SC2016 reads the text as written, not as bash stores
+            # it. `trap 'rm -f "$tmp"' EXIT` is the idiom that scores SAFE.
+            "tmp=/tmp/x.$$; trap \"rm -f '$tmp'\" EXIT",
+        ],
+    )
+    def test_handlers_shellcheck_must_see_are_blocked(self, monkeypatch, command):
         monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
-        assert validate_command("trap \"rm -r\\$''f / $x\" EXIT").risk_level == RiskLevel.BLOCKED
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
 
 
 # --------------------------------------------------------------------------------------------

@@ -18,7 +18,6 @@ import yaml
 from schlock.core.native_bridge import MAX_COMMAND_SIZE
 from schlock.exceptions import ConfigurationError, ParseError
 from schlock.integrations.shellcheck import (
-    ShellCheckSeverity,
     get_security_findings,
     is_shellcheck_available,
     run_shellcheck,
@@ -30,7 +29,6 @@ from .parser import (
     SHELL_COMMANDS,
     WRAPPER_COMMANDS,
     BashCommandParser,
-    expanding_words,
     has_compound_redirects,
     heredoc_owner,
     reset_parse_budget,
@@ -552,6 +550,9 @@ _FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
 # members let the wrapped target be found; a member matched sooner only recurses earlier, it
 # can never make the scan miss. su/sg/runuser happen to sit in both unioned sets.
 _DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find", "trap"})
+
+# Assigned on the last line of a ShellCheck run carrying trap handlers; see Step 6.
+_TRAP_SENTINEL = "schlock_trap_sentinel"
 
 # bash's `trap` listing options: any of them prints traps or signal names instead of setting one.
 _TRAP_LISTING_FLAGS: frozenset[str] = frozenset("lpP")
@@ -3284,32 +3285,23 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # delimiter (`<<'E'OF`) any more than bashlex can, and answers with SC1044
             # parse noise instead of findings - silently emptying this whole tier for
             # the commands normalisation exists to rescue (LAB-3094).
-            findings = run_shellcheck("\n".join([parse_target, *trap_handlers]))
-            unparsed = False
-            if trap_handlers and findings:
-                first_handler_line = parse_target.count("\n") + 2
+            checked = "\n".join([parse_target, *trap_handlers])
+            if trap_handlers:
                 # ShellCheck gives up on a file it cannot parse and reports only SC1xxx parse
-                # errors, none of them security codes. A handler bashlex accepts but ShellCheck
-                # cannot parse (`trap '[ a' USR2`) would so silence the whole command, so that is
-                # no verdict. Only a handler's own errors count, plus the two that end the parse
-                # wherever they land: an SC1xxx error in the command itself (`echo "$10"`) is
-                # scored the same with or without a trap.
-                unparsed = any(
-                    1000 <= f.code < 2000
-                    and f.level is ShellCheckSeverity.ERROR
-                    and (f.line >= first_handler_line or f.code in (1072, 1089))
-                    for f in findings
-                )
-                # A handler bash expands when `trap` runs (`trap "rm -f '$tmp'" EXIT`) stores the
-                # expanded text, so single quotes inside it hold a value, not a `$tmp` left
-                # unexpanded: SC2016 reads the text as written, which bash never runs.
-                expanded, line = expanding_words(ast), first_handler_line
-                expanded_lines: set[int] = set()
-                for handler in trap_handlers:
-                    span = range(line, line + handler.count("\n") + 1)
-                    expanded_lines.update(span if handler in expanded else ())
-                    line = span.stop
-                findings = None if unparsed else [f for f in findings if not (f.code == 2016 and f.line in expanded_lines)]
+                # errors, none of them security codes, wherever it stopped: `[ a ] b` on the
+                # command's own line hides a handler after it, and `trap '[ a' USR2` hides the
+                # command. Which codes stop the parse is ShellCheck's to decide, so test whether
+                # it reached the end instead: a sentinel assignment on the last line draws SC2034
+                # there, or ShellCheck did not read that far. Using or silencing the sentinel
+                # fails closed the same way.
+                checked += f"\n{_TRAP_SENTINEL}=1"
+            findings = run_shellcheck(checked)
+            unparsed = False
+            if trap_handlers and findings is not None:
+                sentinel_line = checked.count("\n") + 1
+                reached = [f for f in findings if f.code == 2034 and f.line == sentinel_line]
+                unparsed = not reached
+                findings = None if unparsed else [f for f in findings if f not in reached]
             # A run with no verdict is refused in three cases, and read as clean otherwise:
             # - a payload re-entered from Step 5c (`bash -c "…"`): this is its only
             #   ShellCheck, since no outer spawn reads inside a `-c` string (LAB-4586);
@@ -3324,7 +3316,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 subject = "payload" if _depth > 0 else "command"
                 alternatives = [f"Shorten the {subject} or run its parts as separate Bash calls"]
                 name, message = (
-                    ("shellcheck:unparseable", "ShellCheck could not parse a trap handler, so the command is unchecked")
+                    ("shellcheck:unparseable", f"ShellCheck stopped before the {subject} ended; a trap handler is unchecked")
                     if unparsed
                     else ("shellcheck:incomplete", f"ShellCheck did not complete, so the {subject} is unchecked")
                 )
