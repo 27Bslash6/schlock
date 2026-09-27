@@ -379,9 +379,6 @@ DANGEROUS_COMMAND_FLAGS: dict[str, tuple[list[str], str, list[str]]] = {
     ),
 }
 
-# awk implementations whose program is checked for a pipe to a command (awk_command_pipe).
-_AWK_COMMANDS = frozenset({"awk", "gawk", "mawk", "nawk"})
-
 
 def _check_dangerous_command_flags(
     commands_with_args: list[tuple[str, list[str]]],
@@ -465,15 +462,15 @@ def _check_dangerous_command_flags(
         # HIGH like kubectl — this does deny the legitimate `print | "sort"` idiom, but the shell
         # pipe (`awk '...' | sort`) is the plain alternative, and an arbitrary command from an awk
         # arg has no defensible top-level use. system() stays a HIGH YAML rule, and -f /
-        # `print > file` stay allowed here. Only a pipe in code every awk lexes alike is BLOCKED;
-        # one seen only in text the awks read differently asks instead (_check_contextual_high_risk).
-        if base_name in _AWK_COMMANDS:
-            awk_pipe = awk_command_pipe(args)
-            if awk_pipe and awk_pipe[1]:
+        # `print > file` stay allowed here. A pipe any awk would run is BLOCKED, including one only
+        # some awks see: they disagree on a few `/`s, and awk_command_pipe reads each way.
+        if base_name in ("awk", "gawk", "mawk", "nawk"):
+            awk_reason = awk_command_pipe(args)
+            if awk_reason:
                 return ValidationResult(
                     allowed=False,
                     risk_level=RiskLevel.BLOCKED,
-                    message=f"BLOCKED: {awk_pipe[0]}",
+                    message=f"BLOCKED: {awk_reason}",
                     alternatives=[
                         "Pipe awk's output to the command in the shell: awk '...' | cmd",
                         "Run the command directly instead of from inside awk",
@@ -757,16 +754,12 @@ def _check_contextual_high_risk(
     commands_with_args: list[tuple[str, list[str]]],
 ) -> Optional[tuple[str, str]]:
     """Return (base_name, reason) for the first kubectl command that modifies cluster state or
-    executes code, or awk program that may pipe to a command, else None.
+    executes code, else None.
 
     Top-level parity with the SubstitutionValidator kubectl check (which BLOCKs these inside
     `$()`/`<()`). At the top level `kubectl delete`/`apply`/`exec` are common legitimate ops, so the
     caller elevates to HIGH (ask) and lets the preset decide, rather than hard-blocking. Reuses the
     same `dangerous_kubectl` helper as the substitution path.
-
-    awk lands here only when its pipe shows in text the awks lex differently (a certain pipe was
-    already BLOCKED by _check_dangerous_command_flags): the `|` may sit inside a string or regex,
-    so ask rather than hard-deny, the same rating as awk system().
 
     NOTE: find is deliberately NOT handled here. The substitution path blocks *any* `find -exec`
     (conservative), but at the top level read-only `find -exec grep/cat/...` is legitimate, so
@@ -775,16 +768,11 @@ def _check_contextual_high_risk(
     """
     from schlock.core.substitution import dangerous_kubectl  # noqa: PLC0415
 
-    for cmd_name, raw_args in commands_with_args:
-        base_path_stripped = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
-        base_name, args = resolve_multicall(base_path_stripped, raw_args)
-        if base_name == "kubectl":
-            reason = dangerous_kubectl(args)
-        elif base_name in _AWK_COMMANDS:
-            awk_pipe = awk_command_pipe(args)
-            reason = awk_pipe[0] if awk_pipe else None
-        else:
+    for cmd_name, args in commands_with_args:
+        base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
+        if base_name != "kubectl":
             continue
+        reason = dangerous_kubectl(args)
         if reason:
             return base_name, reason
     return None
@@ -3170,8 +3158,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             )
             # Don't cache config errors
 
-        # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing, an
-        # awk pipe the awks lex differently).
+        # Step 5b: Contextual HIGH-risk commands (find -exec*/-delete, kubectl state-changing).
         # Top-level parity with SubstitutionValidator (which BLOCKs these in $()); at the top level
         # they are common legitimate ops, so elevate to HIGH (ask) and let the preset decide rather
         # than hard-blocking. Only elevate when nothing already matched at >= HIGH. See #97.

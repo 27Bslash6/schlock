@@ -3045,6 +3045,13 @@ class TestDangerousAwkHelper:
             ["awk", '{x /= 2; print x "|" $2}'],  # a bare-name lvalue at statement start: `/=` divides
             ["awk", 'BEGIN{x = 8; y = x /= 2; print y "|" x}'],  # x after `=` is a fresh lvalue
             ["awk", '{y = $1 + $2 / 2; print y "|" $3}'],  # a `/` after an arithmetic operand divides
+            # a class the awks end differently, where every reading ends its regex at the same `/`
+            ["awk", '{gsub(/[\\[\\]]/,""); print $1 "|" $2}'],
+            ["awk", 'match($0, /\\[[^\\]]*\\]/) {print substr($0, RSTART, RLENGTH) "|" $1}'],
+            ["awk", '{gsub(/[][]/,""); print $1 "|" $2}'],
+            ["awk", "{" + 'gsub(/[\\[\\]]/,""); ' * 8 + 'print $1 "|" $2}'],  # many on one line
+            # `case` as a variable divides: `case / foo|bar / : print` has no print before its `|`
+            ["awk", "{switch ($1) {case /foo|bar/: print; break}}"],
         ],
     )
     def test_safe_awk(self, args):
@@ -3116,8 +3123,8 @@ class TestDangerousAwkHelper:
             ["awk", "BEGIN{c=ARGV[1]; y = 4 /=/; print 1 | c}"],
             ["awk", 'BEGIN{c=ARGV[1]; y = "q" /=/; print 1 | c}'],
             ["awk", "BEGIN{c=ARGV[1]; y = (4) /=/; print 1 | c}"],
-            # a bracket the awks parse differently -> kept raw: `\]` (busybox closes, others escape),
-            # a leading `]` after `^`, a `[:class:]`
+            # a bracket the awks parse differently, so each place its regex can end is lexed: `\]`
+            # (busybox closes, others escape), a leading `]` after `^`, a `[:class:]`
             ["awk", "BEGIN{c=ARGV[1]; if ($0 ~ /[\\]/) x=1; print 1 | c}"],  # busybox
             ["awk", 'BEGIN{c=ARGV[1]; if ("x" ~ /[^]/"]/) y=1; print 1 | c}'],  # mawk, gawk
             ["awk", 'BEGIN{c=ARGV[1]; if ("x" ~ /[[:alpha:]/"]/) y=1; print 1 | c}'],  # mawk, gawk
@@ -3137,6 +3144,10 @@ class TestDangerousAwkHelper:
             # a binary arithmetic operator's operand is a non-lvalue too: `a + b` is no `/=` target
             ["awk", "BEGIN{c=ARGV[1]; a=1; b=2; y = a + b /=/; print 1 | c}"],
             ["awk", "BEGIN{c=ARGV[1]; a=8; b=2; y = a / b /=/; print 1 | c}"],
+            # a print statement continues past a newline after a comma, so that is no statement break
+            ["awk", "{print $1,\n$2 | c}"],
+            ["awk", "{if ($1) print $2 | c; else print $3}"],
+            ["awk", 'BEGIN{c=ARGV[1]; x = /[\\]/; y = "]/"; print 1 | c}'],  # busybox ends the class first
         ],
     )
     def test_dangerous_awk(self, args):
