@@ -203,13 +203,14 @@ class TestPreToolUseFailsClosedOnNonTerminatingValidation:
     """A validation that never returns must block; Claude Code lets a timed-out hook through (LAB-4959)."""
 
     def test_unterminated_brace_heredoc_denies_promptly(self, tmp_path):
-        """The LAB-4959 repro, through the real hook and its vendored bashlex: vanilla bashlex never returns."""
+        """The LAB-4959 repro, through the real hook: vanilla bashlex loops until the parse budget denies it."""
         payload = {"tool_name": "Bash", "tool_input": {"command": 'git commit -m "$(cat << EOF\n${\nEOF\n)"; echo ran'}}
 
         start = time.monotonic()
         result = _run(_hook_command("Bash"), REPO_ROOT, payload, home=tmp_path)
 
-        # Well inside the soft deadline, so this pins the parse itself returning.
+        # Under PARSE_CPU_BUDGET (CPU seconds, so at least as many wall seconds), so this pins the
+        # brace-expansion refusal denying, not the parse budget or the hook deadline catching a loop.
         assert time.monotonic() - start < 10
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
