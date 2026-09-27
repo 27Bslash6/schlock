@@ -7,18 +7,19 @@ once the interpreter has started and compiled the file. A failure before that po
 `python3` on PATH, a SyntaxError in pre_tool_use.py — exits non-zero with empty stdout,
 and a non-zero exit carrying no decision lets the tool call proceed.
 
-So the manifest carries the outermost guard, `|| exit 2`: exit 2 is the one exit code that
-blocks a PreToolUse tool call on its own, whatever is or is not on stdout. These tests read
-the command string out of hooks.json rather than restating it, so editing the guard away
-fails them.
-
-Windows is not covered — see the skip reason below.
+So the manifest carries the outermost guard: exit 2 is the one exit code that blocks a
+PreToolUse tool call on its own, whatever is or is not on stdout, and the command exits 2
+unless the hook both exits 0 and prints a decision. Exit status alone is not proof the hook
+ran — a `python3` that is not the expected binary can exit 0 having printed nothing. These
+tests read the command string out of hooks.json rather than restating it, so editing the
+guard away fails them.
 """
 
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +31,7 @@ MANIFEST = HOOKS_DIR / "hooks.json"
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
-    reason="shell-form hook commands run under PowerShell on Windows, where `||` needs v7; no Windows CI to pin it",
+    reason="exercises POSIX /bin/sh semantics",
 )
 
 
@@ -43,7 +44,7 @@ def _hook_command(matcher: str) -> str:
     assert len(hooks) == 1, f"expected exactly one hook under PreToolUse/{matcher}"
     assert "args" not in hooks[0], (
         "an `args` array switches Claude Code from shell form to a direct spawn, which makes "
-        "`|| exit 2` inert text rather than shell syntax"
+        "the guard inert text rather than shell syntax"
     )
     return hooks[0]["command"]
 
@@ -123,6 +124,21 @@ class TestPreToolUseFailsClosedOnStartupFailure:
         assert result.returncode == 2, f"expected a block, got rc={result.returncode} stdout={result.stdout!r}"
         assert result.stdout.strip() == "", "a file that will not compile emits no decision"
 
+    @pytest.mark.parametrize("stdout", ["", "hello"], ids=["silent", "not-a-decision"])
+    def test_python3_that_exits_zero_without_a_decision_blocks(self, tmp_path, stdout):
+        """A shadowed `python3` that exits 0 never ran the hook: status 0 is not a decision."""
+        root = _stub_plugin_root(tmp_path, "")
+        fake_bin = tmp_path / "fake-bin"
+        fake_bin.mkdir()
+        fake = fake_bin / "python3"
+        fake.write_text(f"#!/bin/sh\nprintf '{stdout}'\nexit 0\n")
+        fake.chmod(0o755)
+
+        result = _run(_hook_command("Bash"), root, BASH_PAYLOAD, home=tmp_path, path=f"{fake_bin}:/usr/bin:/bin")
+
+        assert result.returncode == 2, f"expected a block, got rc={result.returncode} stdout={result.stdout!r}"
+        assert result.stdout.strip() == "", "nothing the harness could read as a decision may pass through"
+
 
 class TestEveryHookStartsFromAPathContainingASpace:
     """Every plugin-root path is quoted, so `/Users/Jane Smith/...` does not brick a tool.
@@ -134,19 +150,20 @@ class TestEveryHookStartsFromAPathContainingASpace:
 
     @pytest.mark.parametrize("command", _all_commands())
     def test_command_starts(self, tmp_path, command):
-        root = _stub_plugin_root(tmp_path / "plugin root", "print('{\"ok\": true}')\n")
+        root = _stub_plugin_root(tmp_path / "plugin root", 'print(\'{"permissionDecision": "allow"}\')\n')
 
         result = _run(command, root, BASH_PAYLOAD, home=tmp_path)
 
         assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr!r}"
-        assert json.loads(result.stdout) == {"ok": True}
+        assert json.loads(result.stdout) == {"permissionDecision": "allow"}
 
 
 class TestPreToolUseStillDeliversOrdinaryDecisions:
-    """`|| exit 2` fires on a non-zero exit, and allow, ask and deny all exit 0 — so it cannot
-    turn a decision the validator reached into a block it did not choose. `ask` is the case
-    that matters: converting a prompt the user could approve into a hard block would take the
-    choice away from them, which is the opposite of what the risk presets are for.
+    """The guard fires on a non-zero exit or a missing decision, and allow, ask and deny all
+    exit 0 with a decision — so it cannot turn a decision the validator reached into a block
+    it did not choose. `ask` is the case that matters: converting a prompt the user could
+    approve into a hard block would take the choice away from them, which is the opposite of
+    what the risk presets are for.
     """
 
     @pytest.mark.parametrize(
@@ -164,14 +181,14 @@ class TestPreToolUseStillDeliversOrdinaryDecisions:
         result = _run(_hook_command("Bash"), REPO_ROOT, payload, home=tmp_path)
 
         assert result.returncode == 0, (
-            f"an ordinary decision must exit 0 or `|| exit 2` turns it into a hard block: "
+            f"an ordinary decision must exit 0 or the guard turns it into a hard block: "
             f"rc={result.returncode} stderr={result.stderr[-500:]!r}"
         )
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == expected
 
 
 class TestSelfProtectStaysFailOpen:
-    """The write-tool hook is deliberately fail-open and must not inherit `|| exit 2`.
+    """The write-tool hook is deliberately fail-open and must not inherit the exit-2 guard.
 
     self_protect.py is a lock on schlock's own config file, not a gate. If python3 is missing
     the Bash entry already blocks every command, so guarding this one too would only remove
@@ -180,3 +197,42 @@ class TestSelfProtectStaysFailOpen:
 
     def test_write_tool_hook_has_no_exit_guard(self):
         assert "exit 2" not in _hook_command("Write|Edit|MultiEdit|NotebookEdit")
+
+
+class TestPreToolUseFailsClosedOnNonTerminatingValidation:
+    """A validation that never returns must block; Claude Code lets a timed-out hook through (LAB-4959)."""
+
+    def test_unterminated_brace_heredoc_denies_promptly(self, tmp_path):
+        """The LAB-4959 repro, through the real hook and its vendored bashlex: vanilla bashlex never returns."""
+        payload = {"tool_name": "Bash", "tool_input": {"command": 'git commit -m "$(cat << EOF\n${\nEOF\n)"; echo ran'}}
+
+        start = time.monotonic()
+        result = _run(_hook_command("Bash"), REPO_ROOT, payload, home=tmp_path)
+
+        # Well inside the soft deadline, so this pins the parse itself returning.
+        assert time.monotonic() - start < 10
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_stall_the_soft_deadline_cannot_interrupt_blocks(self, tmp_path):
+        """SIGALRM held off (as C code holding the GIL would): the watchdog exits and `|| exit 2` blocks."""
+        stub = f"""
+import signal, sys, time
+sys.path.insert(0, {str(HOOKS_DIR)!r})
+import pre_tool_use
+
+def stall(command):
+    signal.pthread_sigmask(signal.SIG_BLOCK, {{signal.SIGALRM}})
+    time.sleep(30)
+
+pre_tool_use.validate_command = stall
+pre_tool_use.VALIDATION_DEADLINE_S = 0.1
+pre_tool_use.HARD_DEADLINE_S = 1
+pre_tool_use.main()
+"""
+        root = _stub_plugin_root(tmp_path / "plugin", stub)
+
+        result = _run(_hook_command("Bash"), root, BASH_PAYLOAD, home=tmp_path)
+
+        assert result.returncode == 2, f"expected a block, got rc={result.returncode} stdout={result.stdout!r}"
+        assert result.stdout.strip() == ""

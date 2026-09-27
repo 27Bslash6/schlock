@@ -1015,13 +1015,16 @@ class TestDecoyPaddingIsScannedExactly:
 
     A bound here looks like cheap insurance and is not. An earlier cut capped the
     rescan and reported the last SUPPRESSED match on exhaustion, reasoning that
-    padding should buy a denial. It bought the opposite: `validate_command` runs
-    its cross-segment scan only when NO segment matched, so a bogus segment match
-    hides a BLOCKED the whole command would have earned. Padding with 32 repeats
-    of any unanchored low-risk pattern switched off every cross-segment rule.
-    Returning None on exhaustion is no better -- then padding silences the rule.
+    padding should buy a denial. It denies benign text instead: a quoted doc
+    listing many install lines. It also under-blocked while `validate_command`
+    ran its cross-segment scan only when no segment matched; that scan now runs
+    whatever the segments matched, so a bogus segment match no longer hides the
+    BLOCKED. Returning None on exhaustion is no better -- then padding silences
+    the rule.
 
-    Both directions are pinned below at 40 repeats, past where the cap sat.
+    Pinned below at 40 repeats, past where the cap sat. The over-block test is
+    what pins the last-suppressed-match bound; nothing here pins a bound that
+    returns None, because the fork bomb matches on its first iteration.
     Found by adversarial review of this branch (LAB-4321 / PR #170, whose
     rules.py this file's engine change is byte-identical to).
     """
@@ -1030,8 +1033,9 @@ class TestDecoyPaddingIsScannedExactly:
         """The under-block, and the serious one: a fork bomb behind the padding.
 
         `_segment_nodes` fragments `:(){ :|:& };:` into inert `:` segments, so the
-        whole-command scan is the ONLY thing that can see it. A bogus segment match
-        skips that scan.
+        whole-command scan is the ONLY thing that can see it. That scan runs
+        whatever the segments matched, so this is the end-to-end contract rather
+        than the guard on the bound.
         """
         padded = "echo '" + ("pip install -r requirements.txt " * 40) + "' && :(){ :|:& };:"
         assert not verdict(padded, rules_dir_path).allowed
