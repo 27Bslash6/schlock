@@ -1023,9 +1023,9 @@ class TestDecoyPaddingIsScannedExactly:
     BLOCKED. Returning None on exhaustion is no better -- then padding silences
     the rule.
 
-    Pinned below at 40 repeats, past where the cap sat. The over-block test is
-    what pins the last-suppressed-match bound; nothing here pins a bound that
-    returns None, because the fork bomb matches on its first iteration.
+    `test_padding_does_not_deny_inert_text` pins the last-suppressed-match bound.
+    `test_padding_does_not_silence_the_rule_that_decides_the_verdict` pins a bound
+    that returns None, padded to MAX_COMMAND_SIZE so no bound has room to sit.
     Found by adversarial review of this branch (LAB-4321 / PR #170, whose
     rules.py this file's engine change is byte-identical to).
     """
@@ -1045,12 +1045,6 @@ class TestDecoyPaddingIsScannedExactly:
         """The over-block: a quoted doc listing many install lines is not a command."""
         assert verdict("echo '" + ("sudo apt-get install -y pkg " * 40) + "'", rules_dir_path).allowed
 
-    def test_a_modest_number_of_decoys_still_finds_the_real_read(self, rules_dir_path):
-        command = "echo '" + ("od ~/.ssh/id_rsa " * 4) + "' ; nl ~/.ssh/id_ed25519"
-        result = verdict(command, rules_dir_path)
-        assert result.risk_level == RiskLevel.BLOCKED
-        assert "ssh_key_exfiltration" in result.matched_rules
-
     def test_padding_does_not_silence_the_rule_that_decides_the_verdict(self, rules_dir_path):
         """The None direction, which no row above can see.
 
@@ -1059,10 +1053,7 @@ class TestDecoyPaddingIsScannedExactly:
         it. Its padded `pip` patterns do exhaust, but they carry HIGH
         (`pip_system`) and LOW (`pip_requirements`) -- both under BLOCKED, so
         silencing them cannot move the verdict. `test_padding_does_not_deny_inert_text`
-        asserts a command is allowed, which no amount of silencing can fail. And
-        `test_a_modest_number_of_decoys_still_finds_the_real_read` pads with four
-        decoys, which reaches no cap at all; its `;` is a real separator, so the
-        payload lands in its own segment and that scan never walks past a decoy.
+        asserts a command is allowed, which no amount of silencing can fail.
 
         Here the scan that walks the padding is the only thing between the command
         and its verdict. ONE `ssh_key_exfiltration` pattern matches both halves:
@@ -1089,8 +1080,9 @@ class TestDecoyPaddingIsScannedExactly:
         """
         decoy = "cat ~/.ssh/identity; "
         shape = "env -u '{}' head ~/.ssh/id_ed25519"
-        padded = shape.format(decoy * ((MAX_COMMAND_SIZE - len(shape.format(""))) // len(decoy)))
-        assert len(padded) <= MAX_COMMAND_SIZE
+        count, slack = divmod(MAX_COMMAND_SIZE - len(shape.format("")), len(decoy))
+        padded = shape.format(decoy * count + " " * slack)
+        assert len(padded) == MAX_COMMAND_SIZE
         result = verdict(padded, rules_dir_path)
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ssh_key_exfiltration" in result.matched_rules
