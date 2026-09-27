@@ -2789,9 +2789,11 @@ def validate_command(
     ``_depth``, ``_shellcheck``, ``_derived`` and ``_as_written`` are internal, keyword-only; see
     :func:`_validate_command`.
     """
-    if _depth == 0 and not _derived:
-        # A new command gets a fresh parse budget; re-entries for its payloads and heredoc
-        # rewrites share the one it is spending (LAB-5659).
+    if _depth == 0 and not _derived and not _as_written:
+        # A new command gets a fresh parse budget; re-entries for its payloads, heredoc
+        # rewrites and Step 3b's two halves share the one it is spending (LAB-5659). The
+        # rewrite half still passes this gate, but Step 3b runs before anything is parsed,
+        # so its reset hands back nothing.
         reset_parse_budget()
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(

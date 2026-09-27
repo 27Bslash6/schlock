@@ -850,6 +850,13 @@ class TestParseBudget:
         assert result.risk_level.name == "BLOCKED"
         assert "too complex to analyse" in result.message
 
+    def test_an_arithmetic_shift_spends_one_budget(self, runaway_parse, no_shellcheck):
+        """Step 3b judges the shift rewrite and the command as written: two halves of one command, one budget."""
+        result = validate_command("(( 1<<b ))\ncat <<heredoc\nbudget test\nheredoc")
+        assert not result.allowed
+        assert result.risk_level.name == "BLOCKED"
+        assert len(runaway_parse) == 1
+
     def test_commit_filter_falls_back_under_a_runaway_parse(self, runaway_parse):
         result = CommitMessageFilter({"enabled": True, "rules": {}}).filter_commit_message('git commit -m "budget test"')
         assert (result.original_message, result.was_modified, result.error) == ("budget test", False, None)
