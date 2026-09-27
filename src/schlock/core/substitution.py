@@ -638,15 +638,14 @@ def dangerous_find(args: list[str]) -> str | None:
     `find -exec grep` and `find -fprint files.txt` are still allowed there.) Order-independent and
     indifferent to a leading "find" token. See #97.
 
-    An arg that bash may still expand is judged as a conservative superset, not emulated: one that
-    holds a `-` next to a brace, `$` or backtick is denied, because brace, parameter, ANSI-C and
-    command expansion can all turn it into a flag (`-fp{r,}int`, `$'-fprint'`, `-fprint${x}`).
-    None of them can create a `-` the word does not already hold (a brace sequence yields one only
-    before digits), so `find {src,lib}` and `find dir{1..3}` stay allowed. The cost is over-blocking
-    rarer args such as `-name '*-{a,b}'` or `${SRC:-.}`, which this tier accepts.
+    An arg that the shell may still expand is not emulated. One that holds a `-` together with a
+    brace, `$` or backtick is denied outright, which covers a flag spelled visibly in the source
+    however it is split up. A value the shell supplies only at run time is outside what this check
+    can see. `find {src,lib}` and `find dir{1..3}` stay allowed. The cost is real: an ordinary
+    expanded path or pattern that holds a `-`, such as `"$HOME/.config/my-app"`, is denied here too.
     """
     for arg in args:
-        if arg.replace("$", "") in _DANGEROUS_FIND_FLAGS:
+        if arg in _DANGEROUS_FIND_FLAGS:
             return f"find {arg} executes commands or modifies files"
         if "-" in arg and _FIND_EXPANSION_CHARS.search(arg):
             return f"find argument {arg!r} may expand to a flag that executes commands or modifies files"

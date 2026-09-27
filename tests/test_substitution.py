@@ -297,7 +297,8 @@ class TestFindDangerousFlags:
             "echo $(find . -fprin{s..u} /tmp/l)",
             "echo $(find . -fprint{0..0} /tmp/l)",
             # Spellings bash still turns into a flag: a `}` before the comma, escaped or quoted
-            # braces, `${...}` in a list, a signed step, and an empty-expansion splice.
+            # braces, `${...}` in a list, a signed step and a signed start, parameter expansions
+            # (empty and default-value), and command substitution.
             "echo $(find . -name {x},-fprint} /tmp/l)",
             "echo $(find . -name {x\\},-o,-fprint} /tmp/l)",
             'echo $(find . {-fls,"/tmp/{l"})',
@@ -334,9 +335,17 @@ class TestFindDangerousFlags:
         # `{}` holds no `-`: find's placeholder expands to nothing bash could turn into a flag.
         assert dangerous_find(["-name", "{}", "-print"]) is None
 
-    def test_expandable_arg_with_a_dash_over_blocks_by_design(self):
-        # The check is a superset, not an emulation of bash: this reads nothing but is denied.
-        assert validate_command("echo $(find . -name '*-{a,b}')").risk_level == RiskLevel.BLOCKED
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(find . -name '*-{a,b}')",
+            'x=$(find "$HOME/.config/my-app" -name "*.json")',
+        ],
+    )
+    def test_expandable_arg_with_a_dash_over_blocks_by_design(self, command):
+        # The check does not emulate the shell: these read nothing but are denied. At top level
+        # the target-aware rule applies instead, so the denied command can be rerun there.
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
 
 class TestGitConfigBypass:

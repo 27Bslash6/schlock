@@ -167,6 +167,14 @@ class TestFindWriteFlagsTopLevel:
             "sort -t $'\\'' -o /etc/cron.d/x f",
             "find . -name $'\\'' -fprint /etc/cron.d/x",
             "find . -name $'a\\'b' -fprint /etc/cron.d/x",
+            # `$$` is the PID: the `'` after it opens a PLAIN quote, which a backslash closes.
+            "sort -t $$'\\' -o /etc/cron.d/x f",
+            "sort -t $$'\\' -o/etc/cron.d/x f",
+            "find . -name $$'\\' -fprint /etc/cron.d/x",
+            "find . -name x$$'\\' -fprint /etc/cron.d/x",
+            "find . -name $$$$'\\' -fprint /etc/cron.d/x",
+            # `$$$'` is the PID then an ANSI-C span, so the `\'` in it does not close it.
+            "sort -t $$$'\\'' -o /etc/cron.d/x f",
             # A quote opens mid-word too.
             "sort -t'|' -o /etc/cron.d/x f",
             "find . -name a'|'b -fprint /etc/cron.d/x",

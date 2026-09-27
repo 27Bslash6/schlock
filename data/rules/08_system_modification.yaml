@@ -106,7 +106,8 @@ rules:
       # sort/sdiff -o / --output (cluster ending in 'o', e.g. -o or -ro), or find -fprint/-fprint0/
       # -fprintf/-fls, space/'='-separated, optional quote, then a sensitive target. '-[a-zA-Z]*o'
       # catches combined short flags like -ro (-r + -o). (?(sortcmd)...) picks the flag set of
-      # whichever command matched; it is named so a capture group added in front cannot re-aim it. The target must follow the flag directly, so a sensitive find START path
+      # whichever command matched; it is named so a capture group added in front cannot re-aim it.
+      # The target must follow the flag directly, so a sensitive find START path
       # (find /etc/cron.d -fprint list.txt) cannot match. The /etc/cron (and similar) prefixes
       # intentionally match anything beneath those dirs: writing under /etc at all is privileged.
       #
@@ -116,8 +117,9 @@ rules:
       # `find . -exec true \; -fprint /etc/cron.d/x` read SAFE. The walk crosses an escaped
       # character or a whole quoted span and still stops at an UNQUOTED ; | & or newline, so it
       # cannot misattribute a flag from the next command. Its branches are disjoint (one parse per
-      # input, no exponential backtracking): the next character alone picks one of backslash,
-      # `$'` (ANSI-C span, whose \' does not close it), a lone `$`, `"`, `'`, or anything else.
+      # input, no exponential backtracking): the next one or two characters pick one of backslash,
+      # `$$` (the PID, so a `'` after it opens a PLAIN quote), `$'` (ANSI-C span, whose \' does not
+      # close it), any other `$`, `"`, `'`, or anything else.
       # Unlike extended_credential_exposure in 03_credential_theft.yaml, the single-quote branch
       # has NO lookbehind: bash opens a quote after a letter too (sort -t'|', -name a'|'b), and
       # here the lookbehind bought only that bypass. See #113.
@@ -125,9 +127,9 @@ rules:
       # `find . -name '-fprint /etc/cron.d/x'` rates HIGH on purpose. The rules also run on the
       # quote-stripped reconstruction, where that match starts at the unquoted `find`; keep that
       # pass, because it is what sees through `"find"` and `f\ind`.
-      - '\b(?:(?P<sortcmd>sort|sdiff)|find)\b(?:\\[\s\S]|[^;|&\n\x27"\\$]|\$(?!\x27)|"(?:[^"\\]|\\[\s\S])*"|\$\x27(?:[^\x27\\]|\\[\s\S])*\x27|\x27[^\x27]*\x27)*(?(sortcmd)(?:-[a-zA-Z]*o|--output)|\s-(?:fprint0?|fprintf|fls))[=\s]+["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
+      - '\b(?:(?P<sortcmd>sort|sdiff)|find)\b(?:\\[\s\S]|[^;|&\n\x27"\\$]|\$\$|\$(?![\x27$])|"(?:[^"\\]|\\[\s\S])*"|\$\x27(?:[^\x27\\]|\\[\s\S])*\x27|\x27[^\x27]*\x27)*(?(sortcmd)(?:-[a-zA-Z]*o|--output)|\s-(?:fprint0?|fprintf|fls))[=\s]+["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
       # attached short form: -o<sensitive-path> or -ro<sensitive-path>
-      - '\b(sort|sdiff)\b(?:\\[\s\S]|[^;|&\n\x27"\\$]|\$(?!\x27)|"(?:[^"\\]|\\[\s\S])*"|\$\x27(?:[^\x27\\]|\\[\s\S])*\x27|\x27[^\x27]*\x27)*-[a-zA-Z]*o["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
+      - '\b(sort|sdiff)\b(?:\\[\s\S]|[^;|&\n\x27"\\$]|\$\$|\$(?![\x27$])|"(?:[^"\\]|\\[\s\S])*"|\$\x27(?:[^\x27\\]|\\[\s\S])*\x27|\x27[^\x27]*\x27)*-[a-zA-Z]*o["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
     alternatives:
       - "Writing to a system config/persistence path via a command's output-file flag is a backdoor vector"
       - "Write to a non-system path, or use proper configuration management"

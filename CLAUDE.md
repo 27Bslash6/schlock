@@ -108,7 +108,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 
 | Command | Safe Usage | Dangerous Flags/Options |
 |---------|------------|------------------------|
-| `find` | `-name`, `-type`, `-maxdepth` | `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete` |
+| `find` | `-name`, `-type`, `-maxdepth` | `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-fprint`, `-fprint0`, `-fprintf`, `-fls` |
 | `git` | `status`, `log`, `diff` | `-c alias.X=!cmd`, `-c core.sshCommand`, `-c core.pager`, `-c credential.helper`, `-c diff.external`, `-c merge.tool` |
 | `grep` | Pattern matching | (generally safe) |
 | `locate` | File search | (generally safe) |
