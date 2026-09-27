@@ -7,6 +7,7 @@ handles configuration layering (plugin defaults → user → project).
 
 import logging
 import re
+import shlex
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
@@ -536,14 +537,20 @@ _WATCH_VALUE_OPTIONS: frozenset[str] = frozenset({"-n", "--interval"})
 
 # `flock`'s own options, parsed by getopt up to the lock file. Only these take a value: a cluster
 # ending in a value letter takes the next word (`-nw 5`), and getopt_long accepts any unambiguous
-# prefix of a long option (`--tim 5`, verified). `-c`/`--command` is deliberately absent: flock
-# rejects it here and reads it only as the word right after the lock file (see _flock_payload).
+# prefix of a long option (`--tim 5`, verified). An ambiguous prefix (`--c`) is read as taking a
+# value too; flock rejects it and runs nothing, so the reading cannot matter. `-c`/`--command` is
+# deliberately absent: flock rejects it here and reads it only as the word right after the lock
+# file (see _flock_payload).
 _FLOCK_VALUE_LETTERS: frozenset[str] = frozenset("wE")
 _FLOCK_VALUE_LONG_OPTIONS: tuple[str, ...] = ("--timeout", "--wait", "--conflict-exit-code")
 
 # `rsync`'s short options that take a value (rsync 3.2.7 `--help`). popt reads the value from the
 # rest of the cluster (`-eX`, and `-Be` is block size "e") or, when the letter ends it, the next word.
 _RSYNC_VALUE_LETTERS: frozenset[str] = frozenset("B@TfMe")
+
+# Stands in for the argument rsync appends to its `-e` program, to ask whether that program runs its
+# next argument as shell code (`-e 'sh -c'`). Any string no real command contains will do.
+_RSYNC_APPENDED_ARG = "\x00rsync-appended-argument"
 
 # `find`'s clauses that run an external command. Everything up to the terminating `;`/`+` is
 # that command, and the shell inside it is a delegator find never names as a command itself.
@@ -680,6 +687,39 @@ def _flock_payload(args: list[str]) -> Optional[str]:
     return None
 
 
+def _hands_next_arg_to_a_shell(program: str) -> bool:
+    """Whether rsync's `-e` program runs the argument rsync appends to it as shell code.
+
+    Asked of the same extractor, with a stand-in argument appended, so every spelling it knows
+    (`sh -c`, `sudo bash -c --`, `watch`) answers identically. A program shlex cannot split is
+    treated as one that does: rsync's own split is not bash's, and the unknown fails closed.
+    """
+    try:
+        words = shlex.split(program)
+    except ValueError:
+        return True
+    if not words:
+        return False
+    return _RSYNC_APPENDED_ARG in _shell_delegated_payloads([(words[0], [*words[1:], _RSYNC_APPENDED_ARG])])
+
+
+def _rsync_remote_words(operand: str) -> list[str]:
+    """Return the words rsync appends to its `-e` program for one operand: USER and HOST.
+
+    rsync execs `PROG [-l USER] HOST rsync --server ...`, splitting `[USER@]HOST:PATH` at the first
+    `:` and then at the last `@`, and taking `rsync://[USER@]HOST[:PORT]/...` up to the `/` and the
+    port (rsync 3.2.7, read back with an argv-dumping `-e` program). Each part is one argv word,
+    spaces and all. An operand with a `/` before its first `:` is local to rsync; reading its head
+    anyway only over-approximates.
+    """
+    if operand.startswith("rsync://"):
+        operand = operand[len("rsync://") :]
+    elif ":" not in operand:
+        return []  # a local path: nothing of it reaches the remote shell
+    user, _, host = re.split(r"[:/]", operand, maxsplit=1)[0].rpartition("@")
+    return [word for word in (user, host) if word]
+
+
 def _rsync_payloads(args: list[str]) -> list[str]:
     """Return every remote-shell program `rsync -e PROG` / `--rsh PROG` names, verbatim.
 
@@ -687,29 +727,36 @@ def _rsync_payloads(args: list[str]) -> list[str]:
     remote, but PROG may itself be a shell (`-e "sh -c '...'"`), so it is re-validated as bash:
     that over-approximates rsync's own split, and locality is not judged at all, because
     `host:path` cannot be told reliably from a local name containing a colon. popt reads options
-    after the operands too (`rsync a host:b -e PROG`) and has no long-option abbreviations (`--rs`
-    is unknown), so every word up to `--` is scanned.
+    after the operands too (`rsync a host:b -e PROG`), so every word up to `--` is scanned; it
+    has no long-option abbreviations (`--rs` is unknown), so only the exact `--rsh` is matched.
 
-    A value letter other than `e` ends its cluster without consuming the next word. Whether popt
-    would hand that word to it (`-f -e PROG`) is left unmodelled: reading it as a possible `-e`
-    over-approximates, which is the safe direction.
+    When PROG runs its next argument as shell code (`-e 'sh -c'`), that argument is the operand's
+    USER or HOST (see _rsync_remote_words), so those are returned too.
+
+    Values of the other options are not skipped: a value letter other than `e` ends its cluster
+    without consuming the next word, and a long option's value (`--filter X`) is read as a word
+    of its own. Whether popt hands that word to the option (`-f -e PROG`) is left unmodelled:
+    reading it as a possible `-e` or operand over-approximates, which is the safe direction.
     """
     payloads = []
+    operands = []
     i = 0
     while i < len(args):
         word = args[i]
         i += 1
         if word == "--":
+            operands.extend(args[i:])
             break
-        if word == "--rsh":
-            if i < len(args):
-                payloads.append(args[i])
-                i += 1
-            continue
+        if word == "--rsh" and i < len(args):
+            word = f"--rsh={args[i]}"
+            i += 1
         if word.startswith("--rsh="):
             payloads.append(word[len("--rsh=") :])
             continue
-        if word.startswith("--") or not word.startswith("-"):
+        if not word.startswith("-"):
+            operands.append(word)
+            continue
+        if word.startswith("--"):
             continue
         for pos, letter in enumerate(word[1:], 2):
             if letter not in _RSYNC_VALUE_LETTERS:
@@ -721,6 +768,8 @@ def _rsync_payloads(args: list[str]) -> list[str]:
                     payloads.append(args[i])
                     i += 1
             break
+    if any(_hands_next_arg_to_a_shell(program) for program in payloads):
+        payloads.extend(word for operand in operands for word in _rsync_remote_words(operand))
     return payloads
 
 
@@ -794,6 +843,8 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator gramm
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in SHELL_COMMANDS))
+            # Not an `elif` arm above: flock is also a wrapper (`flock FILE bash -c PROG`), so the
+            # wrapper scan below must still run on it.
             if base == "flock":
                 found.append(_flock_payload(args))
             if base in WRAPPER_COMMANDS:

