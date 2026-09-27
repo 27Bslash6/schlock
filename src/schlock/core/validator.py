@@ -3090,35 +3090,19 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # has ruled. heredoc_ranges ARE passed, unlike the unsuppressed multi-segment
             # scan above: that scan still runs, so they cost this pass nothing it must catch,
             # and without them a single segment's heredoc text denies.
-            #
-            # Each segment is matched again on its own slice, whitelisted as the segment
-            # loop does: a rule that ends its target with `(\s|$)` cannot match `/etc;`,
-            # but it matches `/etc` at the end of its segment.
             if match.risk_level < RiskLevel.BLOCKED:
                 masked = parser.mask_substitution_bodies(parse_target, ast)
                 if masked != parse_target:
-                    views = [(masked, string_literals, heredoc_ranges, len(segments) <= 1)]
-                    if len(segments) > 1:
-                        views += [
-                            (
-                                masked[start:end],
-                                parser._rebase(string_literals, start, end),
-                                parser._rebase(heredoc_ranges, start, end),
-                                True,
-                            )
-                            for start, end in (segment.node.pos for segment in segments)
-                            if masked[start:end] != parse_target[start:end]
-                        ]
-                    for text, literals, heredocs, whitelisted in views:
-                        masked_match = engine.match_command(
-                            text, string_literals=literals, heredoc_ranges=heredocs, use_whitelist=whitelisted
-                        )
-                        if masked_match.risk_level > match.risk_level:
-                            match = masked_match
-                            if all_matched_rules and masked_match.rule:
-                                all_matched_rules.append(masked_match.rule.name)
-                        if match.risk_level == RiskLevel.BLOCKED:
-                            break
+                    masked_match = engine.match_command(
+                        masked,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        use_whitelist=len(segments) <= 1,
+                    )
+                    if masked_match.risk_level > match.risk_level:
+                        match = masked_match
+                        if all_matched_rules and masked_match.rule:
+                            all_matched_rules.append(masked_match.rule.name)
 
             # A `"$(…)"` body is code, which the passes above suppressed with its quoted
             # word. Matched once, over the whole AST, after the segments are rated: a `for`

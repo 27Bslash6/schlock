@@ -462,9 +462,10 @@ _FD_VARIABLE_TAG = "schlock_fd_variable"
 # any quotes (dropped by `.sub(r"\1", …)`). Matching the runs first consumes a `$`
 # inside them, and `$$` is the PID, so neither is taken for a marker. No escape
 # handling: only apply it to a span with no backslash.
+_QUOTED_RUN_OR_DOLLAR_MARKER = re.compile(r"""('[^']*'|"[^"]*"|\$\$)|\$(?=['"])""")
+
 # An unescaped `\\<newline>`: an odd backslash run before the newline. Bash joins the lines.
 _LINE_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
-_QUOTED_RUN_OR_DOLLAR_MARKER = re.compile(r"""('[^']*'|"[^"]*"|\$\$)|\$(?=['"])""")
 
 # Quoted-substitution body text may total this many times the command's length
 # before extract_quoted_substitution_bodies fails closed. Bodies nest, so text
@@ -2104,7 +2105,7 @@ class BashCommandParser:
         return bodies
 
     def mask_substitution_bodies(self, command: str, ast_nodes: list[Any], start: int = 0, end: Optional[int] = None) -> str:
-        """`command[start:end]` with each outermost substitution body blanked, every offset kept.
+        """`command[start:end]` with each outermost substitution body blanked, its length kept.
 
         SECURITY: a rule's gap stops at `;`, `|`, `&` and newlines so the
         whole-command scan cannot pair one command's reader with the next command's
@@ -2129,8 +2130,8 @@ class BashCommandParser:
         A `\\<newline>` is blanked too: bash joins the two lines into one, and a
         gap that stops at the newline would not.
 
-        Length-preserving, so the caller's literal and heredoc ranges still index
-        it. A span is blanked only when its opener is at the node's start and its
+        Length-preserving, so the caller's literal and heredoc ranges, rebased
+        onto `start`, still index it. A span is blanked only when its opener is at the node's start and its
         closer where _body_end looks: a `\\<newline>` earlier in the word moves
         bashlex's offsets, and a span left as written only costs this pass a match.
         """

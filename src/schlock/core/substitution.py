@@ -31,7 +31,7 @@ from .parser import EXEC_CHILD_ATTRS, _resolve_multicall, without_fd_variables
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from .rules import RiskLevel
+    from .rules import RiskLevel, RuleMatch
 
 logger = logging.getLogger(__name__)
 
@@ -2380,13 +2380,15 @@ class SubstitutionValidator:
             return None
         literals = sub_node.literal_ranges if vetted else None
         rule_match = self.rule_engine.match_command(sub_node.inner_command, string_literals=literals)
+        amplified_risk = self._amplify_risk(rule_match.risk_level) if rule_match and rule_match.matched else None
+        # A rule only the masked view reaches keeps its own level, as the top-level masked pass
+        # does. That view reads the source, which the word view has already decoded, so an
+        # amplified match there would make `$'\x72'` beside a `$(pwd)` deny and alone prompt.
         masked_match = self._match_masked_body(sub_node, vetted=vetted)
-        if masked_match and masked_match.matched:
-            if not (rule_match and rule_match.matched) or masked_match.risk_level > rule_match.risk_level:
-                rule_match = masked_match
-        if not (rule_match and rule_match.matched):
+        if masked_match and masked_match.matched and (amplified_risk is None or masked_match.risk_level > amplified_risk):
+            rule_match, amplified_risk = masked_match, masked_match.risk_level
+        if amplified_risk is None:
             return None
-        amplified_risk = self._amplify_risk(rule_match.risk_level)
         return SubstitutionValidationResult(
             allowed=amplified_risk not in (RiskLevel.BLOCKED, RiskLevel.HIGH),
             risk_level=amplified_risk,
@@ -2397,7 +2399,7 @@ class SubstitutionValidator:
             matched_rules=[rule_match.rule.name] if rule_match.rule else [],
         )
 
-    def _match_masked_body(self, sub_node: SubstitutionNode, *, vetted: bool) -> Any:
+    def _match_masked_body(self, sub_node: SubstitutionNode, *, vetted: bool) -> RuleMatch | None:
         """The rules matched against this body's source with its own nested bodies blanked.
 
         The word view keeps a nested body as written, so a separator deep inside it ends

@@ -305,18 +305,14 @@ DEEP_RESIDUALS = [
     ("recursive_permission_system_dirs", f"chown -R {D} /etc; true"),
     ("recursive_permission_system_dirs", f"chown -R {D} /etc&&true"),
     # The target ends the command, a group or a subshell, or meets a redirect.
-    pytest.param("recursive_permission_system_dirs", f"chown {D} -R /etc;", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f"{{ chown {D} -R /etc; }}", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f"chown -R {D} /etc;", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f"chown -R {D} /usr&", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f"(chown -R {D} /)", marks=pytest.mark.xfail(strict=True)),
-    pytest.param("recursive_permission_system_dirs", f"chown -R {D} /home>/dev/null", marks=pytest.mark.xfail(strict=True)),
-    pytest.param(
-        "recursive_permission_system_dirs",
-        f"for i in 1; do chown -R {D} /etc; done",
-        marks=pytest.mark.xfail(strict=True),
-    ),
-    pytest.param("recursive_permission_system_dirs", f"nohup chown -R {D} /etc&", marks=pytest.mark.xfail(strict=True)),
+    ("recursive_permission_system_dirs", f"chown {D} -R /etc;"),
+    ("recursive_permission_system_dirs", f"{{ chown {D} -R /etc; }}"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /etc;"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /usr&"),
+    ("recursive_permission_system_dirs", f"(chown -R {D} /)"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /home>/dev/null"),
+    ("recursive_permission_system_dirs", f"for i in 1; do chown -R {D} /etc; done"),
+    ("recursive_permission_system_dirs", f"nohup chown -R {D} /etc&"),
     # A substitution inside an unquoted heredoc body runs when the heredoc is read.
     ("credential_exposure", f"cat <<EOF\n$(cat {D}/.env)\nEOF\necho ok"),
 ]
@@ -343,6 +339,11 @@ class TestADeepSubstitutionResidual:
         assert result.risk_level == RiskLevel.BLOCKED, command
         if rule:
             assert rule in result.matched_rules, (rule, result.matched_rules)
+
+    def test_a_rule_only_the_blanked_body_reaches_keeps_its_level(self, rules_dir_path):
+        # hex_octal_encoding is HIGH on its own, and a nested `$(pwd)` must not make it deny.
+        result = verdict("echo $(echo $(pwd) $'\\x72\\x6d')", rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH, result.matched_rules
 
 
 # Every one-command payload, run inside a substitution instead of on its own.
