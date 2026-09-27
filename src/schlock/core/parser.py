@@ -16,17 +16,85 @@ import json
 import logging
 import re
 import shlex
+import signal
+import threading
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 import bashlex
 import bashlex.errors
+import bashlex.subst
 
 from schlock.core.ast_view import UnmappedNodeError
 from schlock.core.native_bridge import NativeBridge, NativeBridgeError
-from schlock.exceptions import ParseError
+from schlock.exceptions import ParseBudgetError, ParseError
 
 logger = logging.getLogger(__name__)
+
+# CPU seconds one bashlex parse may use (LAB-5659). Some inputs send bashlex's parser into a
+# loop that never returns and keeps allocating, so every parse is bounded and one that runs out
+# is denied. The bound is the process's user CPU time, not wall time: load from other processes
+# slows a parse down without making it use more CPU. The largest legitimate parse measured, a
+# 64 KiB (MAX_COMMAND_SIZE) script of newline-separated commands, used 1.55 s on Python 3.10 on a
+# fast CPU; a slower CPU needs more, so the budget leaves ~6x. A runaway never finishes, so a
+# generous budget costs nothing but the seconds before its denial.
+PARSE_CPU_BUDGET = 10.0
+
+_BUDGET_MESSAGE = "Command too complex to analyse: parsing ran past its CPU budget"
+
+
+class _ParseBudgetSignal(BaseException):
+    """Raised by the SIGVTALRM handler. A BaseException, so no `except Exception` inside bashlex swallows it."""
+
+
+_budget_armed = False
+# Set when a parse runs out, cleared by reset_parse_budget. While set, every parse fails at once:
+# callers that catch a parse failure and carry on (the substitution walk re-parses each body it
+# finds) would otherwise spend one full budget per runaway body, and enough of them outlast any
+# hook timeout.
+_budget_spent = False
+
+
+def reset_parse_budget() -> None:
+    """Give parsing its budget back. Called at the start of each top-level validation."""
+    global _budget_spent  # noqa: PLW0603 - module state shared with _bounded_parse
+    _budget_spent = False
+
+
+def _on_parse_budget(signum: int, frame: Any) -> None:
+    # A signal that lands after the parse has returned must not raise into whatever runs next.
+    if _budget_armed:
+        raise _ParseBudgetSignal
+
+
+def _bounded_parse(src: str) -> list[Any]:
+    """``bashlex.parse(src)``, raising ParseBudgetError once it uses PARSE_CPU_BUDGET of CPU.
+
+    The one place library code installs a signal handler: bounding the parse here covers every
+    caller, not only the hook. The timer is ITIMER_VIRTUAL (SIGVTALRM), so a caller's SIGALRM
+    deadline is untouched, and a caller's own ITIMER_VIRTUAL and handler are put back afterwards.
+    Python runs signal handlers only on the main thread and Windows has no setitimer: there the
+    parse runs unbounded, as it did before.
+    """
+    global _budget_armed, _budget_spent  # noqa: PLW0603 - flags shared with the signal handler
+    if _budget_spent:
+        raise ParseBudgetError(_BUDGET_MESSAGE)
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        return bashlex.parse(src)
+    previous_handler = signal.signal(signal.SIGVTALRM, _on_parse_budget)
+    previous_timer = (0.0, 0.0)
+    try:
+        _budget_armed = True
+        previous_timer = signal.setitimer(signal.ITIMER_VIRTUAL, PARSE_CPU_BUDGET)
+        return bashlex.parse(src)
+    except _ParseBudgetSignal:
+        _budget_spent = True
+        raise ParseBudgetError(_BUDGET_MESSAGE) from None
+    finally:
+        _budget_armed = False
+        signal.setitimer(signal.ITIMER_VIRTUAL, *previous_timer)
+        # None: the previous handler was installed outside Python and cannot be put back.
+        signal.signal(signal.SIGVTALRM, signal.SIG_DFL if previous_handler is None else previous_handler)
 
 
 # Each AND-OR list operator and the `simple_list1` production its `$( … )` close should reduce
@@ -42,7 +110,7 @@ _ANDOR_CORRECTION_SPECS = (
 def _parse_succeeds(src: str) -> bool:
     """True if vendored bashlex parses ``src`` without raising (used by the correction self-check)."""
     try:
-        bashlex.parse(src)
+        _bounded_parse(src)
         return True
     except Exception:  # noqa: BLE001 - any failure means "did not parse", which is all we need
         return False
@@ -131,6 +199,32 @@ def _apply_andor_substitution_correction() -> None:
 _apply_andor_substitution_correction()
 
 
+def _refuse_unterminated_brace_expansion() -> None:
+    """Make bashlex raise on an unterminated ``${`` instead of looping forever (LAB-4959).
+
+    bashlex 0.18's ``subst._paramexpand`` locates the closing brace with ``str.find``, never
+    checks for -1, and hands back scan index 0, so ``_expandwordinternal`` restarts the word and
+    never returns. The tokenizer brace-matches an ordinary word first; the way in is text it does
+    not match, a heredoc body inside a double-quoted ``$( … )`` - Claude Code's own commit form
+    ``git commit -m "$(cat <<EOF … EOF)"`` with a ``${`` in the message. A hook that outlives its
+    timeout fails open, so the loop was an allow.
+
+    Every input that reaches the -1 loops, so raising there changes no parse that ever finished.
+    Unreported upstream.
+    """
+    original = bashlex.subst._paramexpand
+
+    def paramexpand(parserobj: Any, string: str, sindex: int) -> Any:
+        if string[sindex + 1 : sindex + 2] == "{" and string.find("}", sindex + 2) == -1:
+            raise bashlex.errors.ParsingError("bad substitution: no closing '}'", string, sindex)
+        return original(parserobj, string, sindex)
+
+    bashlex.subst._paramexpand = paramexpand
+
+
+_refuse_unterminated_brace_expansion()
+
+
 def parse_bashlex(command: str) -> list[Any]:
     """The in-process bashlex tier: parse or raise `ParseError` (never returns a partial AST).
 
@@ -138,9 +232,15 @@ def parse_bashlex(command: str) -> list[Any]:
     of `TieredParser`: when it raises, nothing rescues the command and validator.py blocks.
     Every AST it returns carries the `{varname}` prefix tags (_mark_fd_variables), whichever
     caller asked, so no tier can hand a consumer an untagged tree.
+    The parse is CPU-bounded (_bounded_parse); one that runs out raises ParseBudgetError,
+    passed through unwrapped.
     """
     try:
-        ast = bashlex.parse(command)
+        ast = _bounded_parse(command)
+    except ParseBudgetError:
+        # Not rewrapped below: that message quotes the command, and a quoted `<<heredoc`
+        # would route the denial to the heredoc fallback, which parses it again.
+        raise
     except bashlex.errors.ParsingError as e:
         # Preserve original bashlex error for debugging
         raise ParseError(
@@ -1050,6 +1150,7 @@ class BashCommandParser:
             ParseError: If bashlex fails to parse the command syntax, or a
                 `{varname}` redirect prefix cannot be read with certainty
                 (see _mark_fd_variables)
+            ParseBudgetError: If the parse uses more than PARSE_CPU_BUDGET of CPU
 
         Example:
             >>> parser = BashCommandParser()

@@ -142,7 +142,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 ## Installation
 
 ```bash
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 /plugin install schlock@schlock
 /schlock:setup   # Optional - configure preferences
 ```
@@ -175,5 +175,5 @@ Config files: `release-please-config.json`, `.release-please-manifest.json`
 - **Publisher**: 27B.io
 - **License**: WTFPL
 - **Python**: >=3.9
-- **Repository**: https://github.com/27Bslash6/schlock
+- **Repository**: https://github.com/27b-io/schlock
 - **Dependencies**: `bashlex>=0.18`, `pyyaml>=6.0` (vendored)

@@ -683,7 +683,7 @@ Include in your project README:
 
 ### Code Quality Tools
 
-This project uses [schlock](https://github.com/27Bslash6/schlock) for:
+This project uses [schlock](https://github.com/27b-io/schlock) for:
 - Bash command safety validation (always on)
 - Automatic code formatting (Python: ruff, JS/TS: prettier)
 - Clean commit history (no advertising)
@@ -767,4 +767,4 @@ export SCHLOCK_DEBUG=1
 1. **Check logs:** stderr output from hooks
 2. **Enable debug mode:** `export SCHLOCK_DEBUG=1`
 3. **Review audit log:** `~/.config/schlock/audit.jsonl`
-4. **File issue:** https://github.com/27Bslash6/schlock/issues
+4. **File issue:** https://github.com/27b-io/schlock/issues
