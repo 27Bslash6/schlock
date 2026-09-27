@@ -288,6 +288,32 @@ class TestFindDangerousFlags:
         if results:
             assert not results[0].allowed
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # bash expands the flag before find sees it, so the literal scan cannot read it
+            "echo \"$(find . {-exec,} git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . $'-exec' git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . ${E:--exec} git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . {-execdir,} git difftool -x 'rm -rf /')\"",
+            'echo "$(find . {-delete,})"',
+        ],
+    )
+    def test_find_obfuscated_exec_blocked(self, command):
+        """An expanding word carrying a dangerous find flag is read for that flag."""
+        assert validate_command(command).allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # a path variable and a literal name that merely contains flag text stay SAFE
+            "echo \"$(find /src -type f -name '*.log')\"",
+            "echo \"$(find . -name '*-exec*')\"",
+        ],
+    )
+    def test_find_plain_words_stay_allowed(self, command):
+        assert validate_command(command).allowed is True
+
     def test_find_name_only_allowed(self, validator, parser):
         """find without dangerous flags is allowed."""
         ast = parser.parse('echo "$(find . -name *.py)"')
@@ -1801,6 +1827,11 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(ls | op run -- git submodule foreach 'rm -rf /')\"",
             "echo \"$(op --account a run -- git submodule foreach 'rm -rf /')\"",
             "echo \"$(op run -- git frobnicate 'rm -rf /')\"",
+            "echo \"$(op plugin run -- git submodule foreach 'rm -rf /')\"",
+            # bash expands the subcommand before op sees it, so an expanded `run` fails closed too
+            "echo \"$(op $'run' -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op {run,} -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op ${X:-run} -- git submodule foreach 'rm -rf /')\"",
         ],
     )
     def test_unresolvable_git_subcommand_suppresses_nothing(self, command):
@@ -1885,9 +1916,11 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git commit -m '- remove rm -rf / from install script')\"",
             "echo \"$(git tag -a v1 -m 'cleanup: rm -rf the old build dir')\"",
             "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
-            # `op` without `run` reads a secret; it runs nothing
+            # `op` without `run` reads a secret; it runs nothing, so a variable in a later arg is data
             'echo "$(op read op://vault/item/field)"',
+            'echo "$(op read op://vault/$ITEM/field)"',
             "echo \"$(op item get 'My Login' --fields username)\"",
+            'echo "$(op vault list)"',
         ],
     )
     def test_inert_subcommands_keep_their_arguments_as_data(self, command):

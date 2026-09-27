@@ -638,6 +638,25 @@ def git_config_exec_payload(args: list[str]) -> str | None:
     return None
 
 
+# Characters bashlex leaves in a token when the word carries an expansion: `$` (parameter,
+# command and ANSI-C `$'…'`), a backtick, and the braces of a brace expansion. A word holding any
+# of them may expand at runtime to something other than its text, so a keyword check on its text
+# is not to be trusted. bashlex strips quotes, and quoting only PREVENTS expansion, so a quoted
+# `run` reads as the literal `run` and is correctly matched.
+_EXPANSION_MARKERS = ("$", "`", "{", "}")
+
+
+def _is_plain_literal(word: str) -> bool:
+    """True if ``word`` cannot expand to anything but itself, so its text may be matched."""
+    return not any(marker in word for marker in _EXPANSION_MARKERS)
+
+
+# op subcommands that only read or edit the vault — they run no shell command. `op run` executes,
+# so it is absent; so is anything unlisted, which fails closed. An expanded subcommand (`op $'run'`,
+# `op {run,}`) is not one of these literals, so it fails closed too.
+_OP_INERT_SUBCOMMANDS = frozenset({"read", "item", "document", "vault", "whoami", "account", "inject"})
+
+
 # find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir) or delete files (-delete).
 _DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
 
@@ -653,6 +672,13 @@ def dangerous_find(args: list[str]) -> str | None:
     for arg in args:
         if arg in _DANGEROUS_FIND_FLAGS:
             return f"find {arg} executes commands or modifies files"
+        # A word that expands (`{-exec,}`, `$'-exec'`, `${E:--exec}`) is read for the flag text it
+        # carries: bash would hand find the flag the literal scan above cannot see. A plain literal
+        # holding the same text (`-name '*-exec*'`) is one argument find never reads as a flag.
+        if not _is_plain_literal(arg):
+            for flag in _DANGEROUS_FIND_FLAGS:
+                if flag in arg:
+                    return f"find {flag} executes commands or modifies files"
     return None
 
 
@@ -1057,6 +1083,22 @@ def _names_option(word: str, options: frozenset[str]) -> bool:
     return name.startswith("-") and any(len(option) == 2 and option[1] in name[1:] for option in options)
 
 
+def _op_executes_an_argument(args: list[str]) -> bool:
+    """Does this ``op`` invocation run a shell command (`op run`) rather than read the vault?
+
+    `op run` executes its argument and no delegation path re-validates it. Allowlist the subcommand
+    the way git's is: the first non-flag word must be a known read-only one, else op fails closed. An
+    expanded word (`op $'run'`, `op {run,}`) never equals a literal member, so it fails closed too. A
+    value taken by a global flag (`op --account A read`) is read as the subcommand and fails closed —
+    an accepted over-block on a rare shape.
+    """
+    for word in args:
+        if word.startswith("-"):
+            continue
+        return word not in _OP_INERT_SUBCOMMANDS
+    return False  # bare `op`, or only flags: runs nothing
+
+
 def _runs_an_exec_option(words: list[str]) -> bool:
     """Does the command at the head of ``words`` hand one of its own arguments to a shell?
 
@@ -1073,9 +1115,7 @@ def _runs_an_exec_option(words: list[str]) -> bool:
     """
     leader = words[0].rsplit("/", 1)[-1] if words else ""
     if leader == "op":
-        # Coarse on purpose: `run` anywhere, so a global flag before it (`op --account A run`)
-        # cannot hide it. The cost is an over-block on an argument that happens to be `run`.
-        return "run" in words[1:]
+        return _op_executes_an_argument(words[1:])
     if leader == "git":
         subcommand, args = _git_subcommand(words[1:])
         if not subcommand or subcommand in _GIT_INERT_SUBCOMMANDS:
