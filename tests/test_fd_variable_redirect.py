@@ -326,10 +326,32 @@ class TestEveryConsumerParsesThroughTheTag:
             _mark_fd_variables("git {fd}xi push", ast)
 
     def test_no_other_bashlex_parse_call(self):
-        # BashCommandParser.parse tags; _parse_succeeds only asks whether a synthetic probe parses.
+        # _bounded_parse is the one call, so every parse is CPU-bounded (LAB-5659). Its callers are
+        # parse_bashlex (the bashlex tier behind BashCommandParser.parse and TieredParser), which
+        # tags, _parse_succeeds, which only asks whether a synthetic probe parses, and
+        # _recover_substitution, which parses a backquote body bashlex dropped (LAB-4950) - inside
+        # parse_bashlex's budget, into the tree parse_bashlex then tags.
         src = pathlib.Path(__file__).parent.parent / "src"
         found = {(path.relative_to(src).as_posix(), owner) for path in src.rglob("*.py") for owner in _bashlex_parse_calls(path)}
-        assert found == {("schlock/core/parser.py", "parse"), ("schlock/core/parser.py", "_parse_succeeds")}
+        assert found == {("schlock/core/parser.py", "_bounded_parse")}
+        callers = {
+            (path.relative_to(src).as_posix(), owner)
+            for path in src.rglob("*.py")
+            for owner in _bashlex_parse_calls(path, targets=("_bounded_parse",))
+        }
+        assert callers == {
+            ("schlock/core/parser.py", "parse_bashlex"),
+            ("schlock/core/parser.py", "_parse_succeeds"),
+            ("schlock/core/parser.py", "_recover_substitution"),
+        }
+        # Recovery also enters bashlex's parser through its `$(…)` body parser, which no search
+        # above sees; parse_bashlex runs recovery inside its budget, so this is the only owner.
+        dolparen = {
+            (path.relative_to(src).as_posix(), owner)
+            for path in src.rglob("*.py")
+            for owner in _bashlex_parse_calls(path, targets=("bashlex.subst._parsedolparen",))
+        }
+        assert dolparen == {("schlock/core/parser.py", "_recover_substitution")}
 
 
 def _import_aliases(tree):
@@ -345,8 +367,11 @@ def _import_aliases(tree):
     return aliases
 
 
-def _bashlex_parse_calls(path):
-    """The enclosing function ("<module>" at top level) of every bashlex parse call in ``path``."""
+def _bashlex_parse_calls(path, targets=("bashlex.parse", "bashlex.parser.parse")):
+    """The enclosing function ("<module>" at top level) of every call in ``path`` to one of ``targets``.
+
+    A target also matches through any module path (``schlock.core.parser._bounded_parse``).
+    """
     tree = ast.parse(path.read_text())
     aliases = _import_aliases(tree)
     owners = {}
@@ -361,8 +386,8 @@ def _bashlex_parse_calls(path):
         while isinstance(func, ast.Attribute):
             chain.insert(0, func.attr)
             func = func.value
-        if isinstance(func, ast.Name) and ".".join([aliases.get(func.id, func.id), *chain]) in (
-            "bashlex.parse",
-            "bashlex.parser.parse",
-        ):
+        if not isinstance(func, ast.Name):
+            continue
+        name = ".".join([aliases.get(func.id, func.id), *chain])
+        if name in targets or name.endswith(tuple(f".{target}" for target in targets)):
             yield owners.get(node, "<module>")

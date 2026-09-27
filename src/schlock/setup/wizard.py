@@ -87,7 +87,7 @@ def find_schlock_root() -> Path:  # noqa: PLR0912
                 continue
 
     raise RuntimeError(
-        "Could not find schlock installation. Is the plugin installed? Run: /plugin marketplace add 27Bslash6/schlock"
+        "Could not find schlock installation. Is the plugin installed? Run: /plugin marketplace add 27b-io/schlock"
     )
 
 
