@@ -81,7 +81,17 @@ class TestDangerousGitConfigHelper:
     # --- the man-viewer chain: `git help` runs the program these keys pick ---
     @pytest.mark.parametrize(
         "config",
-        ["man.viewer=custom", "man.custom.cmd=/tmp/x.sh", "man.custom.path=/tmp/x", "help.format=web", "Man.Viewer=custom"],
+        [
+            "man.viewer=custom",
+            "man.custom.cmd=/tmp/x.sh",
+            "man.custom.path=/tmp/x",
+            "help.format=web",
+            "Man.Viewer=custom",
+            "help.browser=custom",
+            "web.browser=custom",
+            "browser.custom.cmd=/tmp/x.sh",
+            "browser.firefox.path=/tmp/x",
+        ],
     )
     def test_man_viewer_keys_are_dangerous(self, config):
         assert dangerous_git_config(["-c", config, "help", "add"]) is not None
@@ -90,6 +100,11 @@ class TestDangerousGitConfigHelper:
         # git reads man.viewer=true as a viewer NAMED `true` and runs man.true.cmd for it
         # (verified against git 2.43), so the boolean refinement above must not clear it.
         assert dangerous_git_config(["-c", "man.viewer=true", "help", "add"]) is not None
+
+    @pytest.mark.parametrize("args", [["grep", "-c", "man.viewer"], ["log", "-c", "man.c"], ["-c", "man.viewer", "help", "add"]])
+    def test_key_rated_key_without_a_value_is_safe(self, args):
+        # No `=` arms nothing: git rejects `-c man.viewer`, and `git grep -c` is grep's count flag.
+        assert dangerous_git_config(args) is None
 
     def test_man_prefix_needs_its_dot(self):
         assert dangerous_git_config(["-c", "manual.x=y", "status"]) is None
@@ -634,6 +649,11 @@ class TestGitConfigManViewerVerdicts:
         "git config --global man.custom.cmd /tmp/x.sh",
         "git config man.custom.path /tmp/x",
         "git config help.format web",
+        # The web half: `git help -w add` runs the program these pick (verified against git 2.43).
+        "git config help.browser custom",
+        "git config --global web.browser custom",
+        "git config browser.custom.cmd /tmp/x.sh",
+        "git config browser.firefox.path /tmp/x",
         "git config --global help.format web",
         "git config --add man.viewer custom",
         "git config --replace-all man.viewer custom",
@@ -649,11 +669,13 @@ class TestGitConfigManViewerVerdicts:
         # A viewer named `true` is still a viewer: git runs man.true.cmd for it.
         "git config man.viewer true",
         "timeout 5 git config man.viewer custom",
+        "timeout 5 /usr/bin/git config man.viewer custom",
         "env X=1 git config man.viewer custom",
         "nice git config man.viewer custom",
         "command git config man.viewer custom",
         "stdbuf -o0 git config man.viewer custom",
         "find . -maxdepth 0 -exec git config man.viewer custom \\;",
+        "find . -maxdepth 0 -exec /usr/bin/git config man.viewer custom \\;",
         "ls && git config man.viewer custom",
         # A rename writes every key of a section under the NEW name, so `foo.viewer` renamed into
         # `man` arms the viewer without naming man.viewer (verified against git 2.43).
@@ -661,6 +683,8 @@ class TestGitConfigManViewerVerdicts:
         "git config --rename-section foo.custom man.custom",
         "git config --ren foo man",
         "git config rename-section foo help",
+        "git config --rename-section foo browser.custom",
+        "git config --rename-section foo web",
         # Renaming a rated section away rates too: the rename moves its keys either way.
         "git config --rename-section man alias",
         "git config --ren Man foo",
@@ -682,6 +706,8 @@ class TestGitConfigManViewerVerdicts:
         "git -c man.viewer=custom help add",
         "git -c man.custom.cmd=/tmp/x.sh help add",
         "git -c help.format=web help add",
+        "git -c help.browser=custom help -w add",
+        "git -c browser.custom.cmd=/tmp/x.sh help -w add",
     ]
     READS = [
         "git config --get man.viewer",
@@ -690,11 +716,20 @@ class TestGitConfigManViewerVerdicts:
         "git config --get help.format",
         "git config --get man.viewer custom",
         "git config --unset man.viewer",
+        "git config --get web.browser",
     ]
     UNCHANGED = [
         "git help add",
         "git help",
         "git help config",
+        "git help -w add",
+        # A subcommand's own -c flag whose operand merely starts `man.` / `help.` sets no config,
+        # and `-c man.viewer` without `=` is rejected by git.
+        "git grep -c man.viewer",
+        "git grep -c help.format",
+        "git grep -c browser.x",
+        "git log -c man.c",
+        "git -c man.viewer help add",
         "git status",
         "git config user.name x",
         "git config pull.rebase true",

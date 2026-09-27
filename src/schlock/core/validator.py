@@ -439,7 +439,7 @@ def _check_dangerous_command_flags(
                     alternatives=[
                         "Remove the -c config override",
                         "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, "
-                        "man.*, help.format, etc.)",
+                        "man.*, help.format, help.browser, web.browser, browser.*, etc.)",
                     ],
                     exit_code=1,
                     error=None,

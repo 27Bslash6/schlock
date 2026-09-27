@@ -438,11 +438,13 @@ def _is_git_boolean(value: str) -> bool:
 # through a viewer these keys choose: help.format picks man/info/web, man.viewer names the viewer,
 # and man.<tool>.cmd / man.<tool>.path give the program git runs for it. So
 # `git config man.viewer custom` plus `git config man.custom.cmd PROG` turn an everyday
-# `git help add` into a run of PROG. The values an attack needs (`custom`, `web`, `/tmp/x.sh`)
-# are words no command rule can tell from ordinary ones, so judging the value, as
-# `git_config_exec_payloads` does, cannot see this. Rate the write that arms the viewer, never
-# `git help` itself: that is an everyday command.
-_KEY_RATED_GIT_CONFIGS = frozenset({"help.format", "man."})
+# `git help add` into a run of PROG. The web half has the same shape: help.browser or web.browser
+# names the browser and browser.<tool>.cmd / browser.<tool>.path give its program, which
+# `git help -w add` runs. The values an attack needs (`custom`, `web`, `/tmp/x.sh`) are words no
+# command rule can tell from ordinary ones, so judging the value, as `git_config_exec_payloads`
+# does, cannot see this. Rate the write that arms the viewer, never `git help` itself: that is an
+# everyday command.
+_KEY_RATED_GIT_CONFIGS = frozenset({"help.format", "man.", "help.browser", "web.browser", "browser."})
 
 # git -c config keys that execute arbitrary commands when set via -c (top-level under-block fix).
 # Lowercased for case-insensitive match against the config key. Includes the key-rated keys:
@@ -493,10 +495,12 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     # A boolean value selects a built-in and names no executable
                     # (e.g. core.fsmonitor=true); only a path/command value is RCE. A bare
                     # `-c key` (no =VALUE) is key=true to git -> also benign. See #97.
-                    # Not for a key-rated key: git reads man.viewer=true as a viewer NAMED
-                    # `true`, so the key decides there, not the value.
-                    _, _, value = config_val.partition("=")
-                    if _is_git_boolean(value) and dangerous_prefix not in _KEY_RATED_GIT_CONFIGS:
+                    # Not for a key-rated key with a value: git reads man.viewer=true as a viewer
+                    # NAMED `true`, so the key decides there. Without `=` it arms nothing (git
+                    # rejects `-c man.viewer`), and the `-c` is usually a subcommand's own flag
+                    # whose operand merely starts `man.`: `git grep -c man.viewer`.
+                    _, has_value, value = config_val.partition("=")
+                    if _is_git_boolean(value) and (dangerous_prefix not in _KEY_RATED_GIT_CONFIGS or not has_value):
                         continue
                 return f"git config {dangerous_prefix.rstrip('.')} executes commands via -c flag"
     return None
