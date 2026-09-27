@@ -78,6 +78,9 @@ class TestTheNextCommandDoesNotCompleteTheRule:
             "shred -u tmp.txt && echo done > /dev/null",
             "chown -R me:me ./build && ls /",
             "source /tmp/venv/bin/activate && bash test.sh",
+            # A path under or beside a system dir is not the dir.
+            "chown -R $(printf %s $(dirname $(pwd)) | head -1) /etc/app;",
+            "chown -R $(printf %s $(dirname $(pwd)) | head -1) /etcetera;",
         ],
     )
     def test_is_not_a_hard_deny(self, command, rules_dir_path):
@@ -301,6 +304,19 @@ DEEP_RESIDUALS = [
     # A target the rule ends with `(\s|$)`, followed straight by a separator.
     ("recursive_permission_system_dirs", f"chown -R {D} /etc; true"),
     ("recursive_permission_system_dirs", f"chown -R {D} /etc&&true"),
+    # The target ends the command, a group or a subshell, or meets a redirect.
+    pytest.param("recursive_permission_system_dirs", f"chown {D} -R /etc;", marks=pytest.mark.xfail(strict=True)),
+    pytest.param("recursive_permission_system_dirs", f"{{ chown {D} -R /etc; }}", marks=pytest.mark.xfail(strict=True)),
+    pytest.param("recursive_permission_system_dirs", f"chown -R {D} /etc;", marks=pytest.mark.xfail(strict=True)),
+    pytest.param("recursive_permission_system_dirs", f"chown -R {D} /usr&", marks=pytest.mark.xfail(strict=True)),
+    pytest.param("recursive_permission_system_dirs", f"(chown -R {D} /)", marks=pytest.mark.xfail(strict=True)),
+    pytest.param("recursive_permission_system_dirs", f"chown -R {D} /home>/dev/null", marks=pytest.mark.xfail(strict=True)),
+    pytest.param(
+        "recursive_permission_system_dirs",
+        f"for i in 1; do chown -R {D} /etc; done",
+        marks=pytest.mark.xfail(strict=True),
+    ),
+    pytest.param("recursive_permission_system_dirs", f"nohup chown -R {D} /etc&", marks=pytest.mark.xfail(strict=True)),
     # A substitution inside an unquoted heredoc body runs when the heredoc is read.
     ("credential_exposure", f"cat <<EOF\n$(cat {D}/.env)\nEOF\necho ok"),
 ]
