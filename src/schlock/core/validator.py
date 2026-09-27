@@ -502,7 +502,7 @@ def _names_written(builtin: str, operands: list[str]) -> list[str]:
         i += 1
         if option == "--":
             break
-        if option == "-" or not option.startswith("-") or not _EXPANDS.isdisjoint(option):
+        if option == "-" or not _EXPANDS.isdisjoint(option):
             # An expansion can vanish or become any option cluster; every word from here may be a name.
             return names + operands[i - 1 :]
         for j, letter in enumerate(option[1:], start=2):
@@ -560,9 +560,8 @@ def _writes_ifs(words: list[str]) -> bool:
     # bashlex reads `$'read'` as `$read`; dropping `$` restores that literal name. A command word
     # that truly expands at runtime (`$c`, a glob, a brace group) can name any command, so from the
     # text alone it is undecidable which builtin — if any — runs. Treating it as every writer
-    # over-blocks `$cmd IFS`, where `IFS` is a plain data argument to whatever `$cmd` is. Indirect
-    # naming of a writer (variable/glob dispatch, a function forwarding to `read`) is the LAB-5031
-    # class, not caught here; only a name that resolves to a literal writer is.
+    # over-blocks `$cmd IFS`, where `IFS` is a plain data argument to whatever `$cmd` is, so only
+    # a command word that is literally a writer is checked.
     name = words[i].replace("$", "")
     if name in _DECLARATIONS:
         return any(word.startswith("IFS[") for word in words[i + 1 :])
