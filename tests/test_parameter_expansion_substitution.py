@@ -427,11 +427,26 @@ class TestWalkerReparseFailureIsNotSwallowed:
         with patch.object(parser, "parameter_body", side_effect=ParseBudgetError("spent")), pytest.raises(ParseBudgetError):
             parser.exec_children(param)
 
-    def test_verdict_is_blocked_at_every_headroom(self):
-        for headroom in range(40, 400, 3):
+    def test_verdict_is_blocked_at_every_nesting_depth(self):
+        """End to end: the walkers recurse once per ``{ …; }``, so nesting walks them to the edge.
+
+        Just short of the depth where the argument-word form itself runs out of stack, there is
+        room for the outer parse and for Layer 4's shallow re-parse but not for a walker's deep
+        one, and that band rated HIGH. The scan stops where the argument word stops naming its
+        check, so it reaches the band on any Python version without pinning a depth.
+        """
+        argument_word = self.COMMAND.replace("${x:-$(command exec bash)}", "$(command exec bash)")
+        for depth in range(400):
             clear_caches()
-            result = _with_headroom(headroom, lambda: validate_command(self.COMMAND))
-            assert result.risk_level == RiskLevel.BLOCKED, f"headroom {headroom}: {result.message}"
+            nest = "{ " * depth, "; }" * depth
+            baseline = _with_headroom(300, lambda: validate_command(argument_word.join(nest)))  # noqa: B023
+            if "wrapper command bypass" not in baseline.message:
+                break
+            result = _with_headroom(300, lambda: validate_command(self.COMMAND.join(nest)))  # noqa: B023
+            assert result.risk_level == RiskLevel.BLOCKED, f"depth {depth}: {result.message}"
+        else:
+            pytest.fail("the argument word never ran out of stack: the scan never reached the band")
+        assert depth > 0, baseline.message
 
 
 class TestShiftPositions:
