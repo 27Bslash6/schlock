@@ -128,11 +128,11 @@ class TestReDoSProtection:
             "chmod " + "+" * 1500 + "x file",  # Many plus signs
             "rm $(" + "x" * 500 + " rm /)",  # Long substitution
             ":(){" + " " * 1000 + ":|:&};:",  # Long fork bomb
-            # LAB-4466: dense repeats of the `/etc/` credential path anchor.
+            # Dense repeats of the `/etc/` credential path anchor.
             # Shares this class's MAX_VALIDATION_TIME rather than carrying its
             # own constant; the linearity claim is the sibling ratio test's job.
             "cat " + "/etc/" * 1600,
-            # LAB-4466: grep flag storms. `-e`/`-f` must be parseable exactly
+            # grep flag storms. `-e`/`-f` must be parseable exactly
             # one way -- when the flag run could ALSO take them, the two parses
             # made this quadratic (165ms at n=1600 before the branches were
             # made disjoint).
@@ -300,7 +300,7 @@ class TestBoundedQuantifierEdgeCases:
 
 
 class TestSystemCredentialPathAnchorDensity:
-    """LAB-4466: the `/etc/` path branch must stay LINEAR in anchor density.
+    """The `/etc/` path branch must stay LINEAR in anchor density.
 
     The rule file's own note on this pattern says a probe that varies only
     LENGTH cannot see the shape that matters here -- an earlier cut of the
