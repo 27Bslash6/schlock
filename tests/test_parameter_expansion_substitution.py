@@ -208,6 +208,9 @@ FUNSUB = [
     'echo "${X:-"${ rm -rf ~; }"}"',
     'echo "${X:-${Y}${ id; }}"',
     "cat <<EOF\nmsg ${X:-${ rm -rf ~; }}\nEOF",
+    # Beside an ANSI-C quoted run: the $'…' text is literal, the opener after it still runs.
+    "echo $'${ x }'\"${ id; }\"",
+    "echo $'a'${ id; }",
 ]
 
 # Ordinary expansions, and function-substitution text bash never expands. The near-misses
@@ -224,6 +227,7 @@ FUNSUB_BENIGN = [
     'echo "${X:- }"',
     "cat <<'EOF'\nmsg ${ rm -rf ~; }\nEOF",
     "cat <<EOF\nmsg \\${ x }\nEOF",
+    "echo $'${ x }'",
 ]
 
 
@@ -239,13 +243,3 @@ class TestFunctionSubstitution:
         result = validate_command(command)
         assert result.allowed is True, f"{command!r} was denied"
         assert result.risk_level == RiskLevel.SAFE
-
-    def test_ansi_c_quoted_opener_is_a_deliberate_over_block(self):
-        """bash prints ``$'${ x }'`` literally, but bashlex hands it over as a parameter node.
-
-        Denying it fails closed on a string nobody writes. Pinned so it stays a decision; do not
-        special-case ``$'…'`` to make it pass.
-        """
-        result = validate_command("echo $'${ x }'")
-        assert result.allowed is False
-        assert result.risk_level == RiskLevel.BLOCKED
