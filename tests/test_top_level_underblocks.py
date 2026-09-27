@@ -207,8 +207,8 @@ class TestTopLevelAwkCommandPipe:
             "busybox awk '{print $1}' f",  # a benign multicall applet is not blocked
         ],
     )
-    def test_non_exec_awk_not_blocked(self, command):
-        assert validate_command(command).risk_level != RiskLevel.BLOCKED
+    def test_non_exec_awk_is_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
 
     def test_system_stays_high(self):
         """The command-pipe check must not change the existing system() rating (HIGH, ask)."""
@@ -219,11 +219,15 @@ class TestTopLevelAwkCommandPipe:
         [
             '"' + '\\"' * 40000,
             "(/" + "\\/" * 40000,
-            # an ambiguous class every awk leaves open: each used to rescan to its line end (81s)
+            # an ambiguous class some awk leaves open: each used to rescan to its line end (81s)
             "BEGIN{" + "x = /[\\]/; " * 5900 + "}",
-            "BEGIN{x = /[\\]" + "[:" * 30000 + "/}",  # an open `[:` per char used to rescan to the end
-            "BEGIN{" + ("x = /[\\]/; " * 46 + "\n") * 128 + "}",  # many lines just under the class bound
-            "BEGIN{y = " + "x++ / 2; " * 7000 + "}",  # a fork per `/`: stops at the reading limit
+            "BEGIN{x = /[\\]" + "[:" * 30000 + "/}",  # each open `[:` used to search to the line end (8s)
+            "BEGIN{" + ("x = /[\\]/; " * 46 + "\n") * 128 + "}",  # many such classes on each line
+            "BEGIN{y = " + "x++ / 2; " * 7000 + "}",  # a fork per `/`: the readings agree again at `;`
+            # 16 readings, then ambiguous classes: each reading used to redo every class (17s, 34s in $())
+            "BEGIN{" + "a++ / 2 / 1;" * 4 + ("/[\\]/;" * 83 + "\n") * 128 + "}",
+            # readings that never agree again (different open parens and prints) each lex the rest
+            "BEGIN{y = x++ / if ( 1 /;y = x++ / print ( 1 /;y = x++ / ( 1 /;" + "x = y + 1; " * 5800 + "}",
         ],
     )
     def test_literal_scan_is_linear(self, program):

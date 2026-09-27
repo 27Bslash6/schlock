@@ -3050,6 +3050,7 @@ class TestDangerousAwkHelper:
             ["awk", 'match($0, /\\[[^\\]]*\\]/) {print substr($0, RSTART, RLENGTH) "|" $1}'],
             ["awk", '{gsub(/[][]/,""); print $1 "|" $2}'],
             ["awk", "{" + 'gsub(/[\\[\\]]/,""); ' * 8 + 'print $1 "|" $2}'],  # many on one line
+            ["awk", '{gsub(/[\\[\\]]/, "")} $1 ~ /^(GET|POST)$/ {print}'],  # a later regex alternation
             # `case` as a variable divides: `case / foo|bar / : print` has no print before its `|`
             ["awk", "{switch ($1) {case /foo|bar/: print; break}}"],
         ],
@@ -3148,6 +3149,11 @@ class TestDangerousAwkHelper:
             ["awk", "{print $1,\n$2 | c}"],
             ["awk", "{if ($1) print $2 | c; else print $3}"],
             ["awk", 'BEGIN{c=ARGV[1]; x = /[\\]/; y = "]/"; print 1 | c}'],  # busybox ends the class first
+            # getline after the `|` of `cmd | getline`, with blanks, a comment or a continuation between
+            ["awk", 'BEGIN{"id" |\n# c\n getline l}'],
+            ["awk", "BEGIN{c=ARGV[1]; c |\\\n getline l}"],
+            ["awk", "BEGIN{c=ARGV[1]; while ((c | getline l) > 0) n++}"],
+            ["awk", '{printf("%s", $1) | c}'],  # a parenthesised print list
         ],
     )
     def test_dangerous_awk(self, args):
