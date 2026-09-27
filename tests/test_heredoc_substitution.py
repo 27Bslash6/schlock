@@ -164,10 +164,17 @@ class TestSmuggledSubstitutionIsDenied:
 
     @pytest.mark.parametrize("command", SMUGGLED)
     def test_layer_four_is_what_denies(self, command):
-        """No rule may be what carries the verdict: a regex catalogue is not this guard."""
+        """The substitution layer's denial must be in the verdict, not just a rule's.
+
+        Not ``matched_rules == []``: a structural denial now joins with a later rule match
+        (``bash <<EOF`` + ``remote_execution``) so the rule name survives. What must hold is
+        that the substitution layer's reason is still carried — no rule message says
+        "in substitution".
+        """
         result = validate_command(command)
         assert result.allowed is False
-        assert result.matched_rules == [], f"{command!r} denied via rules {result.matched_rules}, not the substitution layer"
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "in substitution" in result.message, f"{command!r} denied without the substitution layer: {result.message!r}"
 
 
 class TestUndecodableBodyFailsClosed:
