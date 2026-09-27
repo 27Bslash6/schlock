@@ -4,10 +4,10 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks. Three readers
+Regex-based parsing is explicitly NOT supported due to security risks. Four readers
 here work on single words whose boundaries bashlex has already fixed, _redirect_words,
-_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE) and _quote_pairs;
-CLAUDE.md lists them as approved exceptions and the constraints each must keep.
+_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE), _quote_pairs and
+_subscript_parts; CLAUDE.md lists them as approved exceptions and the constraints each must keep.
 """
 
 import bisect

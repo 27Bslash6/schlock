@@ -85,6 +85,14 @@
      nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
      shares the parse's CPU budget.
      The same bash-first rule applies.
+   - **Approved exception — delimiting a leading assignment's subscript** (`_subscript_parts`
+     in `src/schlock/core/parser.py`, LAB-4702). bash evaluates `a[…]` in an assignment before
+     the command as arithmetic, which runs a `$(…)` the subscript's decode prints, while the
+     value after `=` is only stored. The walk reads one word bashlex already delimited, steps
+     over each substitution part by its span length, and matches `[`/`]` in what is left. It
+     only narrows which parts the decode check reads. Anything it cannot place (a quoted `]`,
+     a `$` that is no part, no `]=` after the close) returns None, and the whole word is read:
+     the over-block side. The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
