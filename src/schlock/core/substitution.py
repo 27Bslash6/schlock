@@ -101,6 +101,11 @@ class _Separator(str):
     Only the renderer knows where the real boundaries are. A quoted argument that spells one
     (`git x ';' CMD`) is the same string, so _join_tokens tells them apart by this type, never by
     value: splitting on the value let a `';'` argument cut a command that fails closed in two.
+
+    Any str operation (`+`, `.strip()`, slicing, an f-string) returns a plain `str` and drops the
+    tag. The two segments either side then merge and are judged by the first one's leading word,
+    so a lost tag fails OPEN. Build separator tokens only at the render sites and hand them to
+    _join_tokens untouched.
     """
 
 
@@ -956,8 +961,7 @@ def _leading_part(node: Any) -> Any:
 # exactly and against EVERY command: a command-agnostic floor beneath the git buckets and the
 # non-git option table below. _executes_an_argument checks it BEFORE the git buckets, so if an
 # inert subcommand were ever admitted with one of these options, `git log --tree-filter CMD` still
-# fails closed: two independent structures, not one list trusted twice. The send-email and svn
-# entries still matter for `git-send-email` and `git-svn` called by their dashed names.
+# fails closed: two independent structures, not one list trusted twice.
 _ARGUMENT_EXECUTING_FLAGS = frozenset(
     {
         "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
@@ -970,7 +974,7 @@ _ARGUMENT_EXECUTING_FLAGS = frozenset(
 # IS `--upload-pack`, and a short form may end a cluster of booleans (`git clone -qu`). Resolving
 # either is only safe inside the namespace the parser actually searches, so the exec options below
 # are keyed per command, and for git per SUBCOMMAND. A flat prefix match over one set was tried and
-# reverted because `git log --author` resolved to `--authors-prog` (LAB-4268).
+# reverted because `git log --author` resolved to `--authors-prog`.
 #
 # Non-git commands whose value-taking option runs a program. Scanned at every word, so a wrapper
 # or a path (`/usr/bin/sort`) still reaches it.
@@ -980,7 +984,9 @@ _EXEC_OPTIONS = {
 }
 # git subcommands that are safe to suppress UNLESS one of these options is present — the transport
 # and diff/rebase family, whose other arguments (URLs, refspecs, refs, paths) are inert, and `grep`,
-# whose `-O` / `--open-files-in-pager` runs a pager and so keeps it off the inert list. `-u` is
+# whose `-O` / `--open-files-in-pager` runs a pager and so keeps it off the inert list. The pager
+# is only ever an attached value (`-O<cmd>`, `--open-files-in-pager=<cmd>`); a separate word after
+# `-O` is the search pattern, so keying `-O` over-blocks `git grep -O PATTERN` by design. `-u` is
 # `--upload-pack` on clone but `--update-head-ok` on fetch, and `-x` runs a command on rebase and
 # difftool while `grep -x` / `diff -x` / `git clean -x` mean something ordinary — hence per
 # subcommand. Reached only by the literal builtin name: an alias cannot shadow a non-deprecated
@@ -1020,8 +1026,7 @@ _GIT_INERT_SUBCOMMANDS = frozenset(
     }
 )  # fmt: skip
 # git's own options that take their value as the NEXT word (git.c handle_options); matched exactly,
-# so the subcommand walk does not misread a value as the subcommand. `--exec-path=<dir>` and other
-# global RCE surfaces are a separate vector, not an argument-suppression one (see LAB-4268 notes).
+# so the subcommand walk does not misread a value as the subcommand.
 _GIT_OPTIONS_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source", "--shallow-file"}
 )
@@ -1056,13 +1061,19 @@ def _runs_an_exec_option(words: list[str]) -> bool:
     first). For git, only the SEGMENT-LEADING word is read as the invocation: a bare ``git`` sitting
     in someone else's argument list (``grep -rn git src``) names no subcommand. A wrapped git
     (``sudo git fetch --upload-pack``) is re-validated by the delegation path, so it need not be
-    caught a second time here.
+    caught a second time here. ``op`` is the exception: it is whitelisted but not a delegation
+    wrapper, so nothing re-validates the command ``op run`` executes, and its arguments are code.
 
     Three buckets for git: an inert subcommand suppresses nothing extra; the transport/diff family
     executes only when it carries one of its keyed options; every other subcommand — unknown builtin,
     positional-command builtin, script, alias, autocorrect target — fails closed.
     """
-    if words and words[0].rsplit("/", 1)[-1] == "git":
+    leader = words[0].rsplit("/", 1)[-1] if words else ""
+    if leader == "op":
+        # Coarse on purpose: `run` anywhere, so a global flag before it (`op --account A run`)
+        # cannot hide it. The cost is an over-block on an argument that happens to be `run`.
+        return "run" in words[1:]
+    if leader == "git":
         subcommand, args = _git_subcommand(words[1:])
         if not subcommand or subcommand in _GIT_INERT_SUBCOMMANDS:
             return False

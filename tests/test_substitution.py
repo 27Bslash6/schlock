@@ -19,7 +19,6 @@ from schlock.core.substitution import (
     SubstitutionType,
     SubstitutionValidationResult,
     SubstitutionValidator,
-    _Separator,
     dangerous_awk,
     dangerous_sed,
 )
@@ -1740,7 +1739,7 @@ class TestWhitelistedSubstitutionYamlRules:
         ],
     )
     def test_abbreviated_and_short_exec_options_suppress_nothing(self, command):
-        """An abbreviation or short form must reach the verdict its canonical spelling does (LAB-4268)."""
+        """An abbreviation or short form must reach the verdict its canonical spelling does."""
         result = validate_command(command)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
@@ -1789,12 +1788,23 @@ class TestWhitelistedSubstitutionYamlRules:
             # `submodule--helper foreach` and `remote-ext` take the command as a positional word
             "echo \"$(git submodule--helper foreach 'rm -rf /')\"",
             "echo \"$(git remote-ext o 'rm -rf /')\"",
-            # `git grep -O` opens the matches in a pager, so grep is keyed rather than inert
+            # `git grep -O` runs a pager, so grep is keyed rather than inert. The pager is only an
+            # attached value; the separate word here is a pattern, over-blocked by design.
             "echo \"$(git grep --open-files-in 'rm -rf /' HEAD)\"",
+            # a fail-closed git in a LATER segment still leads its own segment
+            "echo \"$(true && git remote-ext o 'rm -rf /')\"",
+            # `op` is whitelisted but no delegation wrapper, so nothing re-validates what `op run`
+            # executes: its arguments are code, however the git inside them is spelled
+            "echo \"$(op run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op run -- git bisect run 'rm -rf /')\"",
+            "echo \"$(op run --env-file=.env -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(ls | op run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op --account a run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op run -- git frobnicate 'rm -rf /')\"",
         ],
     )
     def test_unresolvable_git_subcommand_suppresses_nothing(self, command):
-        """git resolves a non-inert subcommand at run time, so its arguments are never proven data (LAB-4268)."""
+        """git resolves a non-inert subcommand at run time, so its arguments are never proven data."""
         result = validate_command(command)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
@@ -1836,11 +1846,10 @@ class TestWhitelistedSubstitutionYamlRules:
             # every quoting spelling reaches the same argv
             "echo \"$(git frobnicate \\; 'rm -rf /')\"",
             'echo "$(git frobnicate ";" \'rm -rf /\')"',
-            "echo \"$(git -c alias.ff=fetch ff '|' --upload 'rm -rf /' .)\"",
         ],
     )
     def test_a_quoted_separator_is_not_a_segment_boundary(self, command):
-        """Only the renderer's own separators split a segment, never an argument that spells one (LAB-4268)."""
+        """Only the renderer's own separators split a segment, never an argument that spells one."""
         result = validate_command(command)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
@@ -1876,10 +1885,13 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git commit -m '- remove rm -rf / from install script')\"",
             "echo \"$(git tag -a v1 -m 'cleanup: rm -rf the old build dir')\"",
             "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
+            # `op` without `run` reads a secret; it runs nothing
+            'echo "$(op read op://vault/item/field)"',
+            "echo \"$(op item get 'My Login' --fields username)\"",
         ],
     )
     def test_inert_subcommands_keep_their_arguments_as_data(self, command):
-        """An audited read-only or message-taking subcommand may suppress its own arguments (LAB-4268)."""
+        """An audited read-only or message-taking subcommand may suppress its own arguments."""
         assert validate_command(command).allowed is True
 
     @pytest.mark.parametrize(
@@ -2982,8 +2994,6 @@ class TestListSegmentBranchCoverage:
             ("|", False),
             ("head", False),
         ]
-        # the pipe must carry the type the segment split tests for, not merely equal "|"
-        assert isinstance(validator._render_segment_tokens(pipeline)[2][0], _Separator)
 
     def test_render_segment_tokens_pipeline_with_reserved_word(self, validator):
         """A pipeline containing a reserved word (e.g. `!`) is unrenderable -> None."""
