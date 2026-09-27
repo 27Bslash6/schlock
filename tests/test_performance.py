@@ -16,7 +16,9 @@ import os
 
 import pytest
 
+from schlock.core import validator
 from schlock.core.cache import ValidationCache
+from schlock.core.native_bridge import MAX_COMMAND_SIZE
 from schlock.core.rules import RuleEngine
 from schlock.core.validator import validate_command
 
@@ -230,6 +232,48 @@ class TestEndToEndPerformance:
         benchmark(validate_command, cmd, config_path=safety_rules_path)
 
         assert_median_under(benchmark, 0.01, "Cached validation")
+
+
+@requires_benchmark
+class TestShellHeredocBodyPerformance:
+    """A shell heredoc body is validated twice: as text in its command, then as the program.
+
+    Body shape: `echo step 0` repeated. One distinct command, so the body stays under
+    MAX_DELEGATOR_TOKENS and allowed; and `echo` is the worst line for the raw-text scan,
+    whose `echo[^;|&]*>>` rules backtrack across the whole body. Measured median on the
+    unquoted path, same machine, ShellCheck off: 600 lines ~105ms before bodies were
+    re-validated, ~355ms after; 60 KiB ~6.5s before, ~14.7s after. The quoted path, which
+    always re-validated, costs ~260ms and ~7.8s. The budgets leave ~3x.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        # The body re-entry spawns ShellCheck with a 2s timeout, so with it on a 60 KiB body
+        # measures that timeout, not schlock.
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
+
+    @pytest.mark.parametrize(
+        ("lines", "budget_ms"),
+        [(600, 1_000.0), ((60 * 1024) // len("echo step 0\n"), 45_000.0)],
+        ids=["600-lines", "60KiB"],
+    )
+    @pytest.mark.parametrize("opener", ["<<EOF", "<<'EOF'"], ids=["unquoted", "quoted"])
+    def test_shell_heredoc_body(self, benchmark, safety_rules_path, lines, budget_ms, opener):
+        command = f"bash {opener}\n" + "\n".join(["echo step 0"] * lines) + "\nEOF"
+        assert len(command) < MAX_COMMAND_SIZE
+        validate_command("echo warm", config_path=safety_rules_path)
+
+        result = benchmark.pedantic(
+            validate_command,
+            args=(command,),
+            kwargs={"config_path": safety_rules_path},
+            setup=validator._global_cache.clear,
+            rounds=5,
+            iterations=1,
+        )
+
+        assert result.allowed is True, result.message
+        assert_median_under(benchmark, budget_ms, f"bash {opener} with {lines} lines")
 
 
 @requires_benchmark

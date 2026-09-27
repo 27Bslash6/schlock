@@ -30,7 +30,9 @@
         bare spelling (and their bodies to same-length filler, since a quoted body is
         literal): a command with no quoted delimiter reaches bashlex byte for byte. So it
         changes what bashlex sees only on the inputs that used to reach the fallback, or that
-        bashlex misread (LAB-3094).
+        bashlex misread (LAB-3094). It also records where every body it read lies, quoted or
+        not, so a shell consumer's body can be re-validated as code; that only adds validation
+        and changes no text.
      2. **No verdicts** — it decides *where heredoc bodies begin and end*, nothing else. The
         recovered text is re-validated through `validate_command`'s front door, so rules,
         segments, substitutions and dangerous-flag checks all still run on the AST. The only
