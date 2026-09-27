@@ -1753,8 +1753,6 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git -C /repo log --author 'Ray Walker' --grep 'rm -rf')\"",
             # `-u` is `--upload-pack` on clone only; on fetch it is --update-head-ok
             "echo \"$(git fetch -u origin --negotiation-tip 'rm -rf /')\"",
-            # a `git` that ends its command has no subcommand to fail closed on
-            "echo \"$(ls -d git | grep -c 'rm -rf')\"",
         ],
     )
     def test_exec_options_resolve_only_within_their_own_command(self, command):
@@ -1781,15 +1779,73 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git send-email --SENDMAIL-CMD 'rm -rf /' HEAD~1)\"",
             "echo \"$(git send-email +Header 'rm -rf /' HEAD~1)\"",
             "echo \"$(git svn clone --authors-p 'rm -rf /' svn://host/r)\"",
+            "echo \"$(git send-email --sendmail-cmd 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git svn --authors-prog 'rm -rf /' x)\"",
+            # a builtin that runs a command by a route no option key reaches, so failing closed on
+            # every non-inert subcommand is the only thing that catches it. `for-each-repo`
+            # re-dispatches a whole git command line, and its own `-c KEY=VAL` supplies the repo
+            # list, so the exec option is on a subcommand the walk never reaches.
+            "echo \"$(git -c x.y=. for-each-repo --config=x.y rebase -x 'rm -rf /' main)\"",
+            "echo \"$(git -c x.y=. for-each-repo --config=x.y clone -u 'rm -rf /' https://x/y)\"",
+            # `submodule--helper foreach` and `remote-ext` take the command as a positional word
+            "echo \"$(git submodule--helper foreach 'rm -rf /')\"",
+            "echo \"$(git remote-ext o 'rm -rf /')\"",
             # the accepted cost: an alias of log is indistinguishable from one of rebase --exec
             "echo \"$(git lg --author 'Ray Walker' --grep 'rm -rf')\"",
         ],
     )
     def test_unresolvable_git_subcommand_suppresses_nothing(self, command):
-        """git resolves a non-builtin at run time, so its arguments are never proven data (LAB-4268)."""
+        """git resolves a non-inert subcommand at run time, so its arguments are never proven data (LAB-4268)."""
         result = validate_command(command)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A segment that fails closed must not strip the quoted data of the next one: each is
+            # SAFE bare, so the pair must stay SAFE. Every list/pipeline separator the renderer
+            # inserts, so an emptied `_COMMAND_SEPARATORS` would flip these.
+            "echo \"$(git submodule status && grep -rn 'rm -rf' docs)\"",
+            "echo \"$(git submodule status || grep -rn 'rm -rf' docs)\"",
+            "echo \"$(git submodule status ; grep -rn 'rm -rf' docs)\"",
+            "echo \"$(git lfs ls-files | grep -c 'rm -rf')\"",
+            "echo \"$(git remote-ext o safe & grep -rn 'rm -rf' docs)\"",
+            # `git` sitting in another command's argument list names no subcommand — the word after
+            # it must not be read as one and failed closed.
+            "echo \"$(grep -rn git src 'rm -rf')\"",
+            "echo \"$(grep -rn git -e 'rm -rf' src)\"",
+        ],
+    )
+    def test_fail_closed_is_scoped_to_the_git_segment(self, command):
+        """Failing closed on a git subcommand suppresses that segment only, and only when git leads it."""
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An inert subcommand carrying a dangerous-LOOKING message is over-blocked when it is
+            # NOT on the allowlist — the deliberate cost of not trusting a runtime subcommand.
+            "echo \"$(git lg --grep 'rm -rf')\"",
+            "echo \"$(git send-email --to 'Ray Walker' --subject 'rm -rf / fix' p)\"",
+        ],
+    )
+    def test_accepted_overblock_on_unlisted_subcommands(self, command):
+        """schlock cannot tell an alias of `log` from an alias of `rebase --exec`, so it fails closed."""
+        assert validate_command(command).allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An allowlisted subcommand's message IS inert data, so a dangerous-looking one stays SAFE.
+            "echo \"$(git commit -m '- remove rm -rf / from install script')\"",
+            "echo \"$(git tag -a v1 -m 'cleanup: rm -rf the old build dir')\"",
+            "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
+        ],
+    )
+    def test_inert_subcommands_keep_their_arguments_as_data(self, command):
+        """An audited read-only or message-taking subcommand may suppress its own arguments (LAB-4268)."""
+        assert validate_command(command).allowed is True
 
     @pytest.mark.parametrize(
         ("command", "expected_ranges"),

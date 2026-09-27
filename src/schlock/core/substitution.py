@@ -934,9 +934,10 @@ def _leading_part(node: Any) -> Any:
 
 # Shapes that hand one of their own arguments to a shell. These take the command as a SEPARATE
 # word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD. Matched
-# exactly and against EVERY command: the floor under the keyed table below, for the spellings no
-# key reaches (`git daemon --access-hook`, `--pager`, a git subcommand the walk misreads). The
-# overlap with the table is deliberate.
+# exactly and against EVERY command: a command-agnostic floor beneath the git buckets and the
+# non-git option table below, for a flag that reaches a whitelisted command by a path those do
+# not model. A git subcommand is no longer among them — one that is not inert now fails closed in
+# _runs_an_exec_option — but the entries are cheap belt-and-braces and are kept deliberately.
 _ARGUMENT_EXECUTING_FLAGS = frozenset(
     {
         "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
@@ -945,68 +946,62 @@ _ARGUMENT_EXECUTING_FLAGS = frozenset(
         "--authors-prog", "--compress-program", "--diff-program", "--pager",
     }
 )  # fmt: skip
-# getopt_long, git's parse-options and Perl's Getopt::Long all accept an unambiguous prefix, so
-# `git fetch --upload` IS `--upload-pack` and walks straight past the exact set above. Resolving
-# a prefix is only safe inside the namespace the parser actually searches, hence the key: per
-# command, and for git per SUBCOMMAND. A flat prefix match was tried and reverted because
-# `git log --author` resolved to `--authors-prog`, which only `git svn` has (LAB-4268).
-# Short forms are keyed for the same reason: `-u` is `--upload-pack` on clone but
-# `--update-head-ok` on fetch, and `-x` runs a command on rebase and difftool while `grep -x`,
-# `diff -x` and `git clean -x` mean something ordinary. Git keys name builtins only; any other
-# subcommand fails closed, see _GIT_BUILTINS.
-_ARGUMENT_EXECUTING_OPTIONS = {
+# getopt_long and git's parse-options both accept an unambiguous prefix, so `git fetch --upload`
+# IS `--upload-pack`, and a short form may end a cluster of booleans (`git clone -qu`). Resolving
+# either is only safe inside the namespace the parser actually searches, so the exec options below
+# are keyed per command, and for git per SUBCOMMAND. A flat prefix match over one set was tried and
+# reverted because `git log --author` resolved to `--authors-prog` (LAB-4268).
+#
+# Non-git commands whose value-taking option runs a program. Scanned at every word, so a wrapper
+# or a path (`/usr/bin/sort`) still reaches it.
+_EXEC_OPTIONS = {
     "sort": frozenset({"--compress-program"}),
     "sdiff": frozenset({"--diff-program"}),
-    "git clone": frozenset({"-u", "--upload-pack"}),
-    "git fetch": frozenset({"--upload-pack"}),
-    "git pull": frozenset({"--upload-pack"}),
-    "git ls-remote": frozenset({"--upload-pack", "--exec"}),
-    "git push": frozenset({"--receive-pack", "--exec"}),
-    "git send-pack": frozenset({"--receive-pack", "--exec"}),
-    "git archive": frozenset({"--exec"}),
-    "git rebase": frozenset({"-x", "--exec"}),
-    "git difftool": frozenset({"-x", "--extcmd"}),
 }
-# The subcommands whose meaning schlock can know. git looks a name up as a builtin FIRST, and only
-# then as a script on its exec path, an alias or a help.autocorrect guess (run_argv in git.c). An
-# alias may live in a gitconfig schlock never reads and may carry the exec option itself
-# (`alias.rx = rebase --exec`), so no option table reaches it: every other subcommand fails closed.
-# Scripts are out because an alias takes their name wherever the package is absent (git-svn and
-# git-send-email are separate packages on Debian). Builtins in every git from 2.34 (Ubuntu 22.04)
-# to 2.56, less the two git lets an alias override because they are DEPRECATED: `pack-redundant`
-# and `whatchanged`. A name missing here costs an over-block; one added too early is a bypass on
-# an older git, so a newer builtin joins only once its release is the oldest one supported.
-_GIT_BUILTINS = frozenset(
+# git subcommands that are safe to suppress UNLESS one of these options is present — the transport
+# and diff/rebase family, whose other arguments (URLs, refspecs, refs, paths) are inert. `-u` is
+# `--upload-pack` on clone but `--update-head-ok` on fetch, and `-x` runs a command on rebase and
+# difftool while `grep -x` / `diff -x` / `git clean -x` mean something ordinary — hence per
+# subcommand. Reached only by the literal builtin name: an alias cannot shadow a non-deprecated
+# builtin (git.c looks builtins up first), so an alias for one of these lands in the fail-closed
+# default below, not here.
+_GIT_EXEC_OPTIONS = {
+    "clone": frozenset({"-u", "--upload-pack"}),
+    "fetch": frozenset({"--upload-pack"}),
+    "pull": frozenset({"--upload-pack"}),
+    "ls-remote": frozenset({"--upload-pack", "--exec"}),
+    "push": frozenset({"--receive-pack", "--exec"}),
+    "send-pack": frozenset({"--receive-pack", "--exec"}),
+    "archive": frozenset({"--exec"}),
+    "rebase": frozenset({"-x", "--exec"}),
+    "difftool": frozenset({"-x", "--extcmd"}),
+}
+# git subcommands whose separate-word arguments are NEVER handed to a shell: read-only queries, and
+# the porcelain whose only free-text argument is a message (`commit -m`, `tag -m`). Their arguments
+# are opaque data, so a substitution may suppress them. EVERY OTHER git subcommand fails closed
+# (_runs_an_exec_option), which is the whole point: git resolves an unknown name as an exec-path
+# script, an alias, or a help.autocorrect guess (run_argv in git.c), and a builtin may itself run a
+# command it is handed — `for-each-repo` re-dispatches a git command line, `submodule--helper
+# foreach` and `remote-ext` take one positionally, `submodule foreach` / `bisect run` /
+# `filter-branch` / `daemon` likewise. None of those can be trusted from the name, so only this
+# audited allowlist is. A name is admitted only if it is a non-deprecated builtin (so no alias can
+# shadow it) with no argument that names a program, pager, editor or tool, and no config write
+# (`config` is excluded: its write form arms a later exec). Omitting a safe name costs at most an
+# over-block on a dangerous-LOOKING quoted argument; admitting an unsafe one is a bypass, so when
+# in doubt it stays out.
+_GIT_INERT_SUBCOMMANDS = frozenset(
     {
-        "add", "am", "annotate", "apply", "archive", "blame", "branch", "bugreport", "bundle", "cat-file", "check-attr",
-        "check-ignore", "check-mailmap", "checkout", "checkout-index", "checkout--worker", "check-ref-format", "cherry",
-        "cherry-pick", "clean", "clone", "column", "commit", "commit-graph", "commit-tree", "config", "count-objects",
-        "credential", "credential-cache", "credential-cache--daemon", "credential-store", "describe", "diff",
-        "diff-files", "diff-index", "difftool", "diff-tree", "fast-export", "fast-import", "fetch", "fetch-pack",
-        "fmt-merge-msg", "for-each-ref", "for-each-repo", "format-patch", "fsck", "fsck-objects", "gc",
-        "get-tar-commit-id", "grep", "hash-object", "help", "index-pack", "init", "init-db", "interpret-trailers",
-        "log", "ls-files", "ls-remote", "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge", "merge-base",
-        "merge-file", "merge-index", "merge-ours", "merge-recursive", "merge-recursive-ours", "merge-recursive-theirs",
-        "merge-subtree", "merge-tree", "mktag", "mktree", "multi-pack-index", "mv", "name-rev", "notes", "pack-objects",
-        "pack-refs", "patch-id", "pickaxe", "prune", "prune-packed", "pull", "push", "range-diff", "read-tree",
-        "rebase", "receive-pack", "reflog", "remote", "remote-ext", "remote-fd", "repack", "replace", "rerere", "reset",
-        "restore", "revert", "rev-list", "rev-parse", "rm", "send-pack", "shortlog", "show", "show-branch",
-        "show-index", "show-ref", "sparse-checkout", "stage", "stash", "status", "stripspace", "submodule--helper",
-        "switch", "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index", "update-ref",
-        "update-server-info", "upload-archive", "upload-archive--writer", "upload-pack", "var", "verify-commit",
-        "verify-pack", "verify-tag", "version", "worktree", "write-tree",
+        "log", "show", "diff", "diff-tree", "diff-index", "diff-files", "grep", "status", "blame",
+        "annotate", "shortlog", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file",
+        "describe", "name-rev", "show-ref", "show-branch", "for-each-ref", "symbolic-ref",
+        "merge-base", "cherry", "count-objects", "var", "version", "commit", "tag", "reflog",
     }
 )  # fmt: skip
-# git's own options that take their value as the NEXT word. git matches these exactly.
+# git's own options that take their value as the NEXT word (git.c handle_options); matched exactly,
+# so the subcommand walk does not misread a value as the subcommand. `--exec-path=<dir>` and other
+# global RCE surfaces are a separate vector, not an argument-suppression one (see LAB-4268 notes).
 _GIT_OPTIONS_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source", "--shallow-file"}
-)
-# `submodule foreach` and `bisect run` take the command as a positional word; `filter-branch` is
-# caught by name alone, since every one of its filters executes.
-_ARGUMENT_EXECUTING_GIT = (
-    ("submodule", "foreach"),
-    ("bisect", "run"),
-    ("filter-branch",),
 )
 
 
@@ -1020,9 +1015,8 @@ def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
     return args[index], args[index + 1 :]
 
 
-def _names_option(word: str, command: str) -> bool:
-    """Does ``word`` spell one of ``command``'s exec options the way its option parser reads it?"""
-    options = _ARGUMENT_EXECUTING_OPTIONS[command]
+def _names_option(word: str, options: frozenset[str]) -> bool:
+    """Does ``word`` spell one of ``options`` the way git's parse-options reads it?"""
     name = word.partition("=")[0]
     if name in options:
         return True
@@ -1034,41 +1028,55 @@ def _names_option(word: str, command: str) -> bool:
 
 
 def _runs_an_exec_option(words: list[str]) -> bool:
-    """Does any command in ``words`` receive one of its exec options, however it is spelled?
+    """Does the command at the head of ``words`` hand one of its own arguments to a shell?
 
-    A git subcommand that is not a builtin counts as one: git may expand it into anything (see
-    :data:`_GIT_BUILTINS`). Every word is tried as the command, so a wrapper (``sudo``, ``env``,
-    ``xargs``) or a path (``/usr/bin/sort``) still reaches the table. Coarse in the same
-    fail-closed direction as :func:`_executes_an_argument`.
+    ``words`` is one command segment (``_join_tokens`` splits on the list/pipeline separators
+    first). For git, only the SEGMENT-LEADING word is read as the invocation: a bare ``git`` sitting
+    in someone else's argument list (``grep -rn git src``) names no subcommand. A wrapped git
+    (``sudo git fetch --upload-pack``) is re-validated by the delegation path, so it need not be
+    caught a second time here.
+
+    Three buckets for git: an inert subcommand suppresses nothing extra; the transport/diff family
+    executes only when it carries one of its keyed options; every other subcommand — unknown builtin,
+    positional-command builtin, script, alias, autocorrect target — fails closed.
     """
+    if words and words[0].rsplit("/", 1)[-1] == "git":
+        subcommand, args = _git_subcommand(words[1:])
+        if not subcommand or subcommand in _GIT_INERT_SUBCOMMANDS:
+            return False
+        options = _GIT_EXEC_OPTIONS.get(subcommand)
+        if options is None:
+            return True
+        return any(_names_option(arg, options) for arg in args)
+    # Non-git: the keyed option table, at every word so a wrapper or a path still reaches it.
     for index, word in enumerate(words):
-        command, args = word.rsplit("/", 1)[-1], words[index + 1 :]
-        if command == "git":
-            subcommand, args = _git_subcommand(args)
-            # A separator the join put there ends the command; it is not a subcommand.
-            if subcommand and subcommand not in _GIT_BUILTINS and subcommand not in _COMMAND_SEPARATORS:
-                return True
-            command = f"git {subcommand}"
-        if command in _ARGUMENT_EXECUTING_OPTIONS and any(_names_option(arg, command) for arg in args):
+        options = _EXEC_OPTIONS.get(word.rsplit("/", 1)[-1])
+        if options and any(_names_option(arg, options) for arg in words[index + 1 :]):
             return True
     return False
 
 
 def _executes_an_argument(words: list[str]) -> bool:
-    """Does this command hand one of its own arguments to a shell?
+    """Does this command segment hand one of its own arguments to a shell?
 
-    Then NOTHING it receives is opaque data, however it was quoted, and the whole-text rule
-    pass has to see all of it. ``git`` is the case that matters: it is whitelisted per BASE
-    command, but its risk lives in the subcommand, and the structural guard enumerates only
-    ``-c KEY=VAL`` — so ``git submodule foreach 'rm -rf /'`` would otherwise have its payload
-    suppressed as an argument (LAB-4234).
-
-    Deliberately coarse: a match disables suppression for the whole rendered command, which
-    only ever costs a false positive on an exotic spelling, never a missed denial.
+    Then NOTHING it receives is opaque data, however it was quoted, and the whole-text rule pass
+    has to see all of it (LAB-4234: ``git submodule foreach 'rm -rf /'`` would otherwise have its
+    payload suppressed). Deliberately coarse — a match disables suppression for its own segment,
+    which only ever costs a false positive on a dangerous-looking argument, never a missed denial.
     """
-    if any(word in _ARGUMENT_EXECUTING_FLAGS for word in words) or _runs_an_exec_option(words):
-        return True
-    return "git" in words and any(all(part in words for part in shape) for shape in _ARGUMENT_EXECUTING_GIT)
+    return any(word in _ARGUMENT_EXECUTING_FLAGS for word in words) or _runs_an_exec_option(words)
+
+
+def _collect_spans(segment: list[tuple[int, str, bool]], text: str, ranges: list[tuple[int, int]]) -> None:
+    """Append one segment's opaque-data spans to ``ranges`` — unless that segment executes an
+    argument, in which case nothing it holds is data. Scoped to the segment so an executing command
+    does not strip the quoted data of the next one across a `&&` or a `|` (each is SAFE on its own).
+    """
+    if _executes_an_argument([token for _, token, _ in segment]):
+        return
+    for start, token, is_data in segment:
+        if is_data:
+            ranges.append((max(0, start - 1), min(len(text), start + len(token) + 1)))
 
 
 def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, int]]]:
@@ -1077,16 +1085,22 @@ def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, i
     Each span widens by one onto the separators that stand where the quoting used to.
     Rules anchored with ``(\\s|$)`` consume the separator, and ``_is_in_string_literal``
     demands the WHOLE match sit inside a span, so an unwidened span misses the suppression.
+
+    The exec check runs per command segment: the tokens carry the list/pipeline separators the
+    renderer inserted, and suppression is decided for each segment between them independently.
     """
     text = " ".join(token for token, _ in tokens)
-    if _executes_an_argument([token for token, _ in tokens]):
-        return text, []
     ranges: list[tuple[int, int]] = []
     position = 0
+    segment: list[tuple[int, str, bool]] = []
     for token, is_data in tokens:
-        if is_data:
-            ranges.append((max(0, position - 1), min(len(text), position + len(token) + 1)))
+        if token in _COMMAND_SEPARATORS:
+            _collect_spans(segment, text, ranges)
+            segment = []
+        else:
+            segment.append((position, token, is_data))
         position += len(token) + 1
+    _collect_spans(segment, text, ranges)
     return text, ranges
 
 
