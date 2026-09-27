@@ -773,8 +773,9 @@ def _nodes_of_kind(node: Any, kind: str) -> "list[Any]":
     (word-level substitutions are validated separately and are not group stdin consumers).
 
     The ONE walk skeleton behind both stdin-sink surfaces - `_here_string_programs` and the pipe-to-shell
-    `check_pipeline` - and the function table that feeds them (`_function_sinks`), so a future bashlex
-    child-attr change cannot leave one silently under-scanning (LAB-2768, LAB-3006, LAB-3465).
+    `check_pipeline` - the function table that feeds them (`_function_sinks`), and segment extraction
+    (`BashCommandParser._segment_nodes`, via `_command_nodes`), so a future bashlex child-attr change is
+    one edit here and cannot leave one silently under-scanning (LAB-2768, LAB-3006, LAB-3465, LAB-4687).
     """
     found: list[Any] = []
 
@@ -1044,7 +1045,10 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
        substitution) raises: bashlex folded the operator into the word
        (`{fd}>\<newline>o`) and split the command where bash runs it whole.
     2. Only a word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection
-       other than `&>`/`&>>`, is looked at further.
+       other than `&>`/`&>>`, is looked at further. `{$v}` is an argument: an
+       expansion in the name, so bashlex never spells it `{name}`, which is how bash
+       reads it. `{$'fd'}` and `{$"fd"}` are arguments only because bashlex leaves
+       their quoting on the word.
     3. A line continuation anywhere in its enclosing top-level word raises: inside a
        word that holds one, bashlex's offsets stop tracking the source. This comes
        before rule 4, so a continuation is refused even around a quoted word.
@@ -1546,51 +1550,11 @@ class BashCommandParser:
         return segment
 
     def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
-        """Collect the AST nodes that each form one independently-validated segment."""
-        nodes: list[Any] = []
+        """Collect the AST nodes that each form one independently-validated segment.
 
-        def visit(node):  # noqa: PLR0912 - AST traversal requires multiple branches
-            """Recursively visit AST nodes to collect command nodes."""
-            if hasattr(node, "kind"):
-                # Command nodes contain individual commands
-                if node.kind == "command" and hasattr(node, "pos"):
-                    nodes.append(node)
-                    return  # Don't recurse into command parts
-
-                # Pipeline nodes - visit each command in the pipeline
-                if node.kind == "pipeline" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind != "pipe":
-                            visit(part)
-                    return
-
-                # List nodes (;, &&, ||) - visit each command
-                if node.kind == "list" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind not in ("operator",):
-                            visit(part)
-                    return
-
-                # Compound commands (if, for, while, etc.) - recurse into body
-                if node.kind == "compound" and hasattr(node, "list"):
-                    for item in node.list if isinstance(node.list, list) else [node.list]:
-                        visit(item)
-                    return
-
-                # Recursively visit other child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
-
-        for node in ast_nodes or []:
-            visit(node)
-
-        return nodes
+        Delegates to `_command_nodes` so segment extraction shares the one walk skeleton (LAB-4687).
+        """
+        return [n for node in ast_nodes or [] for n in _command_nodes(node)]
 
     @staticmethod
     def _rebase(ranges: list[tuple], base: int, end: int) -> list[tuple]:
