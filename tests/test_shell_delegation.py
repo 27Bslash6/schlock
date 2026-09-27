@@ -12,6 +12,10 @@ zsh): `bash -c -- PROG` runs PROG; `bash -ce PROG` runs PROG; `bash -cPROG` is r
 with "option requires an argument", so an attached payload is not a thing.
 """
 
+import shlex
+import time
+from types import SimpleNamespace
+
 import pytest
 
 from schlock.core import validator
@@ -1340,12 +1344,53 @@ class TestFlockAndRsyncPayloads:
         with pytest.raises(ValueError, match="rsync -e"):
             _rsync_payloads(args)
 
+    def test_remote_shell_count_is_capped_before_any_is_examined(self):
+        # Nested wrapper-plus-rsync: each outer rsync suffix carries an inner program that is
+        # itself a wrapper over many rsyncs with many `-e`. Uncapped, the work multiplied past the
+        # hook's timeout (where it fails open) and came back SAFE. The inner `-e` count now fails
+        # closed before any program is examined.
+        inner = "nice " + "rsync " * 100 + "-e ssh " * 2000 + "h:a b"
+        command = "nice " + "rsync " * 120 + f"-e '{inner}' h:a b"
+        started = time.monotonic()
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "remote-shell programs" in (result.error or "")
+        assert time.monotonic() - started < 10  # generous: well under a second when capped
+        with pytest.raises(ValueError, match="remote-shell programs"):
+            _rsync_payloads(["-e", "ssh"] * (MAX_DELEGATOR_TOKENS + 1) + ["h:a", "b"])
+
+    def test_each_remote_shell_is_examined_once_per_scan(self, monkeypatch):
+        # Under the cap, the same shape must not re-ask the same question at every wrapper
+        # position: 60 outer suffixes x 50 inner suffixes was 3060 examinations. It is 3: the inner
+        # program and `ssh` once in this scan, and `ssh` once more when the inner program is itself
+        # re-validated as a payload, which is a scan of its own.
+        # The examination is the only shlex.split in the validator, so counting splits counts it.
+        examined = []
+        split = shlex.split
+
+        def counting(program):
+            examined.append(program)
+            return split(program)
+
+        monkeypatch.setattr(validator, "shlex", SimpleNamespace(split=counting))
+        inner = "nice " + "rsync " * 50 + "-e ssh " * 200 + "h:a b"
+        assert validate_command("nice " + "rsync " * 60 + f"-e '{inner}' h:a b").risk_level == RiskLevel.SAFE
+        assert sorted(examined) == [inner, "ssh", "ssh"]
+
+    def test_payload_cap_counts_every_source_together(self):
+        # 129 `-c` payloads and 128 here-strings: each source is under the cap, the total is not.
+        segments = [f"bash -c 'echo a{i}'" for i in range(129)] + [f"bash <<< 'echo b{i}'" for i in range(128)]
+        result = validate_command("; ".join(segments))
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "distinct payloads" in (result.error or "")
+
     def test_payload_count_is_capped(self):
-        # The suffix ceiling bounds the scan, not its yield: one rsync returns every `-e`, and
-        # each re-enters validation (ShellCheck too). Past the cap the command fails closed rather
-        # than outrun the hook's timeout, where it would fail open.
-        options = " ".join(f"-e 'ssh -p {i}'" for i in range(MAX_DELEGATOR_TOKENS + 1))
-        result = validate_command(f"rsync {options} h:a b")
+        # The suffix ceiling bounds the scan, not its yield: each rsync returns every `-e`, and
+        # each re-enters validation (ShellCheck too). Two rsyncs under their own cap still total
+        # past the combined one, and fail closed rather than outrun the hook's timeout.
+        half = MAX_DELEGATOR_TOKENS // 2 + 1
+        rsyncs = (" ".join(f"-e 'ssh -p {side}{i}'" for i in range(half)) for side in (1, 2))
+        result = validate_command("; ".join(f"rsync {options} h:a b" for options in rsyncs))
         assert result.risk_level == RiskLevel.BLOCKED
         assert "distinct payloads" in (result.error or "")
         under = " ".join(f"-e 'ssh -p {i}'" for i in range(3))

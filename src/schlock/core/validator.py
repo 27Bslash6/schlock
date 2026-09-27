@@ -687,7 +687,7 @@ def _flock_payload(args: list[str]) -> Optional[str]:
     return None
 
 
-def _hands_next_arg_to_a_shell(program: str) -> bool:
+def _hands_next_arg_to_a_shell(program: str, memo: dict[str, bool]) -> bool:
     """Whether rsync's `-e` program runs the argument rsync appends to it as shell code.
 
     Asked of the same extractor, with a stand-in argument appended, so every spelling it knows
@@ -695,18 +695,28 @@ def _hands_next_arg_to_a_shell(program: str) -> bool:
     one program, so the stand-in is looked for inside each payload, not as a whole one. A program
     shlex cannot split is assumed to be such a shell: rsync's own split is not bash's, and assuming
     the worst over-approximates.
+
+    That extraction starts its own suffix budget, so `memo` holds each program's answer for the
+    whole top-level scan. Without it, every wrapper position naming the same rsync re-asked the
+    same question, and nested wrapper-plus-rsync commands multiplied the work past the hook's
+    timeout without ever tripping a cap.
     """
-    try:
-        words = shlex.split(program)
-    except ValueError:
-        return True
-    if not words:
-        return False
-    payloads = _shell_delegated_payloads([(words[0], [*words[1:], _RSYNC_APPENDED_ARG])])
-    return any(_RSYNC_APPENDED_ARG in payload for payload in payloads)
+    if program not in memo:
+        try:
+            words = shlex.split(program)
+        except ValueError:
+            words = None
+        if words is None:
+            memo[program] = True
+        elif not words:
+            memo[program] = False
+        else:
+            payloads = _shell_delegated_payloads([(words[0], [*words[1:], _RSYNC_APPENDED_ARG])], _shell_memo=memo)
+            memo[program] = any(_RSYNC_APPENDED_ARG in payload for payload in payloads)
+    return memo[program]
 
 
-def _rsync_payloads(args: list[str]) -> list[str]:
+def _rsync_payloads(args: list[str], memo: Optional[dict[str, bool]] = None) -> list[str]:
     """Return every remote-shell program `rsync -e PROG` / `--rsh PROG` names, verbatim.
 
     rsync splits PROG itself (spaces and quotes, no shell) and execs it only when one side is
@@ -729,6 +739,9 @@ def _rsync_payloads(args: list[str]) -> list[str]:
     without consuming the next word, and a long option's value (`--filter X`) is read as a word
     of its own. Whether popt hands that word to the option (`-f -e PROG`) is left unmodelled:
     reading it as a possible `-e` over-approximates, which is the safe direction.
+
+    Also raises ValueError past MAX_DELEGATOR_TOKENS `-e`/`--rsh` values, counted before any is
+    examined, so their count cannot buy work (see MAX_DELEGATOR_TOKENS).
     """
     payloads = []
     i = 0
@@ -756,7 +769,11 @@ def _rsync_payloads(args: list[str]) -> list[str]:
                     payloads.append(args[i])
                     i += 1
             break
-    if any(_hands_next_arg_to_a_shell(program) for program in payloads):
+    if len(payloads) > MAX_DELEGATOR_TOKENS:
+        raise ValueError(f"rsync scan exceeded {MAX_DELEGATOR_TOKENS} remote-shell programs")
+    payloads = list(dict.fromkeys(payloads))
+    memo = {} if memo is None else memo
+    if any(_hands_next_arg_to_a_shell(program, memo) for program in payloads):
         raise ValueError(
             "rsync -e/--rsh program runs its next argument, the remote host rsync appends from an operand, "
             "as shell code; use a remote shell such as ssh"
@@ -768,6 +785,7 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator gramm
     commands_with_args: list[tuple[str, list[str]]],
     *,
     _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
+    _shell_memo: Optional[dict[str, bool]] = None,
 ) -> list[str]:
     """Extract every argument the command will hand to a shell as source code.
 
@@ -803,6 +821,7 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator gramm
     # drops nothing: n distinct suffixes each scanned once, O(n^2) calls in total (the rest are
     # O(1) skips). Pinned by test_repeated_wrappers_extract_each_suffix_once.
     seen = set() if _seen is None else _seen
+    memo = {} if _shell_memo is None else _shell_memo  # see _hands_next_arg_to_a_shell
     payloads = []
     for cmd_name, args in commands_with_args:
         key = (cmd_name, tuple(args))
@@ -826,12 +845,12 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator gramm
         if base == "watch":
             found.append(_watch_payload(args))
         elif base == "rsync":
-            found.extend(_rsync_payloads(args))
+            found.extend(_rsync_payloads(args, memo))
         elif base == "find":
             # Each exec clause is a command in its own right; re-run the FULL extractor on it,
             # so a wrapped or nested delegator inside `-exec` is caught for free.
             for clause in _find_exec_clauses(args):
-                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
+                found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen, _shell_memo=memo))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in SHELL_COMMANDS))
@@ -854,7 +873,7 @@ def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator gramm
                 words = [a.rsplit("/", 1)[-1] for a in args]
                 for i, word in enumerate(words):
                     if word in _DELEGATOR_COMMANDS:
-                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])], _seen=seen))
+                        found.extend(_shell_delegated_payloads([(args[i], args[i + 1 :])], _seen=seen, _shell_memo=memo))
 
         payloads.extend(p for p in found if p and p.strip())
     # The same program can still surface from more than one delegator (`su su bash -c PROG`:
@@ -3323,16 +3342,11 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # exactly as a here-string does, so it counts against the same ceiling.
         payloads: list[str] = []
         if match.risk_level < RiskLevel.BLOCKED:
-            # Distinct payloads, as the here-string count already is: 257 copies of one body
-            # are one program to validate, not 257.
-            stdin_payloads = list(
-                dict.fromkeys(herestring_payloads + _shell_heredoc_bodies(command, normalised.blanked, bashlex_heredocs))
-            )
-            if len(stdin_payloads) > MAX_DELEGATOR_TOKENS:
-                raise ValueError(f"Stdin program re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
+            # Distinct payloads: 257 copies of one body are one program to validate, not 257. The
+            # count covers every source, since the suffix ceiling bounds the scan, not its yield
+            # (one `rsync` suffix returns every `-e` it carries).
+            stdin_payloads = herestring_payloads + _shell_heredoc_bodies(command, normalised.blanked, bashlex_heredocs)
             payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
-            # The suffix ceiling bounds the scan, not its yield: one `rsync` suffix returns every
-            # `-e` it carries, so the re-entries themselves are capped too.
             if len(payloads) > MAX_DELEGATOR_TOKENS:
                 raise ValueError(f"Shell payload re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
         for payload in payloads:
