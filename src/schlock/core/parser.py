@@ -206,6 +206,14 @@ def _parse_all_substitution_units(
             raise bashlex.errors.ParsingError(
                 f"unexpected {terminator.value!r} after substitution unit", string, offset + terminator.lexpos
             )
+        newline = offset + terminator.lexpos
+        if (newline - len(string[:newline].rstrip("\\"))) % 2:
+            # Bash removes a backslash-newline before it tokenizes, so no command ends there. The
+            # tokenizer ends a unit on one only when it has misread raw source: handed
+            # `{fd}>\<newline>o …`, it folds `>\` into the word and stops at the newline, and
+            # reading on would validate a second command bash never runs. Deny, as the one-unit
+            # parse did when it then found no closer.
+            raise bashlex.errors.ParsingError("a unit ended on a line continuation", string, newline)
         # The tokenizer has consumed the terminator - and any heredoc body it opened - so its
         # index is where the next unit starts. Capture it before peeking moves it on.
         resume = unit.tok._shell_input_line_index

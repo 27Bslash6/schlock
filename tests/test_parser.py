@@ -747,6 +747,33 @@ class TestMultilineSubstitutionCorrection:
             )
 
     @pytest.mark.parametrize(
+        ("command", "units"),
+        [
+            ("x=$(git {fd}>\\\no push --force origin main)", None),
+            # An escaped backslash leaves a real newline: two commands, in bash too.
+            ("x=$(echo a\\\\\necho b)", ["command", "operator", "command"]),
+            # Everywhere else the tokenizer joins the continuation itself and never ends a unit on it.
+            ("x=$(ls \\\n-la)", ["command"]),
+            ('x=$(echo "a\\\nb")', ["command"]),
+        ],
+    )
+    def test_a_unit_never_ends_on_a_line_continuation(self, command, units):
+        """Raw source (a caller that re-parses the command text, not bashlex's joined word) keeps `\\<newline>`.
+
+        Real bash 5.3 runs the first row as ONE command: git receives `push --force origin main`
+        and the `{fd}>o` redirect opens `o`. The tokenizer instead folds `>\\` into the `{fd}` word
+        and ends the unit at the newline, so reading on would validate a command `o` that bash
+        never runs. That unit boundary is refused.
+        """
+        outer = bashlex.parser._parser(command)
+        if units is None:
+            with pytest.raises(bashlex.errors.ParsingError, match="a unit ended on a line continuation"):
+                bashlex.subst._parsedolparen(outer, command, command.index("$(") + 2)
+            return
+        node, _ = bashlex.subst._parsedolparen(outer, command, command.index("$(") + 2)
+        assert ([p.kind for p in node.parts] if node.kind == "list" else [node.kind]) == units
+
+    @pytest.mark.parametrize(
         "command,span,body_kind,body_span",
         [
             # Stock bashlex 0.18 values, recorded before the correction: a one-unit body must be
