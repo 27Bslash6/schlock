@@ -2835,7 +2835,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # the audit log. It still wins the join, since nothing outranks BLOCKED.
                 if sub_result.risk_level == RiskLevel.BLOCKED and sub_result.matched_rules:
                     return _substitution_verdict(sub_result)
-                if not _deferred or sub_result.risk_level > _deferred[-1].risk_level:
+                if not _deferred or sub_result.risk_level > _deferred[0].risk_level:
                     _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection

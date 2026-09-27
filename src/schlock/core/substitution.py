@@ -1608,8 +1608,8 @@ class SubstitutionValidator:
             return None
 
         # Handle command list: $(cmd1 && cmd2) / $(cmd1; cmd2) -> first segment's base command.
-        # Without this the list base_command is None and validate_substitution falls through to
-        # the "Cannot determine command in substitution" hard block.
+        # Recorded on the SubstitutionNode only: validate_substitution dispatches a list per
+        # segment before it reads base_command, so this value never decides a list's verdict.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             for part in getattr(cmd_node, "parts", []):
                 if getattr(part, "kind", None) == "operator":
@@ -1794,12 +1794,13 @@ class SubstitutionValidator:
     ) -> tuple[bool, str]:
         """Check if inner command has dangerous structures or arguments.
 
-        These structures can weaponize even whitelisted commands:
-        - $(date | bash) - pipeline bypasses date's safety
-        - $(date; rm -rf /) - chain runs additional commands
-        - $(for x in ...; do rm $x; done) - compound executes loop
+        These arguments and redirections can weaponize even whitelisted commands:
         - $(echo x > /etc/cron.d/x) - output redirection writes files
         - $(git -c 'alias.x=!rm' x) - git alias executes shell command
+
+        The pipeline/list/compound checks are fail-closed backstops only: validate_substitution
+        dispatches or blocks every non-simple command ($(date | bash), $(date; rm -rf /),
+        $(for …)) before calling this helper.
 
         Args:
             node: The substitution AST node
@@ -2178,6 +2179,8 @@ class SubstitutionValidator:
         # writes — blocks. An allowlist, not a denylist: bashlex emits kind "function" for
         # `f() { … }`, whose name still resolves as the base command, so `$(date() { rm -rf /; };
         # date)` took the whitelist fast path and read SAFE before this guard existed.
+        # `cmd_node is None` (the synthetic node for an undecodable `${…}` body) is deliberately
+        # let through: it has no base command, so it hits the "Cannot determine command" block.
         kind = getattr(cmd_node, "kind", None)
         if cmd_node is not None and kind != "command":
             return SubstitutionValidationResult(
