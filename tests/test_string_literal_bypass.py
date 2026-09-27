@@ -811,8 +811,8 @@ class TestParameterEndsWhereBashEndsIt:
         assert not any(low <= opener <= high for low, high in pairs)
 
     def test_deep_nesting_fails_closed_not_recursion_error(self):
-        # a pathological depth of nested `${…}` must deny, never raise RecursionError out of parse
-        command = 'echo "' + '${a:-"' * 2000 + "x" + '"}' * 2000 + '"<(rm -rf /)'
-        clear_caches()
-        result = validate_command(command)
-        assert result.allowed is False
+        # Past the scan's depth cap but shallow enough that bashlex still parses the word, so the
+        # cap is what denies it: without the cap this parses, and the scan's recursion is unbounded.
+        command = 'echo "' + '${a:-"' * 300 + "x" + '"}' * 300 + '"<(rm -rf /)'
+        with pytest.raises(ParseError):
+            BashCommandParser().parse(command)

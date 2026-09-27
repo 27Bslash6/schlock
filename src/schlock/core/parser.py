@@ -484,21 +484,14 @@ def _part_offsets_may_shift(command: str, span: tuple) -> bool:
     return "\\\n" in command[span[0] : span[1]]
 
 
-# A group's closer, keyed by its opener. Inside `${…}` bash counts no bare `{`, only a nested `${`.
-# Closer of each non-substitution group _group_end steps into (a `$(`/backquote is measured by
-# bashlex instead, and `<(`/`>(` in a `${…}` fails closed, so those are not here).
-_GROUP_CLOSERS = {"${": "}", "$[": "]", "'": "'", '"': '"'}
-# The non-substitution openers bash reads inside each kind of group. A `$(`/backquote is
-# handled by _recover_substitution (bashlex knows where a command sub ends), and `<(`/`>(`
-# inside a `${…}` fails closed, so neither is listed here.
-_OPENERS_IN = {
-    "}": ("${", "$[", "'", '"'),
-    "]": ("${", "$[", "'", '"'),
-    '"': ("${", "$["),
-}
-# bash's operator characters after a `${` name; a `'` in a double-quoted `${…}` is a quote
-# under bash's default mode always, under POSIX mode only in a pattern operator's word.
-_PARAM_OPERATORS = "#%^,~:-=?+/"
+# The closer of each group _group_end steps into, and the openers it reads inside each kind.
+# Inside `${…}` bash counts no bare `{`, only a nested `${`. A `$(`/backquote is measured by
+# bashlex instead, and `<(`/`>(`, `$[` and `$${` fail closed, so none of those is listed.
+_GROUP_CLOSERS = {"${": "}", "'": "'", '"': '"'}
+_OPENERS_IN = {"}": ("${", "'", '"'), '"': ("${",)}
+# The parameter a `${` opens, and the operator characters after it that bash --posix treats as
+# a pattern operator (inside whose word a `'` still quotes).
+_PARAM_NAME = re.compile(r"[#!]?(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[-@*#?$!])(?:\[[^]]*\])?")
 _PATTERN_OPERATORS = "#%/^,"
 # _group_end recurses once per nested group; a word this deep is denied, not a RecursionError.
 _GROUP_DEPTH_CAP = 200
@@ -507,29 +500,30 @@ _GROUP_DEPTH_CAP = 200
 def _group_end(  # noqa: PLR0911, PLR0912 - one exit per bash rule
     command: str, i: int, end: int, closer: str, quoted: bool = False, squote: str = "default", depth: int = 0
 ) -> Optional[int]:
-    """Offset just past the ``closer`` ending the group whose body starts at ``i``, read as bash reads it.
+    """Offset just past the ``closer`` ending the group whose body starts at ``i``, read as a shell reads it.
 
     bashlex ends a `${…}` at its first `}`. bash does not: it skips a `}` inside `'…'`,
     `"…"` or `$'…'`, after a `\\`, and inside a nested `${`, `$(`, `<(`, `>(` or backquote,
-    so `"${x#"}"}"` is one expansion. _quote_pairs resumes its scan where bash ends the group.
+    so `"${x#"}"}"` is one expansion. _quote_pairs resumes its scan where the group ends.
 
     Shells disagree about a `'` inside a double-quoted `${…}`, so ``squote`` picks a reading and
     _quote_pairs runs all three and fails closed unless they agree: ``default`` (bash) a `'` is
-    always a quote; ``posix`` (bash --posix) a quote only in a pattern operator's word; ``literal``
-    (zsh) never a quote. A `<(`/`>(` directly in the operand is a process substitution bash may
-    run, and finding its true owner belongs to another change, so this returns None (fail closed)
-    rather than skip it. A `$(…)`/backquote is measured by bashlex; one it cannot place also
-    returns None. None otherwise means no end before ``end``. Either way the word is unreadable.
+    always a quote; ``posix`` (bash --posix) a quote only when the `${…}` has a pattern operator;
+    ``literal`` (zsh) never a quote. A `$(…)`/backquote is measured by bashlex. Returns None, and
+    the word is then unreadable, where the end cannot be known: a `<(`/`>(` in the operand (bash
+    may run it), a `$[` or a `$${` (shells count them differently), a substitution bashlex cannot
+    place, nesting deeper than _GROUP_DEPTH_CAP, or no end before ``end``.
     """
     if depth > _GROUP_DEPTH_CAP:
         return None
     count = 1
-    body = i
-    after_pattern_op = False  # bash's dolbrace_state reached a pattern operator's word
+    pattern_op = False
+    if closer == "}":
+        name = _PARAM_NAME.match(command, i, end)
+        pattern_op = name is not None and name.end() < end and command[name.end()] in _PATTERN_OPERATORS
+    literal_quote = quoted and closer == "}" and (squote == "literal" or (squote == "posix" and not pattern_op))
     while i < end:
         char = command[i]
-        if closer == "}" and not after_pattern_op and char in _PATTERN_OPERATORS and i > body:
-            after_pattern_op = True
         if char == "\\" and closer != "'":
             i += 2
             continue
@@ -539,14 +533,14 @@ def _group_end(  # noqa: PLR0911, PLR0912 - one exit per bash rule
             if count == 0:
                 return i
             continue
-        if closer in ("'", "`"):
+        if closer == "'":
             i += 1
             continue
+        if command.startswith(("$[", "$${"), i) or (closer == "}" and command.startswith(("<(", ">("), i)):
+            return None
         if command.startswith("$$", i):
-            i += 2  # the PID: the `$` after it opens nothing (`$${y}` is `$$` then `{y}`)
+            i += 2  # the PID: the `$` after it opens nothing
             continue
-        if closer == "}" and command.startswith(("<(", ">("), i):
-            return None  # a process substitution bash may run in the operand — fail closed
         if command.startswith(("$(", "`"), i):
             try:
                 node = _recover_substitution(command, i, end)
@@ -554,20 +548,15 @@ def _group_end(  # noqa: PLR0911, PLR0912 - one exit per bash rule
                 return None
             i = node.pos[1]
             continue
-        literal_quote = quoted and closer == "}" and (squote == "literal" or (squote == "posix" and not after_pattern_op))
         if closer != '"' and command.startswith("$'", i) and not literal_quote:
             found = _ansi_c_end(command, i + 2, end)
-            if found is None:
-                return None
-            i = found
-            continue
-        opener = next((o for o in _OPENERS_IN[closer] if command.startswith(o, i)), None)
-        if opener is None or (opener == "'" and literal_quote):
-            i += 1
-            continue
-        inner = _GROUP_CLOSERS[opener]
-        inner_quoted = inner == '"' or (quoted and inner in "}]")
-        found = _group_end(command, i + len(opener), end, inner, inner_quoted, squote, depth + 1)
+        else:
+            opener = next((o for o in _OPENERS_IN[closer] if command.startswith(o, i)), None)
+            if opener is None or (opener == "'" and literal_quote):
+                i += 1
+                continue
+            inner = _GROUP_CLOSERS[opener]
+            found = _group_end(command, i + len(opener), end, inner, inner == '"' or quoted, squote, depth + 1)
         if found is None:
             return None
         i = found
@@ -583,7 +572,7 @@ def _ansi_c_end(command: str, i: int, end: int) -> Optional[int]:
     return None
 
 
-def _quote_pairs(  # noqa: PLR0912, PLR0911 - one branch per bash quoting rule
+def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
     command: str, span: tuple, parts: "list[Any]", recover: "Optional[Any]" = None
 ) -> "Optional[list[tuple[int, int]]]":
     """Offsets of each opening and closing quote in the word at ``span``; with ``recover``, MUTATES ``parts``.
@@ -640,10 +629,9 @@ def _quote_pairs(  # noqa: PLR0912, PLR0911 - one branch per bash quoting rule
             # Read the `${…}` under bash's default rules; where a `'` makes the shells' readings
             # disagree about the end (default / posix / zsh), the end is not knowable — fail closed.
             close = _group_end(command, i + 2, end, "}", opened is not None, "default")
-            if close is None:
-                return None
-            if "'" in command[i:close] and any(
-                _group_end(command, i + 2, end, "}", opened is not None, mode) != close for mode in ("posix", "literal")
+            if close is None or (
+                "'" in command[i:close]
+                and any(_group_end(command, i + 2, end, "}", opened is not None, mode) != close for mode in ("posix", "literal"))
             ):
                 return None
             i = close
