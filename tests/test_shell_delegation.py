@@ -1224,6 +1224,25 @@ class TestSyntheticRuleNamedInMatchedRules:
         result = validate_command(command)
         assert (result.risk_level, result.matched_rules) == (risk, rules)
 
+    @pytest.mark.parametrize(
+        ("command", "rules"),
+        [
+            ("chmod +x x; cat <<'E'OF\nhi\nEOF", ["chmod_exec", "shellcheck:incomplete"]),
+            ("cat <<'E'OF\nhi\nEOF", ["shellcheck:incomplete"]),
+        ],
+    )
+    def test_shellcheck_without_a_verdict_is_named(self, monkeypatch, command, rules):
+        """Step 6 names `shellcheck:incomplete` when a segment rule filled the list first.
+
+        A normalised quoted delimiter fails closed when ShellCheck returns no verdict. The
+        multi-segment case used to report only `['chmod_exec']`.
+        """
+        # The autouse fixture turns ShellCheck off; this case needs a run that returns None.
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: True)
+        monkeypatch.setattr(validator, "run_shellcheck", lambda _target: None)
+        result = validate_command(command)
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.BLOCKED, rules)
+
     def test_compound_redirect_segment_keeps_the_payload_rule(self):
         # Passes on main, where no segment rule matches here. A compound-redirect pass that
         # fills the segment list (#180) must not push the payload rule out of it.
