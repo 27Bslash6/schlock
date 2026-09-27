@@ -8,14 +8,22 @@ rules:
     description: Downloading and executing code is dangerous - classic rootkit vector
     risk_level: BLOCKED
     patterns:
-      # Common download tools piped to shell interpreters
-      - '(curl|wget|fetch|aria2c|http|https).{0,200}\|\s*(bash|sh|zsh|dash|ksh|eval)'
+      # Common download tools piped to shell interpreters.
+      # The interpreter must END its word: `| sha256sum`, `| shasum` and
+      # `| shuf` are not `| sh`. A letter ends the match, not `\b`, so a
+      # versioned shell such as `| ksh93` still counts. The tool gets `\b` on
+      # its left only (`rsync`, `prefetch` and `function` are not `nc` or
+      # `fetch`); a right boundary would drop real clients like `wget2` and
+      # `curlie`. The gap still crosses `;` and `&&` on purpose: download,
+      # then pipe the file to a shell (`curl -o f URL; cat f | sh`) is the
+      # same attack split in two.
+      - '\b(curl|wget|fetch|aria2c|http|https).{0,200}\|\s*(bash|sh|zsh|dash|ksh|eval)(?![A-Za-z])'
       # Text browsers that can dump to stdout
-      - '(lynx|links|elinks|w3m)\s+[^|]*(-dump|-source).{0,100}\|\s*(bash|sh|zsh|eval)'
+      - '(lynx|links|elinks|w3m)\s+[^|]*(-dump|-source).{0,100}\|\s*(bash|sh|zsh|eval)(?![A-Za-z])'
       # Network tools receiving and executing
-      - '(nc|netcat|ncat|socat).{0,200}\|\s*(bash|sh|zsh|eval)'
+      - '\b(nc|netcat|ncat|socat).{0,200}\|\s*(bash|sh|zsh|eval)(?![A-Za-z])'
       # Perl LWP tools (GET, lwp-request, lwp-download)
-      - '(GET|lwp-request)\s+https?://.{0,100}\|\s*(bash|sh|zsh|eval)'
+      - '(GET|lwp-request)\s+https?://.{0,100}\|\s*(bash|sh|zsh|eval)(?![A-Za-z])'
       # Reverse order: shell reading from process substitution
       - '(bash|sh|zsh)\s+<\(.{0,50}(curl|wget|fetch|nc|netcat)'
     alternatives: ["Download first, inspect, then run"]
@@ -39,8 +47,11 @@ rules:
       - '(source|\.)\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
       - 'bash\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
       - 'sh\s+<\(.{0,100}(curl|wget|fetch|aria2c).{0,100}(https?|ftps?|ssh)://'
-      - 'source\s+/tmp/.{0,100}\.(sh|bash)'
-      - '\.\s+/tmp/.{0,100}\.(sh|bash)'
+      # credential_exposure's one-command gap: `source /tmp/venv/bin/activate && bash t.sh` sources
+      # no script. The quoted alternatives start at `/tmp`: bashlex's dequoted reconstruction of
+      # `source "/tmp/R&D/x.sh"` shows the `&` unquoted, so only the original text can match it.
+      - 'source\s+(?:"/tmp/(?:[^"\\\n]|\\.){0,100}|''/tmp/[^''\n]{0,100}|/tmp/(?:(?:\\.|[^;|&\n''"\\$`]|\$\{[^}\s]{0,100}\}|\$(?!\(|\{[^}\s]{0,100}\})|\$\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}\)|`[^`\n]{0,100}`|[<>]&[0-9-]|&>|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}\$\((?!(?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}\))){0,3}(?:\\.|[^;|&\n''"\\$`]|\$\{[^}\s]{0,100}\}|\$(?!\(|\{[^}\s]{0,100}\})|\$\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}\)|`[^`\n]{0,100}`|[<>]&[0-9-]|&>|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\{[^}\s]{0,100}|\$\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}(?:\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100})?(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\{[^}\s]{0,100})?|`[^`\n]{0,100})?)\.(sh|bash)'
+      - '\.\s+(?:"/tmp/(?:[^"\\\n]|\\.){0,100}|''/tmp/[^''\n]{0,100}|/tmp/(?:(?:\\.|[^;|&\n''"\\$`]|\$\{[^}\s]{0,100}\}|\$(?!\(|\{[^}\s]{0,100}\})|\$\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}\)|`[^`\n]{0,100}`|[<>]&[0-9-]|&>|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}\$\((?!(?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}\))){0,3}(?:\\.|[^;|&\n''"\\$`]|\$\{[^}\s]{0,100}\}|\$(?!\(|\{[^}\s]{0,100}\})|\$\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}\)|`[^`\n]{0,100}`|[<>]&[0-9-]|&>|"(?:[^"\\\n]|\\.){0,100}"|''[^''\n]{0,100}''){0,100}(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\{[^}\s]{0,100}|\$\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"|\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100}\)){0,100}(?:\((?:\\.|[^()\n''"\\$]|\$\{[^}\s]{0,100}\}|\$(?!\{[^}\s]{0,100}\})|''[^''\n]{0,100}''|"(?:[^"\\\n]|\\.){0,100}"){0,100})?(?:"(?:[^"\\\n]|\\.){0,100}|''[^''\n]{0,100}|\$\{[^}\s]{0,100})?|`[^`\n]{0,100})?)\.(sh|bash)'
     alternatives: ["Download first, inspect, then run", "Use package managers"]
 
   - name: command_substitution_dangerous

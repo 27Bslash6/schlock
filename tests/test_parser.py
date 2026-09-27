@@ -1,12 +1,21 @@
 """Tests for BashCommandParser."""
 
+import contextlib
 import logging
+import resource
+import signal
+import subprocess
+import sys
+import threading
+import time
 
 import bashlex
 import pytest
 
 from schlock.core import parser as parser_mod
-from schlock.exceptions import ParseError
+from schlock.core.validator import validate_command
+from schlock.exceptions import ParseBudgetError, ParseError
+from schlock.integrations.commit_filter import CommitMessageFilter
 
 
 class TestBashCommandParser:
@@ -134,6 +143,7 @@ class TestBashCommandParser:
             ("/bin/bash <<EOF | x\nrm -rf /\nEOF", ["/bin/bash <<EOF\nrm -rf /\nEOF", "x"]),
             # A wrapper runs its shell with the wrapper's stdin; wrapping cat keeps it inert.
             ("env bash <<EOF | x\nrm -rf /\nEOF", ["env bash <<EOF\nrm -rf /\nEOF", "x"]),
+            ("env bash <<EOF && x\nrm -rf /\nEOF", ["env bash <<EOF\nrm -rf /\nEOF", "x"]),
             ("timeout 5 cat <<EOF | x\nrm -rf /\nEOF", ["timeout 5 cat <<EOF\n\nEOF", "x"]),
             # Each heredoc is closed in opener order.
             ("cat <<A <<B | x\n1\nA\n2\nB", ["cat <<A <<B\n\nA\n\nB", "x"]),
@@ -646,3 +656,234 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
     assert [(seg.text, seg.string_literals) for seg in pairs] == [("echo 'rm -rf /' \\ ", [(6, 14)]), ("ls", [])]
     text, literals = pairs[0].text, pairs[0].string_literals
     assert [text[start:stop] for start, stop in literals] == ["rm -rf /"]
+
+
+@pytest.mark.parametrize(
+    ("command", "masked"),
+    [
+        # The outermost body is blanked whole, nested levels and separators with it.
+        ("cat $(a $(b $(c)) | d)/.env", "cat $(               )/.env"),
+        ("cat <(a | b) `c; d` .env", "cat <(     ) `    ` .env"),
+        # A quoted substitution is still code; a single-quoted one is text.
+        ('cat "$(a | b)/.env"', 'cat "$(     )/.env"'),
+        ("echo '$(a | b)' && ls", "echo '$(a | b)' && ls"),
+        # A redirect target is a word too; a `${...}` has no child nodes, so its interior goes.
+        ("cat < $(a | b)/.env", "cat < $(     )/.env"),
+        ("cat ${x:-$(a | b)}/.env ${y}", "cat ${           }/.env ${y}"),
+        # A `\<newline>` earlier in the word moves bashlex's offsets, but the substitution node is
+        # rebuilt at its source offsets (_recover_dropped_substitutions), so its body is blanked.
+        ('echo "x\\\ny $(echo $(a)x)"', 'echo "x\\\ny $(          )"'),
+        # Top-level separators survive, so the masked text is still two commands.
+        ("echo $(a; b) && git commit -m x", "echo $(    ) && git commit -m x"),
+    ],
+)
+def test_mask_substitution_bodies_blanks_bodies_in_place(command, masked):
+    """Absolute expected text: the caller reuses its literal ranges, so length is the contract."""
+    parser = parser_mod.BashCommandParser()
+    assert parser.mask_substitution_bodies(command, parser.parse(command)) == masked
+
+
+def _parse_hung(signum, frame):
+    pytest.fail("parse did not return within 5 s")
+
+
+# A heredoc body the tokenizer never brace-matches, so an unclosed `${` reaches the expander.
+UNTERMINATED_BRACE = [
+    'git commit -m "$(cat << EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<-EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<\tEOF\n${\nEOF\n)"',
+    'echo "$(sh << EOF\n${\nEOF\n)"',
+    'git push --force "$(cat << EOF\n${\nEOF\n)"',
+    'git commit -m "$(cat <<EOF\nfix: handle ${ in paths\nEOF\n)" && git push',
+    'echo "$(cat <<EOF\na ${b\nEOF\n)"',
+]
+
+
+class TestUnterminatedBraceExpansion:
+    """bashlex 0.18 loops forever on an unclosed `${` (LAB-4959); schlock makes it raise."""
+
+    @pytest.fixture(autouse=True)
+    def _bounded(self):
+        # A regression hangs rather than fails; the alarm turns that into a failure where it exists.
+        # A timer already armed (pytest-timeout's signal method) bounds the hang itself, and re-arming
+        # ITIMER_REAL would silently cancel its deadline for the rest of the run.
+        if not hasattr(signal, "setitimer") or signal.getitimer(signal.ITIMER_REAL)[0]:
+            yield
+            return
+        previous = signal.signal(signal.SIGALRM, _parse_hung)
+        signal.setitimer(signal.ITIMER_REAL, 5)
+        yield
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+    @pytest.mark.parametrize("command", UNTERMINATED_BRACE)
+    def test_unclosed_brace_raises(self, command):
+        with pytest.raises(ParseError, match="no closing"):
+            parser_mod.BashCommandParser().parse(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'git commit -m "$(cat <<EOF\nuse ${HOME} here\nEOF\n)"',
+            'git commit -m "$(cat <<EOF\n${\nx}\nEOF\n)"',
+            'echo "${x:-default}"',
+            "echo ${HOME} $1",
+        ],
+    )
+    def test_closed_brace_still_parses(self, command):
+        assert parser_mod.BashCommandParser().parse(command)
+
+    def test_closed_brace_keeps_its_parameter(self):
+        ast = parser_mod.BashCommandParser().parse('git commit -m "$(cat <<EOF\nuse ${HOME} here\nEOF\n)"')
+        params = []
+
+        class Visitor(bashlex.ast.nodevisitor):
+            def visitparameter(self, node, value):
+                params.append(value)
+
+        for node in ast:
+            Visitor().visit(node)
+        assert "HOME" in params
+
+
+class TestParseBudget:
+    """Every bashlex parse is bounded, and one that runs out is denied (LAB-5659).
+
+    Each test runs under a wall-clock alarm so a regression fails instead of hanging the suite.
+    """
+
+    # bashlex 0.18 never returns on this input and keeps allocating as it goes.
+    PATHOLOGICAL = "x=$(cat <<EOF\n$" + "{x=[[ a ]]\nEOF\n)"
+
+    @pytest.fixture(autouse=True)
+    def wall_clock_guard(self):
+        def expire(signum, frame):
+            pytest.fail("parse was not bounded", pytrace=False)
+
+        previous = signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, 30)
+        yield
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        parser_mod.reset_parse_budget()  # a spent budget must not leak into later tests
+
+    @pytest.fixture
+    def runaway_parse(self, monkeypatch):
+        """Make every bashlex parse spin, swallowing Exception the way parser code may. Returns the call count."""
+        calls = []
+
+        def spin(*args, **kwargs):
+            calls.append(args)
+            while True:
+                with contextlib.suppress(Exception):  # proves the budget signal is not an Exception
+                    sum(range(1000))
+
+        monkeypatch.setattr(parser_mod, "PARSE_CPU_BUDGET", 0.2)
+        monkeypatch.setattr(bashlex, "parse", spin)
+        return calls
+
+    @staticmethod
+    def _validate_in_capped_child(command, budget):
+        """(stdout words, wall seconds) of validate_command in a child capped at 1 GiB, so a regression cannot run away."""
+
+        def cap_memory():
+            resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+
+        probe = (
+            "import sys\n"
+            "from schlock.core import parser\n"
+            "from schlock.core.validator import validate_command\n"
+            "parser.PARSE_CPU_BUDGET = float(sys.argv[2])\n"
+            "r = validate_command(sys.argv[1])\n"
+            "print(r.risk_level.name, r.allowed)\n"
+        )
+        started = time.monotonic()
+        try:
+            done = subprocess.run(  # noqa: S603 - fixed interpreter and script
+                [sys.executable, "-c", probe, command, str(budget)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                preexec_fn=cap_memory,  # noqa: PLW1509 - no threads are started before the fork
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("validate_command did not return", pytrace=False)
+        return done.stdout.split(), time.monotonic() - started, done.stderr
+
+    def test_pathological_heredoc_is_denied_within_the_budget(self):
+        words, _, stderr = self._validate_in_capped_child(self.PATHOLOGICAL, 1.0)
+        assert words == ["BLOCKED", "False"], stderr
+
+    def test_many_runaway_bodies_cost_one_budget(self):
+        """Each git config payload is re-parsed by a caller that catches the failure and carries on."""
+        body = "x=$(cat <<EOF\n$" + "{x\nEOF\n)"
+        command = "".join(f"echo \"$(git config alias.a{n} '!{body}')\";" for n in range(20))
+        words, wall, stderr = self._validate_in_capped_child(command, 0.5)
+        assert words == ["BLOCKED", "False"], stderr
+        assert wall < 8, f"{wall:.1f}s: the budget was spent once per body"  # 20 bodies x 0.5 s = 10 s
+
+    def test_runaway_parse_raises_parse_budget_error(self, runaway_parse):
+        with pytest.raises(ParseBudgetError, match="too complex to analyse"):
+            parser_mod.BashCommandParser().parse("echo hello")
+
+    def test_a_spent_budget_fails_later_parses_at_once(self, runaway_parse):
+        parser = parser_mod.BashCommandParser()
+        for _ in range(3):
+            with pytest.raises(ParseBudgetError):
+                parser.parse("echo hello")
+        assert len(runaway_parse) == 1
+        parser_mod.reset_parse_budget()
+        with pytest.raises(ParseBudgetError):
+            parser.parse("echo hello")
+        assert len(runaway_parse) == 2
+
+    def test_a_new_command_gets_a_fresh_budget(self, runaway_parse, monkeypatch, no_shellcheck):
+        with pytest.raises(ParseBudgetError):
+            parser_mod.BashCommandParser().parse("echo hello")
+        monkeypatch.undo()
+        assert validate_command("echo fresh budget").allowed
+
+    def test_timer_and_handler_are_restored(self, runaway_parse):
+        before = signal.getsignal(signal.SIGVTALRM)
+        with pytest.raises(ParseBudgetError):
+            parser_mod.BashCommandParser().parse("echo hello")
+        assert signal.getitimer(signal.ITIMER_VIRTUAL) == (0.0, 0.0)
+        assert signal.getsignal(signal.SIGVTALRM) is before
+        # The caller's own SIGALRM deadline (the guard fixture's) is still armed.
+        assert signal.getitimer(signal.ITIMER_REAL)[0] > 0
+
+    def test_a_callers_virtual_timer_is_put_back(self, parser):
+        previous = signal.signal(signal.SIGVTALRM, signal.SIG_IGN)
+        try:
+            signal.setitimer(signal.ITIMER_VIRTUAL, 100)
+            parser.parse("echo hello")
+            assert signal.getitimer(signal.ITIMER_VIRTUAL)[0] > 99
+            assert signal.getsignal(signal.SIGVTALRM) is signal.SIG_IGN
+        finally:
+            signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+            signal.signal(signal.SIGVTALRM, previous)
+
+    def test_timer_is_disarmed_after_a_normal_parse(self, parser):
+        parser.parse("echo hello")
+        assert signal.getitimer(signal.ITIMER_VIRTUAL) == (0.0, 0.0)
+
+    def test_validate_command_denies_a_runaway_parse(self, runaway_parse, no_shellcheck):
+        """Denied outright: the word "heredoc" must not route it to the heredoc fallback, which re-parses."""
+        result = validate_command("cat <<heredoc\nbudget test\nheredoc")
+        assert not result.allowed
+        assert result.risk_level.name == "BLOCKED"
+        assert "too complex to analyse" in result.message
+
+    def test_commit_filter_falls_back_under_a_runaway_parse(self, runaway_parse):
+        result = CommitMessageFilter({"enabled": True, "rules": {}}).filter_commit_message('git commit -m "budget test"')
+        assert (result.original_message, result.was_modified, result.error) == ("budget test", False, None)
+
+    def test_parse_off_the_main_thread_still_works(self, parser):
+        """Python runs signal handlers only on the main thread, so a worker thread parses unbounded rather than failing."""
+        out = []
+        worker = threading.Thread(target=lambda: out.append(parser.parse("echo hello")))
+        worker.start()
+        worker.join()
+        assert out and out[0]
