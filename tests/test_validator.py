@@ -1292,18 +1292,13 @@ class TestHeredocSurroundings:
                 "cat <<'EOF' x\\\n\\\n#c \\\n; rm -rf /\nbody\nEOF",
                 "`#` glued across an empty continuation line",
             ),
-            # An ESCAPED word character is word TEXT to bash, not a word
-            # boundary, so a `#` glued to it opens no comment: the logical line
-            # runs on and bash really executes the payload. Both parents denied
-            # these by ACCIDENT, for different reasons - main never joined the
-            # line at all, and this branch left a dangling `cat \` that parsed
-            # nowhere - so only merging the two could expose the class. Every
-            # character in _WORD_START_AFTER can be escaped this way, and the
-            # one-line spelling was already live on main (LAB-4332).
+            # The escaped word character glued to a `#` (the one-line rows below)
+            # arriving on a continuation line: it is still word text on the
+            # joined line, so the `#` opens no comment, the logical line runs on,
+            # and bash really executes the payload.
             ("cat <<'EOF' \\\n\\ #\\\n; rm -rf /\nbody\nEOF", "escaped blank before a glued `#`"),
             ("cat <<'EOF' \\\n\\\t#\\\n; rm -rf /\nbody\nEOF", "escaped tab before a glued `#`"),
             ("cat <<'EOF' \\\n\\;#\\\n; rm -rf /\nbody\nEOF", "escaped `;` before a glued `#`"),
-            ("cat <<'EOF' \\ #\\\n; rm -rf /\nbody\nEOF", "escaped blank before a glued `#`, one line"),
             # `<` ending the opener line and `<<` starting the continuation is a
             # `<<<` here-string once bash deletes the backslash-newline - ONE
             # heredoc, not two. Reading the physical lines separately invents a
@@ -4163,8 +4158,18 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
                 "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC\n\nfoo\\\nEOF\nSCHLOCK_HEREDOC\nrm -rf /\n"
                 "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC",
             ),
+            (
+                "cat <<'Q' <<EOF \\\n> /dev/null\nq\nQ\nEO\\\nF\nrm -rf /\nEOF",
+                "cat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC > /dev/null\n\nSCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /\nEOF",
+            ),
         ],
-        ids=["joined-terminator", "tabs-stripped-from-the-joined-line", "three-physical-lines", "a-body-line-joined-into-EOF"],
+        ids=[
+            "joined-terminator",
+            "tabs-stripped-from-the-joined-line",
+            "three-physical-lines",
+            "a-body-line-joined-into-EOF",
+            "after-a-continued-opener",
+        ],
     )
     def test_the_fallback_ends_the_body_at_the_line_bash_ends_it(self, command, neutered):
         """Bash ran the payload in every row, so it must be shell in the rewrite as bashlex reads it.
@@ -4249,8 +4254,8 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
     def test_the_command_after_a_joined_terminator_is_denied(self, safety_rules_path, command):
         """Bash runs the `rm` in each. The first and last were LOW and allowed.
 
-        The second is denied whichever way it is read: as an opener line that continues, which
-        is refused outright, or, once such a line is joined, as a body with a joined terminator.
+        The second continues its opener line; once that line is joined, it is a body with a
+        joined terminator (its rewrite is pinned in `test_the_fallback_ends_the_body_at_the_line_bash_ends_it`).
         """
         result = validate_command(command, config_path=safety_rules_path)
 
