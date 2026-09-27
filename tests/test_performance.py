@@ -8,8 +8,8 @@ Uses pytest-benchmark for statistically sound measurements:
 
 Run with: pytest tests/test_performance.py -v --benchmark-only
 
-Note: Tests gracefully skip when pytest-benchmark is not installed.
-Install with: uv add --dev pytest-benchmark
+The whole module is marked `slow`, so the local fast gate (`-m "not slow"`)
+skips it. Run it with `pytest tests/test_performance.py` or `make test`.
 """
 
 import os
@@ -22,7 +22,7 @@ from schlock.core.validator import validate_command
 
 # Check if pytest-benchmark is available
 try:
-    import pytest_benchmark  # noqa: F401  # pyright: ignore[reportMissingImports]
+    import pytest_benchmark  # noqa: F401
 
     HAS_BENCHMARK = True
 except ImportError:
@@ -33,6 +33,8 @@ requires_benchmark = pytest.mark.skipif(
     not HAS_BENCHMARK,
     reason="pytest-benchmark not installed (pip install pytest-benchmark)",
 )
+
+pytestmark = pytest.mark.slow
 
 
 def stats_median_ms(benchmark) -> float:
