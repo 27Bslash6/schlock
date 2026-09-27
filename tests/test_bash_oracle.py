@@ -39,6 +39,10 @@ def sandbox(oracle_home):
     return oracle_home
 
 
+# Bash's own test, not ls: ls holds a directory fd of its own while it lists /proc/self/fd.
+LIST_OPEN_FDS = "for n in {3..63}; do [[ -e /proc/self/fd/$n ]] && echo OPEN:$n; done; true"
+
+
 def assert_canaries_intact(home: Path) -> None:
     assert (home / ".ssh" / "id_canary").read_text() == "canary\n"
     assert (home / ".config" / "canary").read_text() == "canary\n"
@@ -81,6 +85,38 @@ class TestContainment:
         probe = "; ".join(f"test -e {shlex.quote(str(p))} && echo VISIBLE:{shlex.quote(str(p))}" for p in paths)
         result = oracle(f"{probe}; true", sandbox)
         assert "VISIBLE" not in result.stdout
+
+    @pytest.mark.parametrize("mode", [os.O_RDWR, os.O_RDONLY], ids=["writable", "read-only"])
+    def test_an_inherited_file_descriptor_reaches_nothing(self, sandbox, tmp_path, mode):
+        host = tmp_path / "host-canary"
+        host.write_text("safe\n")
+        fd = os.open(host, mode)
+        try:
+            result = oracle(f"printf OWNED >&{fd}; cat /proc/self/fd/{fd} <&{fd}; {LIST_OPEN_FDS}", sandbox, pass_fds=(fd,))
+        finally:
+            os.close(fd)
+        assert "safe" not in result.stdout
+        assert "OPEN" not in result.stdout, result.stdout
+        assert host.read_text() == "safe\n"
+
+    def test_an_inherited_directory_descriptor_reaches_nothing(self, sandbox, tmp_path):
+        (tmp_path / "host-canary").write_text("safe\n")
+        fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            # Read-only probes: a regressed sandbox must not be handed a destructive line.
+            result = oracle(f"ls /proc/self/fd/{fd}/ /proc/self/fd/{fd}/../ 2>&1; true", sandbox, pass_fds=(fd,))
+        finally:
+            os.close(fd)
+        assert "host-canary" not in result.stdout
+        assert tmp_path.name not in result.stdout
+
+    def test_the_callers_stdout_file_is_not_reopened(self, sandbox, tmp_path):
+        log = tmp_path / "caller-log"
+        log.write_text("prior\n")
+        with log.open("a") as out:
+            result = oracle(": > /proc/self/fd/1; echo new", sandbox, stdout=out)
+        assert result.returncode == 0, result.stderr
+        assert log.read_text() == "prior\nnew\n"
 
     def test_root_is_read_only_and_home_and_tmp_are_writable(self, sandbox):
         result = oracle("touch /usr/x /etc/x /x 2>/dev/null || echo RO; touch ~/x /tmp/x && echo RW", sandbox)
@@ -143,6 +179,11 @@ class TestFailsClosed:
 
 # --- No real shell outside the oracle -------------------------------------------------
 
+# A tripwire, not the boundary: it reads the common spawn shapes out of the source, so it
+# cannot see a shell started by a helper script or by the code string of `python -c`. The
+# boundary is the rule in CLAUDE.md, and scripts/bash-oracle for anything run under it.
+# It fails closed on what it can see: an argv it cannot read is treated as a shell.
+
 # Test code that spawns a real shell, and why it is not executing candidate commands.
 # Add to this only for fixed, test-authored commands; a candidate goes through the oracle.
 REAL_SHELL_ALLOWLIST = {
@@ -151,33 +192,58 @@ REAL_SHELL_ALLOWLIST = {
     "tests/conftest.py": "run_bash_oracle: the oracle itself",
 }
 
-_SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "busybox"}
-_SPAWNERS = {"run", "call", "check_call", "check_output", "Popen"}
-_STRING_TO_SHELL = {"os.system", "os.popen", "pty.spawn", "subprocess.getoutput", "subprocess.getstatusoutput"}
+_SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "busybox"}
+# Programs that run their operand as a command, so their argv hides the real program.
+_WRAPPERS = {
+    "env", "timeout", "nice", "nohup", "setsid", "stdbuf", "sudo", "doas", "su", "runuser", "xargs",
+    "parallel", "flock", "unshare", "nsenter", "chroot", "script", "time", "ionice", "taskset",
+    "chrt", "systemd-run", "watch", "strace", "ltrace", "unbuffer", "firejail", "fakeroot",
+}  # fmt: skip
+_SPAWNERS = {
+    f"{owner}{name}" for owner in ("", "subprocess.") for name in ("run", "call", "check_call", "check_output", "Popen")
+}
+_STRING_TO_SHELL = {
+    "os.system", "os.popen", "pty.spawn", "subprocess.getoutput", "subprocess.getstatusoutput",
+    "asyncio.create_subprocess_shell",
+}  # fmt: skip
 
 
-def _spawns_real_shell(call: ast.Call) -> bool:
-    """A call that hands a string to a shell: a shell argv, shell=True, os.system and kin."""
+def _call_name(call: ast.Call) -> str:
     func = call.func
     if isinstance(func, ast.Attribute):
         owner = func.value.id if isinstance(func.value, ast.Name) else ""
-        name = f"{owner}.{func.attr}"
-    else:
-        name = getattr(func, "id", "")
+        return f"{owner}.{func.attr}"
+    return getattr(func, "id", "")
+
+
+def _program(node: ast.expr) -> str:
+    return Path(node.value).name if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
+
+
+def _argv_may_run_a_shell(argv: list) -> bool:
+    if not argv or any(isinstance(e, ast.Starred) or _program(e) in _SHELLS for e in argv):
+        return True
+    head = argv[0]
+    if _program(head) in _WRAPPERS:
+        return any(not isinstance(e, ast.Constant) for e in argv[1:])
+    # Python itself is not a shell; any other program the source does not spell out may be.
+    return not isinstance(head, ast.Constant) and ast.unparse(head) != "sys.executable"
+
+
+def _spawns_real_shell(call: ast.Call) -> bool:
+    """A call that may hand a string to a shell: a shell anywhere in argv, shell=True, os.system..."""
+    name = _call_name(call)
     if name in _STRING_TO_SHELL or name.startswith(("os.exec", "os.spawn", "os.posix_spawn")):
         return True
-    if name.rpartition(".")[2] not in _SPAWNERS:
+    if name == "asyncio.create_subprocess_exec":
+        return _argv_may_run_a_shell(list(call.args))
+    if name not in _SPAWNERS:
         return False
     if any(k.arg == "shell" and not (isinstance(k.value, ast.Constant) and k.value.value is False) for k in call.keywords):
         return True
     argv = call.args[0] if call.args else None
-    if isinstance(argv, (ast.List, ast.Tuple)) and argv.elts:
-        head = argv.elts[0]
-        if isinstance(head, ast.Constant):
-            return Path(str(head.value)).name in _SHELLS
-        # Python itself is not a shell; any other program the source does not spell out may be.
-        return ast.unparse(head) != "sys.executable"
-    return False
+    # An argv the source does not spell out may be a shell.
+    return not isinstance(argv, (ast.List, ast.Tuple)) or _argv_may_run_a_shell(argv.elts)
 
 
 def _files_spawning_a_shell():
@@ -202,8 +268,17 @@ def test_allowlist_has_no_stale_entries():
     [
         ('subprocess.run(["bash", "-c", c])', True),
         ('subprocess.Popen(["/bin/sh", "-c", c])', True),
-        ("subprocess.run(argv)", False),
-        ("subprocess.run([shell, script])", True),  # an unknown program may be a shell
+        ("subprocess.run(argv)", True),  # an argv the source does not spell out may be a shell
+        ("subprocess.run([shell, script])", True),
+        ('subprocess.run(["env", "bash", "-c", c])', True),
+        ('subprocess.run(["timeout", "5", "bash", "-c", c])', True),
+        ('subprocess.run(["/usr/bin/env", prog, "-c", c])', True),
+        ('subprocess.run(["sudo", "-u", "x", "--", *cmd])', True),
+        ('subprocess.run(["git", *args])', True),
+        ('subprocess.run(["env", "GIT_DIR=x", "git", "log"])', False),
+        ('asyncio.create_subprocess_exec("bash", "-c", c)', True),
+        ("asyncio.create_subprocess_shell(c)", True),
+        ("asyncio.run(main())", False),
         ('subprocess.run("x", shell=True)', True),
         ('subprocess.check_output(["git", "log"])', False),
         ('subprocess.run([sys.executable, "-c", code])', False),

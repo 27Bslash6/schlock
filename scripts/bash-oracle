@@ -16,11 +16,14 @@
 #   - HOME is an empty tmpfs mounted at the caller's own $HOME path, so `~` and a
 #     literal home path both resolve to it exactly as they would outside. /tmp is a
 #     separate empty tmpfs. Both vanish when the command exits.
+#   - no inherited descriptor beyond stdin (/dev/null) and captured stdout/stderr:
+#     an open fd would reach host files the mounts hide.
 #   - every namespace unshared (no network), a new session (no TIOCSTI onto the
-#     caller's terminal), no capabilities, a cleared environment, stdin from /dev/null.
-#   - killed with the caller (--die-with-parent) and after a timeout (default 10s).
+#     caller's terminal), no capabilities, a cleared environment.
+#   - killed with the caller (--die-with-parent) and after a timeout (default 10s);
+#     no single file it writes may exceed 64 MiB.
 #
-# Output: bash's stdout and stderr pass through unchanged, then one line on stderr:
+# Output: bash's stdout, then its stderr, once it exits; then one line on stderr:
 #   bash-oracle: exit=N          bash ran and exited N (this script also exits N)
 #   bash-oracle: timeout=S       killed after S seconds (exit 124; a command that
 #                                itself exits 124 reports exit=124)
@@ -82,13 +85,35 @@ for dir in /bin /sbin /lib /lib32 /lib64 /libx32; do
     fi
 done
 
-# The marker proves the sandbox was fully built before the command ran: bwrap reports
-# its own setup failures as exit 1, which is indistinguishable from bash's exit 1.
+# Runs inside the sandbox before the command. Mounts are not the only way out: bwrap
+# passes every inherited descriptor through, and /proc/self/fd/N reopens the host file
+# or directory behind it (a directory fd reaches its whole tree, `..` included). So
+# close everything above the marker, and refuse to run if anything survives. Writing
+# the marker last means it proves the sandbox was built AND its descriptors are clean;
+# without it, bwrap's own setup failure (exit 1) looks like bash's exit 1.
+# ulimit -f caps any one file the command writes, including the output capture below.
+# shellcheck disable=SC2016 # expands in the sandboxed bash, not here
+bootstrap='
+for fd in /proc/self/fd/*; do
+    fd=${fd##*/}
+    if ((fd > 3)); then exec {fd}>&-; fi
+done
+for fd in /proc/self/fd/*; do
+    fd=${fd##*/}
+    if ((fd > 3)) && [[ -e /proc/self/fd/$fd ]]; then exit 125; fi
+done
+ulimit -f 65536 &&
+    printf ok >&3 && exec 3>&- && exec bash -c "$1"
+'
+
+# stdout and stderr go to files this script owns rather than to whatever the caller's
+# fds 1 and 2 are (a file in HOME, a terminal), so /proc/self/fd/1 reaches nothing new.
 marker="$(mktemp)"
-trap 'rm -f "$marker"' EXIT
+out="$(mktemp)"
+err="$(mktemp)"
+trap 'rm -f "$marker" "$out" "$err"' EXIT
 
 status=0
-# shellcheck disable=SC2016 # $1 expands in the sandboxed bash, not here
 timeout --kill-after=2 "$timeout_s" \
     bwrap \
     --unshare-all \
@@ -106,9 +131,11 @@ timeout --kill-after=2 "$timeout_s" \
     --tmpfs "$HOME" \
     --chdir "$HOME" \
     --remount-ro / \
-    /usr/bin/bash -c 'printf ok >&3 && exec 3>&- && exec bash -c "$1"' bash "$1" \
-    3> "$marker" < /dev/null || status=$?
+    /usr/bin/bash -c "$bootstrap" bash "$1" \
+    3> "$marker" < /dev/null > "$out" 2> "$err" || status=$?
 
+cat "$out"
+cat "$err" >&2
 if [[ ! -s "$marker" ]]; then
     ((status == 124)) && fail "timed out before the sandbox started"
     fail "bwrap could not build the sandbox (status $status); nothing ran.

@@ -25,12 +25,15 @@ the kind of filter these strings are built to get past: `$'\u72'm -rf ~` passes 
 deletes the home directory. Proving such filters insufficient is what schlock is for.
 
 The oracle runs real bash with no network, a read-only allowlist of host paths (`/usr`,
-`/etc`), and an empty throwaway HOME and `/tmp`, and it refuses to run if it cannot build
-that sandbox. There is no unsandboxed fallback, and you must not write one. Tests reach it
+`/etc`), an empty throwaway HOME and `/tmp`, and no inherited file descriptors (an open fd
+reaches the host file or directory behind it, whatever is mounted). It refuses to run if it
+cannot build that sandbox. There is no unsandboxed fallback, and you must not write one. Tests reach it
 through `run_bash_oracle` / `oracle_home` in `tests/conftest.py`. A test that spawns a
 real shell for any other reason (driving git, running the hook manifest) uses fixed,
 test-authored commands only, and must be listed with its reason in `REAL_SHELL_ALLOWLIST`
-in `tests/test_bash_oracle.py`, which fails on any spawn it does not know about. Setup
+in `tests/test_bash_oracle.py`. That test reads spawn calls out of the source, so it is a
+tripwire, not a boundary: it cannot see a shell started from a helper script or from the
+code string of `python -c`. The rule above is what you must follow. Setup
 (bubblewrap, and the AppArmor profile Ubuntu 23.10+ needs) is in CONTRIBUTING.md.
 
 ## Critical Design Principles
