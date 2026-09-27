@@ -331,6 +331,12 @@ class TestEveryConsumerParsesThroughTheTag:
         src = pathlib.Path(__file__).parent.parent / "src"
         found = {(path.relative_to(src).as_posix(), owner) for path in src.rglob("*.py") for owner in _bashlex_parse_calls(path)}
         assert found == {("schlock/core/parser.py", "_bounded_parse")}
+        callers = {
+            (path.relative_to(src).as_posix(), owner)
+            for path in src.rglob("*.py")
+            for owner in _bashlex_parse_calls(path, targets=("_bounded_parse",))
+        }
+        assert callers == {("schlock/core/parser.py", "parse_bashlex"), ("schlock/core/parser.py", "_parse_succeeds")}
 
 
 def _import_aliases(tree):
@@ -346,8 +352,11 @@ def _import_aliases(tree):
     return aliases
 
 
-def _bashlex_parse_calls(path):
-    """The enclosing function ("<module>" at top level) of every bashlex parse call in ``path``."""
+def _bashlex_parse_calls(path, targets=("bashlex.parse", "bashlex.parser.parse")):
+    """The enclosing function ("<module>" at top level) of every call in ``path`` to one of ``targets``.
+
+    A target also matches through any module path (``schlock.core.parser._bounded_parse``).
+    """
     tree = ast.parse(path.read_text())
     aliases = _import_aliases(tree)
     owners = {}
@@ -362,8 +371,8 @@ def _bashlex_parse_calls(path):
         while isinstance(func, ast.Attribute):
             chain.insert(0, func.attr)
             func = func.value
-        if isinstance(func, ast.Name) and ".".join([aliases.get(func.id, func.id), *chain]) in (
-            "bashlex.parse",
-            "bashlex.parser.parse",
-        ):
+        if not isinstance(func, ast.Name):
+            continue
+        name = ".".join([aliases.get(func.id, func.id), *chain])
+        if name in targets or name.endswith(tuple(f".{target}" for target in targets)):
             yield owners.get(node, "<module>")

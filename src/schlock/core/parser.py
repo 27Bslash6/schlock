@@ -228,7 +228,8 @@ _refuse_unterminated_brace_expansion()
 def parse_bashlex(command: str) -> list[Any]:
     """The in-process bashlex tier: parse or raise `ParseError` (never returns a partial AST).
 
-    Runs with the AND-OR substitution correction above applied. This is also the LAST tier
+    Runs with both bashlex patches above applied (the AND-OR substitution correction and the
+    unterminated-``${`` refusal). This is also the LAST tier
     of `TieredParser`: when it raises, nothing rescues the command and validator.py blocks.
     Every AST it returns carries the `{varname}` prefix tags (_mark_fd_variables), whichever
     caller asked, so no tier can hand a consumer an untagged tree.
