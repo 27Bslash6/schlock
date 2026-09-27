@@ -467,7 +467,7 @@ class CommitMessageFilter:
     _STDIN_TARGETS = ("-", "/dev/stdin")
 
     # Whole-token quoted spans whose CONTENT — not the token itself — is a bare stdin target
-    # (LAB-3904 shape 2: `'-'`, `'/dev/stdin'`) or a short/long attached flag+target quoted as one
+    # (`'-'`, `'/dev/stdin'`) or a short/long attached flag+target quoted as one
     # word (`"-F-"`, `"--file=-"`). `_consume_command_line` blanks only the quote characters
     # around one of these, not the content, so the content survives into `scan_text` as a token
     # for `_first_stdin_flag_end` to find — otherwise the ordinary quote pass blanks the whole
@@ -492,7 +492,7 @@ class CommitMessageFilter:
         for ``_stdin_flag_value_indices`` to recognize a stdin target or an attached flag+target
         hidden inside one whole-token quote. Needed because two of its callers hand it words that
         were never quote-processed: ``_git_commit_arg_lists``'s naive ``command.split()`` fallback
-        (only reached when bashlex can't parse — a quoted heredoc delimiter, LAB-3904 shape 2) and
+        (only reached when bashlex can't parse — a quoted heredoc delimiter) and
         raw command-line splits in general. bashlex's own ``.word`` is already quote-removed, so
         this is a no-op there.
         """
@@ -558,10 +558,24 @@ class CommitMessageFilter:
         makes "the" extracted message ambiguous — refuse to guess and bind only the first,
         potentially missing content in the other, same ambiguity-refusal posture as the
         heredoc-opener cap in ``_scan_heredocs``.
+
+        Only flags inside a ``git … commit`` segment count: a quoted stdin-target span kept as a
+        token by ``_blank_quoted_span`` (``echo "-F-"; git commit -F- <<'X'``) is prose in some
+        other command, and counting it as a second flag would make a real heredoc commit look
+        ambiguous and go unscannable. The segment test is loose on purpose (a ``git`` token, then
+        a later ``commit`` token): a blanked quoted global value (``git -C "dir" commit``) leaves no
+        word for a strict argv walk to consume.
         """
-        tokens = list(self._TOKEN_RE.finditer(scan_text))
-        words = [t.group() for t in tokens]
-        positions = [tokens[idx].end() for idx in self._stdin_flag_value_indices(words)]
+        positions: list[int] = []
+        seg_start = 0
+        for seg_end in [m.start() for m in self._COMMAND_SEPARATOR_RE.finditer(scan_text)] + [len(scan_text)]:
+            tokens = list(self._TOKEN_RE.finditer(scan_text, seg_start, seg_end))
+            words = [t.group() for t in tokens]
+            seg_start = seg_end + 1
+            if "git" not in words or "commit" not in words[words.index("git") + 1 :]:
+                continue
+            first = words.index("commit", words.index("git") + 1) + 1
+            positions += [tokens[first + idx].end() for idx in self._stdin_flag_value_indices(words[first:])]
         return positions[0] if len(positions) == 1 else None
 
     # Heredoc opener: `<<` (or `<<-`, tab-stripping form) plus optional blanks; the delimiter WORD
@@ -710,7 +724,7 @@ class CommitMessageFilter:
     def _blank_quoted_span(cls, command: str, scan_chars: list[str], start: int, end: int, quote_char: str) -> None:
         """Blank the quoted span ``command[start:end]`` in ``scan_chars`` — normally the whole
         span, but for a well-terminated span whose content is exactly a stdin target, only the
-        quote characters, so the content stays a token in ``scan_text`` (LAB-3904 shape 2).
+        quote characters, so the content stays a token in ``scan_text``.
         """
         terminated = end - start >= 2 and command[end - 1] == quote_char
         content = command[start + 1 : end - 1] if terminated else None

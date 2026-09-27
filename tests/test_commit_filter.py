@@ -1862,7 +1862,7 @@ class TestHeredocStdinExtraction:
         assert duration < 0.5, f"_scan_heredocs took {duration:.3f}s on large legitimate input"
 
     def test_shape1_ast_later_stdin_redirect_overrides_heredoc(self):
-        # LAB-3904 shape 1, AST tier: bash applies fd-0 redirects left to right, so a later plain
+        # AST tier: bash applies fd-0 redirects left to right, so a later plain
         # redirect after the heredoc opener discards its body entirely (verified against real
         # bash: `bash -c "cat <<X < /dev/null\nbody\nX"` prints nothing). Same for an fd dup
         # (`<&N`) and a here-string (`<<< str`) — all unscannable, not the heredoc's body.
@@ -1897,7 +1897,7 @@ class TestHeredocStdinExtraction:
         assert not clean.patterns_removed
 
     def test_shape1_unrelated_fd_redirect_does_not_falsely_override(self):
-        # Panel-found (expert-panel-review, LAB-3904): the override check must be fd-0-aware, not
+        # The override check must be fd-0-aware, not
         # "any non-`<<` run of `<`". A redirect on a DIFFERENT explicit fd (`2<&1`, `2<file`) never
         # touches stdin, so it must not be mistaken for an override of the commit's own heredoc.
         for suffix in ("2<&1", "2<file"):
@@ -1907,7 +1907,7 @@ class TestHeredocStdinExtraction:
             assert result.patterns_removed, suffix
 
     def test_shape1_sibling_command_redirect_does_not_falsely_override(self):
-        # Panel-found (expert-panel-review, LAB-3904): the override search must stop at a command
+        # The override search must stop at a command
         # separator on the same physical line — a sibling command chained with `;` owns its own
         # redirects, they are not a later redirect on the heredoc opener's own command.
         cmd = "git commit -F- <<'X'; echo hi < /dev/null\nGenerated with Claude Code\nX\n"
@@ -1916,7 +1916,7 @@ class TestHeredocStdinExtraction:
         assert result.patterns_removed
 
     def test_shape2_quoted_stdin_target_binds_heredoc(self):
-        # LAB-3904 shape 2: a quoted stdin target still reads stdin in real bash (verified:
+        # A quoted stdin target still reads stdin in real bash (verified:
         # `cat '-' <<'X'` prints the heredoc body) — the quote pass used to blank the whole span,
         # hiding the target from the flag scan and reporting unscannable even though the message
         # bytes are right there in the command. Covers a separate quoted value (`-F '-'`), a
@@ -1931,6 +1931,27 @@ class TestHeredocStdinExtraction:
             clean = self._filter(self._ad_rules()).filter_commit_message(f"git commit {flag} <<'X'\nclean\nX\n")
             assert clean.message_delivery == "scannable", flag
             assert not clean.patterns_removed, flag
+
+    def test_shape2_quoted_stdin_target_in_other_command_is_not_a_second_flag(self):
+        # A quoted `"-F-"` / `"--file=-"` kept as a token for the flag scan is prose when it sits
+        # in some other command: it must not count as a second stdin flag and turn the real
+        # heredoc commit unscannable.
+        for decoy in ('"-F-"', '"--file=-"', "'-'"):
+            for cmd in (
+                f"echo {decoy}; git commit -F- <<'X'\nGenerated with Claude Code\nX\n",
+                f"git commit -F- <<'X' && echo {decoy}\nGenerated with Claude Code\nX\n",
+            ):
+                result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+                assert result.message_delivery == "scannable", cmd
+                assert result.patterns_removed, cmd
+
+    def test_shape2_quoted_global_value_still_finds_commit_flag(self):
+        # A quoted git global value is blanked in the scan text; the flag search must still find
+        # `commit` and its stdin flag after it.
+        cmd = "git -C \"some dir\" commit -F- <<'X'\nGenerated with Claude Code\nX\n"
+        result = self._filter(self._ad_rules()).filter_commit_message(cmd)
+        assert result.message_delivery == "scannable"
+        assert result.patterns_removed
 
     def test_shape2_quoted_non_stdin_target_stays_unscannable(self):
         # Benign twin: a quoted target that is NOT `-`/`/dev/stdin` is a real file, not the
