@@ -1466,12 +1466,15 @@ class _Context:
     subscript, so no later `[` in the same word is asked again. ``opener`` is
     the text that opened it, kept verbatim because several openers share
     ``comsub`` - `<(` and `>(` are not `$(` - and a refusal that names the wrong
-    construct sends the reader to the wrong part of the line.
+    construct sends the reader to the wrong part of the line. ``in_backtick``
+    says this context or one enclosing it is a backtick, set once when it is
+    pushed so a `<<` asks the innermost context instead of walking all of them.
     """
 
     comsub: bool = False
     compound: bool = False
     backtick: bool = False
+    in_backtick: bool = False
     opener: str = "$("
     serial: int = 0
     state: str = _FRESH
@@ -1548,6 +1551,7 @@ class _ScanState:
         """Push a command context, numbered after every context opened before it."""
         self.opened += 1
         context.serial = self.opened
+        context.in_backtick = context.backtick or self.contexts[-1].in_backtick
         self.contexts.append(context)
 
 
@@ -1767,7 +1771,14 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             if char in "<>" and ctx.start is not None and not _FD_RE.fullmatch(ctx.word(line, pos)):
                 ctx.end_word(line, pos)  # `x=1>f`, `time>f`: the operator starts a new word
                 ctx.start = pos
-            elif char == "-" and ctx.start is not None and _FD_CLOSE_RE.fullmatch(ctx.word(line, pos)):
+            elif (
+                char == "-"
+                and ctx.start is not None
+                # `_FD_CLOSE_RE` only matches a word ending in `&`. Checking that
+                # first keeps a `-` from rebuilding a long carried word each time.
+                and (line[pos - 1] if pos > ctx.start else ctx.prefix[-1:]) == "&"
+                and _FD_CLOSE_RE.fullmatch(ctx.word(line, pos))
+            ):
                 ctx.end_word(line, pos)  # `2>&` owes a target…
                 ctx.start = pos
                 ctx.end_word(line, pos + 1)  # …and this `-` is the whole of it
@@ -1878,7 +1889,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             out.append("<<<")  # here-string, not a heredoc (LAB-2768)
             pos += 3
         elif line.startswith("<<", pos) and not frames:
-            if any(context.backtick for context in scan.contexts):
+            if scan.contexts[-1].in_backtick:
                 # Bash ends a backtick at the first unescaped `` ` `` in the raw
                 # text, quotes included, and takes a heredoc body from inside
                 # it: `echo ` <<b `` then `rm -rf /` then `b` runs the `rm`

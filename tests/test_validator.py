@@ -2610,6 +2610,62 @@ class TestHeredocSurroundings:
         assert result.allowed is False
         assert "unexpected token ';'" in (result.error or "")
 
+    def test_a_dash_does_not_rebuild_the_open_word(self, monkeypatch):
+        """A `-` asks `_FD_CLOSE_RE` only when the open word ends in `&`.
+
+        The regex can match nothing else, and asking it rebuilds the whole open
+        word, carried prefix included. Asked for every `-`, a 60 KB command held
+        the hook for 22 s. The row with a carried `2>&` is the `\\`-continued
+        `cat 2>&\\<newline>-`, where the `&` is in ``prefix`` and not on the line.
+        """
+        pattern = val_module._FD_CLOSE_RE
+        calls = []
+
+        class CountingPattern:
+            def fullmatch(self, *args):
+                calls.append(args)
+                return pattern.fullmatch(*args)
+
+        monkeypatch.setattr(val_module, "_FD_CLOSE_RE", CountingPattern())
+
+        line = "cat 2>&- x" + "-" * 5000 + " <<b"
+        _, openers = val_module._rewrite_openers(line, val_module._ScanState(), 0, val_module._DoubleParen(line))
+        assert [delimiter for delimiter, _, _, _ in openers] == ["b"]
+        assert len(calls) == 1, "only the `-` after `2>&` may reach the regex"
+
+        calls.clear()
+        scan = val_module._ScanState()
+        scan.contexts[-1].prefix = "2>&"
+        _, openers = val_module._rewrite_openers("- <<b", scan, 0, val_module._DoubleParen("- <<b"))
+        assert [delimiter for delimiter, _, _, _ in openers] == ["b"]
+        assert len(calls) == 1, "a `&` carried in the prefix still closes the fd"
+
+    def test_a_heredoc_opener_does_not_walk_the_open_contexts(self):
+        """A `<<` reads whether it is inside a backtick from the innermost context alone.
+
+        Walking every open context per opener cost 36 million steps on a 54 KB
+        command. Each context inherits the flag when it is pushed, so a `$(…)` or
+        a subshell inside a backtick still refuses its heredoc.
+        """
+
+        class CountingList(list):
+            walks = 0
+
+            def __iter__(self):
+                CountingList.walks += 1
+                return super().__iter__()
+
+        line = "( " * 200 + "cat " + "<<a " * 50
+        scan = val_module._ScanState()
+        scan.contexts = CountingList(scan.contexts)
+        _, openers = val_module._rewrite_openers(line, scan, 0, val_module._DoubleParen(line))
+        assert [delimiter for delimiter, _, _, _ in openers] == ["a"] * 50
+        assert CountingList.walks == 0
+
+        for nested in ("echo `( cat <<a )`", "echo `$(cat <<a)`", "echo $(`cat <<a`)"):
+            with pytest.raises(ParseError, match="inside a backtick"):
+                val_module._rewrite_openers(nested, val_module._ScanState(), 0, val_module._DoubleParen(nested))
+
 
 class TestInputSizeCeiling:
     """validate_command refuses oversized input before parsing it (LAB-4363).
