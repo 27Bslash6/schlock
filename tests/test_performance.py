@@ -240,10 +240,10 @@ class TestShellHeredocBodyPerformance:
 
     Body shape: `echo step 0` repeated. One distinct command, so the body stays under
     MAX_DELEGATOR_TOKENS and allowed; and `echo` is the worst line for the raw-text scan,
-    whose `echo[^;|&]*>>` rules backtrack across the whole body. Measured median on the
-    unquoted path, same machine, ShellCheck off: 600 lines ~105ms before bodies were
-    re-validated, ~355ms after; 60 KiB ~6.5s before, ~14.7s after. The quoted path, which
-    always re-validated, costs ~260ms and ~7.8s. The budgets leave ~3x.
+    whose `echo[^;|&]*>>` rules backtrack across the whole body. Re-validating the body
+    measured 3.4x the unquoted path's earlier cost at 600 lines and 2.3x at 60 KiB (median
+    of 5, ShellCheck off); the quoted path, which always re-validated, 2.5x and 1.2x. The
+    budgets leave ~3x over what was measured.
     """
 
     @pytest.fixture(autouse=True)
