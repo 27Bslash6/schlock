@@ -53,13 +53,15 @@
         verdict.
      Bash's tokenization is what it must match, so every behavioural change here is decided by
      running real bash first and pinned by a test that names what bash did.
-   - **Approved exception — re-reading one redirect target.** bashlex mis-dequotes some
-     targets (`/dev/$'sda'`, `""'/dev/sda'`), so `_redirect_words` in
-     `src/schlock/core/parser.py` re-reads the target's own source span with a quote-run regex
-     and `shlex`. It holds only while: bashlex has already fixed the word's boundaries; it
-     decides no structure and no verdict (the word still goes through every rule); and any span
-     it cannot read exactly (a backslash, or not one `shlex` word) keeps bashlex's word, which
-     `_expand_word_internal` has already decoded.
+   - **Approved exception — quote removal for every quoted word** (`_expand_word_internal`,
+     `_dequote` and `_blank_single_quotes` in `src/schlock/core/parser.py`, LAB-3005/LAB-4960).
+     bashlex removes quotes wrongly (`'a'"'"'b'` reads `a'"'"'b`, `$'rm\t-rf'` reads `$rmt-rf`),
+     so its word expander is replaced process-wide. It reads one token bashlex already delimited;
+     bashlex still finds the expansions (shown the token with single-quoted text blanked, since
+     it scans that text as code) and parses every body. Each expansion is copied through raw, a
+     `$(`/`<(`/`>(` to the `)` bashlex's own tokenizer closes it with. Anything it does not
+     model - an unknown escape, an unterminated quote, an unquoted word break, an expansion
+     bashlex left without a part - raises `ParseError`. The same bash-first rule applies.
    - **Approved exception — recognising a `{varname}` redirect prefix.** bashlex splits
      `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
      argument, so `_mark_fd_variables` in `src/schlock/core/parser.py` tags that one word at
@@ -76,8 +78,9 @@
      must raise, never fall back to "argument". Every spelling is decided by real bash first.
    - **Approved exception — the in-word quote scan** (`_quote_pairs` in
      `src/schlock/core/parser.py`, LAB-4950). bashlex drops substitution nodes from words that
-     mix quoted runs with code (`'a'$(x)'b'`, `"a"<(x)"b"`). The scan reads one word bashlex
-     already delimited and only locates quote pairs and code openers. Bodies are still parsed by
+     mix quoted runs with code (`"a"<(x)"b"`; `'a'$(x)'b'` too, before quote removal above).
+     The scan reads one word bashlex already delimited and only locates quote pairs and code
+     openers. Bodies are still parsed by
      bashlex. A body it cannot place raises `ParseError`, and a word it cannot read earns no
      literal range. In a word holding a line continuation bashlex's part offsets are shifted, so
      every code part there is rebuilt from the source and parameter parts are never skip targets.

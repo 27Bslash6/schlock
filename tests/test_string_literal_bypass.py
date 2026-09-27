@@ -492,14 +492,11 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
             # Partial quoting: the outermost chars do not both belong to one quote
             ('x"y"', (0, 4), False),
             ('"a"b', (0, 4), False),
+            ("'a'\"b\"", (0, 6), False),
             # Opens and closes with the same quote, yet two runs around code (LAB-4950)
             ("'a'$(x)'b'", (0, 10), False),
+            ("'a''b'", (0, 6), False),
             ('"a"<(x)"b"', (0, 10), False),
-            ("'a'$'b'", (0, 7), False),  # a `$'…'` run is never returned, so it leaves a gap
-            # Runs that abut leave no room for code: bash reads each as one quoted run (LAB-4960)
-            ("'a''b'", (0, 6), True),
-            ("'a'\"b\"", (0, 6), True),
-            ("'it'\"'\"'s'", (0, 10), True),
             # A single quote char is not a quoted span - `end - start < 2`
             ('"', (0, 1), False),
             # Out-of-bounds spans must not raise
@@ -507,7 +504,7 @@ class TestQuotedTokenDoesNotSuppressReconstructedPass:
         ],
     )
     def test_is_quoted_span_requires_both_ends(self, parser, command, span, expected):
-        """Both ends must belong to quote pairs that tile the word, with nothing between them.
+        """Both ends must belong to the SAME quote pair.
 
         Pinned because this helper gates suppression on both the original and
         the reconstructed pass, so widening it (e.g. testing only the first

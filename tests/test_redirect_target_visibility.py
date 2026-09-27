@@ -332,9 +332,10 @@ class TestDataOperandsStayOut:
 class TestDollarPrefixedQuoteForms:
     """`$'…'` and `$"…"` are a third way to spell a hidden target.
 
-    bashlex keeps the `$` of each marker in the word, at any offset, and its quote
-    removal breaks on adjacent quoted runs, so the word matches no path rule. Found by
-    adversarial review, then by CodeRabbit for markers past the first character.
+    bashlex kept the `$` of each marker in the word, at any offset, and its quote
+    removal broke on adjacent quoted runs, so the word matched no path rule. Found by
+    adversarial review, then by CodeRabbit for markers past the first character. Every
+    quoted word is now decoded at parse time (`_expand_word_internal`, LAB-4960).
     """
 
     @pytest.mark.parametrize(
@@ -373,9 +374,8 @@ class TestDollarPrefixedQuoteForms:
             ("echo x > $HOME/out.txt", "echo x > $HOME/out.txt"),
             ("echo x > '$'\"/dev/sda\"", "echo x > $/dev/sda"),
             ("echo x > $$'/dev/sda'", "echo x > $$/dev/sda"),
-            # An escaped quote would shift the scan's quoted runs, so it is not rebuilt.
+            # Inside "…" a `$'` is literal, and an escaped `"` is a `"`.
             ('echo a > "\\"$\'x\'"', "echo a > \"$'x'"),
-            # A span shlex splits is not rebuilt from its first fragment.
             ("echo a > $'/dev/sda'$(echo a b)", "echo a > /dev/sda$(echo a b)"),
         ],
     )
@@ -385,15 +385,14 @@ class TestDollarPrefixedQuoteForms:
     @pytest.mark.parametrize(
         ("command", "rule"),
         [
-            # A backslash or a multi-word span skips the rebuild; bashlex's parts still
-            # locate the leading markers, even behind an empty fragment.
+            # Escapes, a word-splitting expansion, a leading empty fragment.
             ("echo a > $'/etc/passwd\\x00'", "protect_system_files"),
             ("echo a > $'/dev/sda'$(echo a b)", "disk_destruction_dd"),
             ("echo a > ''$'/dev/'\\sda", "disk_destruction_dd"),
             ("echo a > ''$'/dev/sda'${x:+ }", "disk_destruction_dd"),
         ],
     )
-    def test_unrebuilt_target_still_loses_its_leading_markers(self, command, rule, safety_rules_path):
+    def test_marker_spelled_target_is_decoded(self, command, rule, safety_rules_path):
         assert _verdict(command, safety_rules_path) == (RiskLevel.BLOCKED, (rule,))
 
     def test_real_expansion_after_a_marker_keeps_its_dollar(self, safety_rules_path):

@@ -850,6 +850,19 @@ class TestMixedQuoteWordDecoding:
     def test_line_continuations_do_not_shift_expansions(self, command, expected):
         assert _echo_arg(command) == expected
 
+    @pytest.mark.parametrize(
+        ("word", "expected"),
+        [
+            # bash ends a name at its quote; `$Xrm` would be another variable (LAB-4960 panel)
+            ("""x"$X"'rm -rf ~'""", "x${X}rm -rf ~"),
+            ("""x"$X"\\rm""", "x${X}rm"),
+            ("""x"$X"'-rf'""", "x$X-rf"),  # only a name character would lengthen it
+            ("""x"$HOME"/.bashrc""", "x$HOME/.bashrc"),
+        ],
+    )
+    def test_a_name_ending_at_a_quote_stays_that_name(self, word, expected):
+        assert _echo_arg(f"echo {word}") == expected
+
     def test_nested_words_after_a_line_continuation_are_decoded(self):
         p = parser_mod.BashCommandParser()
         commands = p.extract_commands_with_args(p.parse("echo $(git log \\\n --format='%h' 'a'\"'\"'b')"))
