@@ -1075,6 +1075,17 @@ class TestSelfProtectionArchiveExtraction:
             # one hides a mode-looking value, so neither masks the extraction
             "tar --one-top-level -x -f evil.tar --suffix -t -C .claude/hooks",
             "TAR_OPTIONS=-x tar --suffix -t -f evil.tar -C .claude/hooks",
+            "TAR_OPTIONS=-x tar -f evil.tar --exclude-ignore -t -C .claude/hooks",
+            "TAR_OPTIONS=-x tar -f evil.tar --exclude-ignore-recursive -d .config/schlock",
+            "TAR_OPTIONS=-x tar -f evil.tar --some-future-option -t -C .claude/hooks",
+            # Old-style key letters take the following words as their values, in order
+            "TAR_OPTIONS=-x tar f -t -C .claude/hooks",
+            "tar Cxf .claude/hooks evil.tar",
+            # A value-less option does not take the member filter after it, and an exclude
+            # option that may itself be a value does not hide the word after it
+            "tar -xf evil.tar --exclude-vcs .claude/hooks",
+            "TAR_OPTIONS=-x tar --suffix -X .claude/hooks -f evil.tar",
+            "TAR_OPTIONS=-x tar --suffix --exclude .claude/hooks -f evil.tar",
         ],
     )
     def test_extraction_into_config_dir_is_blocked(self, command):
@@ -1109,6 +1120,12 @@ class TestSelfProtectionArchiveExtraction:
             "tar -cf backup.tar -C .claude/hooks .",
             "tar --create -f backup.tar .claude/hooks",
             "7z l evil.7z -o.claude/hooks",
+            # getopt accepts an unambiguous abbreviation of a long mode
+            "tar --creat -f backup.tar .claude/hooks",
+            "tar --dif -f backup.tar -C .claude/hooks",
+            # A certain option value is not read as a mode
+            "tar -C .claude/hooks -czf backup.tgz .",
+            "tar --exclude '*.log' -czf backup.tgz .claude/hooks",
         ],
     )
     def test_read_only_operation_stays_safe(self, command):
@@ -1166,6 +1183,13 @@ class TestSelfProtectionArchiveExtraction:
         limit = val_module._MAX_WRAPPED_EXTRACTORS
         assert not val_module._extracts_into_config_dir([("sudo", ["tar"] * limit)])
         assert val_module._extracts_into_config_dir([("sudo", ["tar"] * (limit + 1))])
+
+    def test_cumulative_directory_chain_past_its_ceiling_fails_closed(self):
+        """Each -C refolds the whole chain; past the cap an extraction blocks, a listing does not."""
+        chain = ["-C", "a"] * (val_module._MAX_TAR_DIRS + 1)
+        assert not val_module._extracts_into_config_dir([("tar", ["-x", *chain[:-2]])])
+        assert val_module._extracts_into_config_dir([("tar", ["-x", *chain])])
+        assert not val_module._extracts_into_config_dir([("tar", ["-t", *chain])])
 
     def test_extraction_block_ignores_overrides(self, tmp_path, monkeypatch):
         """AC-3: the block survives a user config that disables archive_operations."""

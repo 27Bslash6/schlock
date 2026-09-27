@@ -862,26 +862,11 @@ _MAX_WRAPPED_EXTRACTORS = 16
 _TAR_NAMES = frozenset({"tar", "gtar", "bsdtar"})
 _7Z_NAMES = frozenset({"7z", "7za", "7zr", "7zz"})
 # tar short options that take a value: the rest of the cluster ("-Cdir"), else the next word.
+# GNU tar's full set; new tar options are long-only.
 _TAR_ARG_OPTS = frozenset("bCfFgHIKLNTVX")
-# GNU tar and bsdtar long options whose value is required, so it may be the next word. getopt
-# accepts abbreviations, so a prefix of one of these takes a value too. The list must be
-# complete: a missing entry lets its value pose as a read-only mode. An option whose value is
-# optional (--one-top-level[=DIR], --checkpoint[=N]) takes it only after `=` and is not listed.
-_TAR_LONG_WITH_ARG = frozenset(
-    {
-        "add-file", "after-date", "blocking-factor", "cd", "checkpoint-action", "directory",
-        "exclude", "exclude-from", "exclude-tag", "exclude-tag-all", "exclude-tag-under", "file",
-        "files-from", "format", "gid", "gname", "group", "group-map", "hole-detection", "include",
-        "index-file", "info-script", "label", "level", "listed-incremental", "mode", "mtime",
-        "new-volume-script", "newer", "newer-mtime", "newer-mtime-than", "newer-than",
-        "no-quote-chars", "older", "older-mtime", "older-mtime-than", "older-than", "options",
-        "owner", "owner-map", "passphrase", "pax-option", "quote-chars", "quoting-style",
-        "record-size", "rmt-command", "rsh-command", "set-mtime-command", "set-mtime-format",
-        "sort", "sparse-version", "starting-file", "strip-components", "suffix", "tape-length",
-        "to-command", "transform", "uid", "uname", "use-compress-program", "volno-file",
-        "warning", "xattrs-exclude", "xattrs-include", "xform",
-    }
-)  # fmt: skip
+# A cumulative -C chain is refolded at each -C, so its cost grows with the square of its length.
+# Past this many the destination is unknown and the extraction fails closed.
+_MAX_TAR_DIRS = 64
 # tar modes that never write into the -C directory (list / create / compare / append / update / concat).
 _TAR_READ_MODES = frozenset("tcdruA")
 _TAR_READ_LONG = frozenset(
@@ -932,66 +917,101 @@ def _names_tar_extract(word: str) -> bool:
     return False
 
 
-def _tar_scan(args: list[str]) -> tuple[bool, list[str]]:
+def _tar_value_kind(option: str) -> str:
+    """Role of an option's value: `dir` (-C), `exclude` (never a destination), or `arg`."""
+    if option in ("C", "cd") or (len(option) >= 3 and "directory".startswith(option)):
+        return "dir"
+    return "exclude" if option in ("X", "exclude", "exclude-from") else "arg"
+
+
+def _tar_options(word: str, first: bool) -> Optional[tuple[bool, bool, list[str], list[tuple[str, str]]]]:
+    """One tar word read as options, or None for an operand.
+
+    Returns (names a read mode, may take the next word, roles of the next words it takes,
+    (role, value) pairs carried inside it).
+    """
+    if word.startswith("--") and len(word) > 2:
+        name, eq, value = word[2:].partition("=")
+        reads = any(mode.startswith(name) for mode in _TAR_READ_LONG)
+        kind = _tar_value_kind(name)
+        if eq:
+            return reads, False, [], [(kind, value)]
+        return reads, kind == "arg", [] if kind == "arg" else [kind], []
+    if word.startswith("-") and len(word) > 1:
+        # A cluster ends at its first value letter; the value is the rest, else the next word.
+        j = next((j for j, ch in enumerate(word) if j and ch in _TAR_ARG_OPTS), len(word))
+        reads = bool(set(word[1:j]) & _TAR_READ_MODES)
+        if j == len(word):
+            return reads, False, [], []
+        kind = _tar_value_kind(word[j])
+        return (reads, False, [], [(kind, word[j + 1 :])]) if word[j + 1 :] else (reads, False, [kind], [])
+    if first and word[:1].isalpha():
+        # Old-style keys: "tar xf a.tar", "tar Cxf dir a.tar". Each value letter takes the next
+        # word, in key order.
+        return bool(set(word) & _TAR_READ_MODES), False, [_tar_value_kind(ch) for ch in word if ch in _TAR_ARG_OPTS], []
+    return None
+
+
+def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
     """Read a tar argv: whether it extracts, and the words that may say where members land.
 
-    The mode is read two ways, both erring toward extraction. An extract mode counts in ANY
-    word, even one an option may be taking as its value. A read-only mode counts only in a word
-    no option can be consuming. A valid tar always names a mode, so no visible mode at all
-    (TAR_OPTIONS can supply one) counts as an extraction.
+    The mode is read two ways, both erring toward extraction. An extract mode counts in ANY word.
+    A read-only mode counts only in a word no option can be taking as its value, so a mode-looking
+    value (`--suffix -t`, old-style `tar f -t`) cannot hide an extraction TAR_OPTIONS supplies. A
+    valid tar always names a mode, so no visible mode at all counts as an extraction.
 
-    The destinations are every word except the value of an exclude option, which keeps members
-    out and never writes them, plus each cumulative -C directory: `-C .claude -C hooks` lands in
-    `.claude/hooks` though no single word says so.
+    Which long options take a value is not listed, because a missing entry would be a bypass. A
+    long option without `=` other than -C and --exclude may or may not take the next word, so
+    that word is read both ways: its read modes do not count, it is a destination itself, and an
+    exclude option in it does not hide the word after. The cost is a false block when a read mode
+    directly follows such an option.
+
+    The destinations are every word except a certain --exclude/-X value, which keeps members out,
+    plus each cumulative -C directory: `-C .claude -C hooks` lands in `.claude/hooks` though no
+    single word says so. None means the -C chain is too long to fold.
     """
     extracts = read = False
     destinations: list[str] = []
     cwd = ""
-    role: Optional[str] = None  # set when the previous option consumes this word as its value
+    dirs = 0
+    roles: list[str] = []  # roles of the words the preceding option(s) consume, in order
+    maybe_value = False  # the previous word was a long option that may take this one
 
     def take(kind: str, value: str) -> None:
-        nonlocal cwd
+        nonlocal cwd, dirs
         if kind == "exclude":
             return
         destinations.append(value)
         if kind == "dir":
-            cwd = value if value.startswith(("/", "~", "$")) else posixpath.join(cwd, value)
-            destinations.append(cwd)
+            dirs += 1
+            if dirs <= _MAX_TAR_DIRS:
+                cwd = value if value.startswith(("/", "~", "$")) else posixpath.join(cwd, value)
+                destinations.append(cwd)
 
     for i, word in enumerate(args):
-        extracts = extracts or _names_tar_extract(word)
-        if role is not None:
-            take(role, word)
-            role = None
-        elif word.startswith("--") and len(word) > 2:
-            name, eq, value = word[2:].partition("=")
-            read = read or name in _TAR_READ_LONG
-            kind = "dir" if name == "cd" or (len(name) >= 3 and "directory".startswith(name)) else "arg"
-            kind = "exclude" if name.startswith("exc") else kind
-            if eq:
-                take(kind, value)
-            elif any(option.startswith(name) for option in _TAR_LONG_WITH_ARG):
-                role = kind
-        elif word.startswith("-") and len(word) > 1:
-            for j, ch in enumerate(word[1:], 1):
-                if ch in _TAR_ARG_OPTS:
-                    kind = {"C": "dir", "X": "exclude"}.get(ch, "arg")
-                    if word[j + 1 :]:
-                        take(kind, word[j + 1 :])
-                    else:
-                        role = kind
-                    break
-                read = read or ch in _TAR_READ_MODES
-        elif i == 0 and word[:1].isalpha():
-            # Old-style keys: "tar xf a.tar".
-            extracts = extracts or "x" in word
-            read = read or bool(set(word) & _TAR_READ_MODES)
-        else:
+        extracts = extracts or _names_tar_extract(word) or (i == 0 and word[:1].isalpha() and "x" in word)
+        if roles:
+            take(roles.pop(0), word)
+            continue
+        certain = not maybe_value
+        options = _tar_options(word, first=i == 0)
+        if options is None:
+            maybe_value = False
             destinations.append(word)
-    return extracts or not read, destinations
+            continue
+        reads, maybe_value, kinds, inline = options
+        read = read or (certain and reads)
+        if not certain:
+            destinations.append(word)
+            kinds = ["arg" if kind == "exclude" else kind for kind in kinds]
+            inline = [("arg" if kind == "exclude" else kind, value) for kind, value in inline]
+        for kind, value in inline:
+            take(kind, value)
+        roles.extend(kinds)
+    return extracts or not read, destinations if dirs <= _MAX_TAR_DIRS else None
 
 
-def _unzip_scan(args: list[str]) -> tuple[bool, list[str]]:
+def _unzip_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
     """Read an unzip argv: whether it extracts, and every word but the `-x` exclusion list."""
     extracts = not (_short_flags(args, _UNZIP_ARG_OPTS) & _UNZIP_READ_OPTS)
     destinations: list[str] = []
@@ -1004,13 +1024,13 @@ def _unzip_scan(args: list[str]) -> tuple[bool, list[str]]:
     return extracts, destinations
 
 
-def _7z_scan(args: list[str]) -> tuple[bool, list[str]]:
+def _7z_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
     """Read a 7z argv: whether it extracts, and every word but the `-x` exclusion switches."""
     command = next((arg for arg in args if not arg.startswith("-")), "")
     return command.lower() not in _7Z_NON_EXTRACT, [arg for arg in args if not arg.lower().startswith("-x")]
 
 
-# Each extractor's argv reader, returning (extracts, destination words).
+# Each extractor's argv reader: (extracts, destination words, or None when they cannot be read).
 _EXTRACTOR_SCANS = {**dict.fromkeys(_TAR_NAMES, _tar_scan), "unzip": _unzip_scan, **dict.fromkeys(_7Z_NAMES, _7z_scan)}
 
 
@@ -1098,7 +1118,7 @@ def _extracts_into_config_dir(commands_with_args: list[tuple[str, list[str]]]) -
             wrapped = [(base, args)] if base in _EXTRACTOR_SCANS else []
         for extractor, extractor_args in wrapped:
             extracts, destinations = _EXTRACTOR_SCANS[extractor](extractor_args)
-            if extracts and any(_names_config_dir(word) for word in destinations):
+            if extracts and (destinations is None or any(_names_config_dir(word) for word in destinations)):
                 return True
     return False
 
