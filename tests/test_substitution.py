@@ -1724,17 +1724,12 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git rebase --exe 'rm -rf /' main)\"",
             "echo \"$(git ls-remote --upload 'rm -rf /' .)\"",
             "echo \"$(git push --receive 'rm -rf /' origin)\"",
-            "echo \"$(git send-email --sendmail 'rm -rf /' HEAD~1)\"",
             "echo \"$(sort --compress 'rm -rf /' f)\"",
             "echo \"$(sdiff --diff 'rm -rf /' a b)\"",
             # documented short form, alone or ending a cluster of boolean flags
             "echo \"$(git clone -u 'rm -rf /' https://x/y)\"",
             "echo \"$(git clone -qu 'rm -rf /' https://x/y)\"",
             "echo \"$(git difftool -yx 'rm -rf /' HEAD)\"",
-            # send-email keeps Getopt::Long's defaults: any case, and `-`/`+` as long prefixes
-            "echo \"$(git send-email --SENDMAIL-CMD 'rm -rf /' HEAD~1)\"",
-            "echo \"$(git send-email -to-cmd 'rm -rf /' HEAD~1)\"",
-            "echo \"$(git send-email +Header 'rm -rf /' HEAD~1)\"",
             # the subcommand sits behind git's own value-taking options
             "echo \"$(git -C /repo --git-dir /repo/.git fetch --upload 'rm -rf /' .)\"",
             "echo \"$(git -c color.ui=never clone -u 'rm -rf /' https://x/y)\"",
@@ -1755,16 +1750,46 @@ class TestWhitelistedSubstitutionYamlRules:
             # `--author` prefixes `--authors-prog` — an option of `git svn`, not of `git log`.
             # This is the shape that reverted the first, flat prefix match.
             "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
-            # a complete option is not an abbreviation of the longer one it prefixes
-            "echo \"$(git send-email --to 'Ray Walker' --cc 'a b' --subject 'rm -rf / fix' p)\"",
-            "echo \"$(git send-email -TO 'Ray Walker' --subject 'rm -rf / fix' p)\"",
+            "echo \"$(git -C /repo log --author 'Ray Walker' --grep 'rm -rf')\"",
             # `-u` is `--upload-pack` on clone only; on fetch it is --update-head-ok
             "echo \"$(git fetch -u origin --negotiation-tip 'rm -rf /')\"",
+            # a `git` that ends its command has no subcommand to fail closed on
+            "echo \"$(ls -d git | grep -c 'rm -rf')\"",
         ],
     )
     def test_exec_options_resolve_only_within_their_own_command(self, command):
         """Prefix resolution is safe only inside the namespace the parser actually searches."""
         assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # an alias for a keyed builtin, defined inline or in a gitconfig schlock never reads
+            "echo \"$(git -c alias.ff=fetch ff --upload 'rm -rf /' .)\"",
+            "echo \"$(git -c alias.cl=clone cl -u 'rm -rf /' https://x/y)\"",
+            "echo \"$(git -c alias.rb=rebase rb --exe 'rm -rf /' main)\"",
+            "echo \"$(git ff --upload 'rm -rf /' .)\"",
+            # the alias carries the exec option or subcommand itself, so no option is left to see
+            "echo \"$(git -c 'alias.rx=rebase --exec' rx 'rm -rf /' main)\"",
+            "echo \"$(git -c 'alias.sf=submodule foreach' sf 'rm -rf /')\"",
+            # help.autocorrect runs the builtin a typo is closest to
+            "echo \"$(git -c help.autocorrect=immediate fetc --upload 'rm -rf /' .)\"",
+            # git lets an alias override a DEPRECATED builtin
+            "echo \"$(git -c 'alias.whatchanged=rebase --exec' whatchanged 'rm -rf /' main)\"",
+            # scripts git finds after builtins: an alias takes the name where the package is absent
+            "echo \"$(git send-email --sendmail 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git send-email --SENDMAIL-CMD 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git send-email +Header 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git svn clone --authors-p 'rm -rf /' svn://host/r)\"",
+            # the accepted cost: an alias of log is indistinguishable from one of rebase --exec
+            "echo \"$(git lg --author 'Ray Walker' --grep 'rm -rf')\"",
+        ],
+    )
+    def test_unresolvable_git_subcommand_suppresses_nothing(self, command):
+        """git resolves a non-builtin at run time, so its arguments are never proven data (LAB-4268)."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         ("command", "expected_ranges"),

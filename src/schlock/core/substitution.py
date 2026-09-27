@@ -82,6 +82,8 @@ def _as_double_quoted(body: str) -> str:
 # Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
 _LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
+# What _join_tokens receives between the commands of a pipeline or a list.
+_COMMAND_SEPARATORS: frozenset[str] = _LIST_OPERATORS | {"|"}
 
 # Commands that are ALWAYS safe inside substitution
 # These are read-only, pure, or security-critical tools that don't modify state
@@ -950,8 +952,8 @@ _ARGUMENT_EXECUTING_FLAGS = frozenset(
 # `git log --author` resolved to `--authors-prog`, which only `git svn` has (LAB-4268).
 # Short forms are keyed for the same reason: `-u` is `--upload-pack` on clone but
 # `--update-head-ok` on fetch, and `-x` runs a command on rebase and difftool while `grep -x`,
-# `diff -x` and `git clean -x` mean something ordinary. `git svn` is GNU-style Getopt::Long;
-# `git send-email` keeps Getopt::Long's defaults, see _names_option.
+# `diff -x` and `git clean -x` mean something ordinary. Git keys name builtins only; any other
+# subcommand fails closed, see _GIT_BUILTINS.
 _ARGUMENT_EXECUTING_OPTIONS = {
     "sort": frozenset({"--compress-program"}),
     "sdiff": frozenset({"--diff-program"}),
@@ -964,12 +966,37 @@ _ARGUMENT_EXECUTING_OPTIONS = {
     "git archive": frozenset({"--exec"}),
     "git rebase": frozenset({"-x", "--exec"}),
     "git difftool": frozenset({"-x", "--extcmd"}),
-    "git send-email": frozenset({"--to-cmd", "--cc-cmd", "--header-cmd", "--sendmail-cmd"}),
-    "git svn": frozenset({"--authors-prog"}),
 }
-# A complete option beats the longer one it happens to prefix: send-email's `--to` names a
-# recipient, it does not abbreviate `--to-cmd`.
-_COMPLETE_OPTIONS = {"git send-email": frozenset({"--to", "--cc"})}
+# The subcommands whose meaning schlock can know. git looks a name up as a builtin FIRST, and only
+# then as a script on its exec path, an alias or a help.autocorrect guess (run_argv in git.c). An
+# alias may live in a gitconfig schlock never reads and may carry the exec option itself
+# (`alias.rx = rebase --exec`), so no option table reaches it: every other subcommand fails closed.
+# Scripts are out because an alias takes their name wherever the package is absent (git-svn and
+# git-send-email are separate packages on Debian). Builtins in every git from 2.34 (Ubuntu 22.04)
+# to 2.56, less the two git lets an alias override because they are DEPRECATED: `pack-redundant`
+# and `whatchanged`. A name missing here costs an over-block; one added too early is a bypass on
+# an older git, so a newer builtin joins only once its release is the oldest one supported.
+_GIT_BUILTINS = frozenset(
+    {
+        "add", "am", "annotate", "apply", "archive", "blame", "branch", "bugreport", "bundle", "cat-file", "check-attr",
+        "check-ignore", "check-mailmap", "checkout", "checkout-index", "checkout--worker", "check-ref-format", "cherry",
+        "cherry-pick", "clean", "clone", "column", "commit", "commit-graph", "commit-tree", "config", "count-objects",
+        "credential", "credential-cache", "credential-cache--daemon", "credential-store", "describe", "diff",
+        "diff-files", "diff-index", "difftool", "diff-tree", "fast-export", "fast-import", "fetch", "fetch-pack",
+        "fmt-merge-msg", "for-each-ref", "for-each-repo", "format-patch", "fsck", "fsck-objects", "gc",
+        "get-tar-commit-id", "grep", "hash-object", "help", "index-pack", "init", "init-db", "interpret-trailers",
+        "log", "ls-files", "ls-remote", "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge", "merge-base",
+        "merge-file", "merge-index", "merge-ours", "merge-recursive", "merge-recursive-ours", "merge-recursive-theirs",
+        "merge-subtree", "merge-tree", "mktag", "mktree", "multi-pack-index", "mv", "name-rev", "notes", "pack-objects",
+        "pack-refs", "patch-id", "pickaxe", "prune", "prune-packed", "pull", "push", "range-diff", "read-tree",
+        "rebase", "receive-pack", "reflog", "remote", "remote-ext", "remote-fd", "repack", "replace", "rerere", "reset",
+        "restore", "revert", "rev-list", "rev-parse", "rm", "send-pack", "shortlog", "show", "show-branch",
+        "show-index", "show-ref", "sparse-checkout", "stage", "stash", "status", "stripspace", "submodule--helper",
+        "switch", "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index", "update-ref",
+        "update-server-info", "upload-archive", "upload-archive--writer", "upload-pack", "var", "verify-commit",
+        "verify-pack", "verify-tag", "version", "worktree", "write-tree",
+    }
+)  # fmt: skip
 # git's own options that take their value as the NEXT word. git matches these exactly.
 _GIT_OPTIONS_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source", "--shallow-file"}
@@ -997,32 +1024,30 @@ def _names_option(word: str, command: str) -> bool:
     """Does ``word`` spell one of ``command``'s exec options the way its option parser reads it?"""
     options = _ARGUMENT_EXECUTING_OPTIONS[command]
     name = word.partition("=")[0]
-    if command == "git send-email" and name[:1] in ("-", "+"):
-        # Getopt::Long's defaults, which send-email never overrides: case-insensitive, and `-`
-        # or `+` introduce a long option just as `--` does.
-        name = "--" + name.lstrip("-+").lower()
     if name in options:
         return True
     if name.startswith("--"):
-        if len(name) <= 2 or name in _COMPLETE_OPTIONS.get(command, ()):
-            return False
-        return any(option.startswith(name) for option in options)
+        return len(name) > 2 and any(option.startswith(name) for option in options)
     # A short option may end a cluster of boolean flags (`-qu 'cmd'`). Finding the letter anywhere
-    # in the word can only over-match, as for sort's `-o` above.
+    # in the word can only over-match.
     return name.startswith("-") and any(len(option) == 2 and option[1] in name[1:] for option in options)
 
 
 def _runs_an_exec_option(words: list[str]) -> bool:
     """Does any command in ``words`` receive one of its exec options, however it is spelled?
 
-    Every word is tried as the command, so a wrapper (``sudo``, ``env``, ``xargs``) or a path
-    (``/usr/bin/sort``) still reaches the table. Coarse in the same fail-closed direction as
-    :func:`_executes_an_argument`.
+    A git subcommand that is not a builtin counts as one: git may expand it into anything (see
+    :data:`_GIT_BUILTINS`). Every word is tried as the command, so a wrapper (``sudo``, ``env``,
+    ``xargs``) or a path (``/usr/bin/sort``) still reaches the table. Coarse in the same
+    fail-closed direction as :func:`_executes_an_argument`.
     """
     for index, word in enumerate(words):
         command, args = word.rsplit("/", 1)[-1], words[index + 1 :]
         if command == "git":
             subcommand, args = _git_subcommand(args)
+            # A separator the join put there ends the command; it is not a subcommand.
+            if subcommand and subcommand not in _GIT_BUILTINS and subcommand not in _COMMAND_SEPARATORS:
+                return True
             command = f"git {subcommand}"
         if command in _ARGUMENT_EXECUTING_OPTIONS and any(_names_option(arg, command) for arg in args):
             return True
