@@ -113,6 +113,9 @@ class TestEverySpellingBashConsumes:
             # a newline in the subscript: the shape regex's DOTALL is what refuses these
             '{fd["\n"]}>o',
             "{fd['\n']}>o",
+            # bash consumes these as prefixes (fa[1] is set); bashlex's arithmetic ParseError refuses, not _mark_fd_variables
+            "{fd[$((1))]}<in",
+            "{fd[$((i+1))]}>out",
         ],
     )
     def test_spelling_outside_the_allowlist_fails_closed(self, redirect, safety_rules_path):
