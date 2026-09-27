@@ -43,9 +43,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/27Bslash6/schlock"
-Repository = "https://github.com/27Bslash6/schlock"
-Issues = "https://github.com/27Bslash6/schlock/issues"
+Homepage = "https://github.com/27b-io/schlock"
+Repository = "https://github.com/27b-io/schlock"
+Issues = "https://github.com/27b-io/schlock/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/schlock"]
