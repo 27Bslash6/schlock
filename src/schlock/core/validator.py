@@ -34,7 +34,7 @@ from .parser import (
     reset_parse_budget,
 )
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
-from .substitution import AWK_SYSTEM_CALL, SubstitutionValidationResult, SubstitutionValidator
+from .substitution import AWK_SYSTEM_CALL, SubstitutionValidationResult, SubstitutionValidator, awk_program_texts
 
 logger = logging.getLogger(__name__)
 
@@ -737,14 +737,16 @@ def _check_contextual_high_risk(
     """Return (base_name, reason) for the first kubectl command that modifies cluster state or
     executes code, or awk command whose program calls system(), else None.
 
-    Top-level parity with the SubstitutionValidator kubectl and awk checks (which BLOCK these inside
+    Top-level parity with the SubstitutionValidator kubectl check (which BLOCKs these inside
     `$()`/`<()`). At the top level `kubectl delete`/`apply`/`exec` are common legitimate ops, so the
     caller elevates to HIGH (ask) and lets the preset decide, rather than hard-blocking. Reuses the
-    same `dangerous_kubectl` helper and `system(` pattern as the substitution path.
+    same `dangerous_kubectl` helper as the substitution path.
 
-    awk is read per command, from its own arguments, so a `system(` in any block, line or length of
-    the program counts and one in a later, separate command never does. It stays HIGH, matching the
-    `interpreter_dangerous_execution` rating of a `BEGIN{system(...)}` block.
+    For awk it reuses only the `system(` part of the substitution awk check (`AWK_SYSTEM_CALL`, read
+    through `awk_program_texts`). awk is read per command, from its own arguments, so a `system(` in
+    any block, line or length of the program counts and one in a later, separate command never
+    does. It is HIGH, matching the `interpreter_dangerous_execution` rating of a `BEGIN{system(...)}`
+    block.
 
     NOTE: find is deliberately NOT handled here. The substitution path blocks *any* `find -exec`
     (conservative), but at the top level read-only `find -exec grep/cat/...` is legitimate, so
@@ -760,7 +762,7 @@ def _check_contextual_high_risk(
             # that contains `system(` over-reads. So does a `system(` inside an awk string or
             # comment: a promptable over-read in the fail-safe direction, and the BEGIN rule
             # already rates `awk 'BEGIN{print "system(x)"}'` HIGH.
-            if any(_AWK_SYSTEM_CALL.search(arg) for arg in args):
+            if any(_AWK_SYSTEM_CALL.search(text) for arg in args for text in awk_program_texts(arg)):
                 return base_name, "awk program calls system(), which runs a shell command"
         elif base_name == "kubectl":
             reason = dangerous_kubectl(args)

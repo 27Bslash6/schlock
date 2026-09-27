@@ -778,12 +778,29 @@ class TestTopLevelAwkSystem:
             "awk '{system\\\n($0)}' f",
             "awk '{system \\\r\n($0)}' f",
             "awk 'BEGIN{x=1system(\"id\")}'",
+            "awk '{x=1system($0)}' f",
             "awk 'BEGIN{x\\\nsystem(\"id\")}'",
             "cat f | awk '{system($0)}'",
             "gawk -e '{system($0)}' f",
         ],
     )
     def test_system_anywhere_in_the_program_is_high(self, command):
+        assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk '{sys''tem($0)}' f",
+            "awk 'BEGIN{sys''tem(\"id\")}'",
+            "awk '{system'\"(\"'$0)}' f",
+            "awk '{sys'\"tem\"'($0)}' f",
+            "awk '{sys'\\t'em($0)}' f",
+            "awk '{sys'\\\n'tem($0)}' f",
+            "cat f | awk '{sys''tem($0)}'",
+        ],
+    )
+    def test_name_spliced_from_quoted_runs_is_high(self, command):
+        # bash removes the quoting, so mawk runs system() for each of these.
         assert validate_command(command).risk_level == RiskLevel.HIGH
 
     @pytest.mark.parametrize(
@@ -812,13 +829,23 @@ class TestTopLevelAwkSystem:
 
     @pytest.mark.parametrize("command", ["awk '{print \"system(x)\"}' f", "awk '{print $1} # system(' f"])
     def test_system_in_a_string_or_comment_over_reads_high(self, command):
-        # No lexer strips awk literals here, so this is a promptable over-read, the same rating
-        # the BEGIN rule gives `awk 'BEGIN{print "system(x)"}'`.
         assert validate_command(command).risk_level == RiskLevel.HIGH
 
     def test_continuation_before_the_paren_is_blocked_in_a_substitution(self):
         assert dangerous_awk(["{system\\\n($0)}"]) is not None
         assert validate_command("x=$(awk '{system\\\n($0)}' f)").risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=$(awk '{sys''tem($0)}' f)",
+            "x=$(awk '{system'\"(\"'$0)}' f)",
+            "x=$(awk '{sys'\\t'em($0)}' f)",
+            "x=$(awk '{get''line x < \"/etc/hostname\"}' f)",
+        ],
+    )
+    def test_name_spliced_from_quoted_runs_is_blocked_in_a_substitution(self, command):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
     @pytest.mark.parametrize(
         "commands_with_args",
@@ -827,11 +854,13 @@ class TestTopLevelAwkSystem:
             [("awk", ["system" * (MAX_COMMAND_SIZE // 6)])],
             [("awk", ["system" + " \\\n" * (MAX_COMMAND_SIZE // 3)])],
             [("awk", [("system" + " " * 58) * (MAX_COMMAND_SIZE // 64)])],
+            [("awk", ["sys''t\\em\"" * (MAX_COMMAND_SIZE // 10)])],
         ],
-        ids=["awk_dense", "system_dense", "system_one_long_gap", "system_many_gaps"],
+        ids=["awk_dense", "system_dense", "system_one_long_gap", "system_many_gaps", "quote_dense"],
     )
     def test_check_is_linear_on_64kb(self, commands_with_args):
         start = time.process_time()
         assert _check_contextual_high_risk(commands_with_args) is None
+        assert all(dangerous_awk(args) is None for _, args in commands_with_args)
         elapsed = time.process_time() - start
         assert elapsed < 1.0, f"{elapsed:.3f}s"
