@@ -612,17 +612,20 @@ def git_config_exec_payload(args: list[str]) -> str | None:
     return None
 
 
-# find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir) or delete files (-delete).
-_DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
+# find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir), delete files (-delete), or
+# write a file the caller names (-fprint/-fprint0/-fprintf/-fls; -fprintf also sets the content).
+_DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"})
 
 
 def dangerous_find(args: list[str]) -> str | None:
-    """Return a reason if a find arg list runs commands or deletes files, else None.
+    """Return a reason if a find arg list runs commands, deletes files or writes files, else None.
 
-    Used by the SubstitutionValidator, which is conservative: ANY -exec*/-ok*/-delete inside a
-    substitution is dangerous regardless of the command run. (Top-level find stays command-aware
-    via the find_exec_dangerous / recursive_delete YAML rules, so read-only `find -exec grep` is
-    still allowed there.) Order-independent and indifferent to a leading "find" token. See #97.
+    Used by the SubstitutionValidator, which is conservative: ANY -exec*/-ok*/-delete, and ANY
+    file-writing -fprint/-fprint0/-fprintf/-fls, inside a substitution is dangerous regardless of
+    the command run or the file written. (Top-level find stays command- and target-aware via the
+    find_exec_dangerous / recursive_delete / write_via_arg_persistence YAML rules, so read-only
+    `find -exec grep` and `find -fprint files.txt` are still allowed there.) Order-independent and
+    indifferent to a leading "find" token. See #97.
     """
     for arg in args:
         if arg in _DANGEROUS_FIND_FLAGS:

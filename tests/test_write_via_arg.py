@@ -1,5 +1,7 @@
 """#113: write-via-arg file writes (sort/sdiff/xxd) blocked in substitution; top-level target-aware."""
 
+import pytest
+
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import _WRITE_ARG_COMMANDS, dangerous_write_arg
 from schlock.core.validator import validate_command
@@ -134,3 +136,45 @@ class TestWriteViaArgTopLevel:
 
     def test_sort_output_to_braced_home_ssh_is_high(self):
         assert validate_command('sort -o "${HOME}/.ssh/authorized_keys" k').risk_level == RiskLevel.HIGH
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestFindWriteFlagsTopLevel:
+    """find -fprint/-fprint0/-fprintf/-fls share write_via_arg_persistence's sensitive-target set."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "find . -fprintf /etc/cron.d/x 'rm -rf /'",
+            "find . -fprint /etc/cron.d/x",
+            "find . -fprint '/etc/cron.d/x'",
+            "find . -fprint0 /root/.ssh/authorized_keys",
+            "find . -fprint0 ~/.ssh/authorized_keys",
+            "find . -fls /var/spool/cron/crontabs/root",
+            "find . -name x -fprintf /etc/sudoers.d/x 'ALL ALL=(ALL) NOPASSWD: ALL'",
+            'find . -fprintf "$HOME/.bashrc" %p',
+            "timeout 5 find . -fprintf /etc/cron.d/x 'rm -rf /'",
+        ],
+    )
+    def test_write_flag_to_sensitive_path_is_high(self, command):
+        result = validate_command(command)
+        assert result.risk_level >= RiskLevel.HIGH
+        assert "write_via_arg_persistence" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "find . -name '*.py' -fprint files.txt",
+            "find . -type f -fprintf report.txt '%p %s\\n'",
+            # A sensitive START path is not a write target.
+            "find /etc/cron.d -name x -fprint list.txt",
+            "find . -printf '%p\\n'",
+            "find . -print0",
+            "find . -ls",
+            "find . -exec grep -l TODO {} +",
+            "grep -rn 'rm -rf' src/",
+            "git log --grep 'git push --force'",
+        ],
+    )
+    def test_benign_find_stays_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
