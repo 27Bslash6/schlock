@@ -990,9 +990,9 @@ class TestLauncherDelegation:
 
     @pytest.mark.parametrize("launcher", _LAUNCHERS)
     def test_wrapped_herestring_decode_is_blocked(self, launcher):
-        # On `main` the `base64_shell_execution` regex spans from the outer `bash` into the
-        # quote (its match starts outside the literal, so it is not suppressed); a tempered
-        # pattern stops at the inner `sh`, so the catch moves to re-entry. Either way BLOCKED.
+        # The `base64_shell_execution` regex once spanned from the outer `bash` into the quote
+        # (its match started outside the literal, so it was not suppressed); its tempered
+        # pattern stops at the inner `sh`, so the catch is re-entry. Either way BLOCKED.
         command = f"{launcher} bash -euo pipefail -c 'sh <<< \"$(base64 -d x)\"'"
         result = validate_command(command)
         assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
@@ -1026,6 +1026,18 @@ class TestLauncherDelegation:
         assert result.allowed is False
         assert "shell_delegated_payload" in result.matched_rules, result.matched_rules
 
+    @pytest.mark.parametrize("delimiter", ["EOF", "'EOF'"])
+    @pytest.mark.parametrize("launcher", ["uv run", "pnpm exec", "firejail", "tmux new-session -d"])
+    def test_wrapped_heredoc_is_blocked(self, launcher, delimiter):
+        # Fourth consumer of WRAPPER_COMMANDS: `heredoc_owner` names the first shell among a
+        # wrapper's operands, so the body of `uv run bash <<EOF` is scanned as code the way
+        # `timeout 5 bash <<EOF` is. Pre-fix: SAFE / allowed=True for both delimiters. Verdict only:
+        # the unquoted body is caught by its own rule, the quoted one by re-entry.
+        command = f"{launcher} bash <<{delimiter}\nrm -rf /\nEOF"
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
     @pytest.mark.parametrize(
         "command",
         [
@@ -1049,6 +1061,8 @@ class TestLauncherDelegation:
         "command",
         [
             "uv run ruff check",
+            "uv run python - <<'EOF'\nprint(1)\nEOF",
+            "tmux new-session -d bash <<'EOF'\necho hi\nEOF",
             "uv run python -c 'print(1)'",
             "poetry run pytest -x",
             "conda run -n env python x.py",
