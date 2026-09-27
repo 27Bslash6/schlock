@@ -47,21 +47,7 @@ def stats_median_ms(benchmark) -> float:
 
 
 def grade_median(benchmark, budget_ms: float, what: str) -> None:
-    """Fail when `what`'s median misses its budget.
-
-    Calibrate these on the CI runner, not on a dev box: it is the slowest machine
-    they run on and the only one that gates merges. A dev-box calibration is what
-    left three of them BELOW 1.0x there -- `test_rule_matching` turned main red at
-    0.22ms against a 0.2ms budget while the same commit had passed the identical
-    assertion minutes earlier in its own PR run. The runner moved; the code did not.
-
-    The budgets raised for that reason carry ~3x over the median measured on the 3.9
-    leg, so they read as "not 3x slower than this was measured" rather than as an
-    absolute latency claim -- which is what a regression gate wants, and what
-    survives a runner that varies: across two CI runs on identical code
-    `rule_matching[kubectl]` moved 1.65x. The ones left alone had 7.6x-117x there
-    already; only the families inside that noise band were touched.
-    """
+    """Fail when `what`'s median misses its budget; calibration: CONTRIBUTING.md, Performance Guidelines."""
     median_ms = stats_median_ms(benchmark)
     assert median_ms < budget_ms, f"{what} median too slow: {median_ms:.4f}ms (budget: {budget_ms}ms)"
 
@@ -133,7 +119,7 @@ class TestParserPerformance:
         ids=lambda x: x[:20],
     )
     def test_simple_command_parsing(self, benchmark, parser, cmd):
-        """Simple commands parse in ~0.17ms median on the 3.9 CI leg."""
+        """Simple commands should parse in < 0.6ms median."""
         benchmark(parser.parse, cmd)
 
         grade_median(benchmark, 0.6, f"Parser on {cmd!r}")
@@ -148,7 +134,7 @@ class TestParserPerformance:
         ids=["find_pipe", "ps_pipe", "cat_pipe"],
     )
     def test_complex_command_parsing(self, benchmark, parser, cmd):
-        """Complex pipelines parse in ~0.55ms median on the 3.9 CI leg."""
+        """Complex pipelines should parse in < 2.0ms median."""
         benchmark(parser.parse, cmd)
 
         grade_median(benchmark, 2.0, f"Parser on complex {cmd!r}")
@@ -170,7 +156,7 @@ class TestRuleEnginePerformance:
         ids=lambda x: x.split()[0],
     )
     def test_rule_matching(self, benchmark, safety_rules_path, cmd):
-        """Rule matching completes in ~0.23ms median on the 3.9 CI leg."""
+        """Rule matching should complete in < 0.75ms median."""
         engine = RuleEngine(safety_rules_path)
         benchmark(engine.match_command, cmd)
 
@@ -247,14 +233,12 @@ class TestThroughput:
 
         # Calculate throughput from median time for 100 commands
         median_sec = benchmark.stats.stats.median
-        throughput = 100 / median_sec if median_sec > 0 else float("inf")
+        assert median_sec > 0, "benchmark reported a zero median; throughput is meaningless"
+        throughput = 100 / median_sec
 
         # Log throughput for visibility
         print(f"\nThroughput: {throughput:.0f} validations/sec")
 
-        # An absent or zero median divides into `inf` above and would sail straight
-        # past the throughput assertion.
-        assert median_sec > 0, "benchmark reported a zero median; throughput is meaningless"
         # ~2600/sec typical on CI, so this keeps ~2.6x.
         assert throughput > 1000, f"Throughput too low: {throughput:.0f} validations/sec"
 

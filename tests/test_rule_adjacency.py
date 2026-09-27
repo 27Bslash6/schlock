@@ -27,9 +27,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from schlock.core import validator
+from schlock.core.native_bridge import MAX_COMMAND_SIZE
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import clear_caches, validate_command
-from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
 
 
 @pytest.fixture(autouse=True)
@@ -780,7 +780,7 @@ class TestUnanchoredSearchStaysLinear:
     def test_many_candidate_starts_stay_fast(self, operation, rules_dir_path, clean_worktree):
         """Every rule carrying the option group, not just the one that found it."""
         command = self.ADVERSARY.replace(" status", " " + operation)
-        # LAB-4363 refuses anything over MAX_COMMAND_SIZE before it reaches a rule,
+        # validate_command refuses anything over MAX_COMMAND_SIZE before it parses,
         # and n=2048 sits at ~53 KB of a 64 KB ceiling. Raise n past it and this
         # would time a size refusal instead of a search, staying green whatever the
         # patterns did -- the silent-guard failure this whole class is about.
@@ -793,12 +793,6 @@ class TestUnanchoredSearchStaysLinear:
         # Re-run that when you change this number -- per-call overhead is a fixed
         # ~0.36s on top of a term linear in n, so scaling either column in your head
         # gets it wrong in both directions.
-        #
-        # At the old n=512 the mutant passed, and so did both siblings:
-        # test_cost_grows_linearly_not_quadratically clears its own ceiling by 1.5%
-        # on it, so nothing here is a backstop for this case. CI runs this class on
-        # both matrix legs -- the workflow passes no `-m` deselect -- and only a
-        # local `-m "not slow"` skips it.
         assert time.perf_counter() - start < 10.0
 
     def test_cost_grows_linearly_not_quadratically(self, rules_dir_path):

@@ -2833,12 +2833,8 @@ class TestParseFailureFailsClosed:
 
         The verdict alone does not pin the finding: these ten reach BLOCKED carrying
         three distinct messages, and a routing change that moved a case between them
-        would leave every verdict assertion green. Two return statements produce the
-        three -- the heredoc fallback formats whichever ParseError it caught, so
-        `No heredoc opener found` and `Unexpected parsing error` share an exit and
-        differ by payload, while `Parse error:` is the exit that never reached the
-        fallback. The three strings are mutually exclusive across all ten messages,
-        so a case cannot drift silently.
+        would leave every verdict assertion green. The three strings are mutually
+        exclusive across all ten messages, so a case cannot drift silently.
         """
         result = validate_command(command, config_path=safety_rules_path)
 
