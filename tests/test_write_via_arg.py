@@ -1,4 +1,4 @@
-"""#113: write-via-arg file writes (sort/sdiff/xxd) blocked in substitution; top-level target-aware."""
+"""#113: write-via-arg file writes (sort/sdiff/xxd, find -fprint*/-fls) blocked in substitution; top-level target-aware."""
 
 import pytest
 
@@ -154,6 +154,15 @@ class TestFindWriteFlagsTopLevel:
             "find . -name x -fprintf /etc/sudoers.d/x 'ALL ALL=(ALL) NOPASSWD: ALL'",
             'find . -fprintf "$HOME/.bashrc" %p',
             "timeout 5 find . -fprintf /etc/cron.d/x 'rm -rf /'",
+            # find's own -exec terminator and quoted metacharacters sit inside ONE command.
+            "find . -name x -exec true \\; -fprint /etc/cron.d/x",
+            "find . -name x -exec true ';' -fprint /etc/cron.d/x",
+            'find . -name x -exec true ";" -fprint /etc/cron.d/x',
+            "find . -name x -exec true \\;\\\n -fprint /etc/cron.d/x",
+            "find . -name 'a|b' -fprint /etc/cron.d/x",
+            # The same walk serves sort: a quoted separator before -o.
+            "sort -t '|' -o /etc/cron.d/x in.txt",
+            "sort -t ';' -o/etc/cron.d/x in.txt",
         ],
     )
     def test_write_flag_to_sensitive_path_is_high(self, command):
@@ -172,8 +181,10 @@ class TestFindWriteFlagsTopLevel:
             "find . -print0",
             "find . -ls",
             "find . -exec grep -l TODO {} +",
-            "grep -rn 'rm -rf' src/",
-            "git log --grep 'git push --force'",
+            # An UNQUOTED separator still ends the command: the flag belongs to the next one.
+            "find . -name x -exec true \\; ; echo -fprint /etc/cron.d/x",
+            "find . -name x; echo -fprint /etc/cron.d/x",
+            "find . -name x | tee -a log -fprint /etc/cron.d/x",
         ],
     )
     def test_benign_find_stays_safe(self, command):

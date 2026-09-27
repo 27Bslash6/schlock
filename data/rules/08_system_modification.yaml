@@ -97,21 +97,30 @@ rules:
       - "Use proper configuration management instead"
 
   - name: write_via_arg_persistence
-    description: sort/sdiff writing output (-o) or find writing its listing (-fprint/-fprint0/-fprintf/-fls) to a sensitive system path enables persistence or privilege escalation
+    description: A command's output-file flag (sort/sdiff -o, find -fprint/-fprint0/-fprintf/-fls) writing to a sensitive system path enables persistence or privilege escalation
     risk_level: HIGH
     patterns:
-      # sort/sdiff -o / --output (cluster ending in 'o', e.g. -o or -ro), space/'='-separated,
-      # optional quote, then a sensitive target. '-[a-zA-Z]*o' catches combined short flags like
-      # -ro (-r + -o). The /etc/cron (and similar) prefixes intentionally match anything beneath
-      # those dirs — writing under /etc at all is privileged. [^;|&\n] cannot cross a command
-      # boundary or newline (avoids cross-command misattribution). See #113.
-      # find -fprint/-fprint0/-fprintf/-fls FILE shares the same target set; the target must follow
-      # the flag directly, so a sensitive start path (find /etc/cron.d -fprint list.txt) cannot match.
-      - '(\b(sort|sdiff)\b[^;|&\n]*(-[a-zA-Z]*o|--output)|\bfind\b[^;|&\n]*\s-(fprint0?|fprintf|fls))[=\s]+["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
+      # sort/sdiff -o / --output (cluster ending in 'o', e.g. -o or -ro), or find -fprint/-fprint0/
+      # -fprintf/-fls, space/'='-separated, optional quote, then a sensitive target. '-[a-zA-Z]*o'
+      # catches combined short flags like -ro (-r + -o). (?(1)...) picks the flag set of whichever
+      # command matched. The target must follow the flag directly, so a sensitive find START path
+      # (find /etc/cron.d -fprint list.txt) cannot match. The /etc/cron (and similar) prefixes
+      # intentionally match anything beneath those dirs: writing under /etc at all is privileged.
+      #
+      # The command-to-flag span is a shell-word walk, NOT [^;|&\n]*. find's own syntax puts a `;`
+      # inside one command (-exec ... \; or ';' or ";"), and a quoted operand can hold `|` or `&`
+      # (-name 'a|b', sort -t '|'). A plain negated class stopped at any of them, so
+      # `find . -exec true \; -fprint /etc/cron.d/x` read SAFE. The walk crosses an escaped
+      # character or a whole quoted span and still stops at an UNQUOTED ; | & or newline, so it
+      # cannot misattribute a flag from the next command. Its four branches are disjoint (one
+      # parse per input, no exponential backtracking); extended_credential_exposure in
+      # 03_credential_theft.yaml carries the full rationale, including the apostrophe lookbehind.
+      # See #113.
+      - '\b(?:(sort|sdiff)|find)\b(?:\\[\s\S]|[^;|&\n\x27"\\]|"(?:[^"\\]|\\[\s\S])*"|(?<![A-Za-z0-9])\x27[^\x27]*\x27)*(?(1)(?:-[a-zA-Z]*o|--output)|\s-(?:fprint0?|fprintf|fls))[=\s]+["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
       # attached short form: -o<sensitive-path> or -ro<sensitive-path>
-      - '\b(sort|sdiff)\b[^;|&\n]*-[a-zA-Z]*o["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
+      - '\b(sort|sdiff)\b(?:\\[\s\S]|[^;|&\n\x27"\\]|"(?:[^"\\]|\\[\s\S])*"|(?<![A-Za-z0-9])\x27[^\x27]*\x27)*-[a-zA-Z]*o["\x27]?(~/?\.(bashrc|bash_profile|zshrc|profile|login)|\$HOME/\.(bashrc|bash_profile|zshrc|profile|login)|\$\{HOME\}/\.(bashrc|bash_profile|zshrc|profile|login)|~/?\.ssh/authorized_keys|\$HOME/\.ssh/authorized_keys|\$\{HOME\}/\.ssh/authorized_keys|/root/|/etc/cron|/var/spool/cron|/etc/sudoers|/etc/profile|/etc/bash\.bashrc|/etc/environment|/etc/passwd|/etc/shadow|/etc/ld\.so|/etc/systemd|/(usr/)?lib/systemd)'
     alternatives:
-      - "Writing to a system config/persistence path via -o is a backdoor vector"
+      - "Writing to a system config/persistence path via a command's output-file flag is a backdoor vector"
       - "Write to a non-system path, or use proper configuration management"
 
   - name: system_service_modification

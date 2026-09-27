@@ -626,11 +626,48 @@ def dangerous_find(args: list[str]) -> str | None:
     find_exec_dangerous / recursive_delete / write_via_arg_persistence YAML rules, so read-only
     `find -exec grep` and `find -fprint files.txt` are still allowed there.) Order-independent and
     indifferent to a leading "find" token. See #97.
+
+    Each arg is judged as the words bash will hand find, not as bashlex spells it: comma brace
+    lists are expanded (`{-fprint,out}`, `-ex{e,e}c`), and `$` is dropped, because bashlex reports
+    the ANSI-C word `$'-fprint'` as `$-fprint`. Dropping every `$` can only over-block.
     """
     for arg in args:
-        if arg in _DANGEROUS_FIND_FLAGS:
-            return f"find {arg} executes commands or modifies files"
+        words = _brace_words(arg)
+        if words is None:
+            return f"find argument {arg!r} brace-expands past {_MAX_BRACE_WORDS} words"
+        for word in words:
+            flag = word.replace("$", "")
+            if flag in _DANGEROUS_FIND_FLAGS:
+                return f"find {flag} executes commands or modifies files"
     return None
+
+
+# The innermost comma brace list in a word: `{a,b}` with no brace inside it. `{}` (find's own
+# placeholder) has no comma, so it stays literal, as it does in bash.
+_BRACE_LIST = re.compile(r"\{([^{}]*,[^{}]*)\}")
+# Brace expansion multiplies: n lists make 2**n words. Past this cap, fail closed.
+_MAX_BRACE_WORDS = 64
+
+
+def _brace_words(word: str) -> set[str] | None:
+    """Return the words bash's comma brace expansion makes of `word`, or None past the cap.
+
+    Innermost list first, so nesting (`{a,{b,c}}`) expands correctly. Only comma lists: a
+    `{a..z}` sequence is left as literal text.
+    """
+    words: set[str] = set()
+    pending = [word]
+    while pending:
+        current = pending.pop()
+        match = _BRACE_LIST.search(current)
+        if match is None:
+            words.add(current)
+        else:
+            head, tail = current[: match.start()], current[match.end() :]
+            pending.extend(head + alt + tail for alt in match.group(1).split(","))
+        if len(words) + len(pending) > _MAX_BRACE_WORDS:
+            return None
+    return words
 
 
 # awk constructs that execute commands or write files from inside the program text. Blunt regex
