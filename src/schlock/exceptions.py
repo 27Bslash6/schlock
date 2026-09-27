@@ -55,7 +55,8 @@ class QuotedSubstitutionCeilingError(ValueError):
 
     Raised only by BashCommandParser.extract_quoted_substitution_bodies, and converted to a
     BLOCKED verdict by the `try` around its one call in `_validate_command`. A new call site
-    must catch it itself: an `except ValueError` upstream would turn it into a parse error.
+    must catch it itself: an enclosing `except ValueError` would misreport it as a parse error
+    or swallow it.
 
     A subclass rather than a bare `except ValueError` at the call site: today the extractor
     raises nothing else, but a bare clause would silently convert a FUTURE unrelated
