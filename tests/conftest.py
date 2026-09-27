@@ -145,14 +145,20 @@ BASH_ORACLE = Path(__file__).resolve().parent.parent / "scripts" / "bash-oracle"
 
 
 def run_bash_oracle(
-    command: str, home: Path, *args: str, path: Optional[str] = None, pass_fds: tuple = (), stdout=subprocess.PIPE
+    command: str,
+    home: Path,
+    *args: str,
+    path: Optional[str] = None,
+    pass_fds: tuple = (),
+    stdout=subprocess.PIPE,
+    extra_env: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """Run `command` in real bash inside scripts/bash-oracle, with `home` as the caller's HOME.
 
     The only way a test may execute a candidate command: see CLAUDE.md. `pass_fds` and
     `stdout` let a test hand the oracle the open descriptors a real caller might.
     """
-    env = {"PATH": os.environ["PATH"] if path is None else path, "HOME": str(home), "ORACLE_SECRET": "leak-me"}
+    env = {"PATH": os.environ["PATH"] if path is None else path, "HOME": str(home), **(extra_env or {})}
     return subprocess.run(
         [shutil.which("bash") or "/bin/bash", str(BASH_ORACLE), *args, "--", command],
         env=env,

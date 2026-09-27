@@ -3,11 +3,9 @@
 #
 #   scripts/bash-oracle [-t SECONDS] [--] COMMAND
 #
-# Real bash is the only ground truth for how bash reads a line, so schlock work runs
-# candidate commands through it. Those candidates are built to get past text filters,
-# which is why a guard like `if "rm -rf" in cmd` in a probe script is no guard at all:
-# `$'\u72'm -rf ~` walks straight through it. This script is the only sanctioned way
-# to execute a corpus, test-vector or evasion string (see CLAUDE.md).
+# The only sanctioned way to execute a corpus, test-vector or evasion string: those are
+# built to get past text filters, so no guard in front of a real shell makes it safe
+# (see CLAUDE.md).
 #
 # The sandbox (bubblewrap, unprivileged):
 #   - an allowlist of host paths, all read-only: /usr (plus the /bin, /lib, ... it
@@ -15,20 +13,23 @@
 #     /run, /srv, /opt, /var, /root.
 #   - HOME is an empty tmpfs mounted at the caller's own $HOME path, so `~` and a
 #     literal home path both resolve to it exactly as they would outside. /tmp is a
-#     separate empty tmpfs. Both vanish when the command exits.
+#     separate empty tmpfs. Each holds at most 64 MiB and vanishes when the command
+#     exits; /dev is read-only.
 #   - no inherited descriptor beyond stdin (/dev/null) and captured stdout/stderr:
 #     an open fd would reach host files the mounts hide.
-#   - every namespace unshared (no network), a new session (no TIOCSTI onto the
-#     caller's terminal), no capabilities, a cleared environment.
-#   - killed with the caller (--die-with-parent) and after a timeout (default 10s);
-#     no single file it writes may exceed 64 MiB.
+#   - no caller environment anywhere inside, not even in bwrap's own pid 1.
+#   - every namespace unshared (no network) and no nested user namespaces; a new
+#     session (no TIOCSTI onto the caller's terminal); no capabilities.
+#   - at most 1024 processes, 4 GiB of address space each and 64 MiB per written
+#     file; killed with the caller (--die-with-parent) and after a timeout (default 10s).
 #
-# Output: bash's stdout, then its stderr, once it exits; then one line on stderr:
+# Output: bash's stdout, then its stderr, once it exits; then a status line on stderr,
+# always on a line of its own:
 #   bash-oracle: exit=N          bash ran and exited N (this script also exits N)
-#   bash-oracle: timeout=S       killed after S seconds (exit 124; a command that
-#                                itself exits 124 reports exit=124)
+#   bash-oracle: timeout=S       killed after S seconds (exit 124)
 #   bash-oracle: sandbox-failed  nothing ran (exit 125)
-# There is no unsandboxed fallback: without a working bwrap this script refuses to run.
+# The status line is authoritative, not the exit code: a command may itself exit 124
+# or 125. There is no unsandboxed fallback: without a working bwrap it refuses to run.
 
 set -euo pipefail
 
@@ -59,22 +60,30 @@ if [[ ! "$timeout_s" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+err=""
+status_line() {
+    # A command's stderr need not end in a newline; the status line must start one.
+    if [[ -s "$err" && -n "$(tail -c1 "$err")" ]]; then echo >&2; fi
+    echo "bash-oracle: $1" >&2
+}
+
 fail() {
     echo "bash-oracle: $1" >&2
-    echo "bash-oracle: sandbox-failed" >&2
+    status_line sandbox-failed
     exit 125
 }
 
 # HOME becomes a tmpfs mount point, so it must not shadow the paths bash runs from.
-case "${HOME:-}" in
+# Normalise first (without resolving symlinks): /tmp/../proc must not pass as /tmp.
+[[ "${HOME:-}" == /* ]] || fail "HOME must be an absolute path, got '${HOME:-}'"
+home="$(realpath -m -s -- "$HOME")" || fail "cannot normalise HOME=$HOME"
+case "$home" in
     / | /usr | /usr/* | /etc | /etc/* | /bin* | /sbin* | /lib* | /proc* | /dev*)
         fail "HOME=$HOME would hide system paths inside the sandbox"
         ;;
-    /*) ;;
-    *) fail "HOME must be an absolute path, got '${HOME:-}'" ;;
 esac
 
-command -v bwrap > /dev/null || fail "bwrap not found; refusing to run unsandboxed"
+bwrap_bin="$(command -v bwrap)" || fail "bwrap not found; refusing to run unsandboxed"
 
 mounts=(--ro-bind /usr /usr --ro-bind /etc /etc)
 for dir in /bin /sbin /lib /lib32 /lib64 /libx32; do
@@ -88,21 +97,29 @@ done
 # Runs inside the sandbox before the command. Mounts are not the only way out: bwrap
 # passes every inherited descriptor through, and /proc/self/fd/N reopens the host file
 # or directory behind it (a directory fd reaches its whole tree, `..` included). So
-# close everything above the marker, and refuse to run if anything survives. Writing
-# the marker last means it proves the sandbox was built AND its descriptors are clean;
-# without it, bwrap's own setup failure (exit 1) looks like bash's exit 1.
-# ulimit -f caps any one file the command writes, including the output capture below.
+# close everything above the marker, and refuse to run if anything survives. The first
+# check makes that verification fail closed: fd 3 is the marker, so if it is not
+# visible, /proc/self/fd cannot be read and an empty listing would prove nothing.
+# Writing the marker last means it proves the sandbox was built AND its descriptors are
+# clean; without it, bwrap's own setup failure (exit 1) looks like bash's exit 1.
 # shellcheck disable=SC2016 # expands in the sandboxed bash, not here
 bootstrap='
+if [[ ! -e /proc/self/fd/3 ]]; then
+    echo "bash-oracle: /proc/self/fd is unreadable; cannot prove descriptors are closed" >&2
+    exit 125
+fi
 for fd in /proc/self/fd/*; do
     fd=${fd##*/}
     if ((fd > 3)); then exec {fd}>&-; fi
 done
 for fd in /proc/self/fd/*; do
     fd=${fd##*/}
-    if ((fd > 3)) && [[ -e /proc/self/fd/$fd ]]; then exit 125; fi
+    if ((fd > 3)) && [[ -e /proc/self/fd/$fd ]]; then
+        echo "bash-oracle: inherited fd $fd survived" >&2
+        exit 125
+    fi
 done
-ulimit -f 65536 &&
+ulimit -f 65536 -u 1024 -v 4194304 &&
     printf ok >&3 && exec 3>&- && exec bash -c "$1"
 '
 
@@ -113,38 +130,46 @@ out="$(mktemp)"
 err="$(mktemp)"
 trap 'rm -f "$marker" "$out" "$err"' EXIT
 
+# env -i: bwrap's pid 1 is not cleared by --clearenv, and /proc/1/environ is readable.
+size=$((64 << 20))
+started=${EPOCHREALTIME/./}
 status=0
-timeout --kill-after=2 "$timeout_s" \
-    bwrap \
+env -i PATH=/usr/bin:/bin \
+    timeout --kill-after=2 "$timeout_s" \
+    "$bwrap_bin" \
     --unshare-all \
+    --unshare-user \
+    --disable-userns \
     --die-with-parent \
     --new-session \
     --cap-drop ALL \
     --clearenv \
-    --setenv HOME "$HOME" \
+    --setenv HOME "$home" \
     --setenv PATH /usr/local/bin:/usr/bin:/bin \
     --setenv LANG C.UTF-8 \
     "${mounts[@]}" \
     --proc /proc \
     --dev /dev \
-    --tmpfs /tmp \
-    --tmpfs "$HOME" \
-    --chdir "$HOME" \
+    --remount-ro /dev \
+    --size "$size" --tmpfs /tmp \
+    --size "$size" --tmpfs "$home" \
+    --chdir "$home" \
     --remount-ro / \
-    /usr/bin/bash -c "$bootstrap" bash "$1" \
+    bash -c "$bootstrap" bash "$1" \
     3> "$marker" < /dev/null > "$out" 2> "$err" || status=$?
 
 cat "$out"
 cat "$err" >&2
 if [[ ! -s "$marker" ]]; then
     ((status == 124)) && fail "timed out before the sandbox started"
-    fail "bwrap could not build the sandbox (status $status); nothing ran.
-  bwrap needs unprivileged user namespaces. Ubuntu 23.10+ restricts them with AppArmor
-  (kernel.apparmor_restrict_unprivileged_userns=1); see CONTRIBUTING.md for the profile."
+    fail "the sandbox was not built (status $status); nothing ran. See bwrap's error above.
+  Commonly: bwrap needs unprivileged user namespaces, which Ubuntu 23.10+ restricts with
+  AppArmor (kernel.apparmor_restrict_unprivileged_userns=1); CONTRIBUTING.md has the profile."
 fi
-if ((status == 124)); then
-    echo "bash-oracle: timeout=$timeout_s" >&2
+# timeout also exits 124 when the command itself does; only elapsed time tells them apart.
+if ((status == 124 && ${EPOCHREALTIME/./} - started >= timeout_s * 1000000)); then
+    status_line "timeout=$timeout_s"
     exit 124
 fi
-echo "bash-oracle: exit=$status" >&2
+status_line "exit=$status"
 exit "$status"

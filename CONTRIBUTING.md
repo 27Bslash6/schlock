@@ -20,28 +20,22 @@ uv run pytest
 
 ### Running candidate commands in real bash
 
-Never execute a test vector or evasion string in your own shell. `scripts/bash-oracle -- '<command>'`
-runs it in real bash inside a bubblewrap sandbox (no network, read-only `/usr` and `/etc`, empty
-HOME and `/tmp`), and the tests that compare schlock against bash use it too. It needs `bwrap`
-(`apt install bubblewrap`) and unprivileged user namespaces. Without them it refuses to run, and
-those tests skip locally (in CI they fail).
+Never execute a test vector or evasion string in your own shell. Run it with
+`scripts/bash-oracle -- '<command>'` (`--help` describes the sandbox); the tests that compare
+schlock against bash use it too. It needs `bwrap` (`apt install bubblewrap`) and unprivileged user
+namespaces. Without them it refuses to run, and those tests skip locally (in CI they fail).
 
 Ubuntu 23.10 and later restrict unprivileged user namespaces through AppArmor
-(`kernel.apparmor_restrict_unprivileged_userns=1`). The fix Ubuntu documents is a profile for the
-one binary that needs them, rather than turning the restriction off. Save this as `/etc/apparmor.d/bwrap`:
+(`kernel.apparmor_restrict_unprivileged_userns=1`). Rather than turning the restriction off, load
+the `bwrap-userns-restrict` profile AppArmor ships, which lets bwrap create its namespace but
+confines what runs inside it (on Ubuntu 25.04+ it is already in place):
 
+```bash
+sudo apt install apparmor-profiles
+sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+scripts/bash-oracle -- 'echo ok'   # prints ok, then "bash-oracle: exit=0"
 ```
-abi <abi/4.0>,
-include <tunables/global>
-
-profile bwrap /usr/bin/bwrap flags=(unconfined) {
-  userns,
-  include if exists <local/bwrap>
-}
-```
-
-Then load it with `sudo apparmor_parser -r /etc/apparmor.d/bwrap` and check that
-`scripts/bash-oracle -- 'echo ok'` prints `ok`.
 
 ## Project Structure
 
