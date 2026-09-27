@@ -66,8 +66,7 @@ KNOWN_FALLBACK_CEILINGS = {
     "ansi-c-quoting": "T3 — ANSI-C decoding; bashlex under-decodes, so T3's oracle rules",
     "comments-and-blank-lines": "CLI parses comments off, so a trailing one reads as a prefix parse",
     "arith-command": "bashlex misreads `(( … ))` as a command named after the expression",
-    "here-string-compound": "AstView maps `<<<` on a CallExpr (op 73); a compound's redirects "
-    "raise UnmappedNodeError instead (LAB-4686)",
+    "here-string-compound": "AstView maps `<<<` on a CallExpr (op 73); a compound's redirects raise UnmappedNodeError instead",
 }
 
 
@@ -108,7 +107,7 @@ def bashlex_outputs(command: str) -> "dict[str, set] | None":
 #: one of the corpus" — the `command`-kind and `compound`-kind sinks in
 #: `_here_string_program` are separate code paths, so a regression isolated to
 #: one would still leave the other producing a non-empty set and pass a
-#: corpus-wide vacuity check trivially (LAB-4686 expert-panel security finding).
+#: corpus-wide vacuity check trivially.
 STDIN_PROGRAM_CORPUS_NAMES = ["here-string-stdin-program", "here-string-compound"]
 
 
@@ -118,7 +117,7 @@ def test_stdin_programs_corpus_entry_is_not_vacuous(name):
 
     Registering the walker in `walker_outputs` alone proves nothing if a
     corpus `<<<` row yields `[]` — the superset gate would pass vacuously
-    without ever exercising the new walker (LAB-4686).
+    without ever exercising the new walker.
     """
     command = next(entry["script"] for entry in CORPUS if entry["name"] == name)
     outputs = bashlex_outputs(command)
