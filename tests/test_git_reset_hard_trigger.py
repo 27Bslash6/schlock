@@ -1,4 +1,4 @@
-"""The uncommitted-changes probe fires on the command bash runs, not on one spelling of it (LAB-5493).
+"""The uncommitted-changes probe fires on the command bash runs, not on one spelling of it.
 
 The probe decided whether to run with a raw substring test, so any git global option between
 `git` and `reset` (`-C .`, `--no-pager`, `-c k=v`, ...) skipped it and a dirty-tree hard reset fell

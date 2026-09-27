@@ -937,7 +937,7 @@ def _runs_hard_reset(command: str, result: ValidationResult) -> bool:
     Two legs, and neither subsumes the other. The rule match sees the command bash runs: any git
     global option between `git` and `reset` (`-C .`, `--no-pager`, `-c k=v`, ...) displaces the
     subcommand, and the rule already skips them, so keying on it closes the class instead of
-    listing options that go stale as git grows (LAB-5493). The substring is the only leg that
+    listing options that go stale as git grows. The substring is the only leg that
     sees `reset -q --hard` and `reset HEAD~1 --hard`: the rule requires `reset\\s+--hard`.
     """
     return "git_hard_reset" in result.matched_rules or ("git reset" in command and "--hard" in command)
