@@ -10,9 +10,9 @@ the `<<<`; the `.*` form started at the FIRST shell-name substring on the line a
 let its span leak into any quoted string after it. So `ssh host 'sh <<< "$(base64 -d
 x)"'` was BLOCKED on main only because `ssh` contains `sh`, while `ssh host 'rm -rf
 /'` and `ssh host 'bash <<< "rm -rf /"'` were SAFE. The same leak caught a payload
-quoted behind a local launcher outside the wrapper set (`uv run sh -c '...'`); that is
-SAFE now too, and closing it belongs in the re-entry machinery, not this regex - see
-the YAML note and LAB-4699.
+quoted behind a local launcher outside the wrapper set (`uv run sh -c '...'`); this
+regex no longer does, because closing it belongs in the re-entry machinery - see the
+YAML note and LAB-4699.
 
 Timing sweeps every compiled pattern in the ruleset, because a revert can land
 anywhere, and runs at the regex layer because validating a 64KB command also pays a

@@ -218,8 +218,8 @@ rules:
       # because `ssh` contains `sh`; it is SAFE now, like every other quoted remote
       # payload (remote delegation is deliberately not covered - see validator.py). The
       # same span leak also caught a payload quoted behind a local launcher outside the
-      # wrapper set (`uv run sh -c '...'`, `docker exec c sh -c '...'`); that is SAFE now
-      # too. It is not this regex's job to re-open by chasing `-c` spellings - a shell
+      # wrapper set (`uv run sh -c '...'`, `docker exec c sh -c '...'`); this regex no
+      # longer does. It is not this regex's job to re-open by chasing `-c` spellings - a shell
       # name plus a first-flag `-c` is trivially evaded (`bash --norc -c`), so it would
       # be a bypass with a badge. The fix is the re-entry that already validates known
       # wrappers and direct shells, widened to those launchers for every rule: LAB-4699.
