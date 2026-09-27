@@ -427,13 +427,9 @@ def _past_horizon_rows():
         for payload in ("bash", "date"):
             command = _nest(n, f'$(echo "${{z:-$({payload})}}")', lambda s: f"$(echo {s})")
             yield pytest.param(command, id=f"param-bottom-n{n}-{payload}")
-    # A group's read redirect is only walked once the peeled-group redirect fix is on main.
+    # A peeled group's read redirect, walked by the same depth-capped walk as the group body.
     group = "echo " + _nest(12, "$(bash)", lambda s: f'$({{ cat; }} < "{s}")')
-    yield pytest.param(
-        group,
-        id="group-n12-bash",
-        marks=pytest.mark.xfail(strict=True, reason="needs 27Bslash6/schlock#260 (peeled-group redirects)"),
-    )
+    yield pytest.param(group, id="group-n12-bash")
 
 
 def _inside_horizon_rows():
@@ -2024,6 +2020,70 @@ class TestGroupedAndRedirectedSubstitutions:
             result = validate_command(command)
             assert result.allowed is False, command
             assert result.risk_level == RiskLevel.BLOCKED, command
+
+
+class TestPeeledGroupReadRedirects:
+    """A peeled group's read-redirect targets are still walked for nested substitutions (LAB-5648).
+
+    `_unwrap_compound` peels `( … )` / `{ …; }` and its read redirects go with the wrapper, so the
+    nested walk used to see only the inner command: `$( ( cat ) < "$(bash)" )` read SAFE while the
+    ungrouped `$(cat < "$(bash)")` BLOCKs — and bash expands a redirect target before running the
+    command, so `bash` really runs. Each grouped spelling must rate exactly as its ungrouped twin.
+    """
+
+    @pytest.mark.parametrize(
+        ("grouped", "twin", "level", "target"),
+        [
+            ('x=$( ( cat ) < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( cat ) <<< "$(./payload.sh)" )', 'x=$(cat <<< "$(./payload.sh)")', RiskLevel.HIGH, "./payload.sh"),
+            ("x=$( ( cat ) < <(bash) )", "x=$(cat < <(bash))", RiskLevel.BLOCKED, "bash"),
+            ('x=$( { cat; } < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( ( cat ) < "$(bash)" ) )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # inner layer
+            ('x=$( ( ( cat ) ) < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # outer layer
+            ('x=$(ls; ( cat ) < "$(bash)")', 'x=$(ls; cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # list segment
+            ('x=$( ( cat ) < "$(bash)" | cat )', 'x=$(cat < "$(bash)" | cat)', RiskLevel.BLOCKED, "bash"),  # pipeline
+            ('cat <( ( cat ) < "$(bash)" )', 'cat <(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # process subst
+            # A list or pipeline BODY is validated segment by segment, and the group's redirect
+            # belongs to no segment, so it is judged on its own.
+            ('x=$( ( cat | cat ) < "$(bash)" )', 'x=$(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( { cat; ls; } < "$(bash)" )', 'x=$(cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( cat && ls ) < "$(bash)" )', 'x=$(cat < "$(bash)" && ls)', RiskLevel.BLOCKED, "bash"),
+            (
+                'x=$( ( cat | cat ) <<< "$(./payload.sh)" )',
+                'x=$(cat | cat <<< "$(./payload.sh)")',
+                RiskLevel.HIGH,
+                "./payload.sh",
+            ),
+            ('x=$(ls; ( cat; ls ) < "$(bash)")', 'x=$(ls; cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('cat <( ( cat | cat ) < "$(bash)" )', 'cat <(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+        ],
+    )
+    def test_grouped_read_redirect_matches_ungrouped_twin(self, grouped, twin, level, target):
+        """The message must name the redirect-target command, so a parse-error BLOCK cannot pass."""
+        result = validate_command(grouped, _shellcheck=False)
+        twin_result = validate_command(twin, _shellcheck=False)
+        assert twin_result.risk_level == level  # the twin is the reference; it must not have moved
+        assert result.risk_level == level
+        assert result.allowed is twin_result.allowed
+        assert f"in substitution: {target}" in result.message
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=$( ( cat ) < file )",
+            "x=$( { cat; } < file )",
+            'x=$( ( cat ) < "$(echo hi)" )',
+            'x=$(cat < "$(echo hi)")',  # ungrouped reference
+            'x=$( ( cat | cat ) < "$(echo hi)" )',
+            "x=$( ( cat; ls ) < file )",
+            'x=$( ( cat | wc -l ) < "$(date)" )',
+        ],
+    )
+    def test_benign_grouped_reads_stay_safe(self, command):
+        """Walking the redirects must not turn an inert grouped read into a false positive."""
+        result = validate_command(command, _shellcheck=False)
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.SAFE
 
 
 class TestWorstVerdictWins:
