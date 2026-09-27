@@ -21,6 +21,8 @@ from schlock.core.validator import (
     MAX_DELEGATOR_TOKENS,
     MAX_SHELL_DELEGATION_DEPTH,
     _dash_c_payload,
+    _flock_payload,
+    _rsync_payloads,
     _shell_delegated_payloads,
     _watch_payload,
     clear_caches,
@@ -1228,3 +1230,114 @@ class TestSyntheticRuleNamedInMatchedRules:
         result = validate_command('{ echo a; } > "$HOME/.bashrc"; watch "rm -rf /"')
         assert result.risk_level == RiskLevel.BLOCKED
         assert "shell_delegated_payload" in result.matched_rules
+
+
+class TestFlockAndRsyncPayloads:
+    """`flock FILE -c PROG` and `rsync -e PROG` hand PROG to a shell; the quoted word is code.
+
+    Before this reader existed every deny row below was SAFE: the quoted operand earns a
+    whole-word string-literal range, so the reconstructed rule pass never read it. Grammar
+    pins state what util-linux flock 2.41 and rsync 3.2.7 did, checked with echo payloads only.
+    """
+
+    @pytest.mark.parametrize(
+        ("args", "payload"),
+        [
+            (["lk", "-c", "rm -rf /"], "rm -rf /"),
+            (["lk", "--command", "rm -rf ~"], "rm -rf ~"),
+            # getopt value options before the lock file: separate, clustered, attached, long,
+            # long with `=`, and an abbreviated long option (flock ran `--tim 1 FILE -c PROG`).
+            (["-w", "5", "lk", "-c", "x"], "x"),
+            (["-nw", "5", "lk", "-c", "x"], "x"),
+            (["-nw5", "lk", "-c", "x"], "x"),
+            (["-E", "3", "-x", "lk", "-c", "x"], "x"),
+            (["--timeout", "1", "lk", "-c", "x"], "x"),
+            (["--timeout=1", "lk", "-c", "x"], "x"),
+            (["--tim", "1", "lk", "-c", "x"], "x"),
+            (["--", "lk", "-c", "x"], "x"),
+            # A `-c` that is not right after the lock file belongs to the wrapped program.
+            (["lk", "grep", "-c", "rm -rf /", "build.log"], None),
+            # flock refuses these spellings and runs no payload.
+            (["-c", "x", "lk"], None),
+            (["lk", "-c"], None),
+            (["3"], None),
+        ],
+    )
+    def test_flock_grammar(self, args, payload):
+        assert _flock_payload(args) == payload
+
+    @pytest.mark.parametrize(
+        ("args", "payloads"),
+        [
+            (["-e", "rm -rf ~", "host:a", "b"], ["rm -rf ~"]),
+            (["-ermcmd", "host:a", "b"], ["rmcmd"]),
+            (["-avz", "-e", "x", "src/", "host:dst/"], ["x"]),
+            (["-ae", "x", "host:a", "b"], ["x"]),
+            (["--rsh", "x", "host:a", "b"], ["x"]),
+            (["--rsh=x", "host:a", "b"], ["x"]),
+            # popt reads options after the operands too; rsync ran this `-e` program.
+            (["host:a", "b", "-e", "x"], ["x"]),
+            # `-ea X`: e takes the rest of its cluster ("a"), X is an operand.
+            (["-ea", "x", "host:a", "b"], ["a"]),
+            # `-Be`: -B takes "e" as the block size, so there is no remote shell.
+            (["-Be", "x", "host:a", "b"], []),
+            # `--` ends options; `--rs` is not an abbreviation rsync accepts; the far-end strings
+            # (`--rsync-path`, `-M`) are out of scope.
+            (["--", "-e", "x", "host:a", "b"], []),
+            (["--rs", "x", "host:a", "b"], []),
+            (["--rsync-path=x", "-M", "y", "host:a", "b"], []),
+            (["-avz", "--delete", "src/", "host:dst/"], []),
+        ],
+    )
+    def test_rsync_grammar(self, args, payloads):
+        assert _rsync_payloads(args) == payloads
+
+    def test_extraction_reaches_the_structural_path(self):
+        # An argv word naming a lock file, never opened.
+        assert _shell_delegated_payloads([("flock", ["/tmp/l", "-c", "rm -rf /"])]) == ["rm -rf /"]  # noqa: S108
+        assert _shell_delegated_payloads([("rsync", ["-e", "rm -rf ~", "host:a", "b"])]) == ["rm -rf ~"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "flock /tmp/l -c 'rm -rf /'",
+            "flock /tmp/l --command 'rm -rf ~'",
+            "flock -w 5 /tmp/l -c 'rm -rf ~'",
+            "flock -nw 5 /tmp/l -c 'rm -rf ~'",
+            "flock -E 3 -x /tmp/l -c 'rm -rf ~'",
+            "timeout 5 flock /tmp/l -c 'rm -rf ~'",
+            "rsync -e 'rm -rf /' a b",
+            "rsync -e 'rm -rf ~' host:a b",
+            "rsync -e 'sh -c \"rm -rf ~\"' host:a b",
+            "rsync -avz -e 'rm -rf ~' src/ host:dst/",
+            "rsync -e'rm -rf ~' host:a b",
+            "rsync --rsh 'rm -rf ~' host:a b",
+            # Reaches rsync only because rsync is a delegator the wrapper branch re-enters on.
+            "timeout 30 rsync -e 'rm -rf ~' host:a b",
+        ],
+    )
+    def test_quoted_payload_is_denied(self, command):
+        result = validate_command(command)
+        assert result.allowed is False, f"{command!r} -> {result.risk_level.name}"
+        assert "shell_delegated_payload" in result.matched_rules
+
+    @pytest.mark.parametrize(
+        ("command", "risk"),
+        [
+            ("flock -n /tmp/l -c 'echo hi'", RiskLevel.SAFE),
+            # `watch make` and `bash -c 'make'` are LOW too.
+            ("flock /tmp/l -c 'make'", RiskLevel.LOW),
+            ("rsync -e 'ssh -p 2222' a b", RiskLevel.SAFE),
+            ("rsync -avz -e ssh src/ host:dst/", RiskLevel.SAFE),
+            ("rsync -avz --rsh=ssh src/ host:dst/", RiskLevel.SAFE),
+            ("flock /tmp/l grep -c 'rm -rf /' build.log", RiskLevel.SAFE),
+            # Remote delegation stays out of scope: the remote command is not re-validated.
+            ("ssh h 'ls -la'", RiskLevel.SAFE),
+            ("ssh h 'rm -rf ~'", RiskLevel.SAFE),
+            ("ssh h 'sudo systemctl restart nginx'", RiskLevel.SAFE),
+        ],
+    )
+    def test_benign_verdict_unchanged(self, command, risk):
+        result = validate_command(command)
+        assert result.risk_level == risk, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True

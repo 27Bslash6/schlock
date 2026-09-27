@@ -534,6 +534,17 @@ MAX_DELEGATOR_TOKENS = 256
 # the program), which is the safe direction.
 _WATCH_VALUE_OPTIONS: frozenset[str] = frozenset({"-n", "--interval"})
 
+# `flock`'s own options, parsed by getopt up to the lock file. Only these take a value: a cluster
+# ending in a value letter takes the next word (`-nw 5`), and getopt_long accepts any unambiguous
+# prefix of a long option (`--tim 5`, verified). `-c`/`--command` is deliberately absent: flock
+# rejects it here and reads it only as the word right after the lock file (see _flock_payload).
+_FLOCK_VALUE_LETTERS: frozenset[str] = frozenset("wE")
+_FLOCK_VALUE_LONG_OPTIONS: tuple[str, ...] = ("--timeout", "--wait", "--conflict-exit-code")
+
+# `rsync`'s short options that take a value (rsync 3.2.7 `--help`). popt reads the value from the
+# rest of the cluster (`-eX`, and `-Be` is block size "e") or, when the letter ends it, the next word.
+_RSYNC_VALUE_LETTERS: frozenset[str] = frozenset("B@TfMe")
+
 # `find`'s clauses that run an external command. Everything up to the terminating `;`/`+` is
 # that command, and the shell inside it is a delegator find never names as a command itself.
 _FIND_EXEC_FLAGS: frozenset[str] = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
@@ -545,11 +556,11 @@ _FIND_EXEC_TERMINATORS: frozenset[str] = frozenset({";", "+"})
 # Every base name the extractor itself knows how to unwrap. The wrapper branch re-enters the
 # extractor on each arg that names one of these (LAB-3004), so runner operand semantics,
 # `watch`, `find -exec`, and nested wrappers thread identically to the bare spelling instead of
-# being re-implemented in the wrapper branch. The union of all four recognized-command sets is
-# deliberate: WRAPPER_COMMANDS lets a nested wrapper be skipped past, the program/watch/find
+# being re-implemented in the wrapper branch. The union of every recognized-command set is
+# deliberate: WRAPPER_COMMANDS lets a nested wrapper be skipped past, the program/watch/find/rsync
 # members let the wrapped target be found; a member matched sooner only recurses earlier, it
 # can never make the scan miss. su/sg/runuser happen to sit in both unioned sets.
-_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find"})
+_DELEGATOR_COMMANDS: frozenset[str] = _DASH_C_PROGRAM_COMMANDS | WRAPPER_COMMANDS | frozenset({"watch", "find", "rsync"})
 
 
 def _find_exec_clauses(args: list[str]) -> list[list[str]]:
@@ -639,7 +650,81 @@ def _watch_payload(args: list[str]) -> Optional[str]:
     return " ".join(args[i:]) or None
 
 
-def _shell_delegated_payloads(
+def _flock_payload(args: list[str]) -> Optional[str]:
+    """Return the program `flock FILE -c PROG` hands to `$SHELL -c`, verbatim.
+
+    flock honours `-c`/`--command` only as the word right after the lock file (util-linux 2.41:
+    `flock -c PROG FILE` is an invalid option, `flock FILE -cPROG` execs a program named by the
+    whole word), and a later `-c` belongs to the program flock wraps (`flock FILE grep -c pat f`).
+    So the lock file is located by flock's own option grammar rather than by searching for `-c`.
+    flock refuses a `-c` followed by more than one word; the payload is returned anyway, since
+    re-validating a program that will not run only over-approximates.
+    """
+    i = 0
+    while i < len(args) and args[i].startswith("-") and args[i] != "-":
+        word = args[i]
+        i += 1
+        if word == "--":
+            break
+        if word.startswith("--"):
+            if "=" not in word and any(opt.startswith(word) for opt in _FLOCK_VALUE_LONG_OPTIONS):
+                i += 1
+            continue
+        for pos, letter in enumerate(word[1:], 2):
+            if letter in _FLOCK_VALUE_LETTERS:
+                if pos == len(word):  # ends the cluster, so its value is the next word
+                    i += 1
+                break
+    if i + 2 < len(args) and args[i + 1] in ("-c", "--command"):
+        return args[i + 2]
+    return None
+
+
+def _rsync_payloads(args: list[str]) -> list[str]:
+    """Return every remote-shell program `rsync -e PROG` / `--rsh PROG` names, verbatim.
+
+    rsync splits PROG itself (spaces and quotes, no shell) and execs it only when one side is
+    remote, but PROG may itself be a shell (`-e "sh -c '...'"`), so it is re-validated as bash:
+    that over-approximates rsync's own split, and locality is not judged at all, because
+    `host:path` cannot be told reliably from a local name containing a colon. popt reads options
+    after the operands too (`rsync a host:b -e PROG`) and has no long-option abbreviations (`--rs`
+    is unknown), so every word up to `--` is scanned.
+
+    A value letter other than `e` ends its cluster without consuming the next word. Whether popt
+    would hand that word to it (`-f -e PROG`) is left unmodelled: reading it as a possible `-e`
+    over-approximates, which is the safe direction.
+    """
+    payloads = []
+    i = 0
+    while i < len(args):
+        word = args[i]
+        i += 1
+        if word == "--":
+            break
+        if word == "--rsh":
+            if i < len(args):
+                payloads.append(args[i])
+                i += 1
+            continue
+        if word.startswith("--rsh="):
+            payloads.append(word[len("--rsh=") :])
+            continue
+        if word.startswith("--") or not word.startswith("-"):
+            continue
+        for pos, letter in enumerate(word[1:], 2):
+            if letter not in _RSYNC_VALUE_LETTERS:
+                continue
+            if letter == "e":
+                if pos < len(word):
+                    payloads.append(word[pos:])
+                elif i < len(args):
+                    payloads.append(args[i])
+                    i += 1
+            break
+    return payloads
+
+
+def _shell_delegated_payloads(  # noqa: PLR0912 - one branch per delegator grammar
     commands_with_args: list[tuple[str, list[str]]],
     *,
     _seen: Optional[set[tuple[str, tuple[str, ...]]]] = None,
@@ -647,8 +732,10 @@ def _shell_delegated_payloads(
     """Extract every argument the command will hand to a shell as source code.
 
     Covers `<shell> -c PROG`, the same behind an exec wrapper (`sudo`, `timeout 5`,
-    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, `find -exec/-execdir/-ok/-okdir
-    <shell> -c PROG ;` (LAB-2767), whose clause re-enters this same extraction, and
+    `env FOO=1`, `busybox`, `flock ...`), `watch PROG`, `flock FILE -c PROG` (flock runs it
+    through `$SHELL -c`), `rsync -e PROG` / `--rsh PROG` (the remote shell rsync execs, which
+    may itself be a shell), `find -exec/-execdir/-ok/-okdir <shell> -c PROG ;` (LAB-2767),
+    whose clause re-enters this same extraction, and
     `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
     shell on every later git command in that repo or for that user, not at this command.
 
@@ -657,8 +744,9 @@ def _shell_delegated_payloads(
     Step 5c re-entry as these payloads (LAB-2768).
 
     Deliberately NOT covered, each tracked separately: remote delegation (`ssh host "..."`,
-    a different trust domain) and non-shell interpreters (`python3 -c`, `perl -e`) whose
-    payload is not bash and would be nonsense to re-validate as bash. WRAPPER_COMMANDS is
+    and rsync's `--rsync-path` / `--remote-option`, which the far end runs: a different trust
+    domain) and non-shell interpreters (`python3 -c`, `perl -e`) whose payload is not bash
+    and would be nonsense to re-validate as bash. WRAPPER_COMMANDS is
     best-effort, not an exhaustive enumeration of every exec-passthrough binary.
 
     A first word that is neither a delegator nor a wrapper is never scanned, so
@@ -696,6 +784,8 @@ def _shell_delegated_payloads(
 
         if base == "watch":
             found.append(_watch_payload(args))
+        elif base == "rsync":
+            found.extend(_rsync_payloads(args))
         elif base == "find":
             # Each exec clause is a command in its own right; re-run the FULL extractor on it,
             # so a wrapped or nested delegator inside `-exec` is caught for free.
@@ -704,6 +794,8 @@ def _shell_delegated_payloads(
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
                 found.append(_dash_c_payload(args, operand_ends_options=base in SHELL_COMMANDS))
+            if base == "flock":
+                found.append(_flock_payload(args))
             if base in WRAPPER_COMMANDS:
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
