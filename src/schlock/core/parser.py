@@ -811,9 +811,35 @@ WRAPPER_COMMANDS: frozenset[str] = _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMAN
 
 # Child attributes a walker descends to find commands in argument words AND redirection targets:
 # "redirects"/"output" reach `wc <<< "$(cat x | sh)"` and `( : ) < "$(…)"` (LAB-4838).
+# Walk them through BashCommandParser.exec_children, which also enters `${…}` bodies.
 # Deliberately NOT used by the string-literal, heredoc-range and segment walkers: their ranges
 # suppress rule matches, so widening them can lower a verdict.
 EXEC_CHILD_ATTRS = ("parts", "command", "list", "pipe", "compound", "redirects", "output")
+
+# Text that opens a command/process substitution. Used to decide whether a ``${…}``
+# expansion body is worth re-parsing (see BashCommandParser.parameter_body).
+_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
+
+
+def _shift_positions(node: Any, offset: int) -> None:
+    """Move every node in a subtree `offset` places right (a re-parsed fragment back into its command).
+
+    Each node once, by identity: bashlex links some nodes twice (a `function` node holds its
+    name and body in `parts` AND in `.name`/`.body`), and a node shifted twice indexes nothing.
+    """
+    seen: set[int] = set()
+    pending = [node]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, list):
+            pending.extend(item)
+            continue
+        if not hasattr(item, "kind") or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if getattr(item, "pos", None):
+            item.pos = (item.pos[0] + offset, item.pos[1] + offset)
+        pending.extend(value for value in vars(item).values() if isinstance(value, list) or hasattr(value, "kind"))
 
 
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
@@ -1405,6 +1431,69 @@ class BashCommandParser:
 
         return parse_bashlex(command)
 
+    def parameter_body(self, value: str) -> tuple[str, list[Any]]:
+        """Re-parse a ``${…}`` body (a ``parameter`` node's ``.value``) as a command line.
+
+        Returns the text handed to bashlex and its AST; raises as parse() does. The ONE place a
+        body is re-parsed, so SubstitutionValidator and the walkers below read the same tree.
+        ``#`` is blanked first: it opens a comment on a command line but is plain text inside
+        ``${…}``, and SubstitutionValidator._substitutions_in_parameter records what that cost.
+        Node positions in the AST are relative to the returned text, not the outer command.
+
+        Every call returns a FRESH tree, and that is load-bearing: _parameter_code_parts shifts
+        the positions of the nodes it gets in place. A memo here must hand out copies, or a
+        shared tree is shifted again by every reader and the raw body pass reads the wrong text.
+        """
+        reparsed = value.replace("#", "_")
+        return reparsed, self.parse(reparsed)
+
+    def exec_children(self, node: Any) -> list[Any]:
+        """The child nodes a walker descends into: EXEC_CHILD_ATTRS, plus a ``${…}`` body's substitutions.
+
+        bashlex's ``parameter`` node is childless, so a walker iterating EXEC_CHILD_ATTRS never
+        entered ``echo "${x:-$(timeout 5 exec bash)}"`` and every check that lives only in a
+        walker - wrapper exec, the here-string program, delegated payloads - missed a substitution
+        the same walker catches in ``echo "$(…)"``. A ``parameter`` node yields the command
+        substitutions of its re-parsed body, so they rate as they do in an argument word.
+
+        Only the substitutions, never the body itself: the body is a word, and walking it as a
+        command line would read ``${x/y/eval $(date)}`` as an ``eval`` command. Only command
+        substitutions: bash runs no ``<( )`` inside ``${…}``. A body that does not re-parse
+        yields nothing here; SubstitutionValidator already denies it.
+        """
+        if getattr(node, "kind", None) == "parameter":
+            value = getattr(node, "value", None)
+            if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
+                return []
+            try:
+                _, body = self.parameter_body(value)
+            except (ParseError, ValueError) as exc:
+                # A spent budget or a stack overflow is about where the walker stands, not about
+                # the body: SubstitutionValidator re-parses it from a shallow stack and can decode
+                # it, so swallowing either here left only its HIGH verdict. Raise to the validator.
+                if isinstance(exc, ParseBudgetError) or isinstance(getattr(exc, "original_error", None), RecursionError):
+                    raise
+                return []
+            found: list[Any] = []
+
+            def collect(nodes: list[Any]) -> None:
+                for child in nodes:
+                    if getattr(child, "kind", None) == "commandsubstitution":
+                        found.append(child)
+                    elif hasattr(child, "kind"):
+                        collect(self.exec_children(child))
+
+            collect(body)
+            return found
+        children: list[Any] = []
+        for attr in EXEC_CHILD_ATTRS:
+            child = getattr(node, attr, None)
+            if isinstance(child, list):
+                children.extend(child)
+            elif child:
+                children.append(child)
+        return children
+
     def extract_commands(self, ast_nodes: list[Any]) -> list[str]:
         """Extract all command names from AST.
 
@@ -1480,14 +1569,8 @@ class BashCommandParser:
                         results.append((words[0], words[1:]))
 
                 # Recursively visit child nodes
-                for attr in EXEC_CHILD_ATTRS:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
+                for child in self.exec_children(node):
+                    visit(child)
 
         for node in ast_nodes or []:
             visit(node)
@@ -1523,13 +1606,8 @@ class BashCommandParser:
                 found = _here_string_program(node)
                 if found is not None:
                     results.append(found)
-            for attr in EXEC_CHILD_ATTRS:
-                child = getattr(node, attr, None)
-                if isinstance(child, list):
-                    for item in child:
-                        visit(item)
-                elif child:
-                    visit(child)
+            for child in self.exec_children(node):
+                visit(child)
 
         for node in ast_nodes or []:
             visit(node)
@@ -2128,11 +2206,12 @@ class BashCommandParser:
             # Only a body inside a literal range was suppressed; one between runs
             # is matched bare by the raw pass already.
             code = [
-                part
+                code_part
                 for part in getattr(word, "parts", None) or ()
-                if getattr(part, "kind", None) in _CODE_PART_KINDS
-                and getattr(part, "pos", None)
-                and any(low <= part.pos[0] < high for low, high in ranges)
+                if getattr(part, "pos", None) and any(low <= part.pos[0] < high for low, high in ranges)
+                for code_part in (
+                    [part] if getattr(part, "kind", None) in _CODE_PART_KINDS else self._parameter_code_parts(command, part)
+                )
             ]
             if not code or word_start < whole_until:
                 continue
@@ -2170,6 +2249,30 @@ class BashCommandParser:
                 )
         return bodies
 
+    def _parameter_code_parts(self, command: str, part: Any) -> list[Any]:
+        """The command substitutions in a ``${…}`` part, positioned in ``command``.
+
+        A quoted ``"${x:-$(cat "a|b" .env)}"`` word is one literal range, and a
+        ``parameter`` part has no code part for the loop above to give a body, so
+        the raw pass never read that body: the rule that denies ``"$(cat "a|b" .env)"``
+        passed it. exec_children re-parses the body with positions relative to it;
+        shifted by where the body starts, they index ``command`` and the loop treats
+        each substitution as it treats one written in the word itself.
+
+        Only when the body sits verbatim at ``${`` + 2, and only substitutions whose
+        opener then lands where their span says: a ``\\<newline>`` shifts bashlex's
+        offsets, and a part this cannot place only leaves the body unread, as before.
+        """
+        if getattr(part, "kind", None) != "parameter":
+            return []
+        start, end = part.pos
+        if command[start + 2 : end - 1] != getattr(part, "value", None):
+            return []
+        subs = self.exec_children(part)
+        for sub in subs:
+            _shift_positions(sub, start + 2)
+        return [sub for sub in subs if command.startswith(("$(", "`"), sub.pos[0])]
+
     def mask_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> str:
         """`command` with each outermost substitution body blanked, every offset kept.
 
@@ -2196,8 +2299,6 @@ class BashCommandParser:
         closer where _body_end looks: a `\\<newline>` earlier in the word moves
         bashlex's offsets, and a span left as written only costs this pass a match.
         """
-        from schlock.core.substitution import _SUBSTITUTION_INTRODUCERS  # noqa: PLC0415 - avoids an import cycle
-
         spans: list[tuple[int, int]] = []
 
         def visit(node: Any) -> None:
@@ -2323,14 +2424,8 @@ class BashCommandParser:
 
         def visit_children(node, visitor):
             """Recursively visit child nodes of an AST node."""
-            for attr in EXEC_CHILD_ATTRS:
-                if hasattr(node, attr):
-                    child = getattr(node, attr)
-                    if isinstance(child, list):
-                        for item in child:
-                            visitor(item)
-                    elif child:
-                        visitor(child)
+            for child in self.exec_children(node):
+                visitor(child)
 
         def visit(node):
             """Recursively visit AST nodes to detect dangerous patterns."""
@@ -2493,14 +2588,8 @@ class BashCommandParser:
                     check_pipeline(node)
 
                 # Recurse into child nodes
-                for attr in EXEC_CHILD_ATTRS:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
+                for child in self.exec_children(node):
+                    visit(child)
 
         for node in ast_nodes or []:
             visit(node)

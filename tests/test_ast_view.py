@@ -151,7 +151,7 @@ class TestAcceptanceCommandSubstitution:
         # The second walker family (SubstitutionValidator) must duck-type the
         # view unchanged: .command on the substitution node, .op on operators,
         # .word on words (spec §3.2 — no changes to walker call sites).
-        validator = SubstitutionValidator(parser=None, rule_engine=None)
+        validator = SubstitutionValidator(parser=BashCommandParser(), rule_engine=None)
         subs = validator.extract_substitutions(view("echo $(a && b)"))
         assert len(subs) == 1
         assert subs[0].substitution_type is SubstitutionType.COMMAND

