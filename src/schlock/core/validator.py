@@ -24,7 +24,15 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner, reset_parse_budget
+from .parser import (
+    FD_VARIABLE,
+    WRAPPER_COMMANDS,
+    BashCommandParser,
+    BodyTextCeilingError,
+    has_compound_redirects,
+    heredoc_owner,
+    reset_parse_budget,
+)
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -3023,7 +3031,22 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # word list is in no segment, and a body only ever raises the verdict those
             # checks reached, never takes part in reaching it. No whitelist: a body can be
             # a whole list, and whitelist patterns are prefix matches.
-            for body in parser.extract_quoted_substitution_bodies(command, ast):
+            try:
+                bodies = parser.extract_quoted_substitution_bodies(command, ast)
+            except BodyTextCeilingError as e:
+                # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH and _over_size_ceiling.
+                # Reaching the catch-all denied with `error` set, no alternatives, a message
+                # naming no limit, and `logger.exception(f"... {command!r}")` writing the whole
+                # command to the log. `str(e)` so the limit is stated once, at the raise.
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=str(e),
+                    alternatives=['Assign each nested "$(...)" to a variable first instead of nesting quoted substitutions'],
+                    exit_code=1,
+                    error=None,
+                )
+            for body in bodies:
                 body_match = engine.match_command(
                     body.text,
                     string_literals=body.string_literals,
