@@ -2792,7 +2792,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # Not cached: a parse-level refusal, like the parse errors below.
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
-            dangerous_constructs = parser.has_dangerous_constructs(ast)
+            dangerous_constructs = parser.has_dangerous_constructs(ast, parse_target)
             if dangerous_constructs:
                 return ValidationResult(
                     allowed=False,

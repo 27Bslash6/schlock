@@ -15,7 +15,13 @@ with "option requires an argument", so an attached payload is not a thing.
 import pytest
 
 from schlock.core import validator
-from schlock.core.parser import BashCommandParser, _assignment_runs_decode, _parameter_runs_decode, _subscript_parts
+from schlock.core.parser import (
+    BashCommandParser,
+    _assignment_runs_decode,
+    _may_word_split,
+    _parameter_runs_decode,
+    _subscript_parts,
+)
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
     MAX_DELEGATOR_TOKENS,
@@ -894,6 +900,10 @@ class TestBase64DecodeAtCommandPosition:
             "env -C /tmp $(base64 -d x)",
             "timeout -s KILL 5 $(base64 -d x)",
             "env -u $(base64 -d x)",
+            # A prefixed unquoted operand splits too: `a` is unset and the rest is the command.
+            "env -u a$(base64 -d p)",
+            "env -C /tmp$(base64 -d p)",
+            "env -u a${X:-$(base64 -d p)}",
             # Only `command -v`/`-V` describes: other flags of `command` and `env` still run it.
             "command -p $(base64 -d x)",
             "env -v $(base64 -d x)",
@@ -999,6 +1009,8 @@ class TestBase64DecodeAtCommandPosition:
             "a[0]=$(base64 -d x | grep '[k]=v')",
             # A flag's quoted operand is data, and `command -v` only describes its operands.
             'env -u "$(base64 -d p)" /usr/bin/printf AFTER_ENV',
+            'env -u a"$(base64 -d p)" /usr/bin/printf AFTER',
+            'timeout -s "$(base64 -d s)" 5 true',
             'command -v "$(base64 -d p)"',
             "command -V $(base64 -d p)",
             # `--` ends the flags: no decode flag, so this encodes.
@@ -1029,6 +1041,13 @@ class TestBase64DecodeAtCommandPosition:
         assert _subscript_parts(word) is None
         # ...and the whole word is then read, value included: the over-block side.
         assert _assignment_runs_decode(word, {}) is True
+
+    def test_an_operand_without_its_source_counts_as_splittable(self):
+        # The quotes are only in the source; without it a quoted expansion must not read as data.
+        command = 'env -u "$(base64 -d p)" ls'
+        word = BashCommandParser().parse(command)[0].parts[2]
+        assert _may_word_split(word, command) is False
+        assert _may_word_split(word, None) is True
 
     def test_a_body_that_will_not_parse_counts_as_a_decode(self):
         # Running out of stack inside bashlex is a ParseError too: under `{ ` nested ~243 deep the

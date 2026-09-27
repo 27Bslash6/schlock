@@ -1288,6 +1288,26 @@ def _is_bare_expansion(word: Any) -> bool:
     return sum(p.pos[1] - p.pos[0] for p in parts) == end - start
 
 
+def _may_word_split(word: Any, command: Optional[str]) -> bool:
+    """True if an expansion in `word` is unquoted, so its output may split into more words.
+
+    `env -u a$(…) cmd` unsets `a` plus the first decoded field, and runs the rest as the command;
+    `env -u a"$(…)" cmd` passes one word. bashlex's word has lost its quotes, so they are read
+    from the source with _quote_pairs. Without the source, or where that scan cannot read the
+    word or its part offsets may be shifted, every expansion counts as unquoted: fail closed.
+    """
+    parts = [p for p in getattr(word, "parts", None) or [] if p.kind in ("commandsubstitution", "parameter")]
+    if not parts:
+        return False
+    if command is None or _part_offsets_may_shift(command, word.pos):
+        return True
+    pairs = _quote_pairs(command, word.pos, word.parts)
+    if pairs is None:
+        return True
+    doubles = [(open_, close) for open_, close in pairs if command[open_] == '"']
+    return any(not any(open_ < p.pos[0] and p.pos[1] <= close for open_, close in doubles) for p in parts)
+
+
 _EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
 
 # Wrapper flags whose operand is the NEXT word, data the wrapper never runs: `env -u NAME cmd`
@@ -1391,7 +1411,7 @@ def _assignment_runs_decode(word: Any, seen: "dict[str, bool]") -> bool:
     return any(_runs_decode(part, seen) for part in inside)
 
 
-def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
+def _runs_decoded_output(node: Any, seen: "dict[str, bool]", command: Optional[str] = None) -> bool:
     """True if a command node executes the output of a base-N decode as a command.
 
     `$(base64 -d x)` runs the decoded bytes as a command — the decode-and-execute shape
@@ -1421,8 +1441,10 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
     A wrapper name is resolved as _wrapper_named does (`/usr/bin/en?` is `env`; `{env,}` may be
     any wrapper, or vanish).
     A flag's detached operand (_WRAPPER_OPERAND_FLAGS) is data, so `env -u A $(base64 -d x)` runs
-    the decode and `env -u "$(base64 -d x)" cmd` does not; unquoted, it may word-split into argv,
-    so a bare expansion there is still read. `command -v`/`-V` only describes, and runs nothing.
+    the decode and `env -u "$(base64 -d x)" cmd` does not. An unquoted expansion in it may
+    word-split into argv (`env -u a$(…)`), so an operand that may split is read (_may_word_split,
+    which needs `command`, the source the node's offsets address). `command -v`/`-V` only
+    describes, and runs nothing.
     ponytail: any other literal wrapper operand ends the scan, so `flock /tmp/l $(base64 -d x)`
     and `stdbuf -o L $(…)` stay at the substitution floor (HIGH). Full per-wrapper operand arity
     would close that; only the table above models it.
@@ -1436,8 +1458,9 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]") -> bool:
         text = word.word
         if operand:
             operand = False
-            if not _is_bare_expansion(word):
-                continue
+            if _may_word_split(word, command) and _runs_decode(word, seen):
+                return True
+            continue
         if wrapper is not None and _is_env_assignment(text):
             continue
         if _runs_decode(word, seen):
@@ -2436,7 +2459,7 @@ class BashCommandParser:
             kept.append((start, stop))
         return kept
 
-    def has_dangerous_constructs(self, ast_nodes: list[Any]) -> list[str]:
+    def has_dangerous_constructs(self, ast_nodes: list[Any], command: Optional[str] = None) -> list[str]:
         """Detect dangerous shell constructs in AST.
 
         Checks for constructs that enable arbitrary code execution:
@@ -2452,6 +2475,8 @@ class BashCommandParser:
 
         Args:
             ast_nodes: List of bashlex AST nodes from parse()
+            command: The source the nodes were parsed from. Without it, the decode check reads
+                every wrapper operand holding an expansion as if unquoted (fail closed).
 
         Returns:
             List of warning messages for detected dangerous constructs
@@ -2491,7 +2516,7 @@ class BashCommandParser:
                 # SECURITY: kubectl exec, docker exec use "exec" as argument
                 # We must NOT flag those - they're container tools, not shell exec.
                 if node.kind == "command":
-                    if _runs_decoded_output(node, decode_seen):
+                    if _runs_decoded_output(node, decode_seen, command):
                         dangers.append("base-N decoded output executed as a command")
 
                     cmd_name = self._get_command_name(node)
