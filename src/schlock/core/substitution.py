@@ -1476,14 +1476,15 @@ class SubstitutionValidator:
                 # BOTH lists: a list or pipeline parent is judged per segment by
                 # _validate_segments, which reads only redirect_substitutions, so a raise in the
                 # redirect walk under a group body dropped the payload with only `nested` set.
-                # The AST already parsed, so a raise here is a schlock bug, not hostile input:
-                # log it where it will be seen.
+                # It carries no AST node: this node's own would route a list or pipeline body
+                # back through _validate_segments, whose segments pass. The AST already parsed,
+                # so a raise here is a schlock bug, not hostile input: log it where it will be seen.
                 logger.warning("Nested substitution walk failed in %r: %s", inner_command, exc, exc_info=True)
                 sentinel = SubstitutionNode(
                     substitution_type=sub_type,
                     inner_command=inner_command,
                     base_command=None,
-                    ast_node=node,
+                    ast_node=None,
                     nested_substitutions=[],
                     depth=depth + 1,
                 )
