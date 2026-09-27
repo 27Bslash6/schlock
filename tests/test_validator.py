@@ -3831,3 +3831,25 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
         )
 
         assert result.allowed is True, result.message
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestQuotedRunCommandName:
+    """LAB-4960 AC4: a command name spelled as adjacent quoted runs is named as bash names it.
+
+    bashlex took a word that opens and closes with `'` for ONE single-quoted string, so `'r''m'`
+    was named `r''m` and `'r''m' -rf /` rated SAFE on `main` @ `cc3475d`. bash removes the quotes
+    and runs `rm` (its benign twin `'e''cho' hi` prints `hi`).
+    """
+
+    @pytest.mark.parametrize("command", ["'r''m' -rf /", "'r'm -rf /", "r'm' -rf /", '"r""m" -rf /'])
+    def test_quoted_rm_of_root_is_blocked(self, command):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False)
+
+    def test_quoted_name_rates_as_the_plain_name(self):
+        quoted, plain = validate_command("'r''m' -rf ./build"), validate_command("rm -rf ./build")
+        assert (quoted.risk_level, quoted.allowed) == (plain.risk_level, plain.allowed)
+
+    def test_benign_twin_stays_safe(self):
+        assert validate_command("'e''cho' hi").risk_level == RiskLevel.SAFE

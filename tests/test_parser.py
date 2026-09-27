@@ -855,6 +855,34 @@ class TestMixedQuoteWordDecoding:
         commands = p.extract_commands_with_args(p.parse("echo $(git log \\\n --format='%h' 'a'\"'\"'b')"))
         assert ("git", ["log", "--format=%h", "a'b"]) in commands
 
+    @pytest.mark.parametrize(
+        ("command", "expected", "bodies"),
+        [
+            # bashlex's part for a body stops at its first newline, or short of blanks before `)`;
+            # the word resumes after the `)` bash closes it with, so the quotes after it are removed.
+            # (bashlex's AST keeps only the first line of this body; substitution.py re-reads the rest)
+            ("echo $(true\necho a\n)'z'", "$(true\necho a\n)z", ["true"]),
+            ("echo $( (echo a) )'z'", "$( (echo a) )z", ["echo"]),
+            ("echo $(cat <<EOF\nb ) c\nEOF\n)'z'", "$(cat <<EOF\nb ) c\nEOF\n)z", ["cat"]),
+            # bashlex drops `<(` from a word holding `"`; the parse still returns its body
+            ('diff "a"<(sort x)"b"', "a<(sort x)b", ["sort"]),
+        ],
+    )
+    def test_a_substitution_is_read_through_its_close(self, command, expected, bodies):
+        p = parser_mod.BashCommandParser()
+        commands = p.extract_commands_with_args(p.parse(command))
+        assert commands[0][1][0] == expected
+        assert [name for name, _ in commands[1:]] == bodies
+
+    def test_the_close_is_found_past_a_case_pattern(self):
+        # bashlex cannot parse `case` (the command fails closed), but the lexer that finds the close can
+        src = "$(case a in a) echo ')' ;; esac)'z'"
+        assert src[parser_mod._substitution_end(src, 0) :] == "'z'"
+
+    def test_an_unclosed_substitution_fails_closed(self):
+        with pytest.raises(ParseError):
+            parser_mod._substitution_end("$(echo a'", 0)
+
 
 def _parse_hung(signum, frame):
     pytest.fail("parse did not return within 5 s")

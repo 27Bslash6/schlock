@@ -151,11 +151,6 @@ class TestLookalikesStayArguments:
             "{a\u00e9}<in",  # a non-ASCII name
             "{f$(echo)d}<in",  # an expansion in the NAME
             "{$v}<in",
-            # bash passes `{fd}` for these, as for `{"fd"}` below; they read as arguments
-            # only because bashlex leaves the dollar-quoting on the word
-            "{$'fd'}<in",
-            "{f$'d'}<in",
-            '{$"fd"}<in',
         ],
     )
     def test_lookalike_is_an_argument(self, redirect, safety_rules_path):
@@ -170,6 +165,9 @@ class TestLookalikesStayArguments:
         [
             '{f"d"}<in',  # a quote in the NAME
             '{"fd"}<in',
+            "{$'fd'}<in",  # dollar-quoting is removed like any other quoting (LAB-4960)
+            "{f$'d'}<in",
+            '{$"fd"}<in',
             "{fd[]}<in",  # an empty subscript
             "{fd[0][1]}<in",  # two subscripts
             "{fd[0]]}<in",  # a stray `]`

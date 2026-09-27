@@ -27,7 +27,9 @@ from typing import Any, NamedTuple, Optional
 import bashlex
 import bashlex.ast
 import bashlex.errors
+import bashlex.state
 import bashlex.subst
+import bashlex.tokenizer
 
 from schlock.core.ast_view import UnmappedNodeError
 from schlock.core.native_bridge import NativeBridge, NativeBridgeError
@@ -937,27 +939,10 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
             rebuilt = shlex.split(_QUOTED_RUN_OR_DOLLAR_MARKER.sub(r"\1", span))
     if len(rebuilt) == 1:
         word = rebuilt[0]
-    elif command is not None:
-        # No rebuild (a backslash, or a span shlex cannot read as one word, such as
-        # whitespace inside `$(…)`): keep bashlex's word less its leading markers. Drive
-        # the strip off bashlex's one-character PARAMETER parts, not off the first source
-        # characters: a leading empty fragment (`''$'/dev/'\sda`) moves the `$` off the
-        # start and defeats a positional test, while the part is still there. A real
-        # expansion is wider than one character (`$HOME` spans five), so it is never
-        # stripped. This assumes bashlex left the markers in the word: a word decoded
-        # before it gets here has none, and the strip would eat a real `$` instead.
-        for part in sorted(getattr(target, "parts", None) or [], key=lambda x: getattr(x, "pos", (0,))[0]):
-            pos = getattr(part, "pos", None)
-            is_dollar_quote = (
-                getattr(part, "kind", None) == "parameter"
-                and pos
-                and pos[1] - pos[0] == 1
-                and command[pos[1] : pos[1] + 1] in ("'", '"')
-            )
-            if is_dollar_quote and word.startswith("$"):
-                word = word[1:]
-            else:
-                break
+    # No rebuild (a backslash, or a span shlex cannot read as one word): bashlex's word is
+    # already free of its markers, because every word holding a quote is decoded as bash
+    # reads it (_expand_word_internal) - `$"$HOME"` arrives as `$HOME`, `$'/dev/sda'` as
+    # `/dev/sda` - so it is taken as it stands.
 
     # Did the SOURCE glue the operator to its target? Read the character before the
     # target rather than computing where the operator ended: bashlex NORMALISES the
@@ -1008,8 +993,8 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
     2. Only a word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection
        other than `&>`/`&>>`, is looked at further. `{$v}` is an argument: an
        expansion in the name, so bashlex never spells it `{name}`, which is how bash
-       reads it. `{$'fd'}` and `{$"fd"}` are arguments only because bashlex leaves
-       their quoting on the word.
+       reads it. `{$'fd'}` and `{$"fd"}` are spelled `{fd}` once their quoting is
+       removed (`_expand_word_internal`), so rule 5 refuses them like `{"fd"}`.
     3. A line continuation anywhere in its enclosing top-level word raises: inside a
        word that holds one, bashlex's offsets stop tracking the source. This comes
        before rule 4, so a continuation is refused even around a quoted word.
@@ -1306,9 +1291,13 @@ def _dequote(src: str, children: "dict[int, int]") -> str:  # noqa: PLR0912 - on
     quote = ""  # "", "'" or '"'
     i, end = 0, len(src)
     while i < end:
-        if quote != "'" and i in children:
-            out.append(src[i : children[i]])
-            i = children[i]
+        if quote != "'" and (i in children or (not quote and src.startswith(("<(", ">("), i))):
+            # A part is copied through raw, as bashlex spells it. An unquoted `<(`/`>(` with no part
+            # is one bashlex dropped (a word holding `"` reads to it as double-quoted throughout);
+            # _recover_dropped_substitutions rebuilds its node after the parse.
+            stop = _substitution_end(src, i) if src.startswith(("$(", "<(", ">("), i) else children[i]
+            out.append(src[i:stop])
+            i = stop
             continue
         char, nxt = src[i], src[i + 1 : i + 2] if i + 1 < end else ""
         if quote == "'":
@@ -1341,6 +1330,8 @@ def _dequote(src: str, children: "dict[int, int]") -> str:  # noqa: PLR0912 - on
             else:
                 out.append("$")
                 i += 1
+        elif src.startswith("``", i):
+            i += 2  # empty backquotes run nothing and expand to nothing; bashlex makes no part for them
         elif char == "`" or (not quote and char in _WORD_BREAKS):
             raise ParseError(f"Quoted word token disagrees with bash at {char!r}: {src!r}")
         else:
@@ -1349,6 +1340,22 @@ def _dequote(src: str, children: "dict[int, int]") -> str:  # noqa: PLR0912 - on
     if quote:
         raise ParseError(f"Quoted word ends inside a {quote} quote: {src!r}")
     return "".join(out)
+
+
+def _substitution_end(src: str, i: int) -> int:
+    """Index just past the `)` that closes the `$(`, `<(` or `>(` at ``src[i]``.
+
+    Not bashlex's part offsets: its body parse stops at the first newline (`$(true<newline>rm …)`
+    gets the part `$(true<newline>`) and short of any blanks before the `)`. Its tokenizer's
+    `_parse_comsub` - bash's parse_comsub, which knows heredocs, comments and `case` patterns - is
+    what delimited the word in the first place, so it is asked again for this one substitution.
+    """
+    tok = bashlex.tokenizer.tokenizer(src[i + 2 :], bashlex.state.parserstate())
+    try:
+        tok._parse_comsub(None, "(", ")", parsingcommand=True)
+    except Exception as e:  # noqa: BLE001 - any tokenizer failure means the close is unknown
+        raise ParseError(f"Cannot locate the close of a substitution in: {src!r}", original_error=e) from e
+    return i + 2 + tok._shell_input_line_index
 
 
 def _ansi_c_quote(src: str, i: int, end: int) -> "tuple[str, int]":
@@ -1425,7 +1432,7 @@ def _blank_single_quotes(value: str) -> str:
         char = value[i]
         if value.startswith(_EXPANSION_OPENERS, i):
             break
-        if char == "\\":
+        if char == "\\" or value.startswith("$$", i):  # `$$` is the PID: the `$` after it opens no `$'`
             i += 2
             continue
         if char == '"':
@@ -2088,16 +2095,19 @@ class BashCommandParser:
 
     @staticmethod
     def _is_quoted_span(command: str, span: tuple, parts: "list[Any]") -> bool:
-        """Whether the word at ``span`` is ONE quoted run, from its first character to its last.
+        """Whether the word at ``span`` is quoted runs only, abutting from its first character to its last.
 
         Not "opens and closes with a quote": `'a'$(rm -rf ~)'b'` does both and is
-        two runs around code (LAB-4950). Whole-word is the reconstructed pass's
-        test because its range covers the whole reconstructed word.
+        two runs around code (LAB-4950). Abutting runs leave no gap for code, so
+        `'it'"'"'s'` - the `shlex.quote` idiom for an embedded `'` - is quoted
+        through (LAB-4960). Whole-word is the reconstructed pass's test because
+        its range covers the whole reconstructed word.
         """
         start, end = span
-        if end - start < 2:
+        pairs = _quote_pairs(command, span, parts) if end - start >= 2 else None
+        if not pairs or pairs[0][0] != start or pairs[-1][1] != end - 1:
             return False
-        return _quote_pairs(command, span, parts) == [(start, end - 1)]
+        return all(close + 1 == opened for (_, close), (opened, _) in zip(pairs, pairs[1:]))
 
     @staticmethod
     def _literal_ranges(command: str, word: Any) -> "list[tuple[int, int]]":
