@@ -10,6 +10,7 @@ import logging
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
@@ -2291,6 +2292,50 @@ class _JoinedParen:
         return self._dparen.is_arithmetic(command_start + pos - logical_start)
 
 
+# CPU seconds `_neuter_heredocs` may spend, per command, reading the lines that end in `\`.
+# Whether such a line continues is known only once it has been lexed, so the state it starts in
+# is copied first, and a join lexes the whole logical line again from that copy: only the joined
+# text reads the bytes bash reads across the seam. K joins are K reads of a growing line, and
+# each read also pays what its constructs cost against the state carried into it (open contexts,
+# a word's carried text, the joins so far), which no count of characters or copies sees in full.
+# So the charge is the CPU time the reads take, in the calling thread: load elsewhere mostly
+# slows a read without adding to it. It is checked between reads, so the read that crosses it
+# still finishes, and running out denies. Eighty continued 80-column lines take about 0.1 s on
+# Python 3.14 and 0.2 s on 3.9.
+_JOIN_CPU_BUDGET = 0.5
+
+
+class _JoinBudget(threading.local):
+    """CPU seconds left in the command's join budget.
+
+    Per thread, so concurrent callers of this lock-guarded module neither spend nor refill each
+    other's budget.
+    """
+
+    left = _JOIN_CPU_BUDGET
+
+
+_join_budget = _JoinBudget()
+
+
+def _reset_join_budget() -> None:
+    """Give the join its budget back. Called beside `reset_parse_budget`, once per command."""
+    _join_budget.left = _JOIN_CPU_BUDGET
+
+
+def _charge_join(since: float) -> float:
+    """Charge the CPU time used since ``since`` to the command's join budget, and return the time now.
+
+    Raises:
+        ParseError: when the budget is spent. Reading on would hold the hook before bash runs.
+    """
+    now = time.thread_time()
+    _join_budget.left -= now - since
+    if _join_budget.left < 0:
+        raise ParseError("Lines ending in `\\` took too long to read: the heredoc scan ran past its join budget")
+    return now
+
+
 def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915 - one refusal per uncertain body reading; the join and body loops share one cursor
     """Rewrite a heredoc into something bashlex parses, keeping the rest verbatim.
 
@@ -2319,6 +2364,8 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915
             all in a command bashlex rejected *as* a heredoc. Each means the
             body boundaries are unknown, so which text is shell and which is
             inert data is unknown too. The caller denies rather than guess.
+            Also when its lines ending in `\\` take more CPU to read than the
+            command's join budget allows (`_charge_join`).
     """
     lines = command.split("\n")
     rewritten: list[str] = []
@@ -2345,13 +2392,18 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915
         # A trailing `|` or `&&` does NOT continue a line: bash emits a newline
         # token there and starts the body on the very next line even though the
         # command carries on.
-        start_scan = copy.deepcopy(scan)
         logical = lines[index]
         pieces = [(0, at)]  # (offset in logical, offset in command) of each physical line
         at += len(logical) + 1
         index += 1
+        # Only a line ending in `\` can continue - `_rewrite_openers` sets the flag only
+        # for such a line - so only it can be read again, and only it needs the state it
+        # began in. Copying that state for every line cost lines times the depth carried
+        # in. Reading these lines is what the join budget charges.
+        may_continue = logical.endswith("\\")
+        clock = time.thread_time() if may_continue else 0.0
+        start_scan = copy.deepcopy(scan) if may_continue else scan
         while True:
-            scan = copy.deepcopy(start_scan)  # re-read from where this logical line began
             line, openers, continued = _rewrite_openers(logical, scan, 0, _JoinedParen(dparen, pieces))
             if not continued:
                 break
@@ -2364,6 +2416,10 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915
             logical = logical[:-1] + lines[index]
             at += len(lines[index]) + 1
             index += 1
+            clock = _charge_join(clock)  # before the next read, so a spent budget reads no more
+            scan = copy.deepcopy(start_scan)  # re-read from where this logical line began
+        if may_continue:
+            _charge_join(clock)  # the last read, and the copy made for a line that did not continue
         rewritten.append(line)
 
         if base_command is None and openers:
@@ -2754,6 +2810,7 @@ def validate_command(
         # A new command gets a fresh parse budget; re-entries for its payloads and heredoc
         # rewrites share the one it is spending (LAB-5659).
         reset_parse_budget()
+        _reset_join_budget()  # the heredoc join's budget, shared the same way
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
         command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived

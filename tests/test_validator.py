@@ -9,6 +9,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -2526,6 +2527,128 @@ class TestHeredocSurroundings:
         assert time.perf_counter() - started < 0.5
         assert base.endswith("cat")
         assert neutered.endswith("cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC")
+
+    @pytest.fixture
+    def join_budget(self, monkeypatch):
+        """A fresh join budget, put back afterwards: a spent one would deny every later direct call."""
+        budget = val_module._JoinBudget()
+        monkeypatch.setattr(val_module, "_join_budget", budget)
+        return budget
+
+    def test_ordinary_lines_under_many_open_contexts_are_scanned_in_linear_time(self, join_budget):
+        """Only a line ending in `\\` has the state it starts in copied, because only it can be read again.
+
+        That state holds every context still open. Copying it for every line cost
+        lines times depth: this 3 KB command took 1.6 s, and 10 KB took over 20 s.
+        """
+        depth = 500
+        shell = "( " * depth + "\n" + "a\n" * depth + ") " * depth
+        started = time.perf_counter()
+
+        neutered, _ = val_module._neuter_heredocs("cat <<'A;B'\nx\nA;B\n" + shell)
+
+        assert time.perf_counter() - started < 0.5
+        assert neutered == "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n" + shell
+        assert join_budget.left == val_module._JOIN_CPU_BUDGET
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<'E' \\\n" + "a\\\n" * 4000 + "b\nx\nE",
+            "cat <<'E' " + "x" * 30000 + " \\\n" + "a\\\n" * 300 + "b\nx\nE",
+            "cat <<'A;B'\nx\nA;B\n" + "( " * 500 + "\n" + "a\\\nb\n" * 1000 + ") " * 500,
+            "cat <<'A;B'\nx\nA;B\n" + "(" * 10 + "\\\n" + "\\\n" * 13700 + " ".join(")" * 10) + "\n",
+            "cat <<'A;B'\nx\nA;B\n"
+            + "(" * 2000
+            + "<<a " * 500
+            + "\\\n"
+            + "\\\n" * 299
+            + "\n"
+            + "a\n" * 500
+            + ") " * 2000
+            + "\n",
+            "cat <<'A;B'\nx\nA;B\n" + "0" * 30000 + '"\n"' + "-" * 20 + "\\\n" + "\\\n" * 2999 + "x",
+            "cat <<'A;B'\nx\nA;B\n" + "( " * 500 + "'\n" + "a\\\n" * 2000 + "'" + ") " * 500,
+        ],
+        ids=[
+            "many-short-joins",
+            "few-joins-onto-a-long-line",
+            "joins-under-many-open-contexts",
+            "arithmetic-lookups-over-empty-joins",
+            "openers-under-open-contexts",
+            "dashes-after-a-carried-word",
+            "quoted-backslash-lines-under-many-open-contexts",
+        ],
+    )
+    def test_lines_ending_in_a_backslash_are_read_in_bounded_time(self, join_budget, command):
+        """Every join lexes the logical line again from its start, so the reads multiply.
+
+        The re-read is what keeps a join honest, so it is bounded rather than removed: the
+        command's join budget is CPU time, and running out denies. Each row took seconds
+        before the budget, the slowest over 20 s. The second row is only 300 joins, so a cap
+        on the number of joins would let it through. Rows three to six show why the charge is
+        CPU time rather than a count of characters or copies: a read there also pays for the
+        contexts it copies, the joins so far (each `((` looks its offset up among them), the
+        contexts opened on the line (each `<<` asks whether one is a backtick), and a word
+        carried in from the line before (each `-` rebuilds it). The last row joins nothing, as
+        no `\\` continues inside a quote, but each line is still copied in case it does.
+
+        What is pinned is the time, not the denial: a reading that got cheaper and finished
+        would pass. CPU time rather than wall time, so load on the machine is much less likely
+        to fail a row.
+        1 s: the 0.5 s budget, plus the read that spends the last of it.
+        """
+        assert len(command) <= MAX_COMMAND_SIZE
+        started = time.process_time()
+
+        try:
+            val_module._neuter_heredocs(command)
+        except ParseError as e:
+            assert "join budget" in str(e)
+
+        assert time.process_time() - started < 1.0
+
+    def test_a_spent_join_budget_denies_the_command(self, safety_rules_path, join_budget):
+        """The refusal reaches the verdict: the fallback turns it into BLOCKED, not an allow."""
+        result = validate_command("cat <<'E' \\\n" + "a\\\n" * 4000 + "b\nx\nE", config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "join budget" in result.message
+
+    def test_a_hand_written_continued_command_fits_the_join_budget(self, join_budget):
+        """Sixty continued 80-column lines take about 0.05 s of the 0.5 s (0.12 s on Python 3.9).
+
+        The worst case sets the budget's ceiling; this row sets its floor. Eighty such lines
+        take 0.1 s (0.2 s on 3.9). A budget lowered past this row denies a long command
+        someone did write.
+        """
+        flags = ["  --flag-" + "x" * 68 for _ in range(60)]
+        command = "cat <<'E' > out \\\n" + " \\\n".join(flags) + " \\\n  end\nbody\nE"
+
+        neutered, base = val_module._neuter_heredocs(command)
+
+        assert neutered == "cat <<SCHLOCK_HEREDOC > out " + " ".join(flags) + "   end\n\nSCHLOCK_HEREDOC"
+        assert base == "cat"
+
+    def test_the_join_budget_is_one_per_command(self, safety_rules_path, monkeypatch, join_budget):
+        """A command's delegated payloads are read against the one budget that command is spending.
+
+        It is reset once per top-level command, beside the parse budget, and never on a
+        re-entry: a budget per `_neuter_heredocs` call would be multiplied by the number of
+        payloads a command carries. A new command starts with the whole budget, even when the
+        one before it spent it all.
+        """
+        reset = mock.Mock(wraps=val_module._reset_join_budget)
+        monkeypatch.setattr(val_module, "_reset_join_budget", reset)
+
+        def payload(tag: str) -> str:
+            return 'cat <<"E" > out \\\n' + f"  --{tag}-{'x' * 70} \\\n" * 20 + "  end\nbody\nE"
+
+        join_budget.left = -1.0
+        result = validate_command(f"bash -c '{payload('a')}'; bash -c '{payload('b')}'", config_path=safety_rules_path)
+
+        assert result.allowed, result.message
+        reset.assert_called_once()
 
     def test_arithmetic_after_a_heredoc_denies_for_the_real_reason(self, safety_rules_path):
         """`$((1<<2))` still denies - because bashlex cannot parse arithmetic, not a phantom heredoc.
