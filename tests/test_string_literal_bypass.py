@@ -646,7 +646,9 @@ class TestSubstitutionBetweenQuotedRuns:
 
     def test_a_body_that_cannot_be_placed_fails_closed(self):
         with pytest.raises(ParseError):
-            BashCommandParser().parse("echo 'a'$((1+2))'b'")
+            # A nested body is what makes arithmetic dangerous; `$((1+2))` would pin only that
+            # bashlex cannot read arithmetic, which the native tier rightly calls SAFE.
+            BashCommandParser().parse("echo 'a'$(( $(rm -rf /) ))'b'")
 
     def test_a_body_bashlex_cannot_parse_fails_closed(self, monkeypatch):
         def broken(*_args):
