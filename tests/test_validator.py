@@ -1079,7 +1079,7 @@ class TestSelfProtectionArchiveExtraction:
             "TAR_OPTIONS=-x tar -f evil.tar --exclude-ignore-recursive -d .config/schlock",
             "TAR_OPTIONS=-x tar -f evil.tar --some-future-option -t -C .claude/hooks",
             # Old-style key letters take the following words as their values, in order
-            "TAR_OPTIONS=-x tar f -t -C .claude/hooks",
+            "TAR_OPTIONS=-x tar -f evil.tar -C .claude/hooks",
             "tar Cxf .claude/hooks evil.tar",
             # A value-less option does not take the member filter after it, and an exclude
             # option that may itself be a value does not hide the word after it
@@ -1128,6 +1128,23 @@ class TestSelfProtectionArchiveExtraction:
             "export TAR_OPTIONS=-C.claude/hooks; tar -xf e.tar",
             "declare -x UNZIP=-d.config/schlock; unzip a.zip",
             "printf -v TAR_OPTIONS %s -C.claude/hooks; export TAR_OPTIONS; tar -xf e.tar",
+            # ANSI-C / locale quoting is stripped to the path bash runs, including a cumulative -C
+            "tar -xf e.tar -C .claude -C $'hooks'",
+            "unzip e.zip -d .cl$'a'ude/hooks",
+            "tar -xf e.tar -C .claude/ho$'o'ks",
+            "$'tar' -xf e.tar -C .claude/hooks",
+            "7z x e.7z -o.claude/ho$'o'ks",
+            # An unquoted shell heredoc body that extracts into a config dir
+            "bash <<EOF\ntar -xf e.tar -C .claude/hooks\nEOF",
+            "sh <<END\nunzip a.zip -d .config/schlock\nEND",
+            # An env carrier is matched by the config-dir VALUE, so the variable name may be spelled
+            # any way bash accepts — quoted, escaped, computed, or via env -S
+            'export TAR_""OPTIONS=-C.claude/hooks; tar -xf e.tar',
+            'export "TAR_$(echo OPTIONS)=-C.claude/hooks"; tar -xf e.tar',
+            "env -S 'TAR_OPTIONS=-C.claude/hooks tar -xf e.tar'",
+            "env -S 'tar -xf e.tar -C .claude/hooks'",
+            # A launcher that runs an extractor named in a glued --command= value
+            "flatpak run --command=tar org.x -xf e.tar -C .claude/hooks",
         ],
     )
     def test_extraction_into_config_dir_is_blocked(self, command):
@@ -1222,12 +1239,14 @@ class TestSelfProtectionArchiveExtraction:
     @pytest.mark.parametrize(
         "command",
         [
-            # The extractor name inside a commit message is one quoted arg, not a command word,
-            # so the message keeps its own verdict and is never a self-protection block.
+            # The extractor name inside a commit message is one quoted arg, not a command word, and
+            # a commit with no argv extraction never triggers the carrier scan, so it is not blocked.
             'git commit -m "Add unzip step for .claude/hooks"',
             'git commit -m "docs: note that; tar -xf a.tar -C .claude/hooks is blocked"',
-            # An unrelated later statement that names the dir is not part of the extraction.
-            "tar -xzf tool.tgz -C /opt\nchmod +x .claude/hooks/pre.sh",
+            # A config dir mentioned with no extraction anywhere on the line is left to the
+            # Write/Edit hook, not the archive check.
+            "chmod +x .claude/hooks/pre.sh",
+            "git add .claude/hooks/settings.json",
         ],
     )
     def test_config_dir_mention_is_not_self_protection_blocked(self, command):
@@ -1235,6 +1254,52 @@ class TestSelfProtectionArchiveExtraction:
         result = validate_command(command)
         assert result.risk_level != RiskLevel.BLOCKED, f"False block: {command}"
         assert result.matched_rules != ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A config dir named by a non-reader command sharing a line with a real extraction is
+            # over-blocked on purpose: a carrier could inject that dir into the extractor's env, and
+            # the check keys on the config-dir value, not on which command wrote it. The same class
+            # Check 2 already imposes on protected file names.
+            "tar -xzf tool.tgz -C /opt\nchmod +x .claude/hooks/pre.sh",
+            "tar -xf a.tar -C build && git add .claude/hooks/x.sh",
+        ],
+    )
+    def test_extraction_line_naming_config_dir_over_blocks(self, command):
+        """The carrier scan's accepted cost: a config dir on an extracting line blocks."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A `-s`/`-W` of ambiguous GNU/bsdtar arity no longer fails closed when no word could
+            # name a protected dir, so a package install, a member rewrite into /opt, or an
+            # old-style bundle stays at its normal verdict.
+            "apt-get install -y tar xz-utils",
+            "tar -xpsf backup.tar -C /opt/app",
+            "tar -xf release.tar -s ,^,out/, -C /opt/app",
+            "tar xvsf a.tar",
+            # A bare mention or an unset of the carrier variable, with the extraction elsewhere, is
+            # not a config write (the check keys on the config-dir value, which is absent here).
+            "echo TAR_OPTIONS; tar -xf release.tar -C /opt/app",
+            "unset TAR_OPTIONS; tar -xf a.tar -C build",
+            "env -u TAR_OPTIONS tar -xf a.tar -C build",
+        ],
+    )
+    def test_ambiguous_and_bare_mention_not_over_blocked(self, command):
+        """AC-2: the arity and carrier guards do not fire without a protected-dir word."""
+        result = validate_command(command)
+        assert result.risk_level != RiskLevel.BLOCKED, f"False block: {command}"
+        assert result.matched_rules != ["self_protection:config_write"]
+
+    def test_self_protection_dirs_cover_all_paths(self):
+        """The explicit file/tree split stays in sync with SELF_PROTECTION_PATHS (a desync would
+        silently misclassify a path, and a module-level raise would crash the hook)."""
+        covered = set(val_module._CONFIG_FILE_PATHS) | set(val_module._CONFIG_TREE_PATHS)
+        assert covered == set(val_module.SELF_PROTECTION_PATHS)
 
     @pytest.mark.parametrize(
         "command",

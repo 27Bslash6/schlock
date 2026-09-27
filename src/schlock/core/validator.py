@@ -28,6 +28,7 @@ from schlock.integrations.shellcheck import (
 
 from .cache import ValidationCache
 from .parser import (
+    EXEC_CHILD_ATTRS,
     FD_VARIABLE,
     SHELL_COMMANDS,
     WRAPPER_COMMANDS,
@@ -856,12 +857,11 @@ _PROJECT_CONFIG_DIR = ".claude/hooks"  # holds schlock-config.yaml
 
 # Which SELF_PROTECTION_PATHS entries are files (protect their directory) and which are whole
 # directory subtrees (protect as-is). Split explicitly, not by a `.yaml`/extension guess, so a
-# future non-YAML config file cannot be silently misclassified as a directory. The assert makes
-# adding a path there without classifying it here fail loudly.
+# future non-YAML config file cannot be silently misclassified as a directory. A desync is caught
+# by test_self_protection_dirs_cover_all_paths — not a module-level raise, because the hook imports
+# this module outside a try and a raise here would crash every Bash call instead of denying.
 _CONFIG_FILE_PATHS = ("schlock-config.yaml", ".config/schlock/config.yaml")
 _CONFIG_TREE_PATHS = (".claude-plugin/bin", ".claude-plugin/vendor")
-if set(_CONFIG_FILE_PATHS) | set(_CONFIG_TREE_PATHS) != set(SELF_PROTECTION_PATHS):
-    raise RuntimeError("SELF_PROTECTION_DIRS is out of sync with SELF_PROTECTION_PATHS")
 
 
 def _self_protection_dirs() -> tuple[str, ...]:
@@ -878,6 +878,13 @@ SELF_PROTECTION_DIRS = _self_protection_dirs()
 # `s,^,.claude/hooks/,` all match, and `.claude/hooks-backup` does not.
 _CONFIG_DIR_RE = re.compile(r"(?<![\w.-])(?:" + "|".join(map(re.escape, SELF_PROTECTION_DIRS)) + r")(?![\w.-])")
 _CONFIG_DIR_PARTS = tuple(tuple(path.split("/")) for path in SELF_PROTECTION_DIRS)
+# A word that could name (or expand to) a protected dir: a `.claude`/`.config` component, or a
+# glob/`$`/backtick that could produce one. Only when such a word is present does a `-s`/`-W`
+# arity guess actually decide a config-dir verdict.
+_PROTECTED_HINT_RE = re.compile(r"\.c(?:laude|onfig)|[*?\[$`]")
+# Split a carrier word into the tokens an env assignment or a launcher option glues together,
+# so `TAR_OPTIONS=-C.claude/hooks` and `--command=tar` yield their pieces.
+_TOKEN_SPLIT_RE = re.compile(r"[\s=]+")
 # Leading option name, so "-C.claude/hooks", "-o.claude/hooks", "--directory=x" yield the path.
 _OPTION_PREFIX_RE = re.compile(r"^--?[a-z][a-z-]*=?")
 _GLOB_CHAR_RE = re.compile(r"[*?[]")
@@ -903,6 +910,10 @@ _TAR_VALUE_OPTS = _TAR_ARG_OPTS | _TAR_AMBIGUOUS_OPTS
 _MAX_TAR_DIRS = 64
 # tar modes that never write into the -C directory (list / create / compare / append / update / concat).
 _TAR_READ_MODES = frozenset("tcdruA")
+# Any mode letter (read modes plus extract). A first word is read as old-style keys only if it is
+# all letters AND carries one of these, so a package name like `xz-utils` (a hyphen) or a bare
+# operand is not misread as `tar` keys — which spuriously set the `s`/`W` ambiguity.
+_TAR_MODE_LETTERS = _TAR_READ_MODES | frozenset("x")
 _TAR_READ_LONG = frozenset(
     {"list", "create", "diff", "compare", "append", "update", "catenate", "concatenate", "delete", "test-label"}
 )
@@ -1020,9 +1031,9 @@ def _tar_options(word: str, first: bool) -> Optional[_TarWord]:
         kind = _tar_value_kind(word[j])
         rest = word[j + 1 :]
         return _TarWord(reads, False, [], [(kind, rest)], ambiguous) if rest else _TarWord(reads, False, [kind], [], ambiguous)
-    if first and word[:1].isalpha():
+    if first and word.isalpha() and (set(word) & _TAR_MODE_LETTERS):
         # Old-style keys: "tar xf a.tar", "tar Cxf dir a.tar". Each value letter takes the next
-        # word, in key order.
+        # word, in key order. Only an all-letters word carrying a mode letter is read this way.
         return _TarWord(
             bool(set(word) & _TAR_READ_MODES),
             False,
@@ -1052,8 +1063,10 @@ def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
     The destinations are every word except a certain --exclude/-X value, which keeps members out,
     plus each cumulative -C directory: `-C .claude -C hooks` lands in `.claude/hooks` though no
     single word says so. None (destinations unreadable) is returned when the -C chain is too long
-    to fold or a `-s`/`-W` of ambiguous GNU-vs-bsdtar arity is present, so an extraction fails
-    closed rather than being scanned with a guessed word boundary.
+    to fold, or a `-s`/`-W` of ambiguous GNU-vs-bsdtar arity sits next to a word that could name a
+    protected dir (a `.claude`/`.config` component, a glob, or a `$`/backtick expansion): only then
+    is the guessed word boundary load-bearing, so only then does the extraction fail closed. A
+    `-s`/`-W` with no protected-looking word (a package install, a rename into /opt) scans normally.
     """
     extracts = read = ambiguous = False
     destinations: list[str] = []
@@ -1070,11 +1083,14 @@ def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
         if kind == "dir":
             dirs += 1
             if dirs <= _MAX_TAR_DIRS:
-                cwd = value if value.startswith(("/", "~", "$")) else posixpath.join(cwd, value)
+                # A `$`-prefixed value is folded onto the chain, not read as absolute: `-C .claude
+                # -C $'hooks'` is `.claude/hooks`, and the reset reading of a genuine absolute var
+                # ($HOME) is unmatchable anyway, so joining is the fail-closed choice.
+                cwd = value if value.startswith(("/", "~")) else posixpath.join(cwd, value)
                 destinations.append(cwd)
 
     for i, word in enumerate(args):
-        extracts = extracts or _names_tar_extract(word) or (i == 0 and word[:1].isalpha() and "x" in word)
+        extracts = extracts or _names_tar_extract(word) or (i == 0 and word.isalpha() and "x" in word)
         if roles:
             take(roles.pop(0), word)
             continue
@@ -1096,8 +1112,8 @@ def _tar_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
             take(kind, value)
         roles.extend(kinds)
     extraction = extracts or not read
-    readable = destinations if dirs <= _MAX_TAR_DIRS and not ambiguous else None
-    return extraction, readable
+    unreadable = dirs > _MAX_TAR_DIRS or (ambiguous and any(_PROTECTED_HINT_RE.search(w) for w in args))
+    return extraction, (None if unreadable else destinations)
 
 
 def _unzip_scan(args: list[str]) -> tuple[bool, Optional[list[str]]]:
@@ -1180,66 +1196,151 @@ def _names_config_dir(arg: str) -> bool:
     access. Braces are expanded first; past the expansion cap the word fails closed. Cached because
     the same word is rescanned at every extractor position a look-through visits.
     """
-    value = _OPTION_PREFIX_RE.sub("", arg.lower(), count=1)
+    # Drop `$`: bashlex removes the quotes of `$'…'`/`$"…"` but leaves the `$`, so `.claude/ho$oks`
+    # is `.claude/hooks` after ANSI-C/locale quoting, and a `$VAR` residue is treated as literal
+    # text (fail closed). `$( … )` keeps its inner path, still bounded by the (?<!…) anchor.
+    value = _OPTION_PREFIX_RE.sub("", arg.lower(), count=1).replace("$", "")
     if not value:
         return False
     alternatives = _brace_alternatives(value) if "{" in value else [value]
     return alternatives is None or any(_path_names_config_dir(alt) for alt in alternatives)
 
 
-_TAR_ENV_RE = re.compile(r"\bTAR_OPTIONS\b")
-_UNZIP_ENV_RE = re.compile(r"\b(?:UNZIP|UNZIPOPT)\b")
+def _extractor_base(word: str) -> str:
+    """The extractor name a word denotes, case-folded, with `$'…'` residue and a path stripped."""
+    return word.rsplit("/", 1)[-1].lower().replace("$", "")
 
 
-def _extracts_into_config_dir(commands_with_args: list[tuple[str, list[str]]], command: str = "") -> bool:
+def _prefix_assignment_words(ast_nodes: list) -> list[str]:
+    """Every prefix `NAME=value` assignment word on any command node, e.g. the `TAR_OPTIONS=…` of
+    `TAR_OPTIONS=-C.claude/hooks tar -xf a.tar`, which `extract_commands_with_args` drops.
+
+    Walks the parser's full child set (`EXEC_CHILD_ATTRS`), so a command inside a redirect or a
+    substitution is reached too; it never re-implements command extraction.
+    """
+    words: list[str] = []
+
+    def visit(node) -> None:
+        if not hasattr(node, "kind"):
+            return
+        if node.kind == "command":
+            for part in getattr(node, "parts", None) or []:
+                if getattr(part, "kind", None) == "assignment" and getattr(part, "word", None):
+                    words.append(part.word)
+        for attr in EXEC_CHILD_ATTRS:
+            child = getattr(node, attr, None)
+            for item in child if isinstance(child, list) else (child,):
+                if item is not None and hasattr(item, "kind"):
+                    visit(item)
+
+    for node in ast_nodes or []:
+        visit(node)
+    return words
+
+
+def _env_split_string_words(args: list[str]) -> list[str]:
+    """The words `env -S`/`--split-string` splits its string operand into, else [].
+
+    `env` runs the split string as a command, so its words are command-position; other commands'
+    string arguments are data, which is why this is env-specific and not a blanket whitespace split
+    (that would read `printf '… tar …'` or `git commit -m '… tar …'` as an extraction).
+    """
+    for i, arg in enumerate(args):
+        if arg in ("-S", "--split-string") and i + 1 < len(args):
+            return args[i + 1].split()
+        if arg.startswith("-S") and len(arg) > 2:
+            return arg[2:].split()
+        if arg.startswith("--split-string="):
+            return arg[len("--split-string=") :].split()
+    return []
+
+
+def _wrapped_extractors(name: str, args: list[str]) -> "Optional[list[tuple[str, list[str]]]]":
+    """The (extractor, its-args) pairs a command runs, or None past the look-through cap.
+
+    A direct extractor is itself; a bare reader runs none; any other command is a possible runner,
+    looked through at every word that names an extractor. Args are split on `=` first (so a glued
+    `--command=tar` exposes the extractor), and an `env -S` string is split into its words too (env
+    runs it as a command). Whitespace is otherwise NOT split, so a quoted data argument such as a
+    commit message or a printf format is never read as an extraction.
+    """
+    base = _extractor_base(name)
+    if base in _EXTRACTOR_SCANS:
+        return [(base, args)]
+    if base in _SELF_PROTECTION_READ_ALLOWLIST:
+        return []
+    tokens = args + (_env_split_string_words(args) if base == "env" else [])
+    flat = [piece for token in tokens for piece in token.split("=")]
+    names = [_extractor_base(word) for word in flat]
+    positions = [i for i, word in enumerate(names) if word in _EXTRACTOR_SCANS]
+    if len(positions) > _MAX_WRAPPED_EXTRACTORS:
+        return None
+    return [(names[i], flat[i + 1 :]) for i in positions]
+
+
+def _extracts_into_config_dir(
+    commands_with_args: list[tuple[str, list[str]]],
+    assignment_words: "tuple[str, ...]" = (),
+    heredoc_bodies: "tuple[str, ...]" = (),
+) -> bool:
     """True if a command extracts an archive (tar/bsdtar, unzip, 7z) into a config directory.
 
-    Reads the parser's argv, never the raw text, so quoting, redirections, grouping and line
-    continuations are bash's, and an extraction quoted as text (`git commit -m "... tar -x ..."`)
-    is one argument to another command. Command names are case-folded like paths.
+    Reads the parser's argv, so quoting, redirections, grouping and line continuations are bash's,
+    and an extraction quoted as text (`git commit -m "... tar -x ..."`) is one argument to another
+    command. Command names are case-folded and `$'…'`-stripped like paths.
 
-    Any command that is neither an extractor nor a bare reader (`_SELF_PROTECTION_READ_ALLOWLIST`)
-    is treated as a possible runner and looked through at EVERY word that names an extractor, the
-    way `_shell_delegated_payloads` re-enters wrappers: a runner allowlist is never complete, so
-    gating a fail-closed check on one is the bypass. The price is an over-block when a non-reader
-    names an extractor before a config dir (`rg tar .claude/hooks`, `git log -G tar -- .claude/hooks`);
-    the same line through a bare reader (`grep`, `cat`) is not blocked, and a program handed to a
-    shell (`bash -c`, a shell heredoc) is re-validated by Step 5c, which runs this check again.
+    Detector 1 — the precise scan. Any command that is neither an extractor nor a bare reader
+    (`_SELF_PROTECTION_READ_ALLOWLIST`) is a possible runner and is looked through at every word
+    that names an extractor, the way `_shell_delegated_payloads` re-enters wrappers: a runner
+    allowlist is never complete, so gating a fail-closed check on one is the bypass. Its args are
+    split on whitespace and `=` first, so `env -S 'tar … -C dir'` and `--command=tar` expose the
+    extractor. Any of the extractor's own words naming the dir counts: the target option, a member
+    filter, or a member rewrite (--transform, bsdtar -s).
 
-    `TAR_OPTIONS`/`UNZIP`/`UNZIPOPT` inject option words (a `-C`/`-d` we cannot see) into an
-    extractor's environment. They reach it from an `export`, a `declare`, a `printf -v`, a prefix
-    assignment or an `env NAME=value` operand — all invisible to a single command's argv — so an
-    extraction is failed closed on the mere presence of the variable name in the raw command. The
-    cost is an over-block of a genuinely-elsewhere extraction that also sets `TAR_OPTIONS`.
-
-    Any of the extractor's own words naming the dir counts: the target option ("-C dir",
-    "--directory=dir", "-d dir", "-odir"), a member filter ("tar -xf a.tar .claude/hooks"
-    recreates the dir under the cwd) and a member rewrite (--transform, bsdtar -s) alike.
+    Detector 2 — the fail-closed token scan, run only when detector 1 saw a real extraction. An
+    env carrier (`TAR_OPTIONS`/`UNZIP`, however spelled — quoted, computed, or `env -S`) injects a
+    `-C`/`-d` we cannot read from one argv, so instead of keying on the variable NAME we key on the
+    config-dir VALUE: every carrier command (a non-reader that is not the extractor) and every
+    prefix assignment is split on whitespace/`=`, and a piece naming a config dir blocks. A shell
+    heredoc body that names an extractor and a config dir blocks the same way. The extractor's own
+    args are NOT re-scanned here, so an `--exclude`d config dir stays allowed. The price is an
+    over-block when an extraction shares a line with a config-dir mention (`tar … -C /opt && git
+    add .claude/hooks/x`), the same class Check 2 already imposes on protected file names.
     """
-    tar_env = bool(_TAR_ENV_RE.search(command))
-    unzip_env = bool(_UNZIP_ENV_RE.search(command))
+    extraction_present = False
     for name, args in commands_with_args:
-        base = name.rsplit("/", 1)[-1].lower()
-        if base in _EXTRACTOR_SCANS:
-            wrapped = [(base, args)]
-        elif base in _SELF_PROTECTION_READ_ALLOWLIST:
-            continue
-        else:
-            names = [arg.rsplit("/", 1)[-1].lower() for arg in args]
-            positions = [i for i, word in enumerate(names) if word in _EXTRACTOR_SCANS]
-            if len(positions) > _MAX_WRAPPED_EXTRACTORS:
-                return True
-            wrapped = [(names[i], args[i + 1 :]) for i in positions]
+        wrapped = _wrapped_extractors(name, args)
+        if wrapped is None:
+            return True
         for extractor, extractor_args in wrapped:
             extracts, destinations = _EXTRACTOR_SCANS[extractor](extractor_args)
             if not extracts:
                 continue
+            extraction_present = True
             if destinations is None or any(_names_config_dir(word) for word in destinations):
                 return True
-            # An env carrier could supply the -C/-d that names the dir; we cannot see the value.
-            if (extractor in _TAR_NAMES and tar_env) or (extractor == "unzip" and unzip_env):
+
+    # Detector 2b: a shell heredoc body that is itself an extraction into a config dir.
+    for body in heredoc_bodies:
+        tokens = _TOKEN_SPLIT_RE.split(body)
+        if any(_extractor_base(t) in _EXTRACTOR_SCANS for t in tokens):
+            extraction_present = True
+            if any(_names_config_dir(t) for t in tokens):
                 return True
-    return False
+
+    if not extraction_present:
+        return False
+
+    # Detector 2a: a carrier (env var, launcher operand) naming a config dir on a line that
+    # extracts. Skip the extractors and bare readers; the extractor's own args were scanned above.
+    carrier_words: list[str] = list(assignment_words)
+    for name, args in commands_with_args:
+        base = _extractor_base(name)
+        if base in _EXTRACTOR_SCANS or base in _SELF_PROTECTION_READ_ALLOWLIST:
+            continue
+        carrier_words.append(name)
+        carrier_words.extend(args)
+    return any(_names_config_dir(piece) for word in carrier_words for piece in _TOKEN_SPLIT_RE.split(word))
 
 
 def _is_plain_read(segment: str) -> bool:
@@ -3262,12 +3363,14 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 )
                 # Not cached: a parse-level refusal, like the parse errors below.
 
-            # SELF-PROTECTION: an archive extraction into a config directory, read from the
-            # parsed argv. Hard-coded like Step 3, and ahead of the substitution pass so a
-            # `$(tar …)` is refused by this rule rather than by whatever that pass matches. The
-            # raw command is passed for the env-carrier check, which cannot be seen in one argv.
+            # SELF-PROTECTION: an archive extraction into a config directory, read from the parsed
+            # argv. Hard-coded like Step 3, and ahead of the substitution pass so a `$(tar …)` is
+            # refused by this rule rather than by whatever that pass matches. Prefix env
+            # assignments (dropped from the argv) and shell heredoc bodies are passed in, since a
+            # carrier or a heredoc-borne extraction is not visible in a single command's argv.
             commands_with_args = parser.extract_commands_with_args(ast)
-            if _extracts_into_config_dir(commands_with_args, command):
+            shell_heredoc_bodies = tuple(parse_target[start:end] for start, end, is_shell in heredoc_ranges if is_shell)
+            if _extracts_into_config_dir(commands_with_args, tuple(_prefix_assignment_words(ast)), shell_heredoc_bodies):
                 return _make_self_protection_result(command)
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
