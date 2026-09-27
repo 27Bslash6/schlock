@@ -1335,7 +1335,7 @@ class _DoubleParen:
         over-fire can only deny more.
 
         A `$((` is excluded because it is an expansion, not an arithmetic
-        command, and its over-block is tracked separately (27Bslash6/schlock#112).
+        command, and its over-block is tracked separately (27b-io/schlock#112).
         The backslash IS honoured, so `\\((` - an escaped backslash, then a real
         opener - is still found; a `(?<![$\\])` lookbehind loses that one.
 
@@ -1364,7 +1364,10 @@ class _DoubleParen:
         the stack is answered from the memo next time. Without that, text with
         no closers at all - `((((((…` - re-scans to the end once per opener:
         8 KB of it cost 7.1 s of CPU, on a hook that runs before every Bash
-        call (0.6 ms with the memo).
+        call (0.6 ms with the memo). A quote or expansion that runs out of text
+        inside the pair is the same fact and is recorded the same way. Only that:
+        an `_UnfollowableParenError` is not knowing, and recording it would turn
+        its deny into a skip.
         """
         if opening in self.unclosable:
             raise ParseError("`((` never closes; bash reads no command from this text")
@@ -1381,7 +1384,13 @@ class _DoubleParen:
             elif hit == ")":
                 self.partners[stack.pop()] = found.start()
             else:
-                pos = self._skip(hit, found.start(), pos)
+                try:
+                    pos = self._skip(hit, found.start(), pos)
+                except _UnfollowableParenError:
+                    raise
+                except ParseError:
+                    self.unclosable.update(stack)
+                    raise
         return self.partners[opening]
 
     def _comsub(self, start: int) -> int:
@@ -2791,9 +2800,7 @@ def validate_command(
     """
     if _depth == 0 and not _derived and not _as_written:
         # A new command gets a fresh parse budget; re-entries for its payloads, heredoc
-        # rewrites and Step 3b's two halves share the one it is spending (LAB-5659). The
-        # rewrite half still passes this gate, but Step 3b runs before anything is parsed,
-        # so its reset hands back nothing.
+        # rewrites and Step 3b's two halves share the one it is spending (LAB-5659).
         reset_parse_budget()
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
@@ -2874,11 +2881,13 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             with ShellCheck on, deliberately - ShellCheck never reads inside a `-c` string, so that
             re-entry is the payload's only check.
         _derived: Internal, keyword-only. True when ``command`` is text schlock produced from an
-            admitted command (a heredoc rewrite or one of its segments), so the derived-text
-            ceiling applies, not the caller's. Callers leave it False.
+            admitted command (a heredoc rewrite or one of its segments, or Step 3b's shift
+            rewrite), so the derived-text ceiling applies, not the caller's, and the parse budget
+            is the caller's too. Callers leave it False.
         _as_written: Internal, keyword-only. True skips the Step 3b shift rewrite and judges
             ``command`` as bashlex reads it - the other half of Step 3b's join - and leaves the
-            verdict out of the cache, since a fresh call would join it. Callers leave it False.
+            verdict out of the cache, since a fresh call would join it. Keeps the parse budget
+            it was called under. Callers leave it False.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -2937,7 +2946,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # those lines back to the flow below, which validates them on their
         # merits - so the verdict comes from the rule the payload matches. Only
         # the arithmetic command is handled here; `$(( … ))` is an expansion and
-        # is tracked separately (27Bslash6/schlock#112).
+        # is tracked separately (27b-io/schlock#112).
         #
         # The rewrite is judged ALONGSIDE the command as written, never instead
         # of it, and the worse verdict wins. `command_level_openers` offers every
@@ -2979,7 +2988,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 )
         if neutered != command:
             # ShellCheck runs once, on the half that is the text the user typed.
-            rewritten = validate_command(neutered, config_path, _depth=_depth, _shellcheck=False, _derived=_derived)
+            rewritten = validate_command(neutered, config_path, _depth=_depth, _shellcheck=False, _derived=True)
             as_written = validate_command(
                 command, config_path, _depth=_depth, _shellcheck=_shellcheck, _derived=_derived, _as_written=True
             )
@@ -2989,8 +2998,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 return result.risk_level, not result.allowed, bool(result.matched_rules)
 
             arithmetic_result = as_written if rank(as_written) > rank(rewritten) else rewritten
-            if _depth == 0 and _shellcheck:
-                # Cached under what the user typed; neither half cached itself.
+            if _depth == 0 and _shellcheck and not _deferred and not _as_written:
+                # Cached under what the user typed, with Step 7's guard; neither half cached itself.
                 _global_cache.set(command, arithmetic_result)
             return arithmetic_result
 

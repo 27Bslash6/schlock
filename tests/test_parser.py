@@ -852,7 +852,7 @@ class TestParseBudget:
 
     def test_an_arithmetic_shift_spends_one_budget(self, runaway_parse, no_shellcheck):
         """Step 3b judges the shift rewrite and the command as written: two halves of one command, one budget."""
-        result = validate_command("(( 1<<b ))\ncat <<heredoc\nbudget test\nheredoc")
+        result = validate_command("(( 1<<b ))")
         assert not result.allowed
         assert result.risk_level.name == "BLOCKED"
         assert len(runaway_parse) == 1

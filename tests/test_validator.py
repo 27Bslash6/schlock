@@ -3966,7 +3966,7 @@ class TestArithmeticCommandShift:
         "command,allowed,risk,parse_error,description",
         [
             # AC-3: the measured baseline on main. `for (( … ))` is already
-            # denied by a bashlex parse error - that over-block is 27Bslash6/schlock#106
+            # denied by a bashlex parse error - that over-block is 27b-io/schlock#106
             # and #112, an explicit non-goal here, so it must stay exactly as it is.
             ("(( i++ ))", True, RiskLevel.SAFE, False, "bare increment"),
             ("for (( i=0; i<3; i++ )); do echo $i; done", False, RiskLevel.BLOCKED, True, "`for ((` stays denied"),
@@ -4095,7 +4095,7 @@ class TestArithmeticCommandShift:
         """Neither of these changes a verdict today, so only a direct assertion pins them.
 
         `$((` is denied either way because bashlex cannot parse arithmetic
-        expansion at all (27Bslash6/schlock#112), and mangling a here-string into
+        expansion at all (27b-io/schlock#112), and mangling a here-string into
         `==<` happens to deny the same as leaving it. Both are still the wrong
         reading of bash, and an unpinned decision is the one that gets
         "simplified" away by someone who checked only the verdicts.
@@ -4325,20 +4325,29 @@ class TestArithmeticCommandShift:
 
         assert ratio < 8.0, f"4x the command cost {ratio:.1f}x the CPU; linear is ~4, quadratic is ~16"
 
-    def test_parens_that_never_close_are_not_rescanned_per_opener(self):
+    @pytest.mark.parametrize(
+        "tail",
+        # `${` opens a span only inside quotes: at the paren level it is text. The
+        # `$(` row carries its shift outside, since a heredoc inside `$(` refuses.
+        [" 1<<b", ' "1<<b', ' "${1<<b', " 1<<b $(x", " '1<<b", " $'1<<b", " `1<<b"],
+        ids=["paren level", "double quote", "dollar brace", "command substitution", "single quote", "ansi-c", "backtick"],
+    )
+    def test_parens_that_never_close_are_not_rescanned_per_opener(self, tail):
         """`((((((…` with no closer at all: one scan, not one per opener.
 
         Every opener's `is_arithmetic` runs the paren scan to the end of the
         text and raises, so without memoising the failure this is quadratic -
         measured 7.1 s of CPU on an 8 KB command, on a hook that runs before
         every Bash call. `_DoubleParen` records every paren left on the stack
-        when the text runs out, so the scan happens once.
+        when the text runs out, so the scan happens once. The text runs out
+        just as surely inside a quote or expansion the scan opened, which is
+        why each span that can be left unclosed is a row.
 
         Counted rather than timed: the count separates one scan from n scans
         exactly, on every machine and interpreter.
         """
         openers = 2000
-        command = "((" * openers + " 1<<b"
+        command = "((" * openers + tail
         searches = 0
         real = val_module._PAREN_STOP_RE
 
