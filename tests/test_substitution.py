@@ -3029,10 +3029,10 @@ class TestDangerousAwkHelper:
             ["awk", "NR>1 {print $2}"],  # numeric comparison, not a redirect
             ["awk", "-v", "n=3", "{print $n}"],
             ["awk", "-F|", "{print $1}"],  # pipe as field separator, not pipe-to-command
-            ["awk", "$1 || $2 {print}"],  # logical OR, not a pipe (LAB-4832)
+            ["awk", "$1 || $2 {print}"],  # logical OR, not a pipe
             ["awk", "/error|warn/ {print}"],  # regex alternation, not a pipe
             ["awk", '{print $1 "|" $2}'],  # a pipe character inside a string literal
-            ["awk", "{print $1} # x|y", "f"],  # a pipe inside a comment (LAB-4832 panel)
+            ["awk", "{print $1} # x|y", "f"],  # a pipe inside a comment, not code
             ["awk", "{n++} /a|b/ {print}"],  # only a `/` directly after ++ is ambiguous
             ["awk", "NR == 1\n/a|b/ {print}"],  # a regex pattern opening the second line
             # FP guards: legit one-liners a too-blunt fix would over-block
@@ -3067,11 +3067,11 @@ class TestDangerousAwkHelper:
             ["awk", "-i", "inplace", "{print}"],
             ["awk", "-l", "ext", "{}"],
             ["awk", "-E", "prog.awk"],
-            # LAB-4832: the pipe target is a variable, so no string literal sits beside the `|`
+            # the pipe target is a variable, so no string literal sits beside the `|`
             ["awk", "BEGIN{c=ARGV[1]; print 1 | c}"],
             ["awk", "{print | cmd}"],
             ["awk", "BEGIN{c=ARGV[1]; c | getline l}"],
-            # LAB-4832 panel: a `/re/` in an operand position must be stripped as a regex, or its
+            # a `/re/` in an operand position must be stripped as a regex, or its
             # `"` pairs with a later quote and hides the pipe (verified executable on mawk/nawk).
             ["awk", 'BEGIN{c=ARGV[1]; x = 1 + /"/; print 1 | c; y = "a"}'],
             ["awk", 'BEGIN{c=ARGV[1]; x = ($0 ~ /[/]"/); print 1 | c; y = "a"}'],
@@ -3146,7 +3146,7 @@ class TestDangerousAwkHelper:
         "command",
         [
             "echo \"$(awk 'BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /')\"",
-            "echo \"$(awk 'BEGIN{c=ARGV[1]; c | getline l; print l}' 'id')\"",  # AC-3 guard
+            "echo \"$(awk 'BEGIN{c=ARGV[1]; c | getline l; print l}' 'id')\"",  # getline from a variable command
             # a regex-after-operator evasion the removed literal alternatives would have missed
             "echo \"$(awk 'BEGIN{c=ARGV[1]; x = 1 + /\"/; print 1 | c}' 'rm -rf /')\"",
             "echo \"$(awk 'BEGIN{c=ARGV[1]; x=4; y = x++ / 2; print 1 | c; z = 4 / 1}' 'rm -rf /')\"",
@@ -3154,7 +3154,7 @@ class TestDangerousAwkHelper:
         ],
     )
     def test_variable_pipe_target_blocked_in_substitution(self, command, monkeypatch):
-        """LAB-4832: the payload sits in a quoted argument, so no YAML rule backstops the scan."""
+        """The payload sits in a quoted argument, so no YAML rule backstops the scan."""
         monkeypatch.setattr(validator_module, "is_shellcheck_available", lambda: False)
         assert validate_command(command).allowed is False
 

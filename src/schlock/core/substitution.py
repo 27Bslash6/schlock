@@ -680,7 +680,7 @@ _AWK_PIPE_KEYWORD = re.compile(r"\b(?:printf?|getline)\b")
 #                  ambiguous and the rest is kept raw.
 #   _AWK_EITHER  - a `/` the awks disagree on outright (after postfix `x++`/`x--`, `case`, `length`):
 #                  gawk/busybox may divide where mawk/nawk open a regex, so the rest is kept raw.
-# Keeping the rest raw over-reads a real pipe, never hides one. LAB-4832.
+# Keeping the rest raw over-reads a real pipe, never hides one.
 _AWK_DIVIDE, _AWK_NONVAR, _AWK_REGEX, _AWK_HEADER, _AWK_PREFIX, _AWK_EITHER = (
     "div", "nonvar", "regex", "header", "prefix", "either",
 )  # fmt: skip
@@ -804,16 +804,18 @@ def _awk_after_punct(c: str, slash: str, headers: list[bool]) -> str:
         return _AWK_DIVIDE
     if c in _AWK_OPERAND_OPS:  # an arithmetic/unary operator: its operand is a non-lvalue
         return _AWK_PREFIX
-    return _AWK_REGEX  # a boundary (`;` `{` `=` `,` `?` `:` `(` comparison/logical): next name is a fresh lvalue
+    return _AWK_REGEX  # a boundary (`;` `{` `=` `,` `?` `:` comparison/logical): next name is a fresh lvalue
 
 
-def _awk_strip_literals(prog: str) -> str:
+def _awk_strip_literals(prog: str) -> tuple[str, str]:
     """Replace awk string, regex, and comment content with inert placeholders, leaving code.
+    Return (code, tail): `tail` is the rest of the program kept as written from a `/` the awks
+    read differently, or "" when every awk lexes the whole program the same way.
 
     A single regex cannot do this: a `"` inside `/re/` is not a string and a `/` inside `"str"` is
     not a regex, so the two forms must be tracked left to right with the same state awk's lexer
-    keeps. Where awks disagree on a `/`, the rest of the program is kept as written: a real pipe
-    can then be over-read, never hidden. Each char consumed once -> linear, no backtracking.
+    keeps. Keeping the tail raw means a real pipe in it can be over-read, never hidden. Each char
+    consumed once -> linear, no backtracking.
     """
     out: list[str] = []
     i, n = 0, len(prog)
@@ -831,8 +833,7 @@ def _awk_strip_literals(prog: str) -> str:
         elif c == "/":  # division, a regex literal, or a `/` the awks read differently (-> raw)
             act = _awk_slash(prog, i, slash)
             if act is None:
-                out.append(prog[i:])
-                break
+                return "".join(out), prog[i:]
             chunk, i, slash = act
             out.append(chunk)
         elif c.isalnum() or c == "_":  # name or number
@@ -863,21 +864,36 @@ def _awk_strip_literals(prog: str) -> str:
             out.append(c)
             slash = _awk_after_punct(c, slash, headers)
             i += 1
-    return "".join(out)
+    return "".join(out), ""
 
 
-def awk_command_pipe(args: list[str]) -> str | None:
-    """Return a reason if an awk program pipes output to, or reads from, a command, else None.
+def _awk_has_pipe(code: str) -> bool:
+    return bool(_AWK_PIPE_KEYWORD.search(code) and _AWK_LONE_PIPE.search(code))
+
+
+def awk_command_pipe(args: list[str]) -> tuple[str, bool] | None:
+    """Return (reason, certain) if an awk program pipes output to, or reads from, a command, else None.
 
     Target-agnostic, so `print | c` with `c` from ARGV is caught where the literal-anchored
     _AWK_DANGEROUS_TEXT misses it. Used by dangerous_awk (substitution) and by the top-level
-    validator (BLOCKED), where the payload sits in a quoted arg no YAML rule can see. LAB-4832.
+    validator, where the payload sits in a quoted arg no YAML rule can see.
+
+    `certain` is True when the pipe is in code every awk lexes the same way; the top level BLOCKs
+    it. It is False when the pipe shows only once the raw tail is included: an ambiguous regex
+    such as `/[\\[\\]]/` before a `"|"` string keeps that string raw, so the `|` may be data. The
+    top level asks (HIGH) for that rather than hard-deny ordinary one-liners.
     """
+    uncertain = None
     for arg in args:
-        code = _awk_strip_literals(arg)
-        if _AWK_PIPE_KEYWORD.search(code) and _AWK_LONE_PIPE.search(code):
-            return "awk program pipes to or from a command (print | cmd, cmd | getline)"
-    return None
+        code, tail = _awk_strip_literals(arg)
+        if _awk_has_pipe(code):
+            return "awk program pipes to or from a command (print | cmd, cmd | getline)", True
+        if tail and _awk_has_pipe(code + tail):
+            uncertain = (
+                "awk program may pipe to or from a command (part of it reads differently across awks)",
+                False,
+            )
+    return uncertain
 
 
 def dangerous_awk(args: list[str]) -> str | None:
@@ -890,7 +906,9 @@ def dangerous_awk(args: list[str]) -> str | None:
             return f"awk {arg} loads external program code or enables writes"
         if _AWK_DANGEROUS_TEXT.search(arg):
             return "awk program executes commands or writes files (system/getline/redirect)"
-    return awk_command_pipe(args)
+    # Certain or not: inside a substitution an over-block is acceptable (see _AWK_DANGEROUS_TEXT).
+    pipe = awk_command_pipe(args)
+    return pipe[0] if pipe else None
 
 
 # sed is allowed inside substitution only in a conservative read-only form: clusterable boolean
@@ -2118,7 +2136,7 @@ class SubstitutionValidator:
 
             # awk/sed are whitelisted as read-only pipeline stages but carry exec/write escape
             # hatches (awk system()/getline/pipes to a literal or variable command, sed -i/-f/e/w
-            # commands) — same contextual pattern as find above. See #104, LAB-4832.
+            # commands) — same contextual pattern as find above. See #104.
             if base_command == "awk" and args:
                 awk_reason = dangerous_awk(args)
                 if awk_reason:
