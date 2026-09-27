@@ -996,8 +996,8 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
     2. Only a word bashlex spells as `{name}` or `{name[…]}`, glued to a redirection
        other than `&>`/`&>>`, is looked at further. `{$v}` is an argument: an
        expansion in the name, so bashlex never spells it `{name}`, which is how bash
-       reads it. `{$'fd'}` and `{$"fd"}` are arguments only because bashlex leaves
-       their quoting on the word.
+       reads it. `{$'fd'}` and `{$"fd"}` are spelled `{fd}` once _DollarQuoteDecoder,
+       which parse_bashlex runs first, has decoded them, so rule 5 refuses them like `{"fd"}`.
     3. A line continuation anywhere in its enclosing top-level word raises: inside a
        word that holds one, bashlex's offsets stop tracking the source. This comes
        before rule 4, so a continuation is refused even around a quoted word.
