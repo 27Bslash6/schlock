@@ -559,6 +559,85 @@ class TestP0FileTruncation:
         assert result.risk_level == RiskLevel.HIGH, f"Expected HIGH risk for: {command}, got {result.risk_level}"
         assert "file_truncation" in result.matched_rules
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "true > ~/.aws/credentials",
+            "true 3> ~/.aws/credentials",
+            "true 2> ~/.aws/credentials",
+            "true {fd}> ~/.aws/credentials",
+            "true 1> ~/.aws/credentials",
+            "true &> ~/.aws/credentials",
+            "true 2>| ~/.aws/credentials",
+            ": 2> important.db",
+            "echo -n 2> important.db",
+            # A quoted target is still a target.
+            'true 2> "my file"',
+            "true > 'my file'",
+            # Starting with `/dev/null` does not make a path `/dev/null`.
+            "true 2> /dev/null.bak",
+            "foo | tee /dev/null.bak",
+            # A quoted operand can start with a blank: `"true" 2> ' ;'` reconstructs to
+            # `true 2>  ;`, and only a target that may be a blank reaches it.
+            "\"true\" 2> ' ;'",
+            "'true' > ' |'",
+            # A quoted target of blanks then `/dev/null` names a file under a directory called
+            # " ", not the null device. Reconstructed it reads as the discard `true >  /dev/null`,
+            # so the raw text has to catch it: a quoted producer word, and `>|`, both count.
+            "\"true\" 2> ' /dev/null'",
+            "'true' > ' /dev/null'",
+            "':' > ' /dev/null'",
+            "'echo' -n > ' /dev/null'",
+            "true >| ' /dev/null'",
+            "printf '' >| f",
+        ],
+    )
+    def test_fd_prefixed_truncation_blocked(self, safety_rules_path, command):
+        """A write redirection truncates its target whatever descriptor it names."""
+        result = validate_command(command, config_path=safety_rules_path, _shellcheck=False)
+
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.HIGH, ["file_truncation"])
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "true 2>/dev/null",
+            "true 2> /dev/null",
+            "true 2>&1",
+            "true >&2",
+            ": 2> /dev/null",
+            # A shell metacharacter ends the `/dev/null` word as a blank does.
+            "(true 2> /dev/null)",
+            "echo `true 2> /dev/null`",
+            "true 2> /dev/null; ls",
+            # Repeated blanks before `/dev/null` are still a discard.
+            ">  /dev/null",
+            ": 2>  /dev/null",
+            "true 2>  /dev/null",
+            "echo -n 2>  /dev/null",
+            "printf '' 2>\t /dev/null",
+            "'true' > /dev/null",
+            "true >| /dev/null",
+            # Appending is not truncating.
+            "true >> ~/.aws/credentials",
+            "true 2>> ~/.aws/credentials",
+            # `30` belongs to the argument `10:30`; it is not a descriptor on `:`.
+            "echo 10:30> out.txt",
+            "cmd 2> err.log",
+            # Quoted examples are data: bash prints them and creates no file.
+            "echo ': > f'",
+            "echo ': 2> f'",
+            "echo ': &> f'",
+            "echo ': 2> f' x",
+            'printf "%s" "true 2> f"',
+        ],
+    )
+    def test_fd_prefixed_non_truncation_allowed(self, safety_rules_path, command):
+        """Discards, fd duplications, appends and ordinary stderr capture stay SAFE."""
+        result = validate_command(command, config_path=safety_rules_path, _shellcheck=False)
+
+        assert (result.risk_level, result.matched_rules) == (RiskLevel.SAFE, [])
+
     def test_dev_null_truncation_allowed(self, safety_rules_path):
         """/dev/null truncation should be allowed."""
         result = validate_command("> /dev/null", config_path=safety_rules_path)

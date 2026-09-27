@@ -113,6 +113,9 @@ class TestEverySpellingBashConsumes:
             # a newline in the subscript: the shape regex's DOTALL is what refuses these
             '{fd["\n"]}>o',
             "{fd['\n']}>o",
+            # bash consumes these as prefixes (fa[1] is set); bashlex's arithmetic ParseError refuses, not _mark_fd_variables
+            "{fd[$((1))]}<in",
+            "{fd[$((i+1))]}>out",
         ],
     )
     def test_spelling_outside_the_allowlist_fails_closed(self, redirect, safety_rules_path):
@@ -147,6 +150,12 @@ class TestLookalikesStayArguments:
             "{fd[0]]<in",  # no closing brace
             "{a\u00e9}<in",  # a non-ASCII name
             "{f$(echo)d}<in",  # an expansion in the NAME
+            "{$v}<in",
+            # bash passes `{fd}` for these, as for `{"fd"}` below; they read as arguments
+            # only because bashlex leaves the dollar-quoting on the word
+            "{$'fd'}<in",
+            "{f$'d'}<in",
+            '{$"fd"}<in',
         ],
     )
     def test_lookalike_is_an_argument(self, redirect, safety_rules_path):
