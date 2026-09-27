@@ -170,13 +170,27 @@ class TestReporting:
         result = oracle(f"exit {status}", sandbox)
         assert (result.returncode, result.stderr) == (status, f"bash-oracle: exit={status}\n")
 
+    def test_a_slow_reader_does_not_turn_exit_124_into_a_timeout(self, sandbox, tmp_path):
+        # 256 KiB overflows a pipe buffer, so replaying it blocks until the reader drains.
+        command = [shutil.which("bash") or "/bin/bash", str(REPO_ROOT / "scripts" / "bash-oracle"), "-t", "1", "--"]
+        proc = subprocess.Popen(
+            [*command, "head -c 262144 /dev/zero; exit 124"],
+            env={"PATH": os.environ["PATH"], "HOME": str(sandbox)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(1.5)
+        out, err = proc.communicate(timeout=30)
+        assert len(out) == 262144
+        assert err.decode().endswith("bash-oracle: exit=124\n"), err
+
     def test_status_line_starts_its_own_line(self, sandbox):
         result = oracle("printf partial >&2", sandbox)
         assert result.stderr == "partial\nbash-oracle: exit=0\n"
 
     def test_timeout_kills_the_command(self, sandbox):
         # Unique per run, so another checkout running this suite cannot match it.
-        marker = f"sleep 97.{uuid.uuid4().int % 10**9}"
+        marker = f"sleep 97.{int(uuid.uuid4().hex[:8], 16)}"
         started = time.monotonic()
         result = oracle(marker, sandbox, "-t", "1")
         assert time.monotonic() - started < 10
@@ -237,6 +251,7 @@ REAL_SHELL_ALLOWLIST = {
     "tests/test_post_tool_use.py": (1, "run_bash: fixed git commit commands in a tmp repo; the hook reads git log"),
     "tests/test_hook_manifest.py": (1, "runs hooks.json's own command line with HOME and cwd in tmp_path"),
     "tests/conftest.py": (1, "run_bash_oracle: the oracle itself"),
+    "tests/test_bash_oracle.py": (1, "runs the oracle itself, reading its stdout slowly"),
 }
 
 _SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "busybox"}
@@ -289,6 +304,15 @@ def _argv_may_run_a_shell(argv: list) -> bool:
     return not isinstance(head, ast.Constant) and ast.unparse(head) != "sys.executable"
 
 
+def _keyword_may_run_a_shell(k: ast.keyword) -> bool:
+    if k.arg is None:  # **kwargs may carry shell=True or executable=
+        return True
+    if k.arg == "shell":
+        return not (isinstance(k.value, ast.Constant) and k.value.value is False)
+    # executable= replaces argv[0] as the program actually run.
+    return k.arg == "executable" and _program(k.value) not in {"python", "python3"}
+
+
 def _spawns_real_shell(call: ast.Call, imports: dict) -> bool:
     """A call that may hand a string to a shell: a shell anywhere in argv, shell=True, os.system..."""
     name = _call_name(call, imports)
@@ -298,7 +322,7 @@ def _spawns_real_shell(call: ast.Call, imports: dict) -> bool:
         return _argv_may_run_a_shell(list(call.args))
     if name not in _SPAWNERS:
         return False
-    if any(k.arg == "shell" and not (isinstance(k.value, ast.Constant) and k.value.value is False) for k in call.keywords):
+    if any(_keyword_may_run_a_shell(k) for k in call.keywords):
         return True
     argv = call.args[0] if call.args else None
     # An argv the source does not spell out may be a shell.
@@ -352,6 +376,10 @@ def test_no_real_shell_outside_the_oracle():
         ('subprocess.run("x", shell=True)', True),
         ('subprocess.check_output(["git", "log"])', False),
         ('subprocess.run([sys.executable, "-c", code])', False),
+        ('subprocess.run(["oracle", "-c", c], executable="/bin/bash")', True),
+        ('subprocess.run(["x", "-c", c], executable=prog)', True),
+        ('subprocess.run(["x"], **{"shell": True})', True),
+        ("subprocess.run(argv_list, **opts)", True),
         ("os.system(c)", True),
         ("os.execvp(c, [c])", True),
         ("cursor.execute(sql)", False),

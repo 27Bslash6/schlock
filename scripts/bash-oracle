@@ -157,6 +157,9 @@ env -i PATH=/usr/bin:/bin \
     --remount-ro / \
     bash -c "$bootstrap" bash "$1" \
     3> "$marker" < /dev/null > "$out" 2> "$err" || status=$?
+# Measured before replaying output, so a slow reader of our stdout cannot turn a completed
+# command into a timeout.
+elapsed_us=$((${EPOCHREALTIME/./} - started))
 
 cat "$out"
 cat "$err" >&2
@@ -167,7 +170,7 @@ if [[ ! -s "$marker" ]]; then
   AppArmor (kernel.apparmor_restrict_unprivileged_userns=1); CONTRIBUTING.md has the profile."
 fi
 # timeout also exits 124 when the command itself does; only elapsed time tells them apart.
-if ((status == 124 && ${EPOCHREALTIME/./} - started >= timeout_s * 1000000)); then
+if ((status == 124 && elapsed_us >= timeout_s * 1000000)); then
     status_line "timeout=$timeout_s"
     exit 124
 fi
