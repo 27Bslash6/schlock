@@ -55,13 +55,22 @@
         bashlex reads when it re-parses the rewrite - rather than by asserting a verdict.
      Bash's tokenization is what it must match, so every behavioural change here is decided by
      running real bash first and pinned by a test that names what bash did.
+   - **Approved exception — decoding `$'...'` and `$"..."` words.** bashlex finds these words'
+     boundaries but dequotes them wrongly (`$'rm\t-rf\t/'` reads as `$rmt-rft/`), so
+     `_DollarQuoteDecoder` in `src/schlock/core/parser.py` re-reads each such word's source span
+     with bash's quoting rules (`_dequote`, `_ansi_c_quote`, `_ansi_c_escape`) and rewrites its
+     text on every parse. It holds only while: bashlex has already fixed the word's boundaries and
+     built its expansion nodes, whose spans are copied raw; it decides no structure and no verdict
+     (the decoded word still goes through every rule); and any escape, quote or expansion it does
+     not model raises `ParseError` rather than guess. Every change is decided by running real bash
+     first.
    - **Approved exception — re-reading one redirect target.** bashlex mis-dequotes some
      targets (`/dev/$'sda'`, `""'/dev/sda'`), so `_redirect_words` in
      `src/schlock/core/parser.py` re-reads the target's own source span with a quote-run regex
      and `shlex`. It holds only while: bashlex has already fixed the word's boundaries; it
      decides no structure and no verdict (the word still goes through every rule); and any span
      it cannot read exactly (a backslash, or not one `shlex` word) keeps the word as `parse()`
-     left it, which `_DollarQuoteDecoder` has already read the way bash does.
+     left it: bashlex's reading, or `_DollarQuoteDecoder`'s for a `$'...'` / `$"..."` word.
    - **Approved exception — recognising a `{varname}` redirect prefix.** bashlex splits
      `{fd}>out` into a word `{fd}` plus a redirect, though bash never passes `{fd}` as an
      argument, so `_mark_fd_variables` in `src/schlock/core/parser.py` tags that one word at

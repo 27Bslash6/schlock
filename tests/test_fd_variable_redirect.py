@@ -165,7 +165,9 @@ class TestLookalikesStayArguments:
         [
             '{f"d"}<in',  # a quote in the NAME
             '{"fd"}<in',
-            "{$'fd'}<in",  # decoded before the prefix is read, so read like `{"fd"}`
+            # bash passes `{fd}` as an argument for these three, as for `{"fd"}`; the decoder
+            # runs before the prefix is read, so they are refused like it
+            "{$'fd'}<in",
             "{f$'d'}<in",
             '{$"fd"}<in',
             "{fd[]}<in",  # an empty subscript

@@ -931,9 +931,10 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     # so `\"` would shift every quoted run after it, and inside `$'…'` a backslash may be
     # an ANSI-C escape that shlex cannot decode. Without a rebuild (a backslash, or a
     # span shlex cannot read as one word, such as whitespace inside `$(…)`) the word
-    # stays as parse() left it: _DollarQuoteDecoder has already read every `$'…'` /
-    # `$"…"` word the way bash does, markers gone. Stripping a leading `$` from that
-    # text would eat a real one: `> $"$HOME"/.bash\rc` would write `HOME/.bashrc`.
+    # stays as parse() left it: bashlex's reading, except that _DollarQuoteDecoder has
+    # already read every `$'…'` / `$"…"` word the way bash does, markers gone. Stripping
+    # a leading `$` from that text would eat a real one: `> $"$HOME"/.bash\rc` would
+    # write `HOME/.bashrc`.
     target_pos = getattr(target, "pos", None)
     span = command[target_pos[0] : target_pos[1]] if command is not None and target_pos else ""
     rebuilt: list[str] = []
