@@ -760,7 +760,7 @@ _PAYLOAD_BARE = {
 class TestGitEnvAssignmentValueIsJudged:
     """A git exec variable's value is judged as the command it will run.
 
-    A prefix assignment arms only its own command line; `export` arms the
+    A prefix assignment arms only its own command line; export arms the
     session, and the verdict is still the payload's. So the payload's verdict
     is the right one: no lower (the value must not be suppressed as a string
     literal) and no higher (everyday editors, pagers and ssh wrappers must not
