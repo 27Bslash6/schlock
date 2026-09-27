@@ -157,7 +157,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 
 ```bash
 /plugin marketplace add 27b-io/schlock
-/plugin install schlock@schlock
+/plugin install schlock@27b
 /schlock:setup   # Optional - configure preferences
 ```
 

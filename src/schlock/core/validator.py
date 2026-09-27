@@ -24,7 +24,15 @@ from schlock.integrations.shellcheck import (
 )
 
 from .cache import ValidationCache
-from .parser import FD_VARIABLE, WRAPPER_COMMANDS, BashCommandParser, has_compound_redirects, heredoc_owner, reset_parse_budget
+from .parser import (
+    FD_VARIABLE,
+    SHELL_COMMANDS,
+    WRAPPER_COMMANDS,
+    BashCommandParser,
+    has_compound_redirects,
+    heredoc_owner,
+    reset_parse_budget,
+)
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
 
@@ -456,16 +464,16 @@ def _check_dangerous_command_flags(
 # suppression - then treats it as an inert string. So `bash "-c" "rm -rf /"` came back SAFE
 # while the bare payload was BLOCKED. The fix re-enters validation on the payload.
 #
-# Shells: `-c PROG` runs PROG, and a LEADING operand is the script to run, which ends option
-# parsing (`bash deploy.sh -c production` passes -c to the script, not to bash).
-_SHELL_COMMANDS: frozenset[str] = frozenset({"bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish", "rbash"})
-
+# Shells (the parser's SHELL_COMMANDS, the one shell set): `-c PROG` runs PROG, and a LEADING
+# operand is the script to run, which ends option parsing (`bash deploy.sh -c production`
+# passes -c to the script, not to bash).
+#
 # Not shells, but their `-c` argument is a command string they hand to one. Their leading
 # operand is a user/group/file rather than a script, so it must NOT end option parsing
 # (`sg root -c PROG`, `su postgres -c PROG`).
 _DASH_C_RUNNERS: frozenset[str] = frozenset({"su", "runuser", "sg", "script"})
 
-_DASH_C_PROGRAM_COMMANDS: frozenset[str] = _SHELL_COMMANDS | _DASH_C_RUNNERS
+_DASH_C_PROGRAM_COMMANDS: frozenset[str] = SHELL_COMMANDS | _DASH_C_RUNNERS
 
 # Depth cap for re-entering validation on a payload. Reachable in practice only by chaining
 # `watch` (shell quoting collapses before `bash -c` can nest this far), so it is a backstop,
@@ -640,7 +648,7 @@ def _shell_delegated_payloads(
     `git config <exec-key> PROG` (LAB-4264), whose hand-off is DEFERRED — git runs PROG through a
     shell on every later git command in that repo or for that user, not at this command.
 
-    Here-strings (`bash <<< "..."`) ride a redirect node the word-walker never sees, so they
+    Here-strings (`bash <<< "..."`) are a redirect word, not an argument, so they
     are surfaced by `parser.extract_stdin_program_redirects` instead and fed into the same
     Step 5c re-entry as these payloads (LAB-2768).
 
@@ -691,7 +699,7 @@ def _shell_delegated_payloads(
                 found.extend(_shell_delegated_payloads([(clause[0], clause[1:])], _seen=seen))
         else:
             if base in _DASH_C_PROGRAM_COMMANDS:
-                found.append(_dash_c_payload(args, operand_ends_options=base in _SHELL_COMMANDS))
+                found.append(_dash_c_payload(args, operand_ends_options=base in SHELL_COMMANDS))
             if base in WRAPPER_COMMANDS:
                 # `sudo bash -c ...`, `timeout 5 sg root -c ...`, `timeout 5 watch ...`: re-enter
                 # the FULL extractor on every arg position that names a recognized command, so
@@ -1653,6 +1661,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     openers: list[tuple[str, bool, int, int]] = []
     continued = False
     pos = 0
+    after_escape = -1  # index just past the last `\x` pair; the `#` branch reads it
     opener_serials: list[int] = []
     if scan.contexts[-1].prefix:
         scan.contexts[-1].start = 0  # a word begun on an earlier line continues from the first column
@@ -1811,6 +1820,7 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             continued = pos + 1 >= len(line)
             out.append(line[pos : pos + 2])
             pos += 2
+            after_escape = pos
         elif char == "$" and pos + 1 < len(line) and line[pos + 1] in "'\"":
             # $'…' is ANSI-C quoting, $"…" is locale translation; $" is
             # otherwise an ordinary double quote.
@@ -1835,7 +1845,13 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             ctx.glob = True  # a glob character; no later `[` in this word is a subscript either
             out.append(char)
             pos += 1
-        elif char == "#" and not frames and not ctx.prefix and (pos == 0 or line[pos - 1] in _WORD_START_AFTER):
+        elif (
+            char == "#"
+            and not frames
+            and not ctx.prefix
+            and pos != after_escape
+            and (pos == 0 or line[pos - 1] in _WORD_START_AFTER)
+        ):
             # `#` is ordinary inside every frame - `${#x}`, `${x#pre}` - so the
             # comment branch must not abandon the scan mid-expansion. An open
             # word rules it out too, for its own reason: `ctx.prefix` means text
@@ -1847,6 +1863,11 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
             # The cost of using `prefix` is that a lone operator can be the folded
             # text - `cat >\<newline>#f` reads `#f` as a word - which is a shape
             # bash rejects outright, so it can invent an opener but not hide one.
+            # `pos != after_escape` is the same rule for an escape on this line:
+            # `cat \ #x` is the one argument ` #x`, and the raw lookup at
+            # `line[pos - 1]` cannot tell that escaped blank from a real one.
+            # Read as a comment, the logical line ends early and the commands
+            # after it are handed to _neuter_heredocs as body text.
             out.append(line[pos:])  # comment: text, not shell
             break
         elif line.startswith("<<<", pos):
@@ -2032,7 +2053,7 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     bodies: list[str] = []
     for opener_start, body_start, body_end in blanked:
         owner = owners.get(opener_start)
-        if owner is not None and owner not in _SHELL_COMMANDS:
+        if owner is not None and owner not in SHELL_COMMANDS:
             continue
         if command[body_start:body_end].strip():
             bodies.append(command[body_start:body_end])
@@ -2507,7 +2528,7 @@ def _escalate_past_heredoc(
     # `_bashlex_heredocs`' reading; an unquoted shell body is refused too, for simplicity,
     # though it was kept.
     for heredoc in heredocs:
-        if heredoc.owner is None or heredoc.owner in _SHELL_COMMANDS:
+        if heredoc.owner is None or heredoc.owner in SHELL_COMMANDS:
             return _unreadable_program(heredoc.owner)
     segments = parser.extract_command_segments(neutered, nodes)
 
@@ -2603,7 +2624,7 @@ def validate_command(
     """Validate a command for safety — the main validation API.
 
     Runs every pass (:func:`_validate_command`), then joins the verdict with any substitution
-    verdict above SAFE too weak to have short-circuited it. The join lives HERE, outside the
+    verdict above SAFE that did not short-circuit it (all but a rule-named BLOCKED). The join lives HERE, outside the
     passes, because a join made at any one pass is a join the passes added after it will miss:
     that is precisely how a BLOCKED netcat backdoor and a BLOCKED pipeline segment each walked
     back down to HIGH merely by having a substitution appended. Whatever returns first, the
@@ -2649,15 +2670,16 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
     config_path: Optional[str] = None,
     *,
     _depth: int = 0,
-    _deferred: Optional[list[SubstitutionValidationResult]] = None,
+    _deferred: list[SubstitutionValidationResult],
     _shellcheck: bool = True,
     _derived: bool = False,
 ) -> ValidationResult:
     """Run every validation pass. Call :func:`validate_command` instead.
 
-    ``_deferred`` is an out-parameter: a substitution verdict above SAFE and below BLOCKED is placed
-    there for the caller to join. It is a list rather than a return value so that every one of
-    this function's returns carries it without having to remember to.
+    ``_deferred`` is an out-parameter: a substitution verdict above SAFE, other than a rule-named
+    BLOCKED, is placed there for the caller to join. It is a list rather than a return value so
+    that every one of this function's returns carries it without having to remember to. It is
+    required: a caller that passed none would silently drop every deferred verdict.
 
     Validate command for safety.
 
@@ -2821,16 +2843,20 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # a blocked segment). A weaker substitution verdict returned here therefore DOWNGRADED
             # commands those passes deny outright. Consulting match_command() from here does not
             # fix it: that helper is whitelist-gated, so a whitelisted first word makes it report
-            # SAFE for the whole command. Only a genuine BLOCKED verdict short-circuits; anything
-            # weaker is handed to the caller, which joins it against the completed verdict.
+            # SAFE for the whole command. Only a BLOCKED verdict that names its rule short-circuits;
+            # anything else is handed to the caller, which joins it against the completed verdict.
             for sub_result in sub_results:
                 # An allowed verdict above SAFE is a rule match that decides the level (LAB-4223):
                 # it is owed the join too, and deferring it also keeps the pre-join verdict uncached.
                 if sub_result.allowed and sub_result.risk_level == RiskLevel.SAFE:
                     continue
-                if sub_result.risk_level == RiskLevel.BLOCKED:
+                # A BLOCKED verdict that names no rule (the non-simple-command guard, a blacklist
+                # hit, a depth or topology refusal) is deferred too, so a later pass can name one:
+                # returned here, `echo "$(:(){ :|:& };:)"` stayed BLOCKED but lost `fork_bomb` from
+                # the audit log. It still wins the join, since nothing outranks BLOCKED.
+                if sub_result.risk_level == RiskLevel.BLOCKED and sub_result.matched_rules:
                     return _substitution_verdict(sub_result)
-                if _deferred is not None and (not _deferred or sub_result.risk_level > _deferred[-1].risk_level):
+                if not _deferred or sub_result.risk_level > _deferred[0].risk_level:
                     _deferred[:] = [sub_result]
 
             # SECURITY: Pure AST-based dangerous command detection
@@ -2848,9 +2874,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # not bash and would be nonsense to re-check). Fed into the Step 5c re-entry below.
             herestring_payloads = list(
                 dict.fromkeys(
-                    prog
-                    for name, prog in parser.extract_stdin_program_redirects(ast)
-                    if name in _SHELL_COMMANDS and prog.strip()
+                    prog for name, prog in parser.extract_stdin_program_redirects(ast) if name in SHELL_COMMANDS and prog.strip()
                 )
             )
 
