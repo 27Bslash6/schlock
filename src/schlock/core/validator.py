@@ -691,8 +691,10 @@ def _hands_next_arg_to_a_shell(program: str) -> bool:
     """Whether rsync's `-e` program runs the argument rsync appends to it as shell code.
 
     Asked of the same extractor, with a stand-in argument appended, so every spelling it knows
-    (`sh -c`, `sudo bash -c --`, `watch`) answers identically. A program shlex cannot split is
-    treated as one that does: rsync's own split is not bash's, and the unknown fails closed.
+    (`sh -c`, `sudo bash -c --`, `watch echo`) answers identically. `watch` joins its words into
+    one program, so the stand-in is looked for inside each payload, not as a whole one. A program
+    shlex cannot split is assumed to be such a shell: rsync's own split is not bash's, and assuming
+    the worst over-approximates.
     """
     try:
         words = shlex.split(program)
@@ -700,24 +702,8 @@ def _hands_next_arg_to_a_shell(program: str) -> bool:
         return True
     if not words:
         return False
-    return _RSYNC_APPENDED_ARG in _shell_delegated_payloads([(words[0], [*words[1:], _RSYNC_APPENDED_ARG])])
-
-
-def _rsync_remote_words(operand: str) -> list[str]:
-    """Return the words rsync appends to its `-e` program for one operand: USER and HOST.
-
-    rsync execs `PROG [-l USER] HOST rsync --server ...`, splitting `[USER@]HOST:PATH` at the first
-    `:` and then at the last `@`, and taking `rsync://[USER@]HOST[:PORT]/...` up to the `/` and the
-    port (rsync 3.2.7, read back with an argv-dumping `-e` program). Each part is one argv word,
-    spaces and all. An operand with a `/` before its first `:` is local to rsync; reading its head
-    anyway only over-approximates.
-    """
-    if operand.startswith("rsync://"):
-        operand = operand[len("rsync://") :]
-    elif ":" not in operand:
-        return []  # a local path: nothing of it reaches the remote shell
-    user, _, host = re.split(r"[:/]", operand, maxsplit=1)[0].rpartition("@")
-    return [word for word in (user, host) if word]
+    payloads = _shell_delegated_payloads([(words[0], [*words[1:], _RSYNC_APPENDED_ARG])])
+    return any(_RSYNC_APPENDED_ARG in payload for payload in payloads)
 
 
 def _rsync_payloads(args: list[str]) -> list[str]:
@@ -725,27 +711,30 @@ def _rsync_payloads(args: list[str]) -> list[str]:
 
     rsync splits PROG itself (spaces and quotes, no shell) and execs it only when one side is
     remote, but PROG may itself be a shell (`-e "sh -c '...'"`), so it is re-validated as bash:
-    that over-approximates rsync's own split, and locality is not judged at all, because
+    that over-approximates rsync's own split. Whether a side is remote is not judged, because
     `host:path` cannot be told reliably from a local name containing a colon. popt reads options
     after the operands too (`rsync a host:b -e PROG`), so every word up to `--` is scanned; it
     has no long-option abbreviations (`--rs` is unknown), so only the exact `--rsh` is matched.
+    popt drops one `=` before an attached short value (`-e=PROG` runs PROG, verified).
 
-    When PROG runs its next argument as shell code (`-e 'sh -c'`), that argument is the operand's
-    USER or HOST (see _rsync_remote_words), so those are returned too.
+    Raises ValueError when PROG runs its next argument as shell code (`-e 'sh -c'`). rsync execs
+    `PROG [-l USER] HOST rsync --server ...`, so that argument is text taken from an operand, and
+    reading it would mean copying rsync's host parser exactly (brackets, `@`, `rsync://`), where
+    every drift is a bypass. No ordinary remote shell (ssh, rsh, `kubectl exec -i`) has that
+    shape, so the command is refused instead, through the same fail-closed path as
+    MAX_DELEGATOR_TOKENS.
 
     Values of the other options are not skipped: a value letter other than `e` ends its cluster
     without consuming the next word, and a long option's value (`--filter X`) is read as a word
     of its own. Whether popt hands that word to the option (`-f -e PROG`) is left unmodelled:
-    reading it as a possible `-e` or operand over-approximates, which is the safe direction.
+    reading it as a possible `-e` over-approximates, which is the safe direction.
     """
     payloads = []
-    operands = []
     i = 0
     while i < len(args):
         word = args[i]
         i += 1
         if word == "--":
-            operands.extend(args[i:])
             break
         if word == "--rsh" and i < len(args):
             word = f"--rsh={args[i]}"
@@ -753,23 +742,24 @@ def _rsync_payloads(args: list[str]) -> list[str]:
         if word.startswith("--rsh="):
             payloads.append(word[len("--rsh=") :])
             continue
-        if not word.startswith("-"):
-            operands.append(word)
-            continue
-        if word.startswith("--"):
+        if word.startswith("--") or not word.startswith("-"):
             continue
         for pos, letter in enumerate(word[1:], 2):
             if letter not in _RSYNC_VALUE_LETTERS:
                 continue
             if letter == "e":
                 if pos < len(word):
-                    payloads.append(word[pos:])
+                    attached = word[pos:]
+                    payloads.append(attached[1:] if attached.startswith("=") else attached)
                 elif i < len(args):
                     payloads.append(args[i])
                     i += 1
             break
     if any(_hands_next_arg_to_a_shell(program) for program in payloads):
-        payloads.extend(word for operand in operands for word in _rsync_remote_words(operand))
+        raise ValueError(
+            "rsync -e/--rsh program runs its next argument, the remote host rsync appends from an operand, "
+            "as shell code; use a remote shell such as ssh"
+        )
     return payloads
 
 
