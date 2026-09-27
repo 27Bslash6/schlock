@@ -74,6 +74,17 @@
      widen the allowlist by modelling bash's subscript grammar: four review rounds of that
      never converged. Leaving a real prefix untagged is the bypass, so an uncertain reading
      must raise, never fall back to "argument". Every spelling is decided by real bash first.
+   - **Approved exception — the in-word quote scan** (`_quote_pairs` in
+     `src/schlock/core/parser.py`, LAB-4950). bashlex drops substitution nodes from words that
+     mix quoted runs with code (`'a'$(x)'b'`, `"a"<(x)"b"`). The scan reads one word bashlex
+     already delimited and only locates quote pairs and code openers. Bodies are still parsed by
+     bashlex. A body it cannot place raises `ParseError`, and a word it cannot read earns no
+     literal range. In a word holding a line continuation bashlex's part offsets are shifted, so
+     every code part there is rebuilt from the source and parameter parts are never skip targets.
+     When such a word's quoting cannot be followed after its code parts were dropped (a `"`
+     nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
+     shares the parse's CPU budget.
+     The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
@@ -134,15 +145,15 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 
 **Command Whitelist**: User-level config (`~/.config/schlock/config.yaml`) supports `whitelist:` — a list of regex patterns that bypass ALL rules including BLOCKED. Project-level config cannot define whitelist patterns (privilege escalation risk). See `docs/CONFIGURATION.md`.
 
-**Self-Protection**: Three-layer defense prevents LLM agents from modifying schlock config:
+**Self-Protection**: Three-layer defense prevents LLM agents from modifying schlock config and its vendored parser files (`.claude-plugin/bin/`, `.claude-plugin/vendor/`):
 1. YAML rules (`14_self_protection.yaml`, BLOCKED) — can't be overridden
-2. Hardcoded validator check (`_check_self_protection`) — independent of YAML rules
-3. Dedicated PreToolUse hook (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting config files
+2. Hardcoded validator check (`_check_self_protection`) — independent of YAML rules; its read allowlist admits only bare readers, and excludes any that can run another program (e.g. rg, bat, less, view)
+3. Dedicated PreToolUse hook (`self_protect.py`, matcher `Write|Edit|MultiEdit|NotebookEdit`) — blocks Write/Edit tool calls targeting protected paths
 
 ## Installation
 
 ```bash
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 /plugin install schlock@schlock
 /schlock:setup   # Optional - configure preferences
 ```
@@ -175,5 +186,5 @@ Config files: `release-please-config.json`, `.release-please-manifest.json`
 - **Publisher**: 27B.io
 - **License**: WTFPL
 - **Python**: >=3.9
-- **Repository**: https://github.com/27Bslash6/schlock
+- **Repository**: https://github.com/27b-io/schlock
 - **Dependencies**: `bashlex>=0.18`, `pyyaml>=6.0` (vendored)
