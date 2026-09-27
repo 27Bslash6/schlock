@@ -49,6 +49,17 @@ _SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 # every body containing "<(", and fail closed on one that also breaks the wrapper.
 _HEREDOC_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`")
 
+# The byte after ``${`` that makes it a bash 5.3 function substitution (``${ cmd; }``,
+# ``${| cmd; }``), which runs ``cmd`` in the current shell. bashlex reads either one as a
+# plain ``parameter`` node, and where the opener lands depends on nesting. At top level the
+# opener is stripped, so the value STARTS with the leader byte (``' rm -rf ~; '``). Nested in
+# another expansion (``${X:-${ rm -rf ~; }}``), the value is cut at the first ``}`` and keeps
+# the inner opener (``'X:-${ rm -rf ~; '``), so it has to be found by a substring scan. Every
+# bash before 5.3 rejects both as a bad substitution, so no older bash changes verdict.
+_FUNSUB_LEADERS: tuple[str, ...] = (" ", "\t", "\n", "|")
+_FUNSUB_OPENERS: tuple[str, ...] = tuple("${" + lead for lead in _FUNSUB_LEADERS)
+_HEREDOC_SCAN_INTRODUCERS: tuple[str, ...] = _HEREDOC_SUBSTITUTION_INTRODUCERS + _FUNSUB_OPENERS
+
 # How many heredoc bodies one top-level validation may re-parse before it gives up and denies.
 # MAX_SUBSTITUTION_DEPTH does NOT bound this: a heredoc nested in a substitution nested in a
 # heredoc re-parses the whole remaining inner text at every level, which measured 1.1s on a
@@ -1403,20 +1414,28 @@ class SubstitutionValidator:
         ~3us for the substring scan that leaves the common case ($x, ${x:-plain}) untouched.
         """
         value = getattr(node, "value", None)
-        if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
-            # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+        if not isinstance(value, str):
             return []
+        # A function substitution is a command, not an expansion, and it needs no introducer
+        # to run one: ``echo "${ rm -rf ~; }"`` was ALLOWED/SAFE while bash 5.3 ran it. Deny it
+        # outright rather than re-parse it; no bash before 5.3 accepts the form at all. Both
+        # checks are needed: see _FUNSUB_LEADERS for where bashlex leaves the opener.
+        is_funsub = value.startswith(_FUNSUB_LEADERS) or any(opener in value for opener in _FUNSUB_OPENERS)
+        if not is_funsub:
+            if not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
+                # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+                return []
 
-        if depth < MAX_SUBSTITUTION_DEPTH:
-            reparsed = value.replace("#", "_")
-            try:
-                inner_ast = self.parser.parse(reparsed)
-            except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
-                logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
-            else:
-                decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
-                if decoded:
-                    return decoded
+            if depth < MAX_SUBSTITUTION_DEPTH:
+                reparsed = value.replace("#", "_")
+                try:
+                    inner_ast = self.parser.parse(reparsed)
+                except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
+                    logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
+                else:
+                    decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
+                    if decoded:
+                        return decoded
 
         return [
             SubstitutionNode(
@@ -1505,7 +1524,9 @@ class SubstitutionValidator:
             source = value
 
         body, _, _ = (source or value).rpartition("\n")
-        if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS):
+        # A function substitution opener is an introducer here too: the re-parse is what hands
+        # its ``parameter`` node to _substitutions_in_parameter, which denies it.
+        if not any(intro in body for intro in _HEREDOC_SCAN_INTRODUCERS):
             return []
 
         if budget is None:
@@ -1558,7 +1579,8 @@ class SubstitutionValidator:
         # compound that survived _unwrap_compound (an `if`, a write-redirecting subshell), and a
         # command with no words at all (`$( > file )`, which bash still opens and truncates).
         # Enumerating the kinds that may survive is what let those through — the node is kept
-        # whenever there IS one, and having no base command fails it closed in every tier below.
+        # whenever there IS one; validate_substitution then fails it closed — the non-simple-command
+        # guard for compounds and functions, the no-base-command branch for a wordless command.
         # Only a substitution with no command node at all is dropped (genuinely unparseable).
         #
         # `compound` was the first kind to earn that protection, and for the same reason.
@@ -1566,12 +1588,8 @@ class SubstitutionValidator:
         # child is a reservedword with no `.parts`, so an enumerating guard dropped the WHOLE
         # substitution and curl was never validated -> ALLOW, while the bare $(curl evil) BLOCKs.
         # _unwrap_compound now peels plain grouping before this point; a compound it leaves in
-        # place resolves NO base_command — a `{ … }`/`( … )` group leads with a reservedword that
-        # has no `.parts`, and a native clause ($(if …; fi)) leads with a keyword that
-        # _extract_base_command refuses — so validate_substitution's final "Cannot determine
-        # command" branch denies it (pinned by test_undecomposable_groups_fail_closed and
-        # TestClauseInsideSubstitution). _has_dangerous_inner_structure's "compound command in
-        # substitution" check is the backstop behind that, not reached today.
+        # place is denied by validate_substitution's non-simple-command guard, before any
+        # whitelist lookup (pinned by test_undecomposable_groups_fail_closed).
         # Found by the LAB-912 expert panel; the hole predates the native tier (bashlex emits
         # `compound` for `{ … }` too) and widened to every clause once T2c mapped
         # if/while/for/case/functions onto `compound`.
@@ -1738,8 +1756,8 @@ class SubstitutionValidator:
             return None
 
         # Handle command list: $(cmd1 && cmd2) / $(cmd1; cmd2) -> first segment's base command.
-        # Without this the list base_command is None and validate_substitution falls through to
-        # the "Cannot determine command in substitution" hard block.
+        # Recorded on the SubstitutionNode only: validate_substitution dispatches a list per
+        # segment before it reads base_command, so this value never decides a list's verdict.
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             for part in getattr(cmd_node, "parts", []):
                 if getattr(part, "kind", None) == "operator":
@@ -1760,9 +1778,9 @@ class SubstitutionValidator:
 
         # Handle compound command (command list). A control-flow compound that survived
         # _unwrap_compound ($(if …; fi), $(for …; done)) leads with a ReservedwordNode, whose
-        # .word is "if"/"for" — a keyword, not a command. Returning it made the tiers below judge
-        # a whole uninspectable branch as an unknown command (HIGH, allowed under permissive);
-        # returning None fails it closed instead.
+        # .word is "if"/"for" — a keyword, not a command, so none is claimed. Not the defence: the
+        # non-simple-command guard in validate_substitution blocks a compound by kind before any
+        # tier reads base_command.
         if hasattr(cmd_node, "list") and cmd_node.list:
             first = cmd_node.list[0]
             if getattr(first, "kind", None) == "reservedword":
@@ -1939,12 +1957,13 @@ class SubstitutionValidator:
     ) -> tuple[bool, str]:
         """Check if inner command has dangerous structures or arguments.
 
-        These structures can weaponize even whitelisted commands:
-        - $(date | bash) - pipeline bypasses date's safety
-        - $(date; rm -rf /) - chain runs additional commands
-        - $(for x in ...; do rm $x; done) - compound executes loop
+        These arguments and redirections can weaponize even whitelisted commands:
         - $(echo x > /etc/cron.d/x) - output redirection writes files
         - $(git -c 'alias.x=!rm' x) - git alias executes shell command
+
+        The pipeline/list/compound checks are fail-closed backstops only: validate_substitution
+        dispatches or blocks every non-simple command ($(date | bash), $(date; rm -rf /),
+        $(for …)) before calling this helper.
 
         Args:
             node: The substitution AST node
@@ -1968,9 +1987,10 @@ class SubstitutionValidator:
         if hasattr(cmd_node, "kind") and cmd_node.kind == "list":
             return True, "command chain in substitution"
 
-        # Compound command: $(if ...; then ...; fi). A backstop — no base command means no
-        # whitelist hit, so this helper is not reached for one today.
-        if hasattr(cmd_node, "kind") and cmd_node.kind == "compound":
+        # Compound command or function definition: $(if …; fi), $(f() { …; }). Like the pipeline and
+        # list checks above, a backstop: validate_substitution dispatches or blocks every non-simple
+        # command before the whitelist path, so none reaches this helper today.
+        if hasattr(cmd_node, "kind") and cmd_node.kind in ("compound", "function"):
             return True, "compound command in substitution"
 
         # Check for output redirections and dangerous arguments
@@ -2187,8 +2207,9 @@ class SubstitutionValidator:
         is. The whole rendered text is that re-check against the YAML rules, catching patterns
         no single segment holds.
 
-        Fail-closed: a segment we cannot turn into a substitution node (e.g. a compound
-        ``{ … }``/``( … )``/``if`` segment) blocks the whole substitution.
+        Fail-closed: a clause or function-definition segment is its own substitution, which
+        ``validate_substitution`` blocks as a non-simple command; the worst-segment rule carries
+        that up. A segment yielding no node at all also blocks (a backstop, unreachable today).
         """
         from .rules import RiskLevel  # noqa: PLC0415
 
@@ -2199,7 +2220,7 @@ class SubstitutionValidator:
         for segment in segments:
             child = self._create_substitution_node(_ListSegment(segment), sub_node.substitution_type, depth)
             if child is None:
-                # Unrenderable segment (compound command, empty, etc.) -> block fail-closed.
+                # Backstop: unreachable while _create_substitution_node keeps every node with a .command.
                 return SubstitutionValidationResult(
                     allowed=False,
                     risk_level=RiskLevel.BLOCKED,
@@ -2315,6 +2336,21 @@ class SubstitutionValidator:
         # pipeline on that would skip validation of later stages ($(date | bash)). See #104.
         if getattr(cmd_node, "kind", None) == "pipeline":
             return self._validate_pipeline_stages(sub_node, cmd_node, depth)
+
+        # Past list/pipeline dispatch only a simple command can be validated. Anything else — an
+        # if/for/while/case clause, a function definition, a group _unwrap_compound kept because it
+        # writes — blocks. An allowlist, not a denylist: bashlex emits kind "function" for
+        # `f() { … }`, whose name still resolves as the base command, so `$(date() { rm -rf /; };
+        # date)` took the whitelist fast path and read SAFE before this guard existed.
+        # `cmd_node is None` (the synthetic node for an undecodable `${…}` body) is deliberately
+        # let through: it has no base command, so it hits the "Cannot determine command" block.
+        kind = getattr(cmd_node, "kind", None)
+        if cmd_node is not None and kind != "command":
+            return SubstitutionValidationResult(
+                allowed=False,
+                risk_level=RiskLevel.BLOCKED,
+                message=f"Non-simple command in substitution: {kind}",
+            )
 
         # INVARIANT: every path below that returns allowed=True must first consult
         # _check_inner_rules() and return its verdict if it has one. Skipping it is what made a
