@@ -49,6 +49,17 @@ _SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 # every body containing "<(", and fail closed on one that also breaks the wrapper.
 _HEREDOC_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`")
 
+# The byte after ``${`` that makes it a bash 5.3 function substitution (``${ cmd; }``,
+# ``${| cmd; }``), which runs ``cmd`` in the current shell. bashlex reads either one as a
+# plain ``parameter`` node, and where the opener lands depends on nesting. At top level the
+# opener is stripped, so the value STARTS with the leader byte (``' rm -rf ~; '``). Nested in
+# another expansion (``${X:-${ rm -rf ~; }}``), the value is cut at the first ``}`` and keeps
+# the inner opener (``'X:-${ rm -rf ~; '``), so it has to be found by a substring scan. Every
+# bash before 5.3 rejects both as a bad substitution, so no older bash changes verdict.
+_FUNSUB_LEADERS: tuple[str, ...] = (" ", "\t", "\n", "|")
+_FUNSUB_OPENERS: tuple[str, ...] = tuple("${" + lead for lead in _FUNSUB_LEADERS)
+_HEREDOC_SCAN_INTRODUCERS: tuple[str, ...] = _HEREDOC_SUBSTITUTION_INTRODUCERS + _FUNSUB_OPENERS
+
 # How many heredoc bodies one top-level validation may re-parse before it gives up and denies.
 # MAX_SUBSTITUTION_DEPTH does NOT bound this: a heredoc nested in a substitution nested in a
 # heredoc re-parses the whole remaining inner text at every level, which measured 1.1s on a
@@ -1276,20 +1287,28 @@ class SubstitutionValidator:
         ~3us for the substring scan that leaves the common case ($x, ${x:-plain}) untouched.
         """
         value = getattr(node, "value", None)
-        if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
-            # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+        if not isinstance(value, str):
             return []
+        # A function substitution is a command, not an expansion, and it needs no introducer
+        # to run one: ``echo "${ rm -rf ~; }"`` was ALLOWED/SAFE while bash 5.3 ran it. Deny it
+        # outright rather than re-parse it; no bash before 5.3 accepts the form at all. Both
+        # checks are needed: see _FUNSUB_LEADERS for where bashlex leaves the opener.
+        is_funsub = value.startswith(_FUNSUB_LEADERS) or any(opener in value for opener in _FUNSUB_OPENERS)
+        if not is_funsub:
+            if not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
+                # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+                return []
 
-        if depth < MAX_SUBSTITUTION_DEPTH:
-            reparsed = value.replace("#", "_")
-            try:
-                inner_ast = self.parser.parse(reparsed)
-            except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
-                logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
-            else:
-                decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
-                if decoded:
-                    return decoded
+            if depth < MAX_SUBSTITUTION_DEPTH:
+                reparsed = value.replace("#", "_")
+                try:
+                    inner_ast = self.parser.parse(reparsed)
+                except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
+                    logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
+                else:
+                    decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
+                    if decoded:
+                        return decoded
 
         return [
             SubstitutionNode(
@@ -1378,7 +1397,9 @@ class SubstitutionValidator:
             source = value
 
         body, _, _ = (source or value).rpartition("\n")
-        if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS):
+        # A function substitution opener is an introducer here too: the re-parse is what hands
+        # its ``parameter`` node to _substitutions_in_parameter, which denies it.
+        if not any(intro in body for intro in _HEREDOC_SCAN_INTRODUCERS):
             return []
 
         if budget is None:
