@@ -96,17 +96,24 @@
      and rewrites each `<<` inside a pair bash reads as arithmetic to the same-width `==`. It
      holds only while all four constraints do:
      1. **Never trusted alone** — the rewrite and the command as written are both validated
-        and the worse verdict wins. The as-written half is main's pipeline, so the join can
-        deny more than main and never less. The matcher over-approximates on purpose (every
-        `((` is a candidate, since a missed one is the bypass), and an over-fired rewrite can
-        re-parent a real heredoc; the join is what makes that deny-side.
+        and the worse verdict wins. The as-written half is the pipeline without Step 3b, so
+        the join can deny more than that pipeline and never less. The matcher over-approximates
+        on purpose (every `((` is a candidate, since a missed one is the bypass), and an
+        over-fired rewrite can re-parent a real heredoc; the join is what makes that deny-side.
+        The join cannot recover a MISSED opener, so an opener is dropped as nested only when its
+        own pair was followed at paren level inside a region already collected: one skipped
+        inside a span an earlier walk opened (a decoy `((` whose quote bash never reads) is
+        asked fresh.
      2. **Cannot-follow fails closed** — a pair it cannot follow (`_UnfollowableParenError`:
         nesting too deep, a `case` or heredoc inside `$(…)`) is BLOCKED with that reason. Only
         a pair that provably never closes is skipped, because bash runs none of that text.
      3. **No verdicts of its own** beyond that refusal: the rewritten text goes through the
         same flow, so the payload is denied by the rule it matches.
-     4. **Linear** — every never-closes exit, including a quote or expansion that runs out of
-        text, is memoised, and the rewrite half shares the caller's parse budget.
+     4. **Linear** — the matcher does not run under the parse CPU budget, so its memo is its
+        only CPU bound: every pair it follows and every never-closes exit, including a quote or
+        expansion that runs out of text, is recorded and answered from the memo next time. The
+        two halves' bashlex parses share one budget, because the as-written half skips the
+        budget reset.
      Every reading is decided by running bash first.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.

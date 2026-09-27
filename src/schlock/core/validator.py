@@ -1483,23 +1483,31 @@ class _DoubleParen:
 def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tuple[int, int]]:
     """The outermost arithmetic regions among ``openers``, as ``(first offset inside, offset of the `)`)``.
 
-    Nested openers are dropped rather than yielded: every one of them lies
-    inside the region already collected, so collecting them again re-walks the
-    same text once per level. `(( (( (( … )) )) ))` is otherwise quadratic in
-    the nesting depth, on a hook that runs before every Bash call.
+    A nested opener is dropped rather than yielded when its own pair was
+    followed at paren level and closes inside the region already collected:
+    its shifts are that region's, so collecting it again re-scans the same text
+    once per level, and `(( (( (( … )) )) ))` is quadratic in the nesting depth.
+    A walk that pushed its `(` reads it exactly as a fresh walk would, so the
+    recorded partner is the answer it would get if asked.
+
+    An opener with NO recorded partner is asked, even when it sits before the
+    last closer. The walk that passed it may have skipped it inside a quote or
+    expansion that bash never reads as one: in `# (( "` / `(( a" ))"+1<<b ))`
+    the comment's `"` swallows the real `((` and the decoy closes on the `))`
+    in its quote, before the `<<`. Dropping the real opener by offset alone
+    left the payload after it hidden.
 
     Only an opener whose pair provably NEVER CLOSES is skipped: that is a bash
     syntax error, bash runs none of the text, so nothing is hidden behind it.
     An opener `_DoubleParen` cannot FOLLOW is a different answer and propagates
     as `_UnfollowableParenError` - bash may evaluate that arithmetic and run the
     lines after it, so dropping it is a bypass rather than a conservative skip.
-    This is the LAB-4270 lesson ("a missed opener only ever denies" is false)
-    in its third spelling; do not collapse the two arms back together.
+    Do not collapse the two arms back together.
     """
     regions: list[tuple[int, int]] = []
     collected_to = -1
     for opener in openers:
-        if opener < collected_to:
+        if dparen.partners.get(opener + 1, collected_to) < collected_to:
             continue
         try:
             if not dparen.is_arithmetic(opener):
@@ -1509,7 +1517,7 @@ def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tupl
         except ParseError:
             continue
         closer = dparen.partners[opener + 1]
-        collected_to = closer
+        collected_to = max(collected_to, closer)
         regions.append((opener + 2, closer))
     return regions
 
@@ -1521,7 +1529,7 @@ def _neuter_arithmetic_shifts(command: str) -> str:
     is a shift. bashlex reads the same bytes as two nested subshells, where
     `1 <<b` is a command owning a heredoc delimited by `b` - and every line up to
     a lone `b`, `rm -rf /` included, becomes a body that `extract_heredoc_ranges`
-    marks inert and no rule ever sees, while bash runs it (LAB-4317).
+    marks inert and no rule ever sees, while bash runs it.
 
     The two readings are told apart by `_DoubleParen`, which already models
     bash's matched-pair rule for the heredoc-fallback tier: the construct is
@@ -3020,7 +3028,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
 
         # Step 3b: a `<<` inside `(( … ))` is a left shift to bash and a heredoc
         # opener to bashlex, and the phantom body hides every line after it from
-        # the rules while bash runs them (LAB-4317). Rewriting the shift hands
+        # the rules while bash runs them. Rewriting the shift hands
         # those lines back to the flow below, which validates them on their
         # merits - so the verdict comes from the rule the payload matches. Only
         # the arithmetic command is handled here; `$(( … ))` is an expansion and

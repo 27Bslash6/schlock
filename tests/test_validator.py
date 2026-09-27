@@ -2338,8 +2338,8 @@ class TestHeredocSurroundings:
         denied it was the phantom-heredoc guard ("does not open"), which says
         that bashlex's reading cannot be trusted but not what the payload is.
 
-        The Step 3b guard rewrites the shift before bashlex sees the command
-        (LAB-4317), so the verdict now comes from the rule the payload matches;
+        The Step 3b guard rewrites the shift before bashlex sees the command,
+        so the verdict now comes from the rule the payload matches;
         the guard's own refusal is pinned by `..._fails_closed` below. Both
         halves are asserted: the fallback lexer still keeps the payload in its
         rewrite, and the end-to-end verdict names `system_destruction`.
@@ -3934,7 +3934,7 @@ def _regions(command: str) -> list[tuple[int, int]]:
     and 3.9's C tracer bills a linear character scan several times over while
     leaving C-level work untraced, which squeezed a 13.6x regression down to
     9.4x - a clock cannot be trusted across that, and a count of collected
-    regions is identical on every machine, tracer and interpreter (LAB-4337).
+    regions is identical on every machine, tracer and interpreter.
     """
     dparen = val_module._DoubleParen(command)
     return val_module._arithmetic_regions(dparen, dparen.command_level_openers())
@@ -3942,7 +3942,7 @@ def _regions(command: str) -> list[tuple[int, int]]:
 
 @pytest.mark.usefixtures("no_shellcheck")
 class TestArithmeticCommandShift:
-    """LAB-4317: a `<<` inside `(( … ))` is a left shift, not a heredoc opener.
+    """A `<<` inside `(( … ))` is a left shift, not a heredoc opener.
 
     bashlex reads `(( 1<<b ))` as two nested subshells, which makes `1 <<b` a
     command owning a heredoc delimited by `b` - so `rm -rf /` on the next line
@@ -3972,7 +3972,7 @@ class TestArithmeticCommandShift:
             ("(( 1<<b )) <<'Q'\nbody\nQ\nrm -rf /", "a real heredoc alongside the shift"),
             ("((1<<b\\) ))\nrm -rf /\nb", "an escaped `)` does not close the region"),
             ("cat <<'EOF'\nx\nEOF\n(( 1<<b ))\nrm -rf /\nb", "after an unrelated quoted heredoc"),
-            # The native-path phantom guard's shapes (LAB-3094), which this now reads first.
+            # The native-path phantom guard's shapes, which this now reads first.
             ("git push --force <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb", "behind a head matching a lesser rule"),
             ("git push --force <<'A'\nz\nA\nx=`(( 1<<b ))\nrm -rf /\nb`", "inside a backtick substitution"),
             (
@@ -3980,6 +3980,11 @@ class TestArithmeticCommandShift:
                 "cat > /tmp/b.txt <<'EOF'\nx\nEOF",
                 "a shift whose operand is a real heredoc's delimiter",
             ),
+            # A decoy `((` in a comment: its walk reads the comment's quote, which
+            # swallows the real opener, and closes on the `))` inside that quote.
+            # bash 5.3 ran the line after each (canary).
+            ('# (( "\n(( a" ))"+1<<b ))\nrm -rf /\nb', "a comment's `\"` swallows the real opener"),
+            ("# (( '\n(( a' ))'1<<b ))\nrm -rf /\nb", "a comment's `'` swallows the real opener"),
         ],
     )
     def test_payload_after_arithmetic_shift_is_validated(self, safety_rules_path, command, description):
@@ -3996,7 +4001,7 @@ class TestArithmeticCommandShift:
         """A `_shellcheck=False` caller gets no spawn and no cache entry through the rewrite.
 
         _escalate_past_heredoc validates its candidates with ShellCheck off because it
-        ShellChecks the rewrite whole (LAB-2780). The as-written half of the join forwards
+        ShellChecks the rewrite whole. The as-written half of the join forwards
         that flag, the rewritten half never spawns, and the verdict stays out of the cache,
         like every other `_shellcheck=False` exit.
         """
@@ -4484,6 +4489,19 @@ class TestArithmeticCommandShift:
         assert searches < 10 * openers, (
             f"{searches} paren scans over {openers} openers; one pass is ~{openers}, one scan per opener is ~{openers**2}"
         )
+
+    def test_a_pair_it_cannot_follow_is_not_memoised_as_never_closing(self):
+        """Asked twice, an unfollowable pair is unfollowable both times.
+
+        The never-closes memo records a span's failure, and `_UnfollowableParenError`
+        is a `ParseError`. Recorded, the second ask would answer "never closes" - a
+        skip - where the first answered "cannot follow" - a deny.
+        """
+        dparen = val_module._DoubleParen("(( $(case x in a) ;; esac) ))")
+
+        for _ in range(2):
+            with pytest.raises(val_module._UnfollowableParenError):
+                dparen.is_arithmetic(0)
 
 
 class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
