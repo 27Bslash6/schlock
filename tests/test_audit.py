@@ -170,8 +170,11 @@ class TestAuditLogger:
         today = datetime.now().strftime("%Y-%m-%d")
         assert AuditLogger().log_file == tmp_path / f"audit-{today}.jsonl"
 
-    def test_logger_user_settings_null_device(self):
+    def test_logger_user_settings_null_device(self, tmp_path, monkeypatch):
         """The platform null device disables logging: nothing is written anywhere."""
+        # Windows platformdirs asks the shell API, not HOME or LOCALAPPDATA, so point the fallback here instead.
+        default_dir = tmp_path / "default"
+        monkeypatch.setattr("schlock.integrations.audit.user_data_dir", lambda *_: str(default_dir))
         null_dev = get_null_device()
         _user_settings(Path.home(), null_dev)
         logger = AuditLogger()
@@ -181,7 +184,7 @@ class TestAuditLogger:
                 timestamp="t", event_type="allow", command="ls", risk_level="SAFE", violations=[], decision="allow", context={}
             )
         )
-        assert not _default_log_dir().exists()
+        assert not default_dir.exists()
 
     def test_logger_creates_log_directory(self):
         """AuditLogger creates log directory if it doesn't exist."""
