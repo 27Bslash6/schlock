@@ -4,26 +4,33 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks. Two readers
-here work on single words whose boundaries bashlex has already fixed, _redirect_words
-and _mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE); CLAUDE.md lists
-both as approved exceptions and the constraints each must keep.
+Regex-based parsing is explicitly NOT supported due to security risks. Three readers
+here work on single words whose boundaries bashlex has already fixed, _redirect_words,
+_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE) and _quote_pairs;
+CLAUDE.md lists them as approved exceptions and the constraints each must keep.
 """
 
 import bisect
 import contextlib
 import itertools
+import json
 import logging
 import posixpath
 import re
 import shlex
 import signal
 import threading
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 import bashlex
+import bashlex.ast
 import bashlex.errors
+import bashlex.subst
 
+from schlock.core.ast_view import UnmappedNodeError
+from schlock.core.native_bridge import NativeBridge, NativeBridgeError
 from schlock.exceptions import ParseBudgetError, ParseError
 
 logger = logging.getLogger(__name__)
@@ -64,26 +71,42 @@ def _on_parse_budget(signum: int, frame: Any) -> None:
         raise _ParseBudgetSignal
 
 
-def _bounded_parse(src: str) -> list[Any]:
-    """``bashlex.parse(src)``, raising ParseBudgetError once it uses PARSE_CPU_BUDGET of CPU.
+@contextlib.contextmanager
+def _parse_budget() -> Iterator[None]:
+    """Raise ParseBudgetError once the body uses PARSE_CPU_BUDGET of CPU.
 
     The one place library code installs a signal handler: bounding the parse here covers every
     caller, not only the hook. The timer is ITIMER_VIRTUAL (SIGVTALRM), so a caller's SIGALRM
     deadline is untouched, and a caller's own ITIMER_VIRTUAL and handler are put back afterwards.
     Python runs signal handlers only on the main thread and Windows has no setitimer: there the
-    parse runs unbounded, as it did before.
+    body runs unbounded, as it did before.
+
+    Reentrant (LAB-4950): inside a running budget, a nested one only yields. Arming its own
+    would end in its `finally`, which disarms the handler for the rest of the outer body - a
+    backquote body parsed during substitution recovery left the recovery after it unbounded.
+    "Running" is read from the live timer and handler, not from `_budget_armed` alone: a
+    teardown the signal interrupts can leave that flag set, and trusting it would then leave
+    every later parse unbounded.
     """
     global _budget_armed, _budget_spent  # noqa: PLW0603 - flags shared with the signal handler
     if _budget_spent:
         raise ParseBudgetError(_BUDGET_MESSAGE)
     if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
-        return bashlex.parse(src)
+        yield
+        return
+    if (
+        _budget_armed
+        and signal.getsignal(signal.SIGVTALRM) is _on_parse_budget
+        and signal.getitimer(signal.ITIMER_VIRTUAL)[0] > 0
+    ):
+        yield
+        return
     previous_handler = signal.signal(signal.SIGVTALRM, _on_parse_budget)
     previous_timer = (0.0, 0.0)
     try:
         _budget_armed = True
         previous_timer = signal.setitimer(signal.ITIMER_VIRTUAL, PARSE_CPU_BUDGET)
-        return bashlex.parse(src)
+        yield
     except _ParseBudgetSignal:
         _budget_spent = True
         raise ParseBudgetError(_BUDGET_MESSAGE) from None
@@ -92,6 +115,12 @@ def _bounded_parse(src: str) -> list[Any]:
         signal.setitimer(signal.ITIMER_VIRTUAL, *previous_timer)
         # None: the previous handler was installed outside Python and cannot be put back.
         signal.signal(signal.SIGVTALRM, signal.SIG_DFL if previous_handler is None else previous_handler)
+
+
+def _bounded_parse(src: str) -> list[Any]:
+    """``bashlex.parse(src)`` under _parse_budget - the one bashlex parse call (LAB-5659)."""
+    with _parse_budget():
+        return bashlex.parse(src)
 
 
 # Each AND-OR list operator and the `simple_list1` production its `$( … )` close should reduce
@@ -195,6 +224,183 @@ def _apply_andor_substitution_correction() -> None:
 
 _apply_andor_substitution_correction()
 
+
+def _refuse_unterminated_brace_expansion() -> None:
+    """Make bashlex raise on an unterminated ``${`` instead of looping forever (LAB-4959).
+
+    bashlex 0.18's ``subst._paramexpand`` locates the closing brace with ``str.find``, never
+    checks for -1, and hands back scan index 0, so ``_expandwordinternal`` restarts the word and
+    never returns. The tokenizer brace-matches an ordinary word first; the way in is text it does
+    not match, a heredoc body inside a double-quoted ``$( … )`` - Claude Code's own commit form
+    ``git commit -m "$(cat <<EOF … EOF)"`` with a ``${`` in the message. A hook that outlives its
+    timeout fails open, so the loop was an allow.
+
+    Every input that reaches the -1 loops, so raising there changes no parse that ever finished.
+    Unreported upstream.
+    """
+    original = bashlex.subst._paramexpand
+
+    def paramexpand(parserobj: Any, string: str, sindex: int) -> Any:
+        if string[sindex + 1 : sindex + 2] == "{" and string.find("}", sindex + 2) == -1:
+            raise bashlex.errors.ParsingError("bad substitution: no closing '}'", string, sindex)
+        return original(parserobj, string, sindex)
+
+    bashlex.subst._paramexpand = paramexpand
+
+
+_refuse_unterminated_brace_expansion()
+
+
+def parse_bashlex(command: str) -> list[Any]:
+    """The in-process bashlex tier: parse or raise `ParseError` (never returns a partial AST).
+
+    Runs with both bashlex patches above applied (the AND-OR substitution correction and the
+    unterminated-``${`` refusal). This is also the LAST tier
+    of `TieredParser`: when it raises, nothing rescues the command and validator.py blocks.
+    Every AST it returns carries the `{varname}` prefix tags (_mark_fd_variables) and the
+    substitution nodes bashlex dropped from quoted words (_recover_dropped_substitutions,
+    LAB-4950), whichever caller asked, so no tier can hand a consumer a tree missing either.
+    The parse and the substitution recovery share one CPU budget (_parse_budget), because
+    recovery re-enters bashlex's parser for each body; running out raises ParseBudgetError,
+    passed through unwrapped.
+    """
+    with _parse_budget():
+        try:
+            ast = _bounded_parse(command)
+        except ParseBudgetError:
+            # Not rewrapped below: that message quotes the command, and a quoted `<<heredoc`
+            # would route the denial to the heredoc fallback, which parses it again.
+            raise
+        except bashlex.errors.ParsingError as e:
+            # Preserve original bashlex error for debugging
+            raise ParseError(
+                f"Failed to parse bash command: {command!r}",
+                original_error=e,
+            )
+        except Exception as e:
+            # Catch any other unexpected bashlex errors
+            logger.error(f"Unexpected error parsing command: {e}")
+            raise ParseError(
+                f"Unexpected parsing error for command: {command!r}",
+                original_error=e,
+            )
+        _recover_dropped_substitutions(command, ast)
+    _mark_fd_variables(command, ast)
+    return ast
+
+
+# --- Parser tiers: `SCHLOCK_PARSER` switch + fail-closed state machine (spec §6, LAB-409 T5) ---
+
+PARSER_TIER_ENV = "SCHLOCK_PARSER"
+PARSER_TIERS = frozenset({"auto", "native", "bashlex"})
+DEFAULT_PARSER_TIER = "auto"
+
+
+def _user_settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def resolve_parser_tier(user_settings: Optional[Path] = None) -> str:
+    """Resolve the forced parser tier from `SCHLOCK_PARSER` (spec §6).
+
+    `auto` (default) runs the fail-closed chain native → bashlex → deny. `bashlex` skips the
+    native tier entirely (the kill-switch: never spawns). `native` is native-ONLY: every native
+    failure denies with no bashlex rescue, so CI can prove the native path on its own and a
+    native under-block cannot pass green on a bashlex save.
+
+    The value is read from the `env` block of the USER-scope Claude Code settings file
+    (`~/.claude/settings.json`) and from nothing else. The process environment is deliberately
+    NOT consulted: Claude Code applies every settings file's `env` block to the session and its
+    subprocesses, project over user, so an environment variable carries no provenance — a
+    hostile checkout's `.claude/settings.json` can override or junk the user's value, and
+    refusing "project-looking" values would still leave the user's kill-switch defeated. The
+    one file a checkout cannot write is the user's own; that is the same trust line as the
+    project-scope whitelist ban. CI pins a tier by writing that file. Anything unreadable or
+    outside the allowlist resolves to `auto` with one warning. Never raises.
+    """
+    try:
+        path = _user_settings_path() if user_settings is None else user_settings
+        if not path.is_file():
+            return DEFAULT_PARSER_TIER
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - HOME unresolvable, unreadable or malformed: the switch is unknowable
+        logger.warning(f"Cannot read {PARSER_TIER_ENV} from user settings ({exc}); using {DEFAULT_PARSER_TIER}")
+        return DEFAULT_PARSER_TIER
+    env_block = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env_block, dict):
+        return DEFAULT_PARSER_TIER
+    # Case-insensitive key: Windows environments are, and a user's own typo is not a threat.
+    raw = next((v for k, v in env_block.items() if str(k).upper() == PARSER_TIER_ENV), None)
+    if raw is None:
+        return DEFAULT_PARSER_TIER
+    tier = str(raw).strip().lower()
+    if tier not in PARSER_TIERS:
+        logger.warning(
+            f"Ignoring {PARSER_TIER_ENV}={raw!r} in {path} (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}"
+        )
+        return DEFAULT_PARSER_TIER
+    return tier
+
+
+class TieredParser:
+    """Spec §6 state machine: native → in-process bashlex → deny.
+
+    Every `parse` exit returns a mapped AST or raises `ParseError`; validator.py's parse-failure
+    path then BLOCKS (or, for a heredoc parse failure, re-validates the command before the
+    heredoc — that special case keys off bashlex's own message, which is why the bashlex tier's
+    `ParseError` is the one that propagates). The deny tier is terminal in every mode; no path
+    allows on failure.
+
+    Args:
+        tier: one of PARSER_TIERS; defaults to `resolve_parser_tier()`.
+        bridge: the native tier (tests inject scripted binaries and short timeouts).
+
+    T8 must hold ONE instance per process (inside the cached `BashCommandParser`): the
+    once-per-process warning below is per instance.
+    """
+
+    def __init__(self, tier: Optional[str] = None, bridge: Optional[NativeBridge] = None):
+        self.tier = resolve_parser_tier() if tier is None else tier
+        if self.tier not in PARSER_TIERS:
+            raise ValueError(f"unknown parser tier {self.tier!r}; expected one of {sorted(PARSER_TIERS)}")
+        self._bridge = NativeBridge() if bridge is None else bridge
+        self._warned = False
+
+    def parse(self, command: str) -> list[Any]:
+        if self.tier == "bashlex":
+            return parse_bashlex(command)
+        try:
+            return self._bridge.parse(command)
+        except Exception as exc:  # noqa: BLE001 - spec §6: ANY native failure moves to the next tier
+            self._note_native_failure(exc)
+            if self.tier == "native":
+                # Native-only: no rescue. A native parse error is already a ParseError; wrap the rest.
+                if isinstance(exc, ParseError):
+                    raise
+                raise ParseError(
+                    f"native parser failed and {PARSER_TIER_ENV}=native forbids the bashlex fallback: {exc}",
+                    original_error=exc,
+                ) from exc
+        return parse_bashlex(command)  # raises ParseError itself when bashlex also fails → deny
+
+    def _note_native_failure(self, exc: Exception) -> None:
+        if isinstance(exc, (ParseError, UnmappedNodeError)):
+            # Designed, per-command outcomes (exit 2; a construct ast_view has not mapped): debug only.
+            logger.debug(f"native parser tier declined the command: {exc}")
+            return
+        # Everything else — no binary, crash, timeout, guard trip, malformed output — says the
+        # native tier is broken on this machine, and a silent permanent degrade to bashlex would
+        # hide it. One warning per process is the noise budget (the hook is one process per
+        # command; the hook's root logger sits at INFO, so debug never reaches stderr).
+        if self._warned:
+            return
+        self._warned = True
+        action = f"denying ({PARSER_TIER_ENV}=native)" if self.tier == "native" else "using bashlex"
+        in_contract = isinstance(exc, NativeBridgeError)
+        contract = "" if in_contract else f" ({type(exc).__name__} is outside the bridge's exception contract)"
+        logger.warning(f"native parser tier failed{contract}: {exc}; {action}", exc_info=not in_contract)
+
+
 # Interpreters that EXECUTE their standard input as a program when given no program source.
 # Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
 # those run a *named* command, not stdin-as-program, and are covered by the download->shell
@@ -268,6 +474,148 @@ _QUOTED_RUN_OR_DOLLAR_MARKER = re.compile(r"""('[^']*'|"[^"]*"|\$\$)|\$(?=['"])"
 # before extract_quoted_substitution_bodies fails closed. Bodies nest, so text
 # is scanned once per enclosing body; an honest command stays under 3x.
 _MAX_BODY_TEXT_FACTOR = 4
+
+_CODE_PART_KINDS = ("commandsubstitution", "processsubstitution")
+
+
+def _part_offsets_may_shift(command: str, span: tuple) -> bool:
+    r"""Whether bashlex's offsets for the parts of the word at ``span`` may be wrong.
+
+    bashlex deletes a word's line continuations before it numbers the word's parts, so past
+    the first one every part offset is short by two per continuation (`"a \<newline> $(x)"`
+    puts the `$(` two characters early). Any backslash-newline counts, including the ones
+    that are not continuations (inside `'…'`, or after an escaped backslash): the cost of
+    over-matching is a rebuild that fails closed, never a skip to a wrong end. Both
+    _recover_dropped_substitutions and _quote_pairs must ask this same question.
+    """
+    return "\\\n" in command[span[0] : span[1]]
+
+
+def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
+    command: str, span: tuple, parts: "list[Any]", recover: "Optional[Any]" = None
+) -> "Optional[list[tuple[int, int]]]":
+    """Offsets of each opening and closing quote in the word at ``span``; with ``recover``, MUTATES ``parts``.
+
+    SECURITY (LAB-4950): bashlex drops the substitution node from two word shapes
+    bash runs. A word holding any `"` loses every `<(`/`>(` (it reads the word's
+    DQUOTE flag, not the quoting at the opener), and a word that opens and closes
+    with `'` is returned whole as one literal, so `'a'$(rm -rf ~)'b'` has no parts.
+    Every pass reads parts, so each went blind. This scan knows where bash runs
+    code - `$(` and a backquote outside `'…'`, `<(`/`>(` only unquoted, never
+    inside `$'…'` - and finds each opener bashlex left without a node.
+
+    ``recover(command, offset, word_end)`` builds the missing node, which is appended to
+    ``parts`` (the word's own list). Without it a missing node returns None: the caller cannot tell
+    quoted text from code, so it must treat the word as having no quotes at all.
+    `$'…'` pairs are skipped, never returned: ANSI-C escapes mean the source text
+    is not what the program receives.
+    """
+    start, end = span
+    if end > len(command):
+        return None  # a span from another string: nothing here can be read
+    # In a word with a continuation only the code parts are skipped, and only because
+    # _recover_dropped_substitutions rebuilt all of them at source offsets. A parameter's
+    # offsets are bashlex's, and a skip to a shifted end resumes the scan mid-word.
+    kinds = _CODE_PART_KINDS if _part_offsets_may_shift(command, span) else (*_CODE_PART_KINDS, "parameter")
+    skip = {p.pos[0]: p.pos[1] for p in parts if getattr(p, "pos", None) and p.kind in kinds}
+    pairs: list[tuple[int, int]] = []
+    opened: Optional[int] = None  # offset of an open `"`
+    i = start
+    while i < end:
+        char = command[i]
+        if char == "\\":
+            i += 2
+        elif opened is None and char == "'":
+            close = command.find("'", i + 1, end)
+            if close < 0:
+                return None
+            pairs.append((i, close))
+            i = close + 1
+        elif opened is None and command.startswith("$'", i):
+            i += 2
+            while i < end and command[i] != "'":
+                i += 2 if command[i] == "\\" else 1
+            i += 1
+        elif char == '"':
+            if opened is None:
+                opened = i
+            else:
+                pairs.append((opened, i))
+                opened = None
+            i += 1
+        elif i in skip:
+            i = skip[i]
+        elif command.startswith("``", i):
+            i += 2  # empty backquotes run nothing, and bashlex makes no node for them
+        elif command.startswith(("$(", "`"), i) or (opened is None and command.startswith(("<(", ">("), i)):
+            if recover is None:
+                return None
+            node = recover(command, i, end)
+            parts.append(node)
+            i = node.pos[1]
+        else:
+            i += 1
+    return None if opened is not None else pairs
+
+
+def _recover_substitution(command: str, offset: int, word_end: int) -> Any:
+    """Parse the substitution at ``offset`` that bashlex dropped, as the node it would have built.
+
+    Uses bashlex's own `$(…)` body parser, so a recovered body reads exactly as a
+    bare one does. Anything it cannot place inside the word raises: the Goal is to
+    validate the body, and a body with no known end cannot be validated (fail closed).
+    """
+    try:
+        if command.startswith("$((", offset):
+            raise ParseError("Arithmetic expansion inside a quoted word")  # bashlex rejects it bare, too
+        if command[offset] == "`":
+            close = bashlex.subst._stringextract(command, offset + 1, "`")
+            body = _bounded_parse(command[offset + 1 : close]) if offset < close < word_end else []
+            if len(body) != 1:
+                raise ParseError(f"Cannot locate the backquote body at offset {offset}")
+            bashlex.subst._adjustpositions(body[0], offset + 1, len(command))  # what bashlex does for a bare one
+            return bashlex.ast.node(kind="commandsubstitution", command=body[0], pos=(offset, close + 1))
+        body, close = bashlex.subst._parsedolparen(bashlex.parser._parser(command), command, offset + 2)
+        # bashlex ends a body before its trailing newlines (`$(date<newline>)`); the closer follows them.
+        while close < word_end and command[close] in " \t\n":
+            close += 1
+        if not close < word_end or command[close] != ")":
+            raise ParseError(f"Cannot locate the substitution body at offset {offset}")
+        kind = "commandsubstitution" if command[offset] == "$" else "processsubstitution"
+        return bashlex.ast.node(kind=kind, command=body, pos=(offset, close + 1))
+    except ParseError:
+        raise
+    except Exception as e:  # noqa: BLE001 - any bashlex failure means the body is unknown
+        raise ParseError(f"Cannot parse the substitution at offset {offset}", original_error=e) from e
+
+
+def _recover_dropped_substitutions(command: str, nodes: "list[Any]") -> None:
+    """Give every word the substitution nodes bashlex dropped from it - see `_quote_pairs`."""
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if node.kind in ("word", "assignment") and getattr(node, "pos", None):
+            node.parts = list(getattr(node, "parts", None) or [])
+            dropped = _part_offsets_may_shift(command, node.pos)
+            if dropped:
+                # bashlex's offsets are shifted here: rebuild every code part from the source
+                # rather than skip to a wrong end.
+                node.parts = [part for part in node.parts if part.kind not in _CODE_PART_KINDS]
+            if _quote_pairs(command, node.pos, node.parts, recover=_recover_substitution) is None and dropped:
+                # We deleted bashlex's own code parts above, and now the scan cannot read the
+                # word's quoting (a `"` nested in `${x#"'"}`, or a skip its shifted offsets sent
+                # mid-word), so an opener it should have rebuilt may have gone unseen - the
+                # deleted node is lost. Fail closed. Only when we dropped: a None on an intact
+                # word means the scan found no ranges, and bashlex's own nodes (plus the
+                # `${…}` re-parse in substitution.py) still cover it, so raising there would
+                # over-block a benign `${A:-"${B}"}`. Fixed text: a message holding the command
+                # could route this to the heredoc fallback.
+                raise ParseError("Cannot read the quoting of a word that may hold a substitution")
+            node.parts.sort(key=lambda part: part.pos[0])
+        for value in vars(node).values():
+            children = value if isinstance(value, list) else [value]
+            stack.extend(child for child in children if isinstance(child, bashlex.ast.node))
+
 
 STDIN_EXEC_INTERPRETERS = frozenset(
     {
@@ -969,8 +1317,9 @@ def _first_command_node(node: Any) -> Optional[Any]:
     handled separately by the recursive walk, so first-command is the right target here (#97) -
     unlike a here-string's shared fd, which any command in the group may read (`_command_nodes`).
 
-    Expressed via `_command_nodes` so the two security-critical traversals share ONE walk skeleton:
-    a future bashlex child-attr change cannot leave one of them silently under-scanning (LAB-2768).
+    Expressed via `_command_nodes`, as is `BashCommandParser._segment_nodes`, so every
+    security-critical command-node traversal shares ONE walk skeleton: a bashlex child-attr
+    change is one edit there and cannot leave one of them silently under-scanning (LAB-2768, LAB-4687).
     """
     return next(iter(_command_nodes(node)), None)
 
@@ -1034,7 +1383,7 @@ def has_compound_redirects(ast_nodes: list[Any]) -> bool:
     return any(visit(node) for node in ast_nodes or [])
 
 
-def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Optional[tuple]]]:
+def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Optional[tuple], list[Any]]]:
     r"""One redirection, rendered as reconstruction words: operator, then target.
 
     SECURITY (LAB-2760): a redirect target is never inert the way an argument can
@@ -1076,7 +1425,7 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     if isinstance(target, int):
         # fd duplication (`2>&1`): no path, and the source glues it.
         glued_fd = f"{fd}{operator}" if isinstance(fd, int) else operator
-        return [(f"{glued_fd}{target}", None)]
+        return [(f"{glued_fd}{target}", None, [])]
 
     word: Optional[str] = getattr(target, "word", None)
     if word is None:
@@ -1142,9 +1491,9 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
 
     if glued:
         # One token, so the joining space cannot open a gap the source did not have.
-        return [(f"{operator}{word}", None)]
+        return [(f"{operator}{word}", None, [])]
 
-    return [(operator, None), (word, None)]
+    return [(operator, None, []), (word, None, [])]
 
 
 def _unreadable(source: str, word: Any, cause: str) -> ParseError:
@@ -1247,7 +1596,7 @@ def without_fd_variables(parts: "list[Any]") -> "list[Any]":
 
 def _command_part_words(
     parts: "list[Any]", include_redirects: bool, command: Optional[str]
-) -> list[tuple[str, Optional[tuple]]]:
+) -> list[tuple[str, Optional[tuple], list[Any]]]:
     """One command node's reconstruction words, in source order (see BashCommandParser._collect_words).
 
     A `{fd}` prefix is part of its redirection, not an argument: it leaves the
@@ -1257,18 +1606,18 @@ def _command_part_words(
     carried further, it glued onto an unrelated redirect (`{fd}<<<x > f` read as
     `{fd}> f`, and `{fd}` then disowned the write).
     """
-    words: list[tuple[str, Optional[tuple]]] = []
+    words: list[tuple[str, Optional[tuple], list[Any]]] = []
     fd_prefix = None
     for part in parts:
         prefix, fd_prefix = fd_prefix, None
         if _is_fd_variable(part):
             fd_prefix = part.word
         elif hasattr(part, "word"):
-            words.append((part.word, getattr(part, "pos", None)))
+            words.append((part.word, getattr(part, "pos", None), getattr(part, "parts", None) or []))
         elif include_redirects and getattr(part, "kind", None) == "redirect":
             redirect = _redirect_words(part, command)
             if prefix and redirect:
-                redirect[0] = (prefix + redirect[0][0], None)
+                redirect[0] = (prefix + redirect[0][0], None, [])
             words.extend(redirect)
     return words
 
@@ -1598,27 +1947,7 @@ class BashCommandParser:
         if not command.strip():
             raise ValueError("Command cannot be whitespace-only")
 
-        try:
-            ast = _bounded_parse(command)
-        except ParseBudgetError:
-            # Not rewrapped below: that message quotes the command, and a quoted `<<heredoc`
-            # would route the denial to the heredoc fallback, which parses it again.
-            raise
-        except bashlex.errors.ParsingError as e:
-            # Preserve original bashlex error for debugging
-            raise ParseError(
-                f"Failed to parse bash command: {command!r}",
-                original_error=e,
-            )
-        except Exception as e:
-            # Catch any other unexpected bashlex errors
-            logger.error(f"Unexpected error parsing command: {e}")
-            raise ParseError(
-                f"Unexpected parsing error for command: {command!r}",
-                original_error=e,
-            )
-        _mark_fd_variables(command, ast)
-        return ast
+        return parse_bashlex(command)
 
     def extract_commands(self, ast_nodes: list[Any]) -> list[str]:
         """Extract all command names from AST.
@@ -1784,51 +2113,11 @@ class BashCommandParser:
         return segment
 
     def _segment_nodes(self, ast_nodes: list[Any]) -> list[Any]:
-        """Collect the AST nodes that each form one independently-validated segment."""
-        nodes: list[Any] = []
+        """Collect the AST nodes that each form one independently-validated segment.
 
-        def visit(node):  # noqa: PLR0912 - AST traversal requires multiple branches
-            """Recursively visit AST nodes to collect command nodes."""
-            if hasattr(node, "kind"):
-                # Command nodes contain individual commands
-                if node.kind == "command" and hasattr(node, "pos"):
-                    nodes.append(node)
-                    return  # Don't recurse into command parts
-
-                # Pipeline nodes - visit each command in the pipeline
-                if node.kind == "pipeline" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind != "pipe":
-                            visit(part)
-                    return
-
-                # List nodes (;, &&, ||) - visit each command
-                if node.kind == "list" and hasattr(node, "parts"):
-                    for part in node.parts:
-                        if hasattr(part, "kind") and part.kind not in ("operator",):
-                            visit(part)
-                    return
-
-                # Compound commands (if, for, while, etc.) - recurse into body
-                if node.kind == "compound" and hasattr(node, "list"):
-                    for item in node.list if isinstance(node.list, list) else [node.list]:
-                        visit(item)
-                    return
-
-                # Recursively visit other child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
-                    if hasattr(node, attr):
-                        child = getattr(node, attr)
-                        if isinstance(child, list):
-                            for item in child:
-                                visit(item)
-                        elif child:
-                            visit(child)
-
-        for node in ast_nodes or []:
-            visit(node)
-
-        return nodes
+        Delegates to `_command_nodes` so segment extraction shares the one walk skeleton (LAB-4687).
+        """
+        return [n for node in ast_nodes or [] for n in _command_nodes(node)]
 
     @staticmethod
     def _rebase(ranges: list[tuple], base: int, end: int) -> list[tuple]:
@@ -1956,7 +2245,7 @@ class BashCommandParser:
 
     def _collect_words(
         self, ast_nodes: list[Any], include_redirects: bool = True, command: Optional[str] = None
-    ) -> list[tuple[str, Optional[tuple]]]:
+    ) -> list[tuple[str, Optional[tuple], list[Any]]]:
         r"""Collect the word parts that make up the reconstructed command.
 
         SECURITY (LAB-2760): redirections are collected too, via
@@ -1978,11 +2267,12 @@ class BashCommandParser:
         both and takes the higher risk.
 
         Returns:
-            List of (word_text, original_span) tuples in reconstruction order.
-            original_span is the node's (start, end) offsets in the source
-            command, or None when the node carries no position.
+            List of (word_text, original_span, parts) tuples in reconstruction
+            order. original_span is the node's (start, end) offsets in the source
+            command, or None when the node carries no position; parts are the
+            node's own, which _quote_pairs needs to step over substitutions.
         """
-        words: list[tuple[str, Optional[tuple]]] = []
+        words: list[tuple[str, Optional[tuple], list[Any]]] = []
 
         def visit(node):
             """Recursively visit AST nodes to extract words."""
@@ -2034,7 +2324,7 @@ class BashCommandParser:
             >>> parser.reconstruct_command(ast)
             'rm -rf /'
         """
-        return " ".join(word for word, _ in self._collect_words(ast_nodes))
+        return " ".join(word for word, _, _ in self._collect_words(ast_nodes))
 
     def reconstruct_without_redirects(self, command: str, ast_nodes: list[Any]) -> tuple[str, list[tuple]]:
         """The reconstruction as it stood before LAB-2760: words only, no redirections.
@@ -2130,7 +2420,7 @@ class BashCommandParser:
         ranges = []
         offset = 0
 
-        for word, span in words:
+        for word, span, parts in words:
             for start, end in inert_heredocs:
                 if span is None or not (span[0] <= start and end <= span[1]):
                     continue  # this word does not own that heredoc
@@ -2150,7 +2440,7 @@ class BashCommandParser:
                 if found < 0 or word.find(body, found + 1, high) >= 0:
                     continue  # unlocatable, or ambiguous - do not guess which copy is the body
                 ranges.append((offset + found, offset + found + len(body)))
-            if span is not None and self._quoting_is_load_bearing(command, word, span):
+            if span is not None and self._quoting_is_load_bearing(command, word, span, parts):
                 # Absorb the following joining space. In the source that offset
                 # held the closing quote, a character no rule pattern can cross;
                 # reconstruction turns it into whitespace, which patterns ending
@@ -2161,9 +2451,9 @@ class BashCommandParser:
                 ranges.append((offset, offset + len(word) + 1))
             offset += len(word) + 1  # +1 for the joining space
 
-        return " ".join(word for word, _ in words), ranges
+        return " ".join(word for word, _, _ in words), ranges
 
-    def _quoting_is_load_bearing(self, command: str, word: str, span: tuple) -> bool:
+    def _quoting_is_load_bearing(self, command: str, word: str, span: tuple, parts: "list[Any]") -> bool:
         """Whether a word's quotes do real work, rather than just hiding it.
 
         SECURITY CRITICAL: this is the whole of LAB-1732. Quotes suppress a rule
@@ -2180,22 +2470,37 @@ class BashCommandParser:
         `env FOO=1 "mkfs.ext4" …`, `nice/command/nohup/setsid "mkfs.ext4" …` -
         where bash executes a word that is NOT in command-name position.
         """
-        if not word or not self._is_quoted_span(command, span):
+        if not word or not self._is_quoted_span(command, span, parts):
             return False
         # Shell-significant characters are the ones quoting actually protects.
         return any(char in word for char in " \t\n;|&<>()$`*?[]#~!\\'\"")
 
     @staticmethod
-    def _is_quoted_span(command: str, span: tuple) -> bool:
-        """Whether the source text at ``span`` is wrapped in matching quotes.
+    def _is_quoted_span(command: str, span: tuple, parts: "list[Any]") -> bool:
+        """Whether the word at ``span`` is ONE quoted run, from its first character to its last.
 
-        Shared with extract_string_literals so both derive "is this token a
-        quoted literal" from one rule.
+        Not "opens and closes with a quote": `'a'$(rm -rf ~)'b'` does both and is
+        two runs around code (LAB-4950). Whole-word is the reconstructed pass's
+        test because its range covers the whole reconstructed word.
         """
         start, end = span
-        if start >= len(command) or end > len(command) or end - start < 2:
+        if end - start < 2:
             return False
-        return (command[start] == '"' and command[end - 1] == '"') or (command[start] == "'" and command[end - 1] == "'")
+        return _quote_pairs(command, span, parts) == [(start, end - 1)]
+
+    @staticmethod
+    def _literal_ranges(command: str, word: Any) -> "list[tuple[int, int]]":
+        """The inside of each quoted run in ``word`` that the program receives as plain data.
+
+        One range per run (LAB-4950), so code between runs is never covered. A run
+        after an `=` earns none: `--extcmd='rm -rf /'` arrives as one argument that
+        git splits at the `=` and runs, so only its unquoted spelling was ever
+        suppressed - the same test _STRUCTURED_WORD applies inside substitutions.
+        A word _quote_pairs cannot read earns none either (fail closed).
+        """
+        pairs = _quote_pairs(command, word.pos, getattr(word, "parts", None) or []) or []
+        equals = command.find("=", *word.pos)  # once per word: a slice per pair is quadratic in the runs
+        return [(open_ + 1, close) for open_, close in pairs if close > open_ + 1 and not 0 <= equals < open_]
 
     def extract_heredoc_ranges(self, command: str, ast_nodes: list[Any]) -> list[tuple]:
         """Extract heredoc content ranges that should NOT be pattern matched.
@@ -2301,23 +2606,20 @@ class BashCommandParser:
             >>> # literals = [(6, 14)]  # Position of content inside quotes
         """
         words, parameter_spans = self._quoted_words(command, ast_nodes)
-        # Record the position INSIDE the quotes (exclude quote chars).
-        # _is_quoted_span's own `end - start < 2` check rules out the
-        # empty-quote span that would invert this range.
-        string_literals = [(word.pos[0] + 1, word.pos[1] - 1) for word in words]
+        string_literals = [literal for _, literals in words for literal in literals]
         if not parameter_spans:
             return string_literals
         return self._drop_ranges_inside(string_literals, parameter_spans)
 
-    def _quoted_words(self, command: str, ast_nodes: list[Any]) -> tuple[list[Any], list[tuple]]:
-        """Every word node whose span is quoted, and every `parameter` span, in walk order.
+    def _quoted_words(self, command: str, ast_nodes: list[Any]) -> tuple[list[tuple[Any, list[tuple]]], list[tuple]]:
+        """Every word node with a literal range, with its ranges, and every `parameter` span, in walk order.
 
         The one definition of which words earn a suppression range. It is shared
         with extract_quoted_substitution_bodies because that pass exists to cover
         exactly those words: a walk widened for one and not the other suppresses a
         body with nothing matching it.
         """
-        words: list[Any] = []
+        words: list[tuple[Any, list[tuple]]] = []
         parameter_spans: list[tuple] = []
 
         def visit(node):
@@ -2329,8 +2631,9 @@ class BashCommandParser:
                 if node.kind == "parameter" and hasattr(node, "pos"):
                     parameter_spans.append(node.pos)
 
-                if node.kind == "word" and hasattr(node, "pos") and self._is_quoted_span(command, node.pos):
-                    words.append(node)
+                literals = self._literal_ranges(command, node) if node.kind == "word" and hasattr(node, "pos") else []
+                if literals:
+                    words.append((node, literals))
 
                 # Recursively visit child nodes
                 for attr in ["parts", "command", "list", "pipe", "compound"]:
@@ -2349,8 +2652,8 @@ class BashCommandParser:
     def extract_quoted_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> list[CommandSegment]:
         """The body of each substitution inside a quoted word, as a segment of its own.
 
-        SECURITY: extract_string_literals gives a quoted word ONE range, so the raw
-        pass suppresses a `"$(…)"` body along with the rest of the word. The only
+        SECURITY: extract_string_literals gives each quoted run ONE range, so the raw
+        pass suppresses a `"$(…)"` body along with the rest of its run. The only
         other view of that body is SubstitutionValidator's word view, where the
         quotes are already gone, so a rule that reads quote characters has no text
         that shows them: `"$(IFS=' ,'; …)"` reads as `IFS= ,`, an empty IFS.
@@ -2368,7 +2671,7 @@ class BashCommandParser:
         each `\\<newline>` moves every later inner offset two places early. The
         word's own span is exact, so a word holding a newline, or a substitution
         whose closer is not where _body_end looks, gets ONE body, from its first
-        substitution to its closing quote. That body keeps its heredoc
+        suppressed substitution to the closing quote of the last one's run. That body keeps its heredoc
         ranges only while no `\\<newline>` has moved them, and never its literal
         ranges, which is a false positive on a quoted argument in a multi-line
         body and never a missed payload.
@@ -2382,12 +2685,16 @@ class BashCommandParser:
         whole_until = -1  # end of the last multi-line word, already one body
         budget = _MAX_BODY_TEXT_FACTOR * len(command)
         words, _ = self._quoted_words(command, ast_nodes)
-        for word in words:
+        for word, ranges in words:
             word_start, word_end = word.pos
+            # Only a body inside a literal range was suppressed; one between runs
+            # is matched bare by the raw pass already.
             code = [
                 part
                 for part in getattr(word, "parts", None) or ()
-                if getattr(part, "kind", None) in ("commandsubstitution", "processsubstitution") and getattr(part, "pos", None)
+                if getattr(part, "kind", None) in _CODE_PART_KINDS
+                and getattr(part, "pos", None)
+                and any(low <= part.pos[0] < high for low, high in ranges)
             ]
             if not code or word_start < whole_until:
                 continue
@@ -2399,7 +2706,8 @@ class BashCommandParser:
                 first = code[0].pos[0]
                 start = word_start + 1 if "\\\n" in command[word_start:first] else self._body_start(command, first)
                 heredocs = [] if "\\\n" in text else self.extract_heredoc_ranges(command, [word])
-                spans = [(start, word_end - 1, [], heredocs)]
+                close = next(high for low, high in ranges if low <= code[-1].pos[0] < high)
+                spans = [(start, close, [], heredocs)]
             else:
                 spans = [
                     (

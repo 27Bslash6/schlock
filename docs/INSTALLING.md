@@ -20,7 +20,7 @@ Install schlock for your personal use across all projects.
 
 ```bash
 # Add the GitHub marketplace
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 
 # Install the plugin
 /plugin install schlock@schlock
@@ -30,7 +30,7 @@ Install schlock for your personal use across all projects.
 ```
 
 **What just happened:**
-1. Added 27Bslash6/schlock GitHub repo as a plugin marketplace
+1. Added 27b-io/schlock GitHub repo as a plugin marketplace
 2. Installed schlock from that marketplace
 3. Setup wizard configures advertising blocker and creates `.claude/hooks/schlock-config.yaml`
 
@@ -38,7 +38,7 @@ Install schlock for your personal use across all projects.
 
 ```bash
 # Add the marketplace
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 
 # Open plugin browser
 /plugin
@@ -83,7 +83,7 @@ Add to `.claude/settings.json` in your repository root:
     "schlock": {
       "source": {
         "source": "github",
-        "repo": "27Bslash6/schlock"
+        "repo": "27b-io/schlock"
       }
     }
   },
@@ -208,13 +208,13 @@ After installation, verify schlock is working:
 **Check marketplace:**
 ```bash
 /plugin marketplace list
-# Should see "schlock" (from 27Bslash6/schlock)
+# Should see "schlock" (from 27b-io/schlock)
 ```
 
 **Re-add marketplace:**
 ```bash
 /plugin marketplace remove schlock
-/plugin marketplace add 27Bslash6/schlock
+/plugin marketplace add 27b-io/schlock
 /plugin install schlock@schlock
 ```
 
@@ -283,7 +283,7 @@ python -m json.tool .claude/settings.json
 cat ~/.config/schlock/audit.jsonl
 ```
 
-If empty, hook isn't running. File a bug at: https://github.com/27Bslash6/schlock/issues
+If empty, hook isn't running. File a bug at: https://github.com/27b-io/schlock/issues
 
 ---
 
@@ -340,7 +340,6 @@ After installation:
 
 ## Support
 
-- **Issues**: https://github.com/27Bslash6/schlock/issues
-- **Discussions**: https://github.com/27Bslash6/schlock/discussions
+- **Issues**: https://github.com/27b-io/schlock/issues
 - **Security**: security@27b.io
 - **Documentation**: [README.md](../README.md) | [CONFIGURATION.md](CONFIGURATION.md)

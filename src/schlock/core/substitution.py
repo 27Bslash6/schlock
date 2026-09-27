@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -890,8 +890,8 @@ def _is_opaque_argument(part: Any) -> bool:
     * ``--extcmd='rm -rf /'`` survives word-splitting as one argv entry, yet only the VALUE was
       quoted — git splits at the ``=`` and runs the right-hand side. Treating it as data made
       the substitution path WEAKER than bare text for eight such flags. The top-level
-      :meth:`BashCommandParser.extract_string_literals` refuses a partially-quoted word for the
-      same reason; this keeps the two models agreeing.
+      :meth:`BashCommandParser.extract_string_literals` gives no range to a quoted run that
+      follows an ``=`` for the same reason; this keeps the two models agreeing.
     * ``$(echo rm -rf /)`` inside a word holds whitespace with no quote anywhere — bashlex keeps
       a nested substitution's source verbatim in ``.word``. It is code, and suppressing it would
       silently disable this whole-text pass over every nested substitution.
@@ -997,6 +997,9 @@ class SubstitutionNode:
     base_command: str | None  # First word of inner command (e.g., "op" from "op read ...")
     ast_node: Any  # The bashlex AST node
     nested_substitutions: list[SubstitutionNode] = field(default_factory=list)
+    # The subset of nested_substitutions found in the read redirects of groups _unwrap_compound
+    # peeled off. They belong to no list/pipeline segment, so _validate_segments judges them here.
+    redirect_substitutions: list[SubstitutionNode] = field(default_factory=list)
     depth: int = 0  # Nesting depth
     # Spans of inner_command that are quoted arguments, for the rule engine's string_literals.
     literal_ranges: list[tuple[int, int]] = field(default_factory=list)
@@ -1068,7 +1071,7 @@ def _strip_group_terminator(node: Any) -> Any:
     return _TrimmedList(parts)
 
 
-def _unwrap_compound(node: Any) -> Any:
+def _unwrap_compound(node: Any) -> tuple[Any, list[Any]]:
     """Peel `( … )` / `{ …; }` wrappers off a substitution so the extractors see the real command.
 
     bashlex models `$( (cmd) )` as a CompoundNode whose ``.list`` is
@@ -1083,18 +1086,25 @@ def _unwrap_compound(node: Any) -> Any:
     single command (`if`/`for`/`while`, whose branches this module cannot decompose). A read or a
     discard (`$( (ls) 2>/dev/null )`) is inert, so it unwraps — refusing on *any* redirect made
     grouping lose the /dev/null exemption that the same redirect gets on a bare command.
+
+    Returns the peeled node and the read redirects peeled off with its wrappers. Those are inert
+    only as I/O: bash expands a redirect target before it runs the command, so the `$(bash)` in
+    `$( ( cat ) < "$(bash)" )` runs, and the caller must still walk them (LAB-5648).
     """
+    dropped: list[Any] = []
     for _ in range(MAX_SUBSTITUTION_DEPTH):
         cmd = getattr(node, "command", None)
         if getattr(cmd, "kind", None) != "compound":
-            return node
-        if any(_is_write_redirect(r) for r in getattr(cmd, "redirects", None) or []):
-            return node  # a write on the group is a real side effect, not inert grouping
+            return node, dropped
+        redirects = getattr(cmd, "redirects", None) or []
+        if any(_is_write_redirect(r) for r in redirects):
+            return node, dropped  # a write on the group is a real side effect, not inert grouping
         inner = [c for c in getattr(cmd, "list", None) or [] if getattr(c, "kind", None) != "reservedword"]
         if len(inner) != 1 or getattr(inner[0], "kind", None) not in ("command", "list", "pipeline", "compound"):
-            return node
+            return node, dropped
+        dropped.extend(redirects)
         node = _ListSegment(_strip_group_terminator(inner[0]))
-    return node
+    return node, dropped
 
 
 @dataclass
@@ -1412,7 +1422,7 @@ class SubstitutionValidator:
         Returns:
             SubstitutionNode or None if extraction fails
         """
-        node = _unwrap_compound(node)
+        node, peeled_redirects = _unwrap_compound(node)
         inner_command, literal_ranges = self._extract_inner_command_text(node)
         # A command list ($(a && b), $(a; b)) is validated per-segment from its AST, so it must
         # survive even when text rendering is partial (e.g. a compound segment renders to None).
@@ -1446,10 +1456,14 @@ class SubstitutionValidator:
 
         # Find nested substitutions
         nested: list[SubstitutionNode] = []
+        redirect_nested: list[SubstitutionNode] = []
         if depth < MAX_SUBSTITUTION_DEPTH and hasattr(node, "command"):
             try:
                 inner_ast = [node.command] if node.command else []
                 nested = self.extract_substitutions(inner_ast, depth + 1, command, budget)
+                # Walking only the peeled command rated $( ( cat ) < "$(bash)" ) SAFE while
+                # $(cat < "$(bash)") BLOCKs: the peel had dropped the redirect (LAB-5648).
+                redirect_nested = self.extract_substitutions(peeled_redirects, depth + 1, command, budget)
             except Exception:  # noqa: S110 - Parse errors treated as suspicious AST
                 nested = []  # Failed to parse nested - treat as no nested subs
 
@@ -1458,7 +1472,8 @@ class SubstitutionValidator:
             inner_command=inner_command,
             base_command=base_command,
             ast_node=node,
-            nested_substitutions=nested,
+            nested_substitutions=nested + redirect_nested,
+            redirect_substitutions=redirect_nested,
             depth=depth,
             literal_ranges=literal_ranges,
         )
@@ -2049,8 +2064,18 @@ class SubstitutionValidator:
                     message="Cannot determine command in substitution segment",
                     inner_results=inner_results,
                 )
-            result = self.validate_substitution(child, depth)
+            inner_results.append(self.validate_substitution(child, depth))
+
+        # A peeled group's read redirects belong to no segment, so no segment walks them:
+        # $( (cat | cat) < "$(bash)" ) rated SAFE while $(cat | cat < "$(bash)") BLOCKs. Judge
+        # them as nested, the way a single command's are (LAB-5648).
+        for nested in sub_node.redirect_substitutions:
+            result = self.validate_substitution(nested, depth + 1)
+            if not result.allowed:
+                result = replace(result, message=f"Nested substitution blocked: {result.message}")
             inner_results.append(result)
+
+        for result in inner_results:
             if not result.allowed:
                 # Worst segment wins, not the first denied one. The level decides the action
                 # (HIGH -> ask, BLOCKED -> deny), so returning here reported `$( (a && rm -rf /) )`
