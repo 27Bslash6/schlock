@@ -260,8 +260,9 @@ def parse_bashlex(command: str) -> list[Any]:
     substitution nodes bashlex dropped from quoted words (_recover_dropped_substitutions,
     LAB-4950), whichever caller asked, so no tier can hand a consumer a tree missing either.
     It also refuses a subscript before a command name that runs past bashlex's word
-    (_refuse_split_subscripts, after the tags it reads past). The native tier refuses every
-    subscripted prefix, so under `auto` such a command always falls through to this tier.
+    (_refuse_split_subscripts). That runs last: after _mark_fd_variables, whose tagged words it
+    skips, and after recovery, so recovered bodies are checked too. The defect it catches is
+    bashlex's word boundary, so only this tier needs it.
     The parse and the substitution recovery share one CPU budget (_parse_budget), because
     recovery re-enters bashlex's parser for each body; running out raises ParseBudgetError,
     passed through unwrapped.
@@ -1160,11 +1161,13 @@ _SUBSCRIPT_TOKEN = re.compile(
 def _subscript_span_is_trustworthy(command: str, word: Any) -> "Optional[dict[int, int]]":
     """The command-substitution spans inside ``word`` to skip, or None when they cannot be trusted.
 
-    The scan skips a `$(...)` / backtick / `<(...)` using bashlex's own span so a `]` inside one is
-    not read as the subscript's close. Two things make that span wrong, and bash still runs the
-    command, so both must fail closed:
-    - A backslash-newline: bashlex removes it and shifts every later offset, so no child span lines
-      up with ``command`` any more.
+    The scan skips a `$(...)` / backtick / `<(...)` using the part's span (bashlex's, or one
+    _recover_dropped_substitutions rebuilt from the source) so a `]` inside one is not read as the
+    subscript's close. Two things can make a bashlex span wrong, and bash still runs the command,
+    so both must fail closed:
+    - A backslash-newline: bashlex removes it and shifts every later offset. Recovery rebuilds that
+      word's code parts at source offsets before this runs, but the word is refused outright rather
+      than trust the rebuild.
     - A `#` comment or a `<<` heredoc inside the substitution: bashlex ends the span before the real
       closer, and the scan would resume inside the substitution and read a `]` bash never reaches.
     """
@@ -1422,10 +1425,8 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax, a
-                `{varname}` redirect prefix cannot be read with certainty
-                (see _mark_fd_variables), or a subscript before the command
-                name runs past bashlex's word (see _PrefixSubscriptCheck)
+            ParseError: If bashlex cannot parse the command or one of
+                parse_bashlex's post-parse checks refuses it (see parse_bashlex)
             ParseBudgetError: If the parse uses more than PARSE_CPU_BUDGET of CPU
 
         Example:

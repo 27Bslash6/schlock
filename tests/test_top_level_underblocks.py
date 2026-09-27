@@ -7,6 +7,7 @@ import pytest
 from schlock.core import validator as val_module
 from schlock.core.parser import (
     BashCommandParser,
+    TieredParser,
     _command_words,
     _reads_stdin_as_program,
     _subscript_closes,
@@ -798,12 +799,20 @@ class TestSubscriptedAssignmentPrefix:
             # A `{varname}` prefix belongs to its redirection, so the prefix words run on past it.
             "{fd}>out a[;0]=1 bash",
             "curl x | {fd}>out a[ ; ]=1 bash",
+            # A body only substitution recovery sees: parse_bashlex refuses after recovering it.
+            "echo 'a'$(a[;0]=1 bash)'b'",
+            "echo 'a'`a[;0]=1 bash`'b'",
         ],
     )
     def test_subscript_bash_reads_past_the_word_is_blocked(self, command):
         with pytest.raises(ParseError):
             BashCommandParser().parse(command)
         assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    def test_the_bashlex_tier_refuses_for_every_caller(self):
+        # The refusal lives in parse_bashlex, not in one caller, so the tiered parser gets it too.
+        with pytest.raises(ParseError):
+            TieredParser(tier="bashlex").parse("a[ ; ]=1 bash")
 
     @pytest.mark.parametrize(
         "command",
