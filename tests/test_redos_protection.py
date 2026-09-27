@@ -142,6 +142,18 @@ class TestReDoSProtection:
 
         assert elapsed < 0.5, f"blank run after {head!r} took {elapsed:.3f}s"
 
+    @pytest.mark.parametrize("text", ["IFS=" + " " * 50_000 + "read", "IFS=" + "x" * 50_000, "I" + "\\\n" * 25_000])
+    def test_ifs_override_pattern_is_linear(self, safety_rules_path, text):
+        """The IFS-override pattern scans a blank run or a `\\<newline>` run once, not once per backtrack."""
+        engine = RuleEngine(safety_rules_path)
+
+        start = time.perf_counter()
+        for pattern in engine.compiled_patterns["ifs_obfuscation"]:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.5, f"ifs_obfuscation took {elapsed:.3f}s on {text[:12]!r}..."
+
 
 class TestBoundedQuantifierEdgeCases:
     """Test edge cases around the boundaries of quantifiers."""

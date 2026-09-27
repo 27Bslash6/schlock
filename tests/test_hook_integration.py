@@ -10,8 +10,10 @@ Tests cover:
 - Performance requirements (skipped in CI - timing tests are flaky)
 """
 
+import io
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -31,7 +33,11 @@ skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI env
 import pre_tool_use
 from pre_tool_use import format_message, get_validator, handle_pre_tool_use, map_risk_to_status
 from schlock import RiskLevel, ValidationResult
+from schlock.integrations.audit import AuditLogger
 from schlock.integrations.commit_filter import MAX_COMMAND_SIZE, CommitMessageFilter
+from schlock.setup.config_writer import RISK_PRESETS
+
+needs_itimer = pytest.mark.skipif(not pre_tool_use._HAS_ITIMER, reason="no interval timers (Windows)")
 
 
 @pytest.fixture(autouse=True)
@@ -124,6 +130,64 @@ class TestMessageFormatting:
             message = format_message(result)
             assert f"Risk Level: {risk_level.name}" in message
 
+    @pytest.mark.parametrize("matched_rules", [["x"], [], ["x", "x"]])
+    def test_single_or_no_rule_output_unchanged(self, matched_rules):
+        """One distinct rule or none: no `Rules matched` line, output as before LAB-5002."""
+        result = ValidationResult(
+            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
+        )
+        assert format_message(result, decision="ask") == "CAUTION: Reason\nRisk Level: HIGH\n\nAlternatives:\n  - Alt"
+
+    @pytest.mark.parametrize(("decision", "status"), [("ask", "CAUTION"), ("deny", "BLOCKED")])
+    @pytest.mark.parametrize("matched_rules", [["a", "b"], ["a", "b", "a"]])
+    def test_every_matched_rule_is_named(self, decision, status, matched_rules):
+        """Every distinct matched rule is named, not only the one whose message is shown (LAB-5002)."""
+        result = ValidationResult(
+            allowed=False, risk_level=RiskLevel.HIGH, message="Reason", alternatives=["Alt"], matched_rules=matched_rules
+        )
+        assert format_message(result, decision=decision) == (
+            f"{status}: Reason\nRisk Level: HIGH\nRules matched: a, b\n\nAlternatives:\n  - Alt"
+        )
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_segment_tie_prompt_names_both_rules(self, tmp_path, monkeypatch):
+        """Two HIGH segments on different rules: the ask text names both; the audit line is unchanged."""
+        log_file = tmp_path / "audit.jsonl"
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS["balanced"]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+
+        command = "git push --force origin main && rm -r ./build"
+        output = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})["hookSpecificOutput"]
+
+        assert output["permissionDecision"] == "ask"
+        assert output["permissionDecisionReason"] == (
+            "CAUTION: Force push overwrites remote history\n"
+            "Risk Level: HIGH\n"
+            "Rules matched: git_force_push, recursive_delete\n"
+            "\n"
+            "Alternatives:\n"
+            "  - Use --force-with-lease"
+        )
+        (line,) = log_file.read_text().splitlines()
+        assert json.loads(line)["violations"] == ["git_force_push", "recursive_delete"]
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    def test_shellcheck_audit_entries_stay_out_of_the_prompt_and_the_cache(self, tmp_path, monkeypatch):
+        """The hook appends ShellCheck findings to the audit list; that must not reach `matched_rules`."""
+        log_file = tmp_path / "audit.jsonl"
+        finding = SimpleNamespace(sc_code="SC2086", message="Double quote")
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS["balanced"]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([finding], "ShellCheck says"))
+
+        for _ in range(2):
+            output = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}})
+            assert "Rules matched" not in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        violations = [json.loads(line)["violations"] for line in log_file.read_text().splitlines()]
+        assert violations == [["git_commit", "ShellCheck SC2086: Double quote"]] * 2
+
 
 class TestHookHandler:
     """Test hook handler integration with validation engine."""
@@ -195,6 +259,39 @@ class TestHookHandler:
         output = response["hookSpecificOutput"]
         assert output["permissionDecision"] == "deny"
         assert output["permissionDecisionReason"].startswith("BLOCKED: Command exceeds size limit")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAmplifiedMediumSubstitutionThroughTheHook:
+    """`git commit` in a substitution is the LOW rule `git_commit` amplified to MEDIUM (LAB-4223).
+
+    It read SAFE with no rule, so paranoid never asked and the audit line claimed no rule matched.
+    """
+
+    COMMAND = 'echo "$(git commit -m evil)"'
+
+    @pytest.mark.parametrize(("preset", "action"), [("paranoid", "ask"), ("balanced", "allow"), ("permissive", "allow")])
+    def test_preset_action_and_audit_line(self, preset, action, tmp_path, monkeypatch):
+        log_file = tmp_path / "audit.jsonl"
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "get_audit_logger", lambda: AuditLogger(log_file=log_file))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": self.COMMAND}})
+
+        assert response["hookSpecificOutput"]["permissionDecision"] == action
+        (line,) = log_file.read_text().splitlines()
+        event = json.loads(line)
+        assert (event["risk_level"], event["violations"], event["decision"]) == ("MEDIUM", ["git_commit"], action)
+
+    @pytest.mark.parametrize("preset", ["paranoid", "balanced", "permissive"])
+    def test_config_extraction_in_a_substitution_is_denied_on_every_preset(self, preset, monkeypatch):
+        """`tar` over schlock's config is BLOCKED bare; wrapped in `cat "$(…)"` it must not become runnable."""
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
+        command = 'cat "$(tar -xf e.tar ~/.claude/hooks/schlock-config.yaml)"'
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 class TestValidatorSingleton:
@@ -564,3 +661,79 @@ class TestUnscannableMessageHookHandling:
         assert block_calls, "expected a block audit entry on validation error"
         joined = " ".join(block_calls[-1].kwargs["violations"]).lower()
         assert "unscannable" in joined  # warn detection survives the error-deny path
+
+
+class TestValidationDeadline:
+    """A validation that never returns must deny, not outlive Claude Code's timeout (LAB-4959).
+
+    Claude Code lets a timed-out PreToolUse command hook through to the permission flow.
+    """
+
+    @needs_itimer
+    def test_stalled_validation_denies_within_the_deadline(self, monkeypatch):
+        def spin(command):
+            give_up = time.perf_counter() + 5  # a regression fails the asserts below instead of hanging
+            while time.perf_counter() < give_up:
+                pass
+
+        monkeypatch.setattr(pre_tool_use, "validate_command", spin)
+        monkeypatch.setattr(pre_tool_use, "VALIDATION_DEADLINE_S", 0.2)
+        audit = []
+        monkeypatch.setattr(AuditLogger, "log_validation", lambda self, **kw: audit.append(kw))
+
+        start = time.perf_counter()
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+
+        assert time.perf_counter() - start < 5
+        output = response["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert "did not finish within" in output["permissionDecisionReason"]
+        assert audit[-1]["decision"] == "block"
+        assert "deadline" in audit[-1]["violations"][0]
+
+    @needs_itimer
+    def test_deadline_escaping_a_sibling_handler_is_audited_by_main(self, monkeypatch, capsys):
+        """The alarm fires inside the RuntimeError branch's own audit call; main must still audit the deny."""
+
+        def fail(command):
+            raise RuntimeError("validator unavailable")
+
+        audit = []
+
+        def stall_first_audit(self, **kw):
+            audit.append(kw)
+            give_up = time.perf_counter() + 5  # a regression fails the asserts below instead of hanging
+            while len(audit) == 1 and time.perf_counter() < give_up:
+                pass
+
+        monkeypatch.setattr(pre_tool_use, "validate_command", fail)
+        monkeypatch.setattr(pre_tool_use, "VALIDATION_DEADLINE_S", 0.2)
+        monkeypatch.setattr(AuditLogger, "log_validation", stall_first_audit)
+        monkeypatch.setattr(pre_tool_use.faulthandler, "dump_traceback_later", lambda *a, **kw: None)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})))
+
+        with pytest.raises(SystemExit):
+            pre_tool_use.main()
+
+        assert json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert len(audit) == 2
+        assert audit[0]["violations"][0].startswith("RuntimeError")  # the alarm fired in the sibling branch
+        assert audit[-1]["command"] == "ls"
+        assert audit[-1]["decision"] == "block"
+        assert "deadline" in audit[-1]["violations"][0]
+
+    @needs_itimer
+    def test_deadline_is_disarmed_after_a_normal_verdict(self):
+        previous = signal.getsignal(signal.SIGALRM)
+        handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+        assert signal.getsignal(signal.SIGALRM) is previous
+
+    def test_platform_without_sigalrm_still_validates(self, monkeypatch):
+        """Windows has no SIGALRM; the soft deadline steps aside and faulthandler alone bounds the hook."""
+        monkeypatch.setattr(pre_tool_use, "_HAS_ITIMER", False)
+        monkeypatch.delattr(signal, "setitimer", raising=False)
+
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+
+        assert response["hookSpecificOutput"]["permissionDecision"] == "allow"
