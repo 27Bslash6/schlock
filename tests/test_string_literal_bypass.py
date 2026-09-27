@@ -567,6 +567,11 @@ class TestSubstitutionBetweenQuotedRuns:
             'echo "a \\\n b"<(rm -rf /)"z"',
             'echo "a \\\n \\\n b"<(rm -rf /)"z"',
             "echo 'a \\\n b'$(rm -rf ~)'c'",
+            # bodies only the AST path can read: bashlex's shifted `${y}` offset once skipped
+            # past the closing quote, and a `"` nested in `${…}` lost the scan its quoting
+            "echo \"a \\\n b\"${y}<(r''m -rf /)",
+            'echo "a \\\n ${x#"\'"}"<(eval "$y")\'x\'',
+            'echo "a\\\\\nb ${x#"\'"}"$(find / -delete)\'x\'',
             # controls that were already caught, so a fix cannot trade one for another
             "echo x<(rm -rf /)",
             'echo "a"$(rm -rf ~)"b"',
@@ -589,7 +594,13 @@ class TestSubstitutionBetweenQuotedRuns:
             "echo 'a'$(echo \")\")'b'",
             # a continuation before a benign body is still validated, not refused
             'echo "one \\\n two $(date)"',
+            'echo "a \\\n b $(date\n)"',
+            # an escaped backslash before a newline is no continuation, but is treated as one
             'echo "a\\\\\nb $(date)"',
+            # a `${…}` follows a continuation, so its bashlex offset is shifted; the scan must
+            # not skip to that wrong end (it would over-block this literal `<(date)` inside
+            # `"…"`). Kept SAFE only because parameter parts are not skip targets in such a word.
+            'echo "a \\\n b${x#"q"}<(date)"',
             # empty backquotes run nothing
             'echo "``"',
             "echo 'a'``'b'",
@@ -622,7 +633,12 @@ class TestSubstitutionBetweenQuotedRuns:
         assert command[sub.pos[0] : sub.pos[1]] == "$(x)"
 
     def test_substitution_recovery_is_cpu_bounded(self, monkeypatch):
-        """Recovery re-enters bashlex's parser, so it runs under the same budget as the parse (LAB-5659)."""
+        """Recovery re-enters bashlex's parser, so it runs under the same budget as the parse (LAB-5659).
+
+        The backquote comes first: its body is parsed through a nested budget, and a nested
+        budget that armed its own timer would disarm the outer one on exit, leaving the `$(`
+        recovery after it unbounded.
+        """
         import schlock.core.parser as parser_mod  # noqa: PLC0415
 
         def spin(*_args):
@@ -638,7 +654,7 @@ class TestSubstitutionBetweenQuotedRuns:
         signal.setitimer(signal.ITIMER_REAL, 30)
         try:
             with pytest.raises(ParseBudgetError):
-                BashCommandParser().parse("echo 'a'$(date)'b'")
+                BashCommandParser().parse("echo 'a'`x`$(date)'b'")
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
@@ -646,8 +662,8 @@ class TestSubstitutionBetweenQuotedRuns:
 
     def test_a_body_that_cannot_be_placed_fails_closed(self):
         with pytest.raises(ParseError):
-            # A nested body is what makes arithmetic dangerous; `$((1+2))` would pin only that
-            # bashlex cannot read arithmetic, which the native tier rightly calls SAFE.
+            # A dangerous body, not `$((1+2))`: tests/test_superset_oracle.py harvests this file,
+            # and the native tier rightly rates benign arithmetic SAFE where bashlex cannot read it.
             BashCommandParser().parse("echo 'a'$(( $(rm -rf /) ))'b'")
 
     def test_a_body_bashlex_cannot_parse_fails_closed(self, monkeypatch):

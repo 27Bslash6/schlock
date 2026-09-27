@@ -80,7 +80,10 @@
      already delimited and only locates quote pairs and code openers. Bodies are still parsed by
      bashlex. A body it cannot place raises `ParseError`, and a word it cannot read earns no
      literal range. In a word holding a line continuation bashlex's part offsets are shifted, so
-     every code part there is rebuilt from the source. Recovery runs under the parse CPU budget.
+     every code part there is rebuilt from the source and parameter parts are never skip targets.
+     When such a word's quoting cannot be followed after its code parts were dropped (a `"`
+     nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
+     shares the parse's CPU budget.
      The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.

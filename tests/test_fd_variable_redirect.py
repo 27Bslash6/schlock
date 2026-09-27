@@ -343,6 +343,14 @@ class TestEveryConsumerParsesThroughTheTag:
             ("schlock/core/parser.py", "_parse_succeeds"),
             ("schlock/core/parser.py", "_recover_substitution"),
         }
+        # Recovery also enters bashlex's parser through its `$(…)` body parser, which no search
+        # above sees; parse_bashlex runs recovery inside its budget, so this is the only owner.
+        dolparen = {
+            (path.relative_to(src).as_posix(), owner)
+            for path in src.rglob("*.py")
+            for owner in _bashlex_parse_calls(path, targets=("bashlex.subst._parsedolparen",))
+        }
+        assert dolparen == {("schlock/core/parser.py", "_recover_substitution")}
 
 
 def _import_aliases(tree):

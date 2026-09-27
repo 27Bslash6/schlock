@@ -4,10 +4,10 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks. Two readers
-here work on single words whose boundaries bashlex has already fixed, _redirect_words
-and _mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE); CLAUDE.md lists
-both as approved exceptions and the constraints each must keep.
+Regex-based parsing is explicitly NOT supported due to security risks. Three readers
+here work on single words whose boundaries bashlex has already fixed, _redirect_words,
+_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE) and _quote_pairs;
+CLAUDE.md lists them as approved exceptions and the constraints each must keep.
 """
 
 import bisect
@@ -77,13 +77,26 @@ def _parse_budget() -> Iterator[None]:
     caller, not only the hook. The timer is ITIMER_VIRTUAL (SIGVTALRM), so a caller's SIGALRM
     deadline is untouched, and a caller's own ITIMER_VIRTUAL and handler are put back afterwards.
     Python runs signal handlers only on the main thread and Windows has no setitimer: there the
-    body runs unbounded, as it did before. Reentrant: a nested budget shares the outer one, so a
-    parse made while recovering a substitution (LAB-4950) cannot reset the clock.
+    body runs unbounded, as it did before.
+
+    Reentrant (LAB-4950): inside a running budget, a nested one only yields. Arming its own
+    would end in its `finally`, which disarms the handler for the rest of the outer body - a
+    backquote body parsed during substitution recovery left the recovery after it unbounded.
+    "Running" is read from the live timer and handler, not from `_budget_armed` alone: a
+    teardown the signal interrupts can leave that flag set, and trusting it would then leave
+    every later parse unbounded.
     """
     global _budget_armed, _budget_spent  # noqa: PLW0603 - flags shared with the signal handler
     if _budget_spent:
         raise ParseBudgetError(_BUDGET_MESSAGE)
-    if _budget_armed or not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    if (
+        _budget_armed
+        and signal.getsignal(signal.SIGVTALRM) is _on_parse_budget
+        and signal.getitimer(signal.ITIMER_VIRTUAL)[0] > 0
+    ):
         yield
         return
     previous_handler = signal.signal(signal.SIGVTALRM, _on_parse_budget)
@@ -245,30 +258,30 @@ def parse_bashlex(command: str) -> list[Any]:
     Every AST it returns carries the `{varname}` prefix tags (_mark_fd_variables) and the
     substitution nodes bashlex dropped from quoted words (_recover_dropped_substitutions,
     LAB-4950), whichever caller asked, so no tier can hand a consumer a tree missing either.
-    The parse is CPU-bounded (_bounded_parse); one that runs out raises ParseBudgetError,
+    The parse and the substitution recovery share one CPU budget (_parse_budget), because
+    recovery re-enters bashlex's parser for each body; running out raises ParseBudgetError,
     passed through unwrapped.
     """
-    try:
-        ast = _bounded_parse(command)
-    except ParseBudgetError:
-        # Not rewrapped below: that message quotes the command, and a quoted `<<heredoc`
-        # would route the denial to the heredoc fallback, which parses it again.
-        raise
-    except bashlex.errors.ParsingError as e:
-        # Preserve original bashlex error for debugging
-        raise ParseError(
-            f"Failed to parse bash command: {command!r}",
-            original_error=e,
-        )
-    except Exception as e:
-        # Catch any other unexpected bashlex errors
-        logger.error(f"Unexpected error parsing command: {e}")
-        raise ParseError(
-            f"Unexpected parsing error for command: {command!r}",
-            original_error=e,
-        )
-    # Bounded like the parse itself: recovery re-enters bashlex's parser for each body.
     with _parse_budget():
+        try:
+            ast = _bounded_parse(command)
+        except ParseBudgetError:
+            # Not rewrapped below: that message quotes the command, and a quoted `<<heredoc`
+            # would route the denial to the heredoc fallback, which parses it again.
+            raise
+        except bashlex.errors.ParsingError as e:
+            # Preserve original bashlex error for debugging
+            raise ParseError(
+                f"Failed to parse bash command: {command!r}",
+                original_error=e,
+            )
+        except Exception as e:
+            # Catch any other unexpected bashlex errors
+            logger.error(f"Unexpected error parsing command: {e}")
+            raise ParseError(
+                f"Unexpected parsing error for command: {command!r}",
+                original_error=e,
+            )
         _recover_dropped_substitutions(command, ast)
     _mark_fd_variables(command, ast)
     return ast
@@ -462,10 +475,18 @@ _MAX_BODY_TEXT_FACTOR = 4
 
 _CODE_PART_KINDS = ("commandsubstitution", "processsubstitution")
 
-# bashlex deletes a word's line continuations before it numbers the word's parts, so past
-# the first one every part offset is short by two per continuation (`"a \<newline> $(x)"`
-# puts the `$(` two characters early). Those offsets cannot be trusted as skip targets.
-_LINE_CONTINUATION = "\\\n"
+
+def _part_offsets_may_shift(command: str, span: tuple) -> bool:
+    r"""Whether bashlex's offsets for the parts of the word at ``span`` may be wrong.
+
+    bashlex deletes a word's line continuations before it numbers the word's parts, so past
+    the first one every part offset is short by two per continuation (`"a \<newline> $(x)"`
+    puts the `$(` two characters early). Any backslash-newline counts, including the ones
+    that are not continuations (inside `'…'`, or after an escaped backslash): the cost of
+    over-matching is a rebuild that fails closed, never a skip to a wrong end. Both
+    _recover_dropped_substitutions and _quote_pairs must ask this same question.
+    """
+    return "\\\n" in command[span[0] : span[1]]
 
 
 def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
@@ -493,7 +514,7 @@ def _quote_pairs(  # noqa: PLR0912 - one branch per bash quoting rule
     # In a word with a continuation only the code parts are skipped, and only because
     # _recover_dropped_substitutions rebuilt all of them at source offsets. A parameter's
     # offsets are bashlex's, and a skip to a shifted end resumes the scan mid-word.
-    kinds = _CODE_PART_KINDS if _LINE_CONTINUATION in command[start:end] else (*_CODE_PART_KINDS, "parameter")
+    kinds = _CODE_PART_KINDS if _part_offsets_may_shift(command, span) else (*_CODE_PART_KINDS, "parameter")
     skip = {p.pos[0]: p.pos[1] for p in parts if getattr(p, "pos", None) and p.kind in kinds}
     pairs: list[tuple[int, int]] = []
     opened: Optional[int] = None  # offset of an open `"`
@@ -553,6 +574,9 @@ def _recover_substitution(command: str, offset: int, word_end: int) -> Any:
             bashlex.subst._adjustpositions(body[0], offset + 1, len(command))  # what bashlex does for a bare one
             return bashlex.ast.node(kind="commandsubstitution", command=body[0], pos=(offset, close + 1))
         body, close = bashlex.subst._parsedolparen(bashlex.parser._parser(command), command, offset + 2)
+        # bashlex ends a body before its trailing newlines (`$(date<newline>)`); the closer follows them.
+        while close < word_end and command[close] in " \t\n":
+            close += 1
         if not close < word_end or command[close] != ")":
             raise ParseError(f"Cannot locate the substitution body at offset {offset}")
         kind = "commandsubstitution" if command[offset] == "$" else "processsubstitution"
@@ -570,11 +594,21 @@ def _recover_dropped_substitutions(command: str, nodes: "list[Any]") -> None:
         node = stack.pop()
         if node.kind in ("word", "assignment") and getattr(node, "pos", None):
             node.parts = list(getattr(node, "parts", None) or [])
-            if _LINE_CONTINUATION in command[node.pos[0] : node.pos[1]]:
-                # bashlex's offsets are shifted here (_LINE_CONTINUATION): rebuild every code
-                # part from the source rather than skip to a wrong end.
+            dropped = _part_offsets_may_shift(command, node.pos)
+            if dropped:
+                # bashlex's offsets are shifted here: rebuild every code part from the source
+                # rather than skip to a wrong end.
                 node.parts = [part for part in node.parts if part.kind not in _CODE_PART_KINDS]
-            _quote_pairs(command, node.pos, node.parts, recover=_recover_substitution)
+            if _quote_pairs(command, node.pos, node.parts, recover=_recover_substitution) is None and dropped:
+                # We deleted bashlex's own code parts above, and now the scan cannot read the
+                # word's quoting (a `"` nested in `${x#"'"}`, or a skip its shifted offsets sent
+                # mid-word), so an opener it should have rebuilt may have gone unseen - the
+                # deleted node is lost. Fail closed. Only when we dropped: a None on an intact
+                # word means the scan found no ranges, and bashlex's own nodes (plus the
+                # `${…}` re-parse in substitution.py) still cover it, so raising there would
+                # over-block a benign `${A:-"${B}"}`. Fixed text: a message holding the command
+                # could route this to the heredoc fallback.
+                raise ParseError("Cannot read the quoting of a word that may hold a substitution")
             node.parts.sort(key=lambda part: part.pos[0])
         for value in vars(node).values():
             children = value if isinstance(value, list) else [value]
