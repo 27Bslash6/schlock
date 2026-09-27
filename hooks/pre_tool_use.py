@@ -21,9 +21,11 @@ Hook Interface:
 """
 
 import contextlib
+import faulthandler
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -95,6 +97,24 @@ except BaseException as exc:  # BaseException, not Exception: a dependency that 
 # Configure logging to stderr
 logging.basicConfig(level=logging.INFO, format="[schlock-hook] %(levelname)s: %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
+
+# Claude Code lets a PreToolUse command hook that outlives its timeout (600 s by default) through
+# to the normal permission flow, so a validation that never returns is an allow (LAB-4959). The
+# deadline turns that into a denial, with headroom over the slowest legitimate input at the 64 KiB cap.
+VALIDATION_DEADLINE_S = 30
+# Backstop for a stall the soft deadline cannot interrupt (C code holding the GIL, a swallowed
+# timeout): faulthandler's watchdog thread exits 1 without the GIL, and the manifest's
+# `|| exit 2` turns that exit into a block. It is also the only bound on Windows, which has no SIGALRM.
+HARD_DEADLINE_S = 45
+_HAS_ITIMER = hasattr(signal, "setitimer")
+
+
+class ValidationDeadlineExceeded(BaseException):
+    """A BaseException, so no `except Exception` on the validation path can swallow it."""
+
+
+def _on_deadline(signum, frame):
+    raise ValidationDeadlineExceeded
 
 
 # Global validator instance (lazy-loaded)
@@ -380,15 +400,11 @@ def format_message(result: ValidationResult, decision: str = "deny") -> str:
     Returns:
         Formatted message string
 
-    Format for "ask" (prompt):
-        CAUTION: <reason>
+    Format ("CAUTION" for "ask", "BLOCKED" for "deny"):
+        CAUTION|BLOCKED: <reason>
         Risk Level: <risk_level>
-        Alternatives:
-          - <alternative 1>
+        Rules matched: <rule>, <rule>   (only when two or more distinct rules matched)
 
-    Format for "deny" (block):
-        BLOCKED: <reason>
-        Risk Level: <risk_level>
         Alternatives:
           - <alternative 1>
     """
@@ -402,6 +418,12 @@ def format_message(result: ValidationResult, decision: str = "deny") -> str:
 
     # Risk level line
     lines.append(f"Risk Level: {result.risk_level.name}")
+
+    # `message` comes from one rule; name every distinct matched rule so none hides behind it (LAB-5002)
+    # Segments repeat rules (`rm -r a && rm -r b`), so dedupe in order before counting
+    rules = list(dict.fromkeys(result.matched_rules))
+    if len(rules) > 1:
+        lines.append("Rules matched: " + ", ".join(rules))
 
     # Alternatives (if any)
     if result.alternatives:
@@ -450,6 +472,9 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
     unscannable_warning = None
     unscannable_audit_violation = None
 
+    if _HAS_ITIMER:
+        previous_handler = signal.signal(signal.SIGALRM, _on_deadline)
+        signal.setitimer(signal.ITIMER_REAL, VALIDATION_DEADLINE_S)
     try:
         # 1. Extract command from stdin JSON
         tool_name = input_data.get("tool_name", "")
@@ -600,8 +625,8 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
         # Calculate execution time
         execution_time_ms = (time.perf_counter() - start_time) * 1000
 
-        # Extract violations from result
-        violations = result.matched_rules if hasattr(result, "matched_rules") and result.matched_rules else []
+        # Copy: the appends below are audit-only and must not leak into the (cached) result or the prompt
+        violations = list(result.matched_rules) if hasattr(result, "matched_rules") and result.matched_rules else []
 
         # Add shellcheck findings to violations for audit
         if shellcheck_findings:
@@ -718,9 +743,41 @@ def handle_pre_tool_use(input_data: dict) -> dict:  # noqa: PLR0915, PLR0911, PL
             }
         }
 
+    except ValidationDeadlineExceeded:
+        logger.error(f"Validation exceeded {VALIDATION_DEADLINE_S}s; denying")
+        deadline_violations = [f"Validation deadline exceeded ({VALIDATION_DEADLINE_S}s)"]
+        if unscannable_audit_violation:
+            deadline_violations.append(unscannable_audit_violation)
+        audit_logger.log_validation(
+            command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
+            risk_level="BLOCKED",
+            violations=deadline_violations,
+            decision="block",
+            execution_time_ms=(time.perf_counter() - start_time) * 1000,
+            context=context,
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"BLOCKED: Validation did not finish within {VALIDATION_DEADLINE_S}s, "
+                    "so schlock cannot vouch for this command. Split it into smaller commands."
+                ),
+            }
+        }
+
+    finally:
+        if _HAS_ITIMER:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
 
 def main():
     """Entry point for Claude Code hook execution."""
+    faulthandler.dump_traceback_later(HARD_DEADLINE_S, exit=True)
+    start_time = time.perf_counter()
+    input_data = {}  # Initialized before the try so the except handlers can read it safely.
     try:
         # Read hook input from stdin
         input_data = json.load(sys.stdin)
@@ -739,8 +796,19 @@ def main():
         }
         print(json.dumps(error_result))
         sys.exit(2)
-    except Exception as e:
-        logger.error(f"Fatal error in main: {e}", exc_info=True)
+    except (Exception, ValidationDeadlineExceeded) as e:
+        # The deadline escapes handle_pre_tool_use when it fires inside a sibling except branch or its finally.
+        logger.error(f"Fatal error in main: {e!r}", exc_info=True)
+        if isinstance(e, ValidationDeadlineExceeded):
+            # That code may have audited nothing, or a verdict this deny replaces, so record the deny.
+            get_audit_logger().log_validation(
+                command=input_data.get("tool_input", {}).get("command", "<unknown>")[:500],
+                risk_level="BLOCKED",
+                violations=[f"Validation deadline exceeded ({VALIDATION_DEADLINE_S}s)"],
+                decision="block",
+                execution_time_ms=(time.perf_counter() - start_time) * 1000,
+                context=get_context(),
+            )
         # Still output valid JSON even on fatal errors
         error_result = {
             "hookSpecificOutput": {

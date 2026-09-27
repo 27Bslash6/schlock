@@ -57,23 +57,33 @@ class TestReDoSFix:
         # This is acceptable tradeoff - DoS protection > catching every variant
         # The important thing is that it completes quickly
 
-    def test_redos_rm_pathological(self, safety_rules_path):
-        """Test original ReDoS attack vector: rm with many flags."""
-        # Pathological input: rm -x -x -x ... -x -rf /
-        # With greedy .* this causes catastrophic backtracking
-        command = "rm " + "-x " * 5000 + "-rf /"
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize(
+        "command",
+        [
+            pytest.param("rm " + "-x " * 5000 + "-rf /", id="unmatched-flags"),
+            pytest.param("rm " + "-rf\\; " * 5000 + "x", id="separator-flags"),
+        ],
+    )
+    def test_redos_rm_pathological(self, safety_rules_path, command):
+        """rm with 5000 flags: schlock's parse and rule pass must stay linear.
+
+        ShellCheck is forced off and the rules load before the clock starts, so the 0.7s
+        budget covers schlock's own parsing and rule matching. ShellCheck is an optional
+        subprocess and was over half the measured time.
+
+        ``-x`` bounds the whole pass. Every ``-rf\\;`` token matches the rm rules' flag
+        group, but each ``;`` stops their ``[^;|&]`` spans, and the trailing ``x`` is not
+        a target those rules accept. A span widened to ``.*`` therefore backtracks across
+        every later token and goes quadratic.
+        """
+        validate_command("true", config_path=safety_rules_path)  # load the rules untimed
 
         start = time.time()
         validate_command(command, config_path=safety_rules_path)  # Result unused - testing timing
         elapsed = time.time() - start
 
-        # PRIMARY GOAL: Must complete quickly (DoS protection)
-        # With 60+ patterns + ShellCheck, ~500ms is expected linear time
-        assert elapsed < 0.7, f"ReDoS in rm pattern: took {elapsed:.3f}s"
-
-        # With bounded quantifiers {0,100}, 5000 flags exceeds bounds
-        # Pattern may not match, but that's acceptable for DoS protection
-        # The fix is about speed, not catching every variant
+        assert elapsed < 0.7, f"validating took {elapsed:.3f}s (budget 0.7s)"
 
     def test_redos_git_pathological(self, safety_rules_path):
         """Test git force push with pathological input."""
