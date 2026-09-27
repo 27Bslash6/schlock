@@ -2922,11 +2922,11 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         except (ParseError, ValueError) as e:
             # A heredoc bashlex rejected (a quoted delimiter with no as-written terminator
             # line), or one it read as written and was refused above: both go to the
-            # fallback. The route keys on "here-document"/"heredoc" in the message, or in an
-            # original error the message does not show (bashlex's `coproc` dump routes on
-            # its `heredoc=None`).
-            route = f"{e} {getattr(e, 'original_error', None) or ''}"
-            if "<<" in command and ("here-document" in route or "heredoc" in route.lower()):
+            # fallback. The route keys on "here-document"/"heredoc" in the message or in the
+            # original error, which the message no longer shows. A `coproc` dump matches only
+            # by accident, on its `heredoc=None`; it is read so that no denial changes its exit.
+            route_text = f"{e} {getattr(e, 'original_error', None) or ''}"
+            if "<<" in command and ("here-document" in route_text or "heredoc" in route_text.lower()):
                 # Extract command before heredoc and validate that instead
                 heredoc_result = _validate_heredoc_command(command, config_path, _derived=_depth > 0 or _derived)
                 if heredoc_result is not None:

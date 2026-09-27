@@ -12,7 +12,9 @@ from typing import Optional
 class ParseError(Exception):
     """Raised when bash command parsing fails.
 
-    Preserves the original bashlex error message for debugging.
+    Preserves the original bashlex error for debugging, but ``str()`` is the message
+    alone: it reaches deny reasons and ERROR logs, and the original's text can hold
+    the command's words. A raise site that wants part of it says so in the message.
     Used by BashCommandParser when bashlex.parse() fails.
 
     Args:
@@ -23,26 +25,16 @@ class ParseError(Exception):
         >>> raise ParseError("Invalid syntax", original_error=bashlex.errors.ParsingError())
     """
 
-    def __init__(self, message: str, original_error: Optional[Exception] = None, *, show_original: bool = True):
+    def __init__(self, message: str, original_error: Optional[Exception] = None):
         """Initialize ParseError with message and optional original error.
 
         Args:
             message: Human-readable error description
             original_error: Original bashlex exception (preserved for debugging)
-            show_original: False keeps the original's text out of ``str()``. Its text
-                reaches deny reasons and ERROR logs, and some originals hold the
-                command's words.
         """
         self.message = message
         self.original_error = original_error
-        self.show_original = show_original
         super().__init__(self.message)
-
-    def __str__(self) -> str:
-        """Return string representation with original error context if available."""
-        if self.original_error and self.show_original:
-            return f"{self.message} (original: {self.original_error})"
-        return self.message
 
 
 class ParseBudgetError(ParseError):

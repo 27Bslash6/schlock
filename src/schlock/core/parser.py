@@ -248,9 +248,25 @@ def _refuse_unterminated_brace_expansion() -> None:
 
 _refuse_unterminated_brace_expansion()
 
-# bashlex's fixed texts for two constructs it cannot parse. They hold none of the command,
-# so a parse error may show them; it shows no other unexpected error's text.
+# bashlex's fixed texts for two constructs it cannot parse. They hold none of the command.
 _SHOWN_UNEXPECTED_ERRORS = frozenset({"arithmetic expansion", "arithmetic substitution"})
+
+
+def _bashlex_failure(e: Exception) -> str:
+    """What a parse error may say about bashlex's exception ``e``: never the command.
+
+    The text reaches the deny reason and the hook's ERROR log, and a command may carry a
+    secret. A ParsingError names the fault and its position, quoting one word at most (the
+    unexpected token, or a heredoc's delimiter). Anything else is named by type: two of
+    bashlex's four NotImplementedError texts are a dump of the parse tree, and its
+    AssertionError quotes a token. The heredoc route in validator.py still reads the text,
+    from ``original_error``.
+    """
+    if isinstance(e, bashlex.errors.ParsingError):
+        return str(e)
+    if str(e) in _SHOWN_UNEXPECTED_ERRORS:
+        return f"{type(e).__name__}: {e}"
+    return type(e).__name__
 
 
 def parse_bashlex(command: str) -> list[Any]:
@@ -274,19 +290,10 @@ def parse_bashlex(command: str) -> list[Any]:
             # would log a budget refusal as an unexpected error.
             raise
         except bashlex.errors.ParsingError as e:
-            # Neither message below quotes the command: both reach the deny reason and the
-            # hook's ERROR log, and a command may carry a secret. bashlex's own message
-            # names the fault and its position, and quotes at most one word.
-            raise ParseError("Failed to parse bash command", original_error=e)
+            raise ParseError(f"Failed to parse bash command: {_bashlex_failure(e)}", original_error=e)
         except Exception as e:
-            # Named by type, not by text: most of bashlex's NotImplementedError texts are a
-            # dump of the parse tree, which holds the command's words. The heredoc route in
-            # validator.py still reads the text, from original_error.
-            reason = type(e).__name__
-            if str(e) in _SHOWN_UNEXPECTED_ERRORS:
-                reason += f": {e}"
-            logger.error(f"Unexpected error parsing command: {reason}")
-            raise ParseError(f"Unexpected parsing error ({reason})", original_error=e, show_original=False)
+            logger.error(f"Unexpected error parsing command: {_bashlex_failure(e)}")
+            raise ParseError(f"Unexpected parsing error ({_bashlex_failure(e)})", original_error=e)
         _recover_dropped_substitutions(command, ast)
     _mark_fd_variables(command, ast)
     return ast
@@ -585,7 +592,7 @@ def _recover_substitution(command: str, offset: int, word_end: int) -> Any:
     except ParseError:
         raise
     except Exception as e:  # noqa: BLE001 - any bashlex failure means the body is unknown
-        raise ParseError(f"Cannot parse the substitution at offset {offset}", original_error=e) from e
+        raise ParseError(f"Cannot parse the substitution at offset {offset}: {_bashlex_failure(e)}", original_error=e) from e
 
 
 def _recover_dropped_substitutions(command: str, nodes: "list[Any]") -> None:
@@ -983,8 +990,9 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
 
 
 def _unreadable(word: Any, cause: str) -> ParseError:
-    # Names the word, not the command: this text reaches the deny reason and the hook's ERROR log.
-    return ParseError(f"Cannot read the `{{varname}}` redirect prefix {word.word!r}: {cause}")
+    # Says where, not what: this text reaches the deny reason and the hook's ERROR log, and the
+    # word's subscript can hold the rest of the command.
+    return ParseError(f"Cannot read the `{{varname}}` redirect prefix at offset {word.pos[0]}: {cause}")
 
 
 def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
