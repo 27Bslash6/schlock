@@ -4,6 +4,7 @@ Targeted tests to improve coverage on uncovered code paths.
 """
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -1365,6 +1366,74 @@ class TestCheckProcessSubstitutionContext:
         assert result is None
 
 
+class TestCommandNameSkipsFdVariablePrefix:
+    """A redirection's `{varname}` prefix is never the command name.
+
+    bash consumes `{fd}` with its redirect, so `{fd}<x date` names its command exactly as
+    `3<x date` does. These lookups read `parts[0]` raw and named `{fd}` instead. Each row
+    pins a `{varname}` spelling and its numeric-fd twin to the same absolute value; a
+    trailing prefix shows the lookup still finds the command. The prefix itself is decided
+    in tests/test_fd_variable_redirect.py.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("{fd}<x date", None),
+            ("3<x date", None),
+            ("date {fd}<x", "date"),
+            ("{fd}<x date | cat", None),
+            ("3<x date | cat", None),
+            ("date {fd}<x | cat", "date"),
+        ],
+    )
+    def test_list_segment_base_command(self, validator, parser, command, expected):
+        assert validator._segment_base_command(parser.parse(command)[0]) == expected
+
+    @pytest.mark.parametrize(
+        ("inner", "expected"),
+        [("{fd}<x date | cat", None), ("3<x date | cat", None), ("date {fd}<x | cat", "date")],
+    )
+    def test_pipeline_base_command(self, validator, parser, inner, expected):
+        (sub,) = validator.extract_substitutions(parser.parse(f"echo $({inner})"))
+        assert sub.base_command == expected
+
+    @pytest.mark.parametrize(("command", "expected"), [("{fd}<x date", None), ("3<x date", None), ("date {fd}<x", "date")])
+    def test_compound_base_command(self, validator, parser, command, expected):
+        """bashlex leads every compound that reaches this branch with a reserved word, so pin it directly."""
+        node = SimpleNamespace(command=SimpleNamespace(kind="compound", list=parser.parse(command)))
+        assert validator._extract_base_command(node) == expected
+
+    @pytest.mark.parametrize(
+        ("command", "brace", "variable"),
+        [
+            ("3<x date", False, False),
+            ("{r,}m {fd}<x -rf /", True, False),
+            ("$CMD {fd}<x", False, True),
+        ],
+    )
+    def test_ast_pattern_checks(self, validator, parser, command, brace, variable):
+        node = parser.parse(command)[0]
+        assert validator._has_brace_expansion_in_command(node) is brace
+        assert validator._has_variable_as_command(node) is variable
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [("{fd}>f bash <(ls)", None), ("3>f bash <(ls)", None), ("bash {fd}>f <(ls)", "bash")],
+    )
+    def test_find_outer_command(self, validator, parser, command, expected):
+        assert validator._find_outer_command(parser.parse(command), None) == expected
+
+    @pytest.mark.usefixtures("no_shellcheck")
+    @pytest.mark.parametrize("prefix", ["{fd}<x", "{fd[0]}<x", "3<x"])
+    def test_denial_names_no_phantom_pattern(self, prefix):
+        result = validate_command(f"echo $({prefix} date)")
+        assert (result.risk_level, result.message) == (
+            RiskLevel.BLOCKED,
+            "BLOCKED: Cannot determine command in substitution",
+        )
+
+
 class TestNestedSubstitutionValidation:
     """Test nested substitution validation paths."""
 
@@ -1894,6 +1963,70 @@ class TestGroupedAndRedirectedSubstitutions:
             result = validate_command(command)
             assert result.allowed is False, command
             assert result.risk_level == RiskLevel.BLOCKED, command
+
+
+class TestPeeledGroupReadRedirects:
+    """A peeled group's read-redirect targets are still walked for nested substitutions (LAB-5648).
+
+    `_unwrap_compound` peels `( … )` / `{ …; }` and its read redirects go with the wrapper, so the
+    nested walk used to see only the inner command: `$( ( cat ) < "$(bash)" )` read SAFE while the
+    ungrouped `$(cat < "$(bash)")` BLOCKs — and bash expands a redirect target before running the
+    command, so `bash` really runs. Each grouped spelling must rate exactly as its ungrouped twin.
+    """
+
+    @pytest.mark.parametrize(
+        ("grouped", "twin", "level", "target"),
+        [
+            ('x=$( ( cat ) < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( cat ) <<< "$(./payload.sh)" )', 'x=$(cat <<< "$(./payload.sh)")', RiskLevel.HIGH, "./payload.sh"),
+            ("x=$( ( cat ) < <(bash) )", "x=$(cat < <(bash))", RiskLevel.BLOCKED, "bash"),
+            ('x=$( { cat; } < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( ( cat ) < "$(bash)" ) )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # inner layer
+            ('x=$( ( ( cat ) ) < "$(bash)" )', 'x=$(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # outer layer
+            ('x=$(ls; ( cat ) < "$(bash)")', 'x=$(ls; cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # list segment
+            ('x=$( ( cat ) < "$(bash)" | cat )', 'x=$(cat < "$(bash)" | cat)', RiskLevel.BLOCKED, "bash"),  # pipeline
+            ('cat <( ( cat ) < "$(bash)" )', 'cat <(cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),  # process subst
+            # A list or pipeline BODY is validated segment by segment, and the group's redirect
+            # belongs to no segment, so it is judged on its own.
+            ('x=$( ( cat | cat ) < "$(bash)" )', 'x=$(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+            ('x=$( { cat; ls; } < "$(bash)" )', 'x=$(cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('x=$( ( cat && ls ) < "$(bash)" )', 'x=$(cat < "$(bash)" && ls)', RiskLevel.BLOCKED, "bash"),
+            (
+                'x=$( ( cat | cat ) <<< "$(./payload.sh)" )',
+                'x=$(cat | cat <<< "$(./payload.sh)")',
+                RiskLevel.HIGH,
+                "./payload.sh",
+            ),
+            ('x=$(ls; ( cat; ls ) < "$(bash)")', 'x=$(ls; cat < "$(bash)"; ls)', RiskLevel.BLOCKED, "bash"),
+            ('cat <( ( cat | cat ) < "$(bash)" )', 'cat <(cat | cat < "$(bash)")', RiskLevel.BLOCKED, "bash"),
+        ],
+    )
+    def test_grouped_read_redirect_matches_ungrouped_twin(self, grouped, twin, level, target):
+        """The message must name the redirect-target command, so a parse-error BLOCK cannot pass."""
+        result = validate_command(grouped, _shellcheck=False)
+        twin_result = validate_command(twin, _shellcheck=False)
+        assert twin_result.risk_level == level  # the twin is the reference; it must not have moved
+        assert result.risk_level == level
+        assert result.allowed is twin_result.allowed
+        assert f"in substitution: {target}" in result.message
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=$( ( cat ) < file )",
+            "x=$( { cat; } < file )",
+            'x=$( ( cat ) < "$(echo hi)" )',
+            'x=$(cat < "$(echo hi)")',  # ungrouped reference
+            'x=$( ( cat | cat ) < "$(echo hi)" )',
+            "x=$( ( cat; ls ) < file )",
+            'x=$( ( cat | wc -l ) < "$(date)" )',
+        ],
+    )
+    def test_benign_grouped_reads_stay_safe(self, command):
+        """Walking the redirects must not turn an inert grouped read into a false positive."""
+        result = validate_command(command, _shellcheck=False)
+        assert result.allowed is True
+        assert result.risk_level == RiskLevel.SAFE
 
 
 class TestWorstVerdictWins:
