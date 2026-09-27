@@ -30,6 +30,7 @@ from .parser import (
     SHELL_COMMANDS,
     WRAPPER_COMMANDS,
     BashCommandParser,
+    expanding_words,
     has_compound_redirects,
     heredoc_owner,
     reset_parse_budget,
@@ -3284,15 +3285,31 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # parse noise instead of findings - silently emptying this whole tier for
             # the commands normalisation exists to rescue (LAB-3094).
             findings = run_shellcheck("\n".join([parse_target, *trap_handlers]))
-            # ShellCheck gives up on a file it cannot parse and reports only SC1xxx parse errors,
-            # none of them security codes. A handler bashlex accepts but ShellCheck cannot parse
-            # (`trap '[ a' USR2`) would so silence the whole command, so that is no verdict.
-            if (
-                trap_handlers
-                and findings
-                and any(1000 <= f.code < 2000 and f.level is ShellCheckSeverity.ERROR for f in findings)
-            ):
-                findings = None
+            unparsed = False
+            if trap_handlers and findings:
+                first_handler_line = parse_target.count("\n") + 2
+                # ShellCheck gives up on a file it cannot parse and reports only SC1xxx parse
+                # errors, none of them security codes. A handler bashlex accepts but ShellCheck
+                # cannot parse (`trap '[ a' USR2`) would so silence the whole command, so that is
+                # no verdict. Only a handler's own errors count, plus the two that end the parse
+                # wherever they land: an SC1xxx error in the command itself (`echo "$10"`) is
+                # scored the same with or without a trap.
+                unparsed = any(
+                    1000 <= f.code < 2000
+                    and f.level is ShellCheckSeverity.ERROR
+                    and (f.line >= first_handler_line or f.code in (1072, 1089))
+                    for f in findings
+                )
+                # A handler bash expands when `trap` runs (`trap "rm -f '$tmp'" EXIT`) stores the
+                # expanded text, so single quotes inside it hold a value, not a `$tmp` left
+                # unexpanded: SC2016 reads the text as written, which bash never runs.
+                expanded, line = expanding_words(ast), first_handler_line
+                expanded_lines: set[int] = set()
+                for handler in trap_handlers:
+                    span = range(line, line + handler.count("\n") + 1)
+                    expanded_lines.update(span if handler in expanded else ())
+                    line = span.stop
+                findings = None if unparsed else [f for f in findings if not (f.code == 2016 and f.line in expanded_lines)]
             # A run with no verdict is refused in three cases, and read as clean otherwise:
             # - a payload re-entered from Step 5c (`bash -c "…"`): this is its only
             #   ShellCheck, since no outer spawn reads inside a `-c` string (LAB-4586);
@@ -3306,17 +3323,22 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 shellcheck_elevated = True
                 subject = "payload" if _depth > 0 else "command"
                 alternatives = [f"Shorten the {subject} or run its parts as separate Bash calls"]
+                name, message = (
+                    ("shellcheck:unparseable", "ShellCheck could not parse a trap handler, so the command is unchecked")
+                    if unparsed
+                    else ("shellcheck:incomplete", f"ShellCheck did not complete, so the {subject} is unchecked")
+                )
                 match = RuleMatch(
                     matched=True,
                     rule=SecurityRule(
-                        name="shellcheck:incomplete",
+                        name=name,
                         description=f"ShellCheck gave no verdict on this {subject}",
                         risk_level=RiskLevel.BLOCKED,
                         patterns=[],
                         alternatives=alternatives,
                     ),
                     risk_level=RiskLevel.BLOCKED,
-                    message=f"ShellCheck did not complete, so the {subject} is unchecked",
+                    message=message,
                     alternatives=alternatives,
                 )
             security_findings = get_security_findings(findings or [])
