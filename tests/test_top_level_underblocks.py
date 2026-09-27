@@ -155,10 +155,52 @@ class TestGitExecPathOverride:
         assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False)
         assert "ast_dangerous_combo:git" in result.matched_rules
 
-    def test_helper_steps_over_option_values(self):
-        # `-C DIR` takes the next word, so a directory literally named `--exec-path=x` is a value.
-        assert dangerous_git_config(["-C", "--exec-path=x", "status"]) is None
-        assert dangerous_git_config(["git", "--git-dir", "d", "--exec-path=x", "log"]) is not None
+    # Every git global option that takes the NEXT word as its value (git.c handle_options).
+    @pytest.mark.parametrize(
+        "option",
+        [
+            "-C",
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "--config-env",
+            "--super-prefix",
+            "--attr-source",
+            "--shallow-file",
+        ],
+    )
+    def test_helper_steps_over_option_values(self, option):
+        # The walk must step over the value, not stop at it as if it were the subcommand...
+        assert dangerous_git_config([option, "v", "--exec-path=x", "log"]) is not None
+        assert dangerous_git_config(["git", option, "v", "--exec-path=x", "log"]) is not None
+        # ...and a value that merely looks like the option is still just a value.
+        assert dangerous_git_config([option, "--exec-path=x", "status"]) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git --attr-source HEAD --exec-path=/tmp/evil frobnicate",
+            "git --shallow-file x --exec-path=/tmp/evil frobnicate",
+            'echo "$(git --attr-source HEAD --exec-path=/tmp/evil status)"',
+            # git re-parses a non-! alias's global options, so the alias carries the override.
+            "git -c alias.x='--exec-path=/tmp/evil gc' x",
+            "git -calias.x='--exec-path=/tmp/evil gc' x",
+            "git -c alias.x='--exec-path=/tmp/evil commit' x -m m",
+            "echo \"$(git -c alias.x='--exec-path=/tmp/evil gc' x)\"",
+        ],
+    )
+    def test_value_options_and_aliases_block(self, command):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False), command
+
+    def test_alias_helper(self):
+        assert dangerous_git_config(["-c", "alias.x=-C d --exec-path=x gc", "x"]) is not None
+        # An alias git cannot split is refused rather than guessed at.
+        assert dangerous_git_config(["-c", "alias.x=log 'unclosed", "x"]) is not None
+        # A plain alias, and one whose operand merely mentions the option, stay allowed.
+        assert dangerous_git_config(["-c", "alias.x=log --oneline", "x"]) is None
+        assert dangerous_git_config(["-c", "alias.x=grep -e --exec-path=x", "x"]) is None
 
 
 class TestReadsStdinAsProgram:

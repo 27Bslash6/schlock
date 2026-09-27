@@ -432,11 +432,11 @@ def _check_dangerous_command_flags(
                             matched_rules=[f"ast_dangerous_combo:{base_name}"],
                         )
 
-        # git -c config keys that execute arbitrary commands (top-level parity with the
-        # SubstitutionValidator check). Lazy import avoids the documented substitution<->validator
-        # mutual-import hazard.
+        # git -c config keys that execute arbitrary commands, and --exec-path=DIR (top-level
+        # parity with the SubstitutionValidator check). Lazy import avoids the documented
+        # substitution<->validator mutual-import hazard.
         if base_name == "git":
-            from schlock.core.substitution import dangerous_git_config  # noqa: PLC0415
+            from schlock.core.substitution import GIT_EXEC_PATH_REASON, dangerous_git_config  # noqa: PLC0415
 
             git_reason = dangerous_git_config(args)
             if git_reason:
@@ -446,7 +446,7 @@ def _check_dangerous_command_flags(
                     message=f"BLOCKED: {git_reason}",
                     alternatives=(
                         ["Remove the --exec-path=DIR override and use git's own exec path"]
-                        if "--exec-path" in git_reason
+                        if git_reason == GIT_EXEC_PATH_REASON
                         else [
                             "Remove the -c config override",
                             "Avoid git -c keys that execute commands (alias=!cmd, core.*, credential.helper, gpg.program, etc.)",

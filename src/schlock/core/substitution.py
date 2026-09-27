@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
@@ -507,8 +508,20 @@ _DANGEROUS_GIT_CONFIGS = frozenset(
 # git global options whose value is the NEXT word, so the exec-path walk below must step over it
 # rather than read it as the subcommand (`git -C --exec-path=x status` is a directory named that).
 _GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+        "--super-prefix",
+        "--attr-source",
+        "--shallow-file",
+    }
 )
+
+GIT_EXEC_PATH_REASON = "git --exec-path=DIR runs git's subcommands and helpers from DIR"
 
 
 def _git_exec_path_override(args: list[str]) -> str | None:
@@ -527,7 +540,7 @@ def _git_exec_path_override(args: list[str]) -> str | None:
     while i < len(args):
         arg = args[i]
         if arg.startswith("--exec-path="):
-            return "git --exec-path=DIR runs git's subcommands and helpers from DIR"
+            return GIT_EXEC_PATH_REASON
         if arg in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
             i += 2
         elif arg.startswith("-") and arg not in ("-", "--exec-path"):
@@ -537,13 +550,24 @@ def _git_exec_path_override(args: list[str]) -> str | None:
     return None
 
 
+def _alias_exec_path_override(alias_value: str) -> str | None:
+    """git feeds a non-! alias back through its global-option parser, so
+    `alias.x=--exec-path=DIR gc` redirects the exec path. An alias git itself cannot split
+    fails in git too; refuse it rather than guess at its words."""
+    try:
+        alias_words = shlex.split(alias_value)
+    except ValueError:
+        return GIT_EXEC_PATH_REASON
+    return _git_exec_path_override(alias_words)
+
+
 def dangerous_git_config(args: list[str]) -> str | None:
     """Return a reason string if `args` (a git command's word-args) sets a -c config that
-    executes arbitrary commands, else None. Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
-    `alias.` is dangerous only when the alias VALUE starts with `!` (shell-command alias);
-    a `!` elsewhere (e.g. a `--grep` pattern) is an ordinary git alias. Pure; the single
-    source of truth shared by SubstitutionValidator and top-level validation. Also covers
-    `--exec-path=DIR`, the same kind of global setting that arms a later exec.
+    executes arbitrary commands or redirects git's exec path (`--exec-path=DIR`), else None.
+    Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
+    `alias.` is dangerous when the alias VALUE starts with `!` (shell-command alias) or sets
+    `--exec-path=`; a `!` elsewhere (e.g. a `--grep` pattern) is an ordinary git alias. Pure; the single
+    source of truth shared by SubstitutionValidator and top-level validation.
     """
     exec_path_reason = _git_exec_path_override(args)
     if exec_path_reason:
@@ -564,6 +588,9 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     # (alias.<name>=!cmd). A '!' elsewhere is a normal git-subcommand alias.
                     _, _, alias_value = config_val.partition("=")
                     if not alias_value.lstrip().startswith("!"):
+                        alias_reason = _alias_exec_path_override(alias_value)
+                        if alias_reason:
+                            return alias_reason
                         continue
                 else:
                     # A boolean value selects a built-in and names no executable
