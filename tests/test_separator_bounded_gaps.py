@@ -268,8 +268,9 @@ class TestADeepSubstitutionIsOneWord:
         [
             # A whitelisted first word vouches for no later segment (`ls` is whitelisted).
             ("ls; cat $(printf %s $(dirname $(pwd)) | head -1)/.env", RiskLevel.BLOCKED),
-            # A single segment keeps its whitelist (`chmod 777 /tmp/...`), as the pass it shadows does.
-            ("chmod 777 /tmp/$(echo x)", RiskLevel.SAFE),
+            # A single segment keeps its whitelist (`ls`; unwhitelisted, the blanked text matches
+            # `chmod_777`), as the pass it shadows does.
+            ("ls $(pwd) chmod 777 x", RiskLevel.SAFE),
             # A non-shell heredoc body stays text in the blanked pass too.
             ("cat $(echo x) <<EOF\nrm -rf /\nEOF", RiskLevel.SAFE),
         ],
