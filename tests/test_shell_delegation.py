@@ -814,3 +814,33 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+class TestSyntheticRuleNamedInMatchedRules:
+    """LAB-5003: Steps 5b/5c name the rule that set the verdict, even on multi-segment commands.
+
+    On `main` @ `4ca7af0` the two `chmod +x x; ...` cases reported only `['chmod_exec']`: the
+    segment loop filled `all_matched_rules` and the join preferred it, dropping the synthetic
+    rule. Verdicts were already right; this pins the audit trail.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "risk", "rules"),
+        [
+            ('chmod +x x; watch "rm -rf /"', RiskLevel.BLOCKED, ["chmod_exec", "shell_delegated_payload"]),
+            ("chmod +x x; kubectl apply -f x.yaml", RiskLevel.HIGH, ["chmod_exec", "ast_contextual_high:kubectl"]),
+            # Single segment: the list stays empty and the join falls back to the synthetic rule.
+            ('watch "rm -rf /"', RiskLevel.BLOCKED, ["shell_delegated_payload"]),
+            ("kubectl apply -f x.yaml", RiskLevel.HIGH, ["ast_contextual_high:kubectl"]),
+        ],
+    )
+    def test_verdict_rule_is_named(self, command, risk, rules):
+        result = validate_command(command)
+        assert (result.risk_level, result.matched_rules) == (risk, rules)
+
+    def test_compound_redirect_segment_keeps_the_payload_rule(self):
+        # Passes on main, where no segment rule matches here. A compound-redirect pass that
+        # fills the segment list (#180) must not push the payload rule out of it.
+        result = validate_command('{ echo a; } > "$HOME/.bashrc"; watch "rm -rf /"')
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "shell_delegated_payload" in result.matched_rules
