@@ -9,7 +9,7 @@ Key facts:
 - **Risk presets**: `permissive` (allow HIGH), `balanced` (ask HIGH, default), `paranoid` (deny HIGH, ask MEDIUM)
 - **Per-rule and per-category overrides** via `rule_overrides` and `category_overrides` in config YAML. BLOCKED rules cannot be downgraded (security floor)
 - **Self-protection**: Three-layer defense prevents LLM agents from modifying schlock config files
-- **Audit logging** is always on, writing to `~/.config/schlock/audit-YYYY-MM-DD.jsonl`
+- **Audit logging** is always on, writing to `~/.local/share/schlock/audit-YYYY-MM-DD.jsonl` on Linux
 - **Advertising blocker** (optional): Blocks "Generated with Claude Code" spam from commits
 - **ShellCheck integration** (optional): Catches command injection, format string vulnerabilities, and unquoted variable expansion
 - **Config hierarchy**: Plugin defaults → User overrides (`~/.config/schlock/config.yaml`) → Project overrides (`.claude/hooks/schlock-config.yaml`)

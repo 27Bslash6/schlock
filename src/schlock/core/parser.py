@@ -317,8 +317,9 @@ def resolve_parser_tier(user_settings: Optional[Path] = None) -> str:
         return DEFAULT_PARSER_TIER
     tier = str(raw).strip().lower()
     if tier not in PARSER_TIERS:
+        source = user_settings or "~/.claude/settings.json"
         logger.warning(
-            f"Ignoring {PARSER_TIER_ENV}={raw!r} in user settings (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}"
+            f"Ignoring {PARSER_TIER_ENV}={raw!r} in {source} (allowed: {sorted(PARSER_TIERS)}); using {DEFAULT_PARSER_TIER}"
         )
         return DEFAULT_PARSER_TIER
     return tier

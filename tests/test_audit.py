@@ -1,6 +1,7 @@
 """Tests for audit logging module."""
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -29,6 +30,7 @@ def _isolated_user_settings(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv("SCHLOCK_AUDIT_LOG", raising=False)
     return home
@@ -44,6 +46,10 @@ def _user_settings(home: Path, value) -> Path:
 
 def _default_log_dir() -> Path:
     return Path(user_data_dir("schlock", "27b.io"))
+
+
+def _default_log_file() -> Path:
+    return _default_log_dir() / f"audit-{datetime.now().strftime('%Y-%m-%d')}.jsonl"
 
 
 class TestAuditContext:
@@ -396,8 +402,7 @@ class TestAuditLogPathProvenance:
 
     def test_process_environment_alone_is_ignored(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SCHLOCK_AUDIT_LOG", str(tmp_path / "project.jsonl"))
-        today = datetime.now().strftime("%Y-%m-%d")
-        assert AuditLogger().log_file == _default_log_dir() / f"audit-{today}.jsonl"
+        assert AuditLogger().log_file == _default_log_file()
 
     def test_user_settings_win_over_process_environment(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SCHLOCK_AUDIT_LOG", str(tmp_path / "project.jsonl"))
@@ -419,24 +424,38 @@ class TestAuditLogPathProvenance:
             pytest.param(b'{"env": {"SCHLOCK_AUDIT_LOG": null}}', id="null"),
             pytest.param(b'{"env": {"SCHLOCK_AUDIT_LOG": ""}}', id="empty"),
             pytest.param(b'{"env": {"SCHLOCK_AUDIT_LOG": "~no-such-user-zz/a.jsonl"}}', id="unknown-user"),
+            pytest.param(b'{"env": {"SCHLOCK_AUDIT_LOG": "/x\\u0000y"}}', id="nul-character"),
+            pytest.param(b'{"env": {"SCHLOCK_AUDIT_LOG": "/tmp/\\ud800"}}', id="lone-surrogate"),
+            pytest.param(b'{"env": {"SCHLOCK_AUDIT_LOG": "audit.jsonl"}}', id="relative-file"),
+            pytest.param(b'{"env": {"SCHLOCK_AUDIT_LOG": "logs"}}', id="relative-directory"),
         ],
     )
     def test_unusable_user_settings_fall_back_to_default(self, content):
         settings = Path.home() / ".claude" / "settings.json"
         settings.parent.mkdir()
         settings.write_bytes(content)
-        today = datetime.now().strftime("%Y-%m-%d")
-        assert AuditLogger().log_file == _default_log_dir() / f"audit-{today}.jsonl"
+        assert AuditLogger().log_file == _default_log_file()
 
     @pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="needs POSIX permissions, non-root")
     def test_unreadable_user_settings_fall_back_to_default(self):
         settings = _user_settings(Path.home(), "/elsewhere/audit.jsonl")
         settings.chmod(0)
         try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            assert AuditLogger().log_file == _default_log_dir() / f"audit-{today}.jsonl"
+            assert AuditLogger().log_file == _default_log_file()
         finally:
             settings.chmod(0o600)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="NUL is the null device on Windows")
+    def test_windows_null_device_name_is_not_a_relative_file_elsewhere(self):
+        # Outside Windows "NUL" is a relative path, so it would name a file in the open checkout.
+        _user_settings(Path.home(), "NUL")
+        assert AuditLogger().log_file == _default_log_file()
+
+    def test_ignored_value_is_reported(self, caplog):
+        _user_settings(Path.home(), "relative/audit.jsonl")
+        with caplog.at_level(logging.WARNING, logger="schlock.integrations.audit"):
+            AuditLogger()
+        assert any("relative/audit.jsonl" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks and POSIX HOME")
@@ -461,7 +480,7 @@ class TestProjectScopedAuditLogThroughTheHook:
         return json.loads(result.stdout)["hookSpecificOutput"]
 
     def _assert_audited_at_default(self, home: Path) -> None:
-        logs = list((home / ".local" / "share" / "schlock").glob("audit-*.jsonl"))
+        logs = list(_default_log_dir().glob("audit-*.jsonl"))
         assert len(logs) == 1
         assert self.COMMAND in logs[0].read_text(encoding="utf-8")
 

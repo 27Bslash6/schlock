@@ -451,6 +451,8 @@ Override with `SCHLOCK_AUDIT_LOG` in the `env` block of your own `~/.claude/sett
 }
 ```
 
+- The value must be an absolute path, or start with `~`. A relative value is ignored, because it
+  would resolve against whichever repository is open.
 - A value ending in `.jsonl` is used as a single file.
 - Any other value is a directory, and schlock writes `audit-YYYY-MM-DD.jsonl` inside it.
 - `/dev/null` (`NUL` on Windows) disables logging.
@@ -459,8 +461,9 @@ schlock reads this value from `~/.claude/settings.json` only. It ignores `SCHLOC
 process environment, so a shell `export` is not honoured. Claude Code passes every settings file's
 `env` block to hooks, including a project's `.claude/settings.json`, and an environment variable
 does not say which file set it. Your user settings file is the one place a repository you open
-cannot write. A missing, unreadable or malformed settings file, or a value that is not a string,
-falls back to the default location. `SCHLOCK_PARSER` is read the same way.
+cannot write. A missing, unreadable or malformed settings file, or a value that is not a string
+or not absolute, falls back to the default location; an unusable value logs a warning.
+`SCHLOCK_PARSER` is read the same way.
 
 ### Log Format (JSONL)
 
@@ -512,7 +515,7 @@ Daily timestamped files prevent unbounded growth. Each file contains one day's l
 **Manual cleanup (delete old logs):**
 ```bash
 # Delete logs older than 90 days
-find ~/.config/schlock -name "audit-*.jsonl" -mtime +90 -delete
+find ~/.local/share/schlock -name "audit-*.jsonl" -mtime +90 -delete
 
 # Delete specific year
 rm ~/.local/share/schlock/audit-2024-*.jsonl
