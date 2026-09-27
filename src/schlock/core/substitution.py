@@ -26,7 +26,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
-from .parser import without_fd_variables
+from .parser import EXEC_CHILD_ATTRS, _resolve_multicall, without_fd_variables
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -48,6 +48,17 @@ _SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`", "<(", ">(")
 # Carrying them over would not change a verdict - it would only spend a ~100us re-parse on
 # every body containing "<(", and fail closed on one that also breaks the wrapper.
 _HEREDOC_SUBSTITUTION_INTRODUCERS: tuple[str, ...] = ("$(", "`")
+
+# The byte after ``${`` that makes it a bash 5.3 function substitution (``${ cmd; }``,
+# ``${| cmd; }``), which runs ``cmd`` in the current shell. bashlex reads either one as a
+# plain ``parameter`` node, and where the opener lands depends on nesting. At top level the
+# opener is stripped, so the value STARTS with the leader byte (``' rm -rf ~; '``). Nested in
+# another expansion (``${X:-${ rm -rf ~; }}``), the value is cut at the first ``}`` and keeps
+# the inner opener (``'X:-${ rm -rf ~; '``), so it has to be found by a substring scan. Every
+# bash before 5.3 rejects both as a bad substitution, so no older bash changes verdict.
+_FUNSUB_LEADERS: tuple[str, ...] = (" ", "\t", "\n", "|")
+_FUNSUB_OPENERS: tuple[str, ...] = tuple("${" + lead for lead in _FUNSUB_LEADERS)
+_HEREDOC_SCAN_INTRODUCERS: tuple[str, ...] = _HEREDOC_SUBSTITUTION_INTRODUCERS + _FUNSUB_OPENERS
 
 # How many heredoc bodies one top-level validation may re-parse before it gives up and denies.
 # MAX_SUBSTITUTION_DEPTH does NOT bound this: a heredoc nested in a substitution nested in a
@@ -1204,7 +1215,7 @@ class SubstitutionValidator:
             # reaches the simple form and misses every compound one. An fd-duplication target is an
             # int with no `kind` and falls straight back out of visit(). `heredoc` stays
             # off the list: the redirect branch above reads its body.
-            for attr in ["parts", "command", "list", "pipe", "compound", "output", "redirects"]:
+            for attr in EXEC_CHILD_ATTRS:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -1276,20 +1287,28 @@ class SubstitutionValidator:
         ~3us for the substring scan that leaves the common case ($x, ${x:-plain}) untouched.
         """
         value = getattr(node, "value", None)
-        if not isinstance(value, str) or not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
-            # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+        if not isinstance(value, str):
             return []
+        # A function substitution is a command, not an expansion, and it needs no introducer
+        # to run one: ``echo "${ rm -rf ~; }"`` was ALLOWED/SAFE while bash 5.3 ran it. Deny it
+        # outright rather than re-parse it; no bash before 5.3 accepts the form at all. Both
+        # checks are needed: see _FUNSUB_LEADERS for where bashlex leaves the opener.
+        is_funsub = value.startswith(_FUNSUB_LEADERS) or any(opener in value for opener in _FUNSUB_OPENERS)
+        if not is_funsub:
+            if not any(intro in value for intro in _SUBSTITUTION_INTRODUCERS):
+                # Overwhelmingly the common case ($x, ${x:-plain}) - substring scan only, no re-parse.
+                return []
 
-        if depth < MAX_SUBSTITUTION_DEPTH:
-            reparsed = value.replace("#", "_")
-            try:
-                inner_ast = self.parser.parse(reparsed)
-            except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
-                logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
-            else:
-                decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
-                if decoded:
-                    return decoded
+            if depth < MAX_SUBSTITUTION_DEPTH:
+                reparsed = value.replace("#", "_")
+                try:
+                    inner_ast = self.parser.parse(reparsed)
+                except Exception as exc:  # noqa: BLE001 - any decode failure is treated as suspicious
+                    logger.debug("Unparseable parameter expansion body %r: %s", value, exc)
+                else:
+                    decoded = self.extract_substitutions(inner_ast, depth + 1, reparsed, budget)
+                    if decoded:
+                        return decoded
 
         return [
             SubstitutionNode(
@@ -1378,7 +1397,9 @@ class SubstitutionValidator:
             source = value
 
         body, _, _ = (source or value).rpartition("\n")
-        if not any(intro in body for intro in _HEREDOC_SUBSTITUTION_INTRODUCERS):
+        # A function substitution opener is an introducer here too: the re-parse is what hands
+        # its ``parameter`` node to _substitutions_in_parameter, which denies it.
+        if not any(intro in body for intro in _HEREDOC_SCAN_INTRODUCERS):
             return []
 
         if budget is None:
@@ -1675,6 +1696,21 @@ class SubstitutionValidator:
         if not base_command:
             return False
         return base_command in DANGEROUS_SUBSTITUTION_COMMANDS
+
+    @staticmethod
+    def _program_name(sub_node: SubstitutionNode) -> str | None:
+        """Basename of the program the substitution runs, resolved through busybox/toybox.
+
+        That is the first word after any `VAR=value` prefix, which base_command is not: it keeps
+        the prefix, so `$(X=/bin/rm ls)` must not read as `rm` nor `$(X=1 sh -c id)` as `X=1`.
+        A redirection's `{varname}` prefix is not a word of the command either (LAB-4599):
+        `$(X=1 {fd}>/dev/null sh -c id)` runs `sh`, exactly as the `3>/dev/null` spelling does.
+        """
+        if not sub_node.base_command:
+            return None
+        parts = without_fd_variables(getattr(getattr(sub_node.ast_node, "command", None), "parts", None) or [])
+        words = [p.word for p in parts if getattr(p, "kind", None) == "word"] or [sub_node.base_command]
+        return _resolve_multicall(words[0].rsplit("/", 1)[-1], words[1:])[0]
 
     def has_suspicious_ast_patterns(self, node: Any) -> tuple[bool, str]:
         """Check for suspicious AST patterns that indicate bypass attempts.
@@ -2206,8 +2242,10 @@ class SubstitutionValidator:
                 message=f"Contextual whitelist: {sub_node.base_command}",
             )
 
-        # Layer 1c: Blacklist check
-        if self.is_blacklisted(sub_node.base_command):
+        # Layer 1c: Blacklist check, on the program that actually runs: `/bin/sh` and
+        # `busybox sh` are `sh` (LAB-4838). Blacklist only - here normalising can only raise a
+        # verdict, where on the whitelist it would let a local `./date` pass as `date`.
+        if self.is_blacklisted(self._program_name(sub_node)):
             return SubstitutionValidationResult(
                 allowed=False,
                 risk_level=RiskLevel.BLOCKED,
