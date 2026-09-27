@@ -175,8 +175,7 @@ class TestReDoSProtection:
         vcs_directory_deletion twins and 50 `rm -rf` lines cost 2s on
         hidden_glob_destruction, about 8x per doubling; with the spans stopping at
         a bare newline both are far under the bound. The quoted and unpaired-quote
-        lines pin the quote atoms: a pair must not reopen the tail, and an unpaired
-        quote must not make the loop backtrack between readings. Regex layer because
+        lines keep a quote from reopening the tail. Regex layer because
         the whole validator spends ~0.4s on this input in per-segment passes, which
         would hide the twins.
         """
