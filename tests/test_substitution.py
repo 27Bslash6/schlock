@@ -19,6 +19,7 @@ from schlock.core.substitution import (
     SubstitutionType,
     SubstitutionValidationResult,
     SubstitutionValidator,
+    _Separator,
     dangerous_awk,
     dangerous_sed,
 )
@@ -1779,8 +1780,6 @@ class TestWhitelistedSubstitutionYamlRules:
             "echo \"$(git send-email --SENDMAIL-CMD 'rm -rf /' HEAD~1)\"",
             "echo \"$(git send-email +Header 'rm -rf /' HEAD~1)\"",
             "echo \"$(git svn clone --authors-p 'rm -rf /' svn://host/r)\"",
-            "echo \"$(git send-email --sendmail-cmd 'rm -rf /' HEAD~1)\"",
-            "echo \"$(git svn --authors-prog 'rm -rf /' x)\"",
             # a builtin that runs a command by a route no option key reaches, so failing closed on
             # every non-inert subcommand is the only thing that catches it. `for-each-repo`
             # re-dispatches a whole git command line, and its own `-c KEY=VAL` supplies the repo
@@ -1790,8 +1789,8 @@ class TestWhitelistedSubstitutionYamlRules:
             # `submodule--helper foreach` and `remote-ext` take the command as a positional word
             "echo \"$(git submodule--helper foreach 'rm -rf /')\"",
             "echo \"$(git remote-ext o 'rm -rf /')\"",
-            # the accepted cost: an alias of log is indistinguishable from one of rebase --exec
-            "echo \"$(git lg --author 'Ray Walker' --grep 'rm -rf')\"",
+            # `git grep -O` opens the matches in a pager, so grep is keyed rather than inert
+            "echo \"$(git grep --open-files-in 'rm -rf /' HEAD)\"",
         ],
     )
     def test_unresolvable_git_subcommand_suppresses_nothing(self, command):
@@ -1804,13 +1803,14 @@ class TestWhitelistedSubstitutionYamlRules:
         "command",
         [
             # A segment that fails closed must not strip the quoted data of the next one: each is
-            # SAFE bare, so the pair must stay SAFE. Every list/pipeline separator the renderer
-            # inserts, so an emptied `_COMMAND_SEPARATORS` would flip these.
+            # SAFE bare, so the pair must stay SAFE. One row per separator the renderer inserts.
             "echo \"$(git submodule status && grep -rn 'rm -rf' docs)\"",
             "echo \"$(git submodule status || grep -rn 'rm -rf' docs)\"",
             "echo \"$(git submodule status ; grep -rn 'rm -rf' docs)\"",
             "echo \"$(git lfs ls-files | grep -c 'rm -rf')\"",
             "echo \"$(git remote-ext o safe & grep -rn 'rm -rf' docs)\"",
+            # a pipeline inside a list goes through _render_segment_tokens, the third render site
+            "echo \"$(true && git lfs ls-files | grep -c 'rm -rf')\"",
             # `git` sitting in another command's argument list names no subcommand — the word after
             # it must not be read as one and failed closed.
             "echo \"$(grep -rn git src 'rm -rf')\"",
@@ -1819,6 +1819,41 @@ class TestWhitelistedSubstitutionYamlRules:
     )
     def test_fail_closed_is_scoped_to_the_git_segment(self, command):
         """Failing closed on a git subcommand suppresses that segment only, and only when git leads it."""
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An ARGUMENT that spells a separator is not a segment boundary. Split by value, each of
+            # these cut the command in two and the payload landed in a fake segment led by nothing
+            # that fails closed, so it was suppressed as data and read SAFE.
+            "echo \"$(git submodule--helper foreach ';' 'rm -rf /')\"",
+            "echo \"$(git submodule foreach ';' 'rm -rf /')\"",
+            "echo \"$(git remote-ext o '&&' 'rm -rf /')\"",
+            "echo \"$(git frobnicate '||' 'rm -rf /')\"",
+            "echo \"$(git frobnicate '|' 'rm -rf /')\"",
+            "echo \"$(git frobnicate '&' 'rm -rf /')\"",
+            # every quoting spelling reaches the same argv
+            "echo \"$(git frobnicate \\; 'rm -rf /')\"",
+            'echo "$(git frobnicate ";" \'rm -rf /\')"',
+            "echo \"$(git -c alias.ff=fetch ff '|' --upload 'rm -rf /' .)\"",
+        ],
+    )
+    def test_a_quoted_separator_is_not_a_segment_boundary(self, command):
+        """Only the renderer's own separators split a segment, never an argument that spells one (LAB-4268)."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo \"$(git log --grep ';' --grep 'rm -rf')\"",
+            "echo \"$(grep -e '|' -e 'rm -rf' f)\"",
+        ],
+    )
+    def test_a_quoted_separator_in_an_inert_command_stays_data(self, command):
+        """The same argument inside a command that suppresses its arguments is ordinary data."""
         assert validate_command(command).allowed is True
 
     @pytest.mark.parametrize(
@@ -2900,6 +2935,8 @@ class TestListSegmentBranchCoverage:
             ("|", False),
             ("head", False),
         ]
+        # the pipe must carry the type the segment split tests for, not merely equal "|"
+        assert isinstance(validator._render_segment_tokens(pipeline)[2][0], _Separator)
 
     def test_render_segment_tokens_pipeline_with_reserved_word(self, validator):
         """A pipeline containing a reserved word (e.g. `!`) is unrenderable -> None."""

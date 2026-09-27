@@ -82,8 +82,16 @@ def _as_double_quoted(body: str) -> str:
 # Operators bashlex emits in a command-list node's parts. A well-formed list strictly alternates
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
 _LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
-# What _join_tokens receives between the commands of a pipeline or a list.
-_COMMAND_SEPARATORS: frozenset[str] = _LIST_OPERATORS | {"|"}
+
+
+class _Separator(str):
+    """A `|`, `&&`, `||`, `;` or `&` the renderer put between two commands.
+
+    Only the renderer knows where the real boundaries are. A quoted argument that spells one
+    (`git x ';' CMD`) is the same string, so _join_tokens tells them apart by this type, never by
+    value: splitting on the value let a `';'` argument cut a command that fails closed in two.
+    """
+
 
 # Commands that are ALWAYS safe inside substitution
 # These are read-only, pure, or security-critical tools that don't modify state
@@ -935,9 +943,10 @@ def _leading_part(node: Any) -> Any:
 # Shapes that hand one of their own arguments to a shell. These take the command as a SEPARATE
 # word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD. Matched
 # exactly and against EVERY command: a command-agnostic floor beneath the git buckets and the
-# non-git option table below, for a flag that reaches a whitelisted command by a path those do
-# not model. A git subcommand is no longer among them — one that is not inert now fails closed in
-# _runs_an_exec_option — but the entries are cheap belt-and-braces and are kept deliberately.
+# non-git option table below. _executes_an_argument checks it BEFORE the git buckets, so if an
+# inert subcommand were ever admitted with one of these options, `git log --tree-filter CMD` still
+# fails closed: two independent structures, not one list trusted twice. The send-email and svn
+# entries still matter for `git-send-email` and `git-svn` called by their dashed names.
 _ARGUMENT_EXECUTING_FLAGS = frozenset(
     {
         "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
@@ -959,7 +968,8 @@ _EXEC_OPTIONS = {
     "sdiff": frozenset({"--diff-program"}),
 }
 # git subcommands that are safe to suppress UNLESS one of these options is present — the transport
-# and diff/rebase family, whose other arguments (URLs, refspecs, refs, paths) are inert. `-u` is
+# and diff/rebase family, whose other arguments (URLs, refspecs, refs, paths) are inert, and `grep`,
+# whose `-O` / `--open-files-in-pager` runs a pager and so keeps it off the inert list. `-u` is
 # `--upload-pack` on clone but `--update-head-ok` on fetch, and `-x` runs a command on rebase and
 # difftool while `grep -x` / `diff -x` / `git clean -x` mean something ordinary — hence per
 # subcommand. Reached only by the literal builtin name: an alias cannot shadow a non-deprecated
@@ -975,6 +985,7 @@ _GIT_EXEC_OPTIONS = {
     "archive": frozenset({"--exec"}),
     "rebase": frozenset({"-x", "--exec"}),
     "difftool": frozenset({"-x", "--extcmd"}),
+    "grep": frozenset({"-O", "--open-files-in-pager"}),
 }
 # git subcommands whose separate-word arguments are NEVER handed to a shell: read-only queries, and
 # the porcelain whose only free-text argument is a message (`commit -m`, `tag -m`). Their arguments
@@ -991,7 +1002,7 @@ _GIT_EXEC_OPTIONS = {
 # in doubt it stays out.
 _GIT_INERT_SUBCOMMANDS = frozenset(
     {
-        "log", "show", "diff", "diff-tree", "diff-index", "diff-files", "grep", "status", "blame",
+        "log", "show", "diff", "diff-tree", "diff-index", "diff-files", "status", "blame",
         "annotate", "shortlog", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file",
         "describe", "name-rev", "show-ref", "show-branch", "for-each-ref", "symbolic-ref",
         "merge-base", "cherry", "count-objects", "var", "version", "commit", "tag", "reflog",
@@ -1016,7 +1027,7 @@ def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
 
 
 def _names_option(word: str, options: frozenset[str]) -> bool:
-    """Does ``word`` spell one of ``options`` the way git's parse-options reads it?"""
+    """Does ``word`` spell one of ``options`` the way getopt_long and git's parse-options read it?"""
     name = word.partition("=")[0]
     if name in options:
         return True
@@ -1086,15 +1097,15 @@ def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, i
     Rules anchored with ``(\\s|$)`` consume the separator, and ``_is_in_string_literal``
     demands the WHOLE match sit inside a span, so an unwidened span misses the suppression.
 
-    The exec check runs per command segment: the tokens carry the list/pipeline separators the
-    renderer inserted, and suppression is decided for each segment between them independently.
+    The exec check runs per command segment: suppression is decided independently for the tokens
+    between each pair of :class:`_Separator` tokens the renderer inserted.
     """
     text = " ".join(token for token, _ in tokens)
     ranges: list[tuple[int, int]] = []
     position = 0
     segment: list[tuple[int, str, bool]] = []
     for token, is_data in tokens:
-        if token in _COMMAND_SEPARATORS:
+        if isinstance(token, _Separator):
             _collect_spans(segment, text, ranges)
             segment = []
         else:
@@ -1625,7 +1636,7 @@ class SubstitutionValidator:
                         if part.kind == "command" and hasattr(part, "parts"):
                             tokens.extend(_command_tokens(part))
                         elif part.kind == "pipe":
-                            tokens.append(("|", False))
+                            tokens.append((_Separator("|"), False))
             return _join_tokens(tokens) if tokens else (None, [])
 
         # Handle command list: $(cmd1; cmd2), $(cmd1 && cmd2), $(cmd1 | cmd2 || cmd3), ...
@@ -1640,7 +1651,7 @@ class SubstitutionValidator:
                     if kind == "operator":
                         if not hasattr(part, "op"):
                             return None, []
-                        tokens.append((part.op, False))
+                        tokens.append((_Separator(part.op), False))
                         continue
                     rendered = self._render_segment_tokens(part)
                     if rendered is None:
@@ -1699,7 +1710,7 @@ class SubstitutionValidator:
             for part in getattr(node, "parts", []):
                 part_kind = getattr(part, "kind", None)
                 if part_kind == "pipe":
-                    rendered.append(("|", False))
+                    rendered.append((_Separator("|"), False))
                 elif part_kind == "command":
                     tokens = _command_tokens(part)
                     if not tokens:
