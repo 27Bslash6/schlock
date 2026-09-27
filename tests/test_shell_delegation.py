@@ -757,6 +757,12 @@ class TestHereStringDelegationEvasion:
             'bash 3<<< "rm -rf /" <&3',
             'flock ./bash sh <<< "rm -rf /"',
             'strace -o bash sh <<< "rm -rf /"',
+            # Explicit stdin designators (_STDIN_PATHS, LAB-4696): bash/sh treat these path
+            # spellings of stdin as the program to run, same as no operand at all - untested
+            # pre-fix (verified against real bash).
+            'bash /dev/stdin <<< "rm -rf /"',
+            'sh /dev/fd/0 <<< "rm -rf /"',
+            'bash /proc/self/fd/0 <<< "rm -rf /"',
         ],
     )
     def test_here_string_payload_is_blocked(self, command):
