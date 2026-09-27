@@ -62,7 +62,7 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        fetch-depth: 0
+        fetch-depth: 0  # full history: the gitleaks step scans every commit, not just the tip
 
     - name: Set up uv
       uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
@@ -88,8 +88,8 @@ jobs:
       run: uvx semgrep@1.165.0 scan --config p/security-audit --config p/python
 
     - name: Install gitleaks
-      # The MIT-licensed CLI, pinned and checksum-verified. It needs no secret or license key,
-      # so fork and Dependabot pull requests and merge queue runs scan exactly like push.
+      # The MIT-licensed CLI, pinned and checksum-verified. It needs no license key and accepts
+      # every event, so fork and Dependabot pull requests and merge queue runs scan like push.
       # To bump: take the sha256 from the release's gitleaks_<version>_checksums.txt.
       env:
         VERSION: 8.30.1
@@ -105,4 +105,10 @@ jobs:
     - name: gitleaks
       # Every commit reachable from HEAD, with the rules in .gitleaks.toml. --redact keeps
       # secret values out of the log; --verbose still names the rule, file and commit.
-      run: gitleaks git --redact --verbose --log-opts=HEAD
+      # The canary first: a config that loads no rules would report every scan clean.
+      run: |
+        if printf 'ghp_%s%s\n' Ab3dE6gH9jK2mN5pQ8 sT1vW4yZ7bC0eF3hJ6 | gitleaks stdin --redact --no-banner --log-level error; then
+          echo "::error::gitleaks missed its canary token, so .gitleaks.toml loaded no rules (check its [extend] block)"
+          exit 1
+        fi
+        gitleaks git --redact --verbose --log-opts=HEAD
