@@ -672,7 +672,13 @@ def test_restored_escaped_blank_keeps_rebased_literals_honest():
         ("cat ${x:-$(a | b)}/.env ${y}", "cat ${           }/.env ${y}"),
         # A `\<newline>` earlier in the word moves bashlex's offsets, but the substitution node is
         # rebuilt at its source offsets (_recover_dropped_substitutions), so its body is blanked.
-        ('echo "x\\\ny $(echo $(a)x)"', 'echo "x\\\ny $(          )"'),
+        ('echo "x\\\ny $(echo $(a)x)"', 'echo "x  y $(          )"'),
+        # Bash joins the lines at a `\<newline>`, so it is blanked; after an even backslash run
+        # the newline is real and stays.
+        ("cat \\\n$(a | b)/.env", "cat   $(     )/.env"),
+        ("echo a\\\\\nb $(x)", "echo a\\\\\nb $( )"),
+        # bashlex ends a body's span at a newline before its closer.
+        ("cat $(pwd\n)/.env", "cat $(    )/.env"),
         # Top-level separators survive, so the masked text is still two commands.
         ("echo $(a; b) && git commit -m x", "echo $(    ) && git commit -m x"),
     ],

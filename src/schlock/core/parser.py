@@ -462,6 +462,8 @@ _FD_VARIABLE_TAG = "schlock_fd_variable"
 # any quotes (dropped by `.sub(r"\1", …)`). Matching the runs first consumes a `$`
 # inside them, and `$$` is the PID, so neither is taken for a marker. No escape
 # handling: only apply it to a span with no backslash.
+# An unescaped `\\<newline>`: an odd backslash run before the newline. Bash joins the lines.
+_LINE_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
 _QUOTED_RUN_OR_DOLLAR_MARKER = re.compile(r"""('[^']*'|"[^"]*"|\$\$)|\$(?=['"])""")
 
 # Quoted-substitution body text may total this many times the command's length
@@ -2101,8 +2103,8 @@ class BashCommandParser:
                 )
         return bodies
 
-    def mask_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> str:
-        """`command` with each outermost substitution body blanked, every offset kept.
+    def mask_substitution_bodies(self, command: str, ast_nodes: list[Any], start: int = 0, end: Optional[int] = None) -> str:
+        """`command[start:end]` with each outermost substitution body blanked, every offset kept.
 
         SECURITY: a rule's gap stops at `;`, `|`, `&` and newlines so the
         whole-command scan cannot pair one command's reader with the next command's
@@ -2120,7 +2122,12 @@ class BashCommandParser:
         interior blanked from the node's own span.
 
         This reaches a target OUTSIDE every body. A target inside one is blanked
-        with it, so reaching that stays the rule's own gap's job.
+        with it, so SubstitutionValidator masks each body again, one level down,
+        by passing that body's own command node and span as `ast_nodes`, `start`
+        and `end`.
+
+        A `\\<newline>` is blanked too: bash joins the two lines into one, and a
+        gap that stops at the newline would not.
 
         Length-preserving, so the caller's literal and heredoc ranges still index
         it. A span is blanked only when its opener is at the node's start and its
@@ -2160,13 +2167,16 @@ class BashCommandParser:
         for node in ast_nodes or []:
             visit(node)
         # One join, not a splice per body: 64 KB of `$(x)` is thousands of bodies.
+        stop = len(command) if end is None else end
         pieces: list[str] = []
-        done = 0
-        for start, end in sorted(spans):  # Outermost bodies never overlap.
-            pieces += (command[done:start], " " * (end - start))
-            done = end
-        pieces.append(command[done:])
-        return "".join(pieces)
+        done = start
+        for low, high in sorted(spans):  # Outermost bodies never overlap.
+            first, last = max(low, done), min(high, stop)
+            if first < last:
+                pieces += (command[done:first], " " * (last - first))
+                done = last
+        pieces.append(command[done:stop])
+        return _LINE_CONTINUATION_RE.sub(r"\1  ", "".join(pieces))
 
     @staticmethod
     def _body_start(command: str, part_start: int) -> int:
@@ -2178,11 +2188,12 @@ class BashCommandParser:
         """Offset of a substitution's closing delimiter, or None if it is not where bashlex says.
 
         bashlex ends a substitution's span on the first blank of a trailing run
-        (`$(x    )` spans `$(x `), so the closer is found by skipping blanks.
+        (`$(x    )` spans `$(x `), or on a newline before the closer, so the closer
+        is found by skipping both.
         """
         closer = "`" if command[span[0]] == "`" else ")"
         end = span[1] - 1
-        while command[end : end + 1] in (" ", "\t"):
+        while command[end : end + 1] in (" ", "\t", "\n"):
             end += 1
         return end if command[end : end + 1] == closer else None
 

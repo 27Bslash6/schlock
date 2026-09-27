@@ -284,7 +284,8 @@ D = "$(printf %s $(dirname $(pwd)) | head -1)"
 DEEP3 = "$(a $(b $(c)) | d)"
 
 # (rule, command): each reaches its target past a deep substitution some way the
-# blanked-body pass above does not, and each was BLOCKED before that pass landed.
+# top-level blanked-body pass does not: inside an outer body, which that pass blanks
+# whole, across a line break, or right before a separator.
 DEEP_RESIDUALS = [
     # The reader and its target are both inside an outer body, which the pass blanks.
     ("credential_exposure", f"echo $(cat {D}/.env)"),
@@ -306,7 +307,6 @@ DEEP_RESIDUALS = [
 
 
 class TestADeepSubstitutionResidual:
-    @pytest.mark.xfail(strict=True, reason="not reached yet")
     @pytest.mark.parametrize(("rule", "command"), DEEP_RESIDUALS)
     def test_is_blocked_by_its_rule(self, rule, command, rules_dir_path):
         result = verdict(command, rules_dir_path)
@@ -329,26 +329,8 @@ class TestADeepSubstitutionResidual:
             assert rule in result.matched_rules, (rule, result.matched_rules)
 
 
-# Not reached yet: the payloads above whose wrapped spelling under-blocks.
-_WRAPPED_RESIDUALS = {
-    "cat $(printf %s $(dirname $(pwd)) | head -1)/.env",
-    "cat $(printf %s $(dirname $(pwd)) ; true)/.env",
-    "cat $(a $(b $(c)) | d)/id_rsa",
-    "echo $(a $(b $(c)) | d) password",
-    "true; cat $(a $(b $(c $(d)) | e) | f)/.env",
-    "cat < $(printf %s $(dirname $(pwd)) | head -1)/.env",
-    "cat ${x:-$(printf %s $(dirname $(pwd)) | head -1)}/.env",
-    "echo $(a $(b $(c)) | d) $GITHUB_TOKEN",
-    "export A=$(a $(b $(c)) | d) MY_KEY=x",
-    "chroot $(a $(b $(c)) | d) /bin/bash",
-}
-
 # Every one-command payload, run inside a substitution instead of on its own.
-WRAPPED = [
-    pytest.param(wrapper % command, marks=pytest.mark.xfail(strict=True) if command in _WRAPPED_RESIDUALS else ())
-    for _, command in PAYLOADS + DEEP_PAYLOADS
-    for wrapper in ("echo $(%s)", 'ls "$(%s)"')
-]
+WRAPPED = [wrapper % command for _, command in PAYLOADS + DEEP_PAYLOADS for wrapper in ("echo $(%s)", 'ls "$(%s)"')]
 
 
 @pytest.mark.parametrize("command", WRAPPED)
