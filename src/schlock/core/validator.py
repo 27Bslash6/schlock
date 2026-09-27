@@ -1248,6 +1248,12 @@ _OPENER_SCAN_RE = re.compile(r"[(\\]")
 # as arithmetic in the parse-error messages where the rewritten text reaches a human.
 _ARITH_SHIFT = "=="
 
+# `_DoubleParen`'s scan budget, in characters read per character of text, plus a
+# floor for short commands. Every shape measured linear reads under 4x its length;
+# the quadratic shapes the memos miss read hundreds of times it at 20 KB.
+_PAREN_SCAN_BUDGET = 16
+_PAREN_SCAN_SLACK = 4096
+
 
 class _UnfollowableParenError(ParseError):
     """The `((` reading could not be FOLLOWED, as opposed to provably not closing.
@@ -1290,12 +1296,20 @@ class _DoubleParen:
     ``partners`` memoises where each paren-level `(` closes, so nested `((`
     never rescan: `(( (( (( x ) ) ) ) ) )` is otherwise quadratic in the
     nesting depth, on a hook that runs before every Bash call.
+
+    The memos cannot cover everything: an opener every earlier walk passed
+    inside a quote or nested span has no partner and no `unclosable` entry, so
+    asking it walks afresh, and text built of such openers re-walks to the end
+    once per opener. ``budget`` is the bound that does not depend on shape:
+    every character the scan reads is charged, and running out raises
+    `_UnfollowableParenError` - a deny, since not finishing is not knowing.
     """
 
     def __init__(self, text: str) -> None:
         self.text = text
         self.partners: dict[int, int] = {}
         self.unclosable: set[int] = set()
+        self.budget = _PAREN_SCAN_BUDGET * len(text) + _PAREN_SCAN_SLACK
 
     def is_arithmetic(self, pos: int) -> bool:
         """True when the `((` at ``pos`` is an arithmetic command, False when it is two subshells.
@@ -1381,7 +1395,7 @@ class _DoubleParen:
         stack = [opening]
         pos = opening + 1
         while stack:
-            found = _PAREN_STOP_RE.search(self.text, pos)
+            found = self._search(_PAREN_STOP_RE, pos)
             if found is None:
                 self.unclosable.update(stack)
                 raise ParseError("`((` never closes; bash reads no command from this text")
@@ -1473,8 +1487,16 @@ class _DoubleParen:
                 return found.end()
             pos = found.end() + 1
 
-    def _stop(self, pattern: "re.Pattern[str]", pos: int, what: str) -> "re.Match[str]":
+    def _search(self, pattern: "re.Pattern[str]", pos: int) -> "Optional[re.Match[str]]":
+        """``pattern.search`` from ``pos``, charged to ``budget`` for every character it reads."""
         found = pattern.search(self.text, pos)
+        self.budget -= (len(self.text) if found is None else found.end()) - pos + 1
+        if self.budget < 0:
+            raise _UnfollowableParenError("`((` text too costly to follow; its pairs cannot be located")
+        return found
+
+    def _stop(self, pattern: "re.Pattern[str]", pos: int, what: str) -> "re.Match[str]":
+        found = self._search(pattern, pos)
         if found is None:
             raise ParseError(f"{what} never closes; bash reads no command from this text")
         return found
@@ -1483,19 +1505,17 @@ class _DoubleParen:
 def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tuple[int, int]]:
     """The outermost arithmetic regions among ``openers``, as ``(first offset inside, offset of the `)`)``.
 
-    A nested opener is dropped rather than yielded when its own pair was
-    followed at paren level and closes inside the region already collected:
-    its shifts are that region's, so collecting it again re-scans the same text
-    once per level, and `(( (( (( … )) )) ))` is quadratic in the nesting depth.
-    A walk that pushed its `(` reads it exactly as a fresh walk would, so the
-    recorded partner is the answer it would get if asked.
+    Every opener is asked, and one whose pair closes inside the region already
+    collected is dropped: its shifts are that region's. Asking a nested opener
+    whose pair an outer walk followed is a memo lookup, so `(( (( (( … )) )) ))`
+    costs one walk, not one per level.
 
-    An opener with NO recorded partner is asked, even when it sits before the
-    last closer. The walk that passed it may have skipped it inside a quote or
-    expansion that bash never reads as one: in `# (( "` / `(( a" ))"+1<<b ))`
+    Deciding the drop by the opener's OFFSET instead - before the last closer,
+    so nested - was a bypass. The walk that passed it may have skipped it inside
+    a quote or expansion bash never reads as one: in `# (( "` / `(( a" ))"+1<<b ))`
     the comment's `"` swallows the real `((` and the decoy closes on the `))`
-    in its quote, before the `<<`. Dropping the real opener by offset alone
-    left the payload after it hidden.
+    in its quote, before the `<<`. Only the opener's own answer says where its
+    pair closes.
 
     Only an opener whose pair provably NEVER CLOSES is skipped: that is a bash
     syntax error, bash runs none of the text, so nothing is hidden behind it.
@@ -1507,8 +1527,6 @@ def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tupl
     regions: list[tuple[int, int]] = []
     collected_to = -1
     for opener in openers:
-        if dparen.partners.get(opener + 1, collected_to) < collected_to:
-            continue
         try:
             if not dparen.is_arithmetic(opener):
                 continue
@@ -1517,7 +1535,9 @@ def _arithmetic_regions(dparen: "_DoubleParen", openers: list[int]) -> list[tupl
         except ParseError:
             continue
         closer = dparen.partners[opener + 1]
-        collected_to = max(collected_to, closer)
+        if closer < collected_to:
+            continue  # inside a region already collected, so its shifts are that region's
+        collected_to = closer
         regions.append((opener + 2, closer))
     return regions
 
@@ -1560,31 +1580,51 @@ def _neuter_arithmetic_shifts(command: str) -> str:
     # filed the commands after it as body (`SAFE` while bash ran them). Each
     # shift is written back where it sits in ``command``, found through
     # ``splices`` - where each removed splice sits in the scanned text.
+    #
+    # Splicing every `\<newline>` is itself a reading bash does not always make:
+    # it leaves one alone after an escaped backslash and inside a comment, and
+    # `# note \\` then `(( 1<<b ))` splices to `\((`, whose backslash hides the
+    # real opener. So the text as written is scanned too, and the shifts either
+    # scan finds are all rewritten: an extra one is deny-side under the join, a
+    # missed one is the bypass.
     splices = [match.start() - 2 * k for k, match in enumerate(re.finditer(r"\\\n", command))]
     spliced = command.replace("\\\n", "") if splices else command
     if "((" not in spliced or "<<" not in spliced:
         return command
 
-    dparen = _DoubleParen(spliced)
-    openers = dparen.command_level_openers()
+    shifts = _shift_offsets(spliced, splices)
+    if splices:
+        shifts |= _shift_offsets(command, [])
+    if not shifts:
+        return command
+    rewritten = list(command)
+    for first, second in shifts:
+        rewritten[first] = _ARITH_SHIFT[0]
+        rewritten[second] = _ARITH_SHIFT[1]
+    return "".join(rewritten)
 
-    rewritten: Optional[list[str]] = None
-    for start, closer in _arithmetic_regions(dparen, openers):
+
+def _shift_offsets(text: str, splices: list[int]) -> set[tuple[int, int]]:
+    """Where each shift `_DoubleParen` vouches for in ``text`` sits in the command, one offset per `<`.
+
+    ``splices`` are where the removed `\\<newline>` pairs sat in ``text``; each
+    offset is mapped back past them, so a splice between the two `<` is honoured.
+    """
+    dparen = _DoubleParen(text)
+    shifts: set[tuple[int, int]] = set()
+    for start, closer in _arithmetic_regions(dparen, dparen.command_level_openers()):
         pos = start
         while True:
-            shift = spliced.find("<<", pos, closer)
+            shift = text.find("<<", pos, closer)
             if shift < 0:
                 break
             pos = shift + 2
-            if spliced.startswith("<", pos):
+            if text.startswith("<", pos):
                 pos += 1  # `<<<` is a here-string, not a shift
                 continue
-            if rewritten is None:
-                rewritten = list(command)
-            for i, at in enumerate((shift, shift + 1)):
-                rewritten[at + 2 * bisect.bisect_right(splices, at)] = _ARITH_SHIFT[i]
-
-    return command if rewritten is None else "".join(rewritten)
+            first, second = (at + 2 * bisect.bisect_right(splices, at) for at in (shift, shift + 1))
+            shifts.add((first, second))
+    return shifts
 
 
 def _expansion_frame_at(line: str, pos: int, nested: bool) -> Optional[tuple[str, str]]:

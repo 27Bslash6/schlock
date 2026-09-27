@@ -3985,6 +3985,10 @@ class TestArithmeticCommandShift:
             # bash 5.3 ran the line after each (canary).
             ('# (( "\n(( a" ))"+1<<b ))\nrm -rf /\nb', "a comment's `\"` swallows the real opener"),
             ("# (( '\n(( a' ))'1<<b ))\nrm -rf /\nb", "a comment's `'` swallows the real opener"),
+            # bash splices no `\<newline>` after an escaped backslash; splicing it
+            # anyway reads `\((` and hides the opener. bash 5.3 ran both (canary).
+            ("# note \\\\\n(( 1<<b ))\nrm -rf /\nb\n", "a comment ending in an escaped backslash"),
+            ('# note \\\\\n(( a" ))"+1<<b ))\nrm -rf /\nb\n', "the same, before a quote-bearing opener"),
         ],
     )
     def test_payload_after_arithmetic_shift_is_validated(self, safety_rules_path, command, description):
@@ -4408,6 +4412,16 @@ class TestArithmeticCommandShift:
         """
         assert len(_regions("((" * 2000 + "1<<b " * 2000 + "))" * 2000)) == 1
 
+    def test_a_region_inside_a_collected_one_is_not_collected_again(self):
+        """The drop compares against the FURTHEST closer collected, not the last.
+
+        Each quoted `(( 1 ))` here is asked, pairs, and closes early; keeping only
+        the latest closer would re-collect every outer opener after one of them and
+        rewrite-scan its region again, 32M characters at this size against 38k.
+        """
+        k = 2000
+        assert len(_regions("(( " + "'(( 1 ))' (( " * k + "x<<y" + " ))" * k + " ))")) <= k + 1
+
     def test_the_pass_grows_linearly_with_the_command(self):
         """A ratio, because an absolute ceiling here cannot fail.
 
@@ -4502,6 +4516,43 @@ class TestArithmeticCommandShift:
         for _ in range(2):
             with pytest.raises(val_module._UnfollowableParenError):
                 dparen.is_arithmetic(0)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "(('" + "((\\''" * 1000 + "'1<<z))\necho ok",
+            ('a"(($(x' + "''" * 60 + '##"') * 100 + "\n: <<b\nx\nb",
+        ],
+        ids=["quoted opener per opener", "nested span per opener"],
+    )
+    def test_openers_no_memo_covers_stop_at_the_scan_budget(self, safety_rules_path, command):
+        """Every opener here sits inside a span an earlier walk skipped, so no memo answers it.
+
+        Each is asked fresh and walks to the end of the text: 4x the CPU per 2x
+        input, and the hook's 30 s deadline at the size cap. The scan budget stops
+        that at a small multiple of the text and denies, since a pair the scan
+        did not finish is one it cannot vouch for. Counted, like the rows above.
+        """
+        searches = 0
+        real = val_module._PAREN_STOP_RE
+
+        class Counting:
+            def search(self, text: str, pos: int):
+                nonlocal searches
+                searches += 1
+                return real.search(text, pos)
+
+        val_module._PAREN_STOP_RE = Counting()
+        try:
+            with pytest.raises(val_module._UnfollowableParenError, match="too costly"):
+                val_module._neuter_arithmetic_shifts(command)
+        finally:
+            val_module._PAREN_STOP_RE = real
+
+        assert searches < 2 * val_module._PAREN_SCAN_BUDGET * len(command)
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed is False
+        assert "too costly" in result.message
 
 
 class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:

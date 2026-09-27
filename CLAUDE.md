@@ -100,20 +100,23 @@
         the join can deny more than that pipeline and never less. The matcher over-approximates
         on purpose (every `((` is a candidate, since a missed one is the bypass), and an
         over-fired rewrite can re-parent a real heredoc; the join is what makes that deny-side.
-        The join cannot recover a MISSED opener, so an opener is dropped as nested only when its
-        own pair was followed at paren level inside a region already collected: one skipped
-        inside a span an earlier walk opened (a decoy `((` whose quote bash never reads) is
-        asked fresh.
+        The join cannot recover a MISSED opener, so every opener is asked and dropped as
+        nested only when its own pair closes inside a region already collected - never by its
+        offset, since a decoy `((` whose quote bash never reads can swallow a real one. For the
+        same reason the command is scanned both with every `\<newline>` spliced and as
+        written, and the shifts either scan finds are rewritten: bash splices neither after an
+        escaped backslash nor inside a comment.
      2. **Cannot-follow fails closed** — a pair it cannot follow (`_UnfollowableParenError`:
         nesting too deep, a `case` or heredoc inside `$(…)`) is BLOCKED with that reason. Only
         a pair that provably never closes is skipped, because bash runs none of that text.
      3. **No verdicts of its own** beyond that refusal: the rewritten text goes through the
         same flow, so the payload is denied by the rule it matches.
-     4. **Linear** — the matcher does not run under the parse CPU budget, so its memo is its
-        only CPU bound: every pair it follows and every never-closes exit, including a quote or
-        expansion that runs out of text, is recorded and answered from the memo next time. The
-        two halves' bashlex parses share one budget, because the as-written half skips the
-        budget reset.
+     4. **Bounded** — the matcher does not run under the parse CPU budget. Its memos (every
+        pair it follows, every never-closes exit) keep ordinary shapes linear, but they cannot
+        cover an opener every earlier walk skipped inside a span, so each `_DoubleParen`
+        carries its own scan budget, `_PAREN_SCAN_BUDGET` characters read per character of
+        text. Running out raises `_UnfollowableParenError`, which denies. The two halves'
+        bashlex parses share one parse budget, because the as-written half skips the reset.
      Every reading is decided by running bash first.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
