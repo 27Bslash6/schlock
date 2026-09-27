@@ -283,8 +283,86 @@ def parse_bashlex(command: str) -> list[Any]:
                 original_error=e,
             )
         _recover_dropped_substitutions(command, ast)
+    if _double_paren_misparse(ast):
+        # No "heredoc" in the message: the validator routes those to the heredoc fallback,
+        # which would parse this same tree again. This is a plain parse refusal.
+        raise ParseError(_MISPARSE_MESSAGE)
     _mark_fd_variables(command, ast)
     return ast
+
+
+_MISPARSE_MESSAGE = (
+    "`(( … ))` arithmetic containing `<<` is misread as nested subshells; the lines after it would run without validation"
+)
+
+
+def _double_paren_misparse(nodes: list[Any]) -> bool:
+    """True when bashlex read a `(( … ))` arithmetic command as two nested subshells with a heredoc.
+
+    bash reads `(( 1<<b ))` as arithmetic, so its `<<` is a left shift. bashlex reads the same
+    text as `( ( 1 <<b ) )`, where `<<b` opens a heredoc whose body swallows the lines that
+    follow: no rule sees them, and bash runs them. The misread tree is a subshell whose inner
+    subshell sits flush against it on BOTH sides - inner `(` starting where the outer `(` ends,
+    inner `)` ending where the outer `)` starts - with a `<<` redirect inside. Both sides flush
+    is necessary for bash to read arithmetic; a separator on either side makes two real
+    subshells. bashlex folds a `\\<newline>` splice into the opening reservedword, so `(`,
+    splice, `(` counts as flush, as bash splices it into `((`.
+
+    It is checked here, where every tree schlock builds is made, rather than in one caller:
+    substitution bodies are parsed through this too, and a guard that only read the top-level
+    tree missed the same misread one `$( … )` deep. A pre-parse text scan for `((` was tried
+    and bypassed by splices, comments and quotes; the tree carries none of those questions.
+
+    Known over-deny: `((echo # )` then a heredoc and `))` on later lines. bash ends the inner
+    subshell at the `#` comment, bashlex does not, so this reads as flush. bash would run the
+    heredoc for real, so the only cost is a refusal.
+    """
+
+    def parens(compound: Any) -> Optional[tuple[Any, Any]]:
+        kids = getattr(compound, "list", None)
+        if not kids or getattr(kids[0], "kind", None) != "reservedword" or kids[0].word != "(":
+            return None
+        if getattr(kids[-1], "kind", None) != "reservedword" or kids[-1].word != ")":
+            return None
+        return kids[0], kids[-1]
+
+    def children(node: Any) -> Iterator[Any]:
+        for value in vars(node).values():
+            for child in value if isinstance(value, list) else (value,):
+                if hasattr(child, "kind"):
+                    yield child
+
+    def has_heredoc(node: Any) -> bool:
+        # A heredoc inside a substitution belongs to that substitution's own command and hides
+        # nothing here: `(( 1 + $(cat <<E … E) ))` is ordinary arithmetic. A misparse nested
+        # inside one is found by the walk below, which does enter substitutions.
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            kind = getattr(n, "kind", None)
+            if kind in ("commandsubstitution", "processsubstitution"):
+                continue
+            if kind == "redirect" and getattr(n, "type", None) in ("<<", "<<-"):
+                return True
+            stack.extend(children(n))
+        return False
+
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        outer = parens(node) if getattr(node, "kind", None) == "compound" else None
+        if outer is not None:
+            for child in node.list:
+                inner = parens(child) if getattr(child, "kind", None) == "compound" else None
+                if (
+                    inner is not None
+                    and inner[0].pos[0] == outer[0].pos[1]
+                    and inner[1].pos[1] == outer[1].pos[0]
+                    and has_heredoc(child)
+                ):
+                    return True
+        stack.extend(children(node))
+    return False
 
 
 # --- Parser tiers: `SCHLOCK_PARSER` switch + fail-closed state machine (spec §6, LAB-409 T5) ---

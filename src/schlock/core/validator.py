@@ -1237,29 +1237,6 @@ _OPAQUE_SPANS = {
 # places a word can start, plus the newline a comment ends on.
 _COMMENT_START_AFTER = _WORD_START_AFTER | frozenset("\n")
 
-# `_DoubleParen`'s scan budget, in characters read per character of text, plus a
-# floor for short commands. Every shape measured linear reads under 4x its length;
-# the quadratic shapes the memos miss read hundreds of times it at 20 KB.
-_PAREN_SCAN_BUDGET = 16
-_PAREN_SCAN_SLACK = 4096
-
-
-class _UnfollowableParenError(ParseError):
-    """The `((` reading could not be FOLLOWED, as opposed to provably not closing.
-
-    The difference decides a verdict. A pair that never closes is a bash syntax
-    error: bash runs none of the text, so an opener skipped for that reason
-    hides nothing. A pair this cannot follow - quoting nested deeper than the
-    interpreter recurses, a `case` or a heredoc inside a `$(…)` - says only that
-    schlock does not know, and bash may well evaluate the arithmetic and run the
-    lines after it. Skipping THAT is a bypass: `(( 1<<b + "${a:-…×500…}" ))`
-    followed by `rm -rf /` was allowed and rated SAFE while bash ran it, because
-    both causes arrived as one exception and were dropped alike.
-
-    Subclasses `ParseError` so every existing handler still catches it; only the
-    arithmetic guard, which must tell the two apart, looks for this type.
-    """
-
 
 class _DoubleParen:
     """Resolve each top-level `((` the way bash's parser does.
@@ -1285,20 +1262,11 @@ class _DoubleParen:
     ``partners`` memoises where each paren-level `(` closes, so nested `((`
     never rescan: `(( (( (( x ) ) ) ) ) )` is otherwise quadratic in the
     nesting depth, on a hook that runs before every Bash call.
-
-    The memos cannot cover everything: an opener every earlier walk passed
-    inside a quote or nested span has no partner and no `unclosable` entry, so
-    asking it walks afresh, and text built of such openers re-walks to the end
-    once per opener. ``budget`` is the bound that does not depend on shape:
-    every character the scan reads is charged, and running out raises
-    `_UnfollowableParenError` - a deny, since not finishing is not knowing.
     """
 
     def __init__(self, text: str) -> None:
         self.text = text
         self.partners: dict[int, int] = {}
-        self.unclosable: set[int] = set()
-        self.budget = _PAREN_SCAN_BUDGET * len(text) + _PAREN_SCAN_SLACK
 
     def is_arithmetic(self, pos: int) -> bool:
         """True when the `((` at ``pos`` is an arithmetic command, False when it is two subshells.
@@ -1314,45 +1282,22 @@ class _DoubleParen:
             try:
                 close = self._paren(pos + 1)
             except RecursionError:
-                raise _UnfollowableParenError("Quoting nested too deep inside `((` to follow") from None
+                raise ParseError("Quoting nested too deep inside `((` to follow") from None
         return self.text.startswith(")", close + 1)
 
     def _paren(self, opening: int) -> int:
-        """Offset of the `)` balancing the paren-level `(` at ``opening``, recording every pair passed.
-
-        Records the parens that provably do NOT close as well. Running out of
-        text with a `(` still on the stack is a property of the text after that
-        `(`, not of the scan that happened to reach it, so every offset left on
-        the stack is answered from the memo next time. Without that, text with
-        no closers at all - `((((((…` - re-scans to the end once per opener:
-        8 KB of it cost 7.1 s of CPU, on a hook that runs before every Bash
-        call (0.6 ms with the memo). A quote or expansion that runs out of text
-        inside the pair is the same fact and is recorded the same way. Only that:
-        an `_UnfollowableParenError` is not knowing, and recording it would turn
-        its deny into a skip.
-        """
-        if opening in self.unclosable:
-            raise ParseError("`((` never closes; bash reads no command from this text")
+        """Offset of the `)` balancing the paren-level `(` at ``opening``, recording every pair passed."""
         stack = [opening]
         pos = opening + 1
         while stack:
-            found = self._search(_PAREN_STOP_RE, pos)
-            if found is None:
-                self.unclosable.update(stack)
-                raise ParseError("`((` never closes; bash reads no command from this text")
+            found = self._stop(_PAREN_STOP_RE, pos, "`((`")
             hit, pos = found.group(), found.end()
             if hit == "(":
                 stack.append(found.start())
             elif hit == ")":
                 self.partners[stack.pop()] = found.start()
             else:
-                try:
-                    pos = self._skip(hit, found.start(), pos)
-                except _UnfollowableParenError:
-                    raise
-                except ParseError:
-                    self.unclosable.update(stack)
-                    raise
+                pos = self._skip(hit, found.start(), pos)
         return self.partners[opening]
 
     def _comsub(self, start: int) -> int:
@@ -1377,14 +1322,12 @@ class _DoubleParen:
                 if found.start() > start + 1 and self.text[found.start() - 1] not in _COMMENT_START_AFTER:
                     continue  # mid-word: `echo a#b`, `test-case`
                 if hit == "case":
-                    raise _UnfollowableParenError(
-                        "`case` inside `$(…)` inside `((`; its patterns' `)` cannot be told from the closer"
-                    )
+                    raise ParseError("`case` inside `$(…)` inside `((`; its patterns' `)` cannot be told from the closer")
                 pos = self._stop(_NEWLINE_RE, pos, "`$(`").end()
             elif hit == "<<":
                 if self.text.startswith("<", pos):
                     continue  # a here-string is a word
-                raise _UnfollowableParenError("a heredoc inside `$(…)` inside `((`; the closing paren cannot be located")
+                raise ParseError("a heredoc inside `$(…)` inside `((`; the closing paren cannot be located")
             else:
                 pos = self._skip(hit, found.start(), pos)
 
@@ -1428,16 +1371,8 @@ class _DoubleParen:
                 return found.end()
             pos = found.end() + 1
 
-    def _search(self, pattern: "re.Pattern[str]", pos: int) -> "Optional[re.Match[str]]":
-        """``pattern.search`` from ``pos``, charged to ``budget`` for every character it reads."""
-        found = pattern.search(self.text, pos)
-        self.budget -= (len(self.text) if found is None else found.end()) - pos + 1
-        if self.budget < 0:
-            raise _UnfollowableParenError("`((` text too costly to follow; its pairs cannot be located")
-        return found
-
     def _stop(self, pattern: "re.Pattern[str]", pos: int, what: str) -> "re.Match[str]":
-        found = self._search(pattern, pos)
+        found = pattern.search(self.text, pos)
         if found is None:
             raise ParseError(f"{what} never closes; bash reads no command from this text")
         return found
@@ -2068,74 +2003,6 @@ class _BashlexHeredoc(NamedTuple):
     in_substitution: bool
 
 
-def _double_paren_misparse(nodes: list[Any]) -> bool:
-    """True when bashlex parsed a `(( … ))` arithmetic command as adjacent nested subshells
-    with a `<<` heredoc inside - the exact tree it builds for a shift it misreads as a
-    heredoc opener.
-
-    bash reads `((` as one arithmetic command, so a `<<` in it is a left shift; bashlex reads
-    it as `( ( … ) )`, where the `<<` opens a heredoc whose body swallows the lines after it -
-    inert to every rule, run by bash. The signature cannot be forged. bash reads arithmetic
-    only when BOTH the opening `((` and the closing `))` are adjacent - a real nested subshell
-    needs a separator on each side (`( ( … ) )`), so `((1<<b) )` with a spaced close is two
-    subshells to bash and its heredoc is real. bashlex folds a `\\<newline>` splice into the
-    opening reservedword, so whenever bash would splice `(\\<newline>(` into `((` the inner `(`
-    starts exactly where the outer one ends. Keyed on both adjacencies in bashlex's own AST,
-    the splice, comment and quote questions this used to scan for never arise.
-    """
-
-    def parens(compound: Any) -> Optional[tuple[Any, Any]]:
-        kids = getattr(compound, "list", None)
-        if not kids or getattr(kids[0], "kind", None) != "reservedword" or kids[0].word != "(":
-            return None
-        if getattr(kids[-1], "kind", None) != "reservedword" or kids[-1].word != ")":
-            return None
-        return kids[0], kids[-1]
-
-    def has_heredoc(node: Any) -> bool:
-        stack = [node]
-        while stack:
-            n = stack.pop()
-            if getattr(n, "kind", None) == "redirect" and getattr(n, "type", None) in ("<<", "<<-"):
-                return True
-            for value in vars(n).values():
-                for child in value if isinstance(value, list) else (value,):
-                    if hasattr(child, "kind"):
-                        stack.append(child)
-        return False
-
-    found = False
-
-    def visit(node: Any) -> None:
-        nonlocal found
-        kind = getattr(node, "kind", None)
-        # A misparse inside a `$( … )` or `` ` … ` `` is the substitution validator's to catch,
-        # which re-validates the body and reaches this guard at that level; walking in here too
-        # would only change which check names the deny, as the phantom guard also avoids.
-        if kind in ("commandsubstitution", "processsubstitution"):
-            return
-        outer = parens(node) if kind == "compound" else None
-        if outer is not None:
-            for child in node.list:
-                inner = parens(child) if getattr(child, "kind", None) == "compound" else None
-                if (
-                    inner is not None
-                    and inner[0].pos[0] == outer[0].pos[1]  # `((` adjacent
-                    and inner[1].pos[1] == outer[1].pos[0]  # `))` adjacent
-                    and has_heredoc(child)
-                ):
-                    found = True
-                    return
-        for value in vars(node).values():
-            for child in value if isinstance(value, list) else (value,):
-                if hasattr(child, "kind"):
-                    visit(child)
-
-    for node in nodes:
-        visit(node)
-    return found
-
-
 def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHeredoc]:
     """Every heredoc bashlex reads, anywhere in the tree.
 
@@ -2495,7 +2362,12 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
     return "\n".join(rewritten), base_command
 
 
-def _validate_heredoc_command(command: str, config_path: Optional[str] = None) -> Optional[ValidationResult]:
+def _validate_heredoc_command(
+    command: str,
+    config_path: Optional[str] = None,
+    *,
+    _derived: bool = False,
+) -> Optional[ValidationResult]:
     """Validate command containing heredoc that bashlex couldn't parse.
 
     bashlex reads a quoted heredoc delimiter as written (e.g. `<< 'EOF'` ends at a
@@ -2812,12 +2684,7 @@ def validate_command(
         reset_parse_budget()
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
-        command,
-        config_path,
-        _depth=_depth,
-        _deferred=deferred,
-        _shellcheck=_shellcheck,
-        _derived=_derived,
+        command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
     )
     if not deferred:
         return result
@@ -2889,8 +2756,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             re-entry is the payload's only check.
         _derived: Internal, keyword-only. True when ``command`` is text schlock produced from an
             admitted command (a heredoc rewrite or one of its segments), so the derived-text
-            ceiling applies, not the caller's, and the parse budget is the caller's too. Callers
-            leave it False.
+            ceiling applies, not the caller's. Callers leave it False.
 
     Returns:
         ValidationResult with validation outcome (never raises)
@@ -2992,30 +2858,6 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 )
                 # Not cached: a parse-level refusal, like the parse errors below.
 
-            # A `<<` inside `(( … ))` is a left shift to bash and a heredoc opener to bashlex,
-            # so the phantom body hides every line after it from the rules while bash runs them.
-            # bashlex builds one unforgeable tree for that misread - two adjacent nested subshells
-            # with a `<<` inside - and this denies on it. It runs after the phantom/misread checks
-            # above, which already refuse the quoted-delimiter misreads on their own reason; this
-            # catches the rest, keyed on the AST so where the `((` sits and what quotes, splices or
-            # comments surround it - each of which defeated the pre-parse text scans this replaces -
-            # never arise.
-            if _double_paren_misparse(ast):
-                return ValidationResult(
-                    allowed=False,
-                    risk_level=RiskLevel.BLOCKED,
-                    message=(
-                        "BLOCKED: `(( … ))` arithmetic containing `<<` is read as a subshell heredoc; "
-                        "the lines after it would run without validation"
-                    ),
-                    alternatives=[
-                        "Write the shift as `$(( a << b ))` if you meant arithmetic",
-                        "Run the commands after the arithmetic on their own lines",
-                    ],
-                    exit_code=1,
-                    error="bashlex parses `(( … ))` with a `<<` as nested subshells with a heredoc",
-                )
-
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
             if dangerous_constructs:
@@ -3087,7 +2929,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # fallback. The route keys on "here-document"/"heredoc" in the message.
             if "<<" in command and ("here-document" in str(e) or "heredoc" in str(e).lower()):
                 # Extract command before heredoc and validate that instead
-                heredoc_result = _validate_heredoc_command(command, config_path)
+                heredoc_result = _validate_heredoc_command(command, config_path, _derived=_depth > 0 or _derived)
                 if heredoc_result is not None:
                     return heredoc_result
             # Fall through to block if heredoc handling didn't work
@@ -3473,8 +3315,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # Step 5 whitelist write carries the same guard: its verdict matches a fresh one only
         # because Step 5 returns before Step 6, and one uniform rule needs no such proof.
         # Nor when a substitution verdict is still owed a join: the cached entry would be the
-        # pre-join verdict, and the next identical command would hit it and skip the join. Nor
-        # the as-written half of Step 3b's join, for the same reason.
+        # pre-join verdict, and the next identical command would hit it and skip the join.
         if _depth == 0 and _shellcheck and not _deferred:
             _global_cache.set(command, result)
 

