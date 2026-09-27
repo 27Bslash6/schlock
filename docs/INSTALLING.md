@@ -210,6 +210,10 @@ After installation, verify schlock is working:
 ```
 
 **Re-add marketplace:**
+
+> [!WARNING]
+> `/plugin marketplace remove 27b` also uninstalls `schlock@27b`, and may delete the plugin's saved options and data. Until the install below succeeds, schlock is not validating commands. Run the three commands back to back, and only when you have network access to GitHub. Your schlock config (`.claude/hooks/schlock-config.yaml`, `~/.config/schlock/`) is not affected.
+
 ```bash
 /plugin marketplace remove 27b
 /plugin marketplace add 27b-io/schlock
