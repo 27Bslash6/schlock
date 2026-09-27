@@ -36,13 +36,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import bashlex
 import bashlex.errors
 
-logger = logging.getLogger(__name__)
+# Shared with core's fail-closed pre-spawn guard (spec §5). This module counts code points
+# (bashlex cost) and fails toward skip-extraction, never a raise — see the module docstring.
+from schlock.core.native_bridge import MAX_COMMAND_SIZE
+from schlock.core.parser import BashCommandParser, without_fd_variables
+from schlock.exceptions import ParseError
 
-# Size limit to prevent DoS via huge commands (64KB is generous for commit messages)
-MAX_COMMAND_SIZE = 64 * 1024
+logger = logging.getLogger(__name__)
 
 _GIT_WORD_RE = re.compile(r"\bgit\b")
 _COMMIT_WORD_RE = re.compile(r"\bcommit\b")
@@ -87,6 +89,7 @@ _MSG_FLAG = r"(?:-m\s+|--message(?:\s+|=))"
 # parses within a single filter_commit_message call (the actual win). Small: a process rarely sees
 # this many distinct git-commit commands.
 _PARSE_CACHE_MAX = 64
+_PARSER = BashCommandParser()
 
 
 @dataclass(frozen=True)
@@ -296,7 +299,7 @@ class CommitMessageFilter:
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
-                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p.word for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
                 idx = self._commit_subcommand_index(words)
                 if idx != -1:
                     globals_before = words[1:idx]
@@ -349,7 +352,7 @@ class CommitMessageFilter:
         # Size limit check (DoS prevention per Security Specialist)
         if len(command) > MAX_COMMAND_SIZE:
             logger.warning(
-                f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} bytes). Skipping extraction (fail-open)."
+                f"Command exceeds size limit ({len(command)} > {MAX_COMMAND_SIZE} chars). Skipping extraction (fail-open)."
             )
             return None
 
@@ -801,7 +804,7 @@ class CommitMessageFilter:
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
-                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p.word for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
                 idx = self._commit_subcommand_index(words)
                 if idx != -1 and self._arg_targets_stdin(words[idx + 1 :]):
                     winner = None
@@ -913,7 +916,15 @@ class CommitMessageFilter:
         # Parse OUTSIDE the lock: never hold the lock across a ~300ms parse. A concurrent
         # double-miss on the same command just parses twice harmlessly (idempotent, last write wins).
         try:
-            parsed = list(bashlex.parse(command))
+            # The parser's own entry point, so words carry its `{varname}` redirect tag
+            # (LAB-4599). A ParseError wrapping a bashlex error is unwrapped, so callers'
+            # `except bashlex.errors.ParsingError` behaves as before. One with no bashlex
+            # cause (an unreadable prefix) re-raises as ParseError: callers' broad except
+            # takes it to the regex fallback, and the validation hook denies the command.
+            try:
+                parsed = list(_PARSER.parse(command))
+            except ParseError as exc:
+                raise exc.original_error or exc from None
         except Exception as exc:  # noqa: BLE001 - memoize the failure, then re-raise verbatim
             with self._parse_lock:
                 self._store(command, (False, exc))
@@ -944,7 +955,7 @@ class CommitMessageFilter:
 
         def visit(node: Any) -> None:
             if getattr(node, "kind", None) == "command":
-                words = [p.word for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p.word for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
                 idx = self._commit_subcommand_index(words)
                 if idx != -1:
                     results.append(words[idx + 1 :])
@@ -1030,7 +1041,7 @@ class CommitMessageFilter:
         def visit(node: Any) -> None:
             """Recursively visit AST nodes to find git commit messages."""
             if hasattr(node, "kind") and node.kind == "command":
-                words = [p for p in getattr(node, "parts", []) if hasattr(p, "word")]
+                words = [p for p in without_fd_variables(getattr(node, "parts", [])) if hasattr(p, "word")]
 
                 # Check if this is 'git [global-opts] commit' (issue #82: tolerate -C/-c/etc.)
                 idx = self._commit_subcommand_index([w.word for w in words])
