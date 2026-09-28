@@ -357,7 +357,8 @@ class CommitMessageFilter:
         except (AttributeError, KeyError, IndexError) as e:
             logger.warning(f"Bashlex AST traversal error: {e}. Trying regex fallback.")
         except Exception as e:
-            logger.warning(f"Unexpected bashlex error: {e}. Trying regex fallback.")
+            # By type: bashlex's text for an unsupported construct is a dump holding the command's words.
+            logger.warning(f"Unexpected bashlex error: {type(e).__name__}. Trying regex fallback.")
 
         # Fallback to regex (handles heredoc and other edge cases)
         try:

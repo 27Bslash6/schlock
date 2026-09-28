@@ -30,12 +30,11 @@ class TestParseErrorCoverage:
         assert error.original_error is None
 
     def test_str_with_original_error(self):
-        """ParseError.__str__ with original_error includes both."""
-        original = ValueError("original issue")
+        """ParseError.__str__ is the message alone; the original is kept, never shown (its text can hold the command)."""
+        original = NotImplementedError("dump holding the command's words")
         error = ParseError("Test message", original_error=original)
-        result = str(error)
-        assert "Test message" in result
-        assert "original: original issue" in result
+        assert str(error) == "Test message"
+        assert error.original_error is original
 
 
 class TestConfigurationErrorCoverage:

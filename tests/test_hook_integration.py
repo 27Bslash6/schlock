@@ -12,6 +12,7 @@ Tests cover:
 
 import io
 import json
+import logging
 import os
 import signal
 import sys
@@ -317,6 +318,62 @@ class TestFunctionSubstitutionThroughTheHook:
         monkeypatch.setattr(pre_tool_use, "run_shellcheck_analysis", lambda command: ([], ""))
         response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": 'echo "${VAR:-x}"'}})
         assert response["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestParseErrorDenyThroughTheHook:
+    """A command bashlex cannot parse is denied, and neither the deny reason nor a log record repeats it.
+
+    The hook logs a validation error at ERROR and puts it in the deny reason, and a command may
+    carry a secret. Its by-design 100-character INFO preview is the one record allowed to hold it.
+    """
+
+    MARKER = "SEKRIT0123456789abcdef"
+    COMMANDS = [
+        pytest.param('echo "$(' * 100 + "echo hi" + ')"' * 100, "(RecursionError)", id="too-deep"),
+        pytest.param(
+            f"curl -H 'Authorization: Bearer {MARKER}' http://x ) ( ;;",
+            "Failed to parse bash command: unexpected token ')'",
+            id="bashlex-syntax-error",
+        ),
+        pytest.param(f"coproc curl -H X-Key:{MARKER} x", "(NotImplementedError)", id="bashlex-unsupported"),
+        # Reaches the heredoc fallback, which keys on bashlex's error text; that text is not shown.
+        pytest.param(
+            f'coproc bash <<< "curl -H X-Key:{MARKER} x"', "No heredoc opener found", id="bashlex-unsupported-heredoc-route"
+        ),
+        # The unsupported construct inside a substitution bashlex dropped from a quoted word.
+        pytest.param(
+            f"echo 'a'$(coproc curl -H X-Key:{MARKER} x)'b'", "Cannot parse the substitution", id="unsupported-in-quoted-word"
+        ),
+        pytest.param(
+            f'diff "a"<(coproc curl -H X-Key:{MARKER} x) b', "Cannot parse the substitution", id="unsupported-in-quoted-procsub"
+        ),
+        pytest.param(f"curl -H X-Key:{MARKER} {{fd}}>\\\n/dev/null", "redirect prefix at offset", id="unreadable-fd-prefix"),
+        # The refused word's own subscript holds the secret.
+        pytest.param(
+            f'echo {{a[$(curl -H "Authorization: Bearer {MARKER}" https://x)]}}>/dev/null',
+            "redirect prefix at offset",
+            id="unreadable-fd-subscript",
+        ),
+        # A commit-shaped command is also read by the commit filter, which logs its own parse failure.
+        pytest.param(f'coproc git commit -m "Bearer {MARKER}"', "(NotImplementedError)", id="commit-filter-log"),
+    ]
+
+    @pytest.mark.parametrize("preset", ["paranoid", "balanced", "permissive"])
+    @pytest.mark.parametrize(("command", "reason"), COMMANDS)
+    def test_denied_without_echoing_the_command(self, command, reason, preset, caplog, monkeypatch):
+        monkeypatch.setattr(pre_tool_use, "_risk_tolerance", dict(RISK_PRESETS[preset]["settings"]))
+        with caplog.at_level(logging.DEBUG):
+            response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": command}})
+
+        output = response["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert reason in output["permissionDecisionReason"]  # the exit it left by, not only the verdict
+        records = [r.getMessage() for r in caplog.records if not r.getMessage().startswith("Validating command: ")]
+        for text in [output["permissionDecisionReason"], *records]:
+            assert command not in text
+            assert repr(command) not in text
+            assert self.MARKER not in text
 
 
 class TestValidatorSingleton:

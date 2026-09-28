@@ -248,6 +248,26 @@ def _refuse_unterminated_brace_expansion() -> None:
 
 _refuse_unterminated_brace_expansion()
 
+# bashlex's fixed texts for two constructs it cannot parse. They hold none of the command.
+_SHOWN_UNEXPECTED_ERRORS = frozenset({"arithmetic expansion", "arithmetic substitution"})
+
+
+def _bashlex_failure(e: Exception) -> str:
+    """What a parse error may say about bashlex's exception ``e``: never the command.
+
+    The text reaches the deny reason and the hook's ERROR log, and a command may carry a
+    secret. A ParsingError names the fault and its position, quoting one word at most (the
+    unexpected token, or a heredoc's delimiter). Anything else is named by type: two of
+    bashlex's four NotImplementedError texts are a dump of the parse tree, and its
+    AssertionError quotes a token. The heredoc route in validator.py still reads the text,
+    from ``original_error``.
+    """
+    if isinstance(e, bashlex.errors.ParsingError):
+        return str(e)
+    if str(e) in _SHOWN_UNEXPECTED_ERRORS:
+        return f"{type(e).__name__}: {e}"
+    return type(e).__name__
+
 
 def parse_bashlex(command: str) -> list[Any]:
     """The in-process bashlex tier: parse or raise `ParseError` (never returns a partial AST).
@@ -266,22 +286,14 @@ def parse_bashlex(command: str) -> list[Any]:
         try:
             ast = _bounded_parse(command)
         except ParseBudgetError:
-            # Not rewrapped below: that message quotes the command, and a quoted `<<heredoc`
-            # would route the denial to the heredoc fallback, which parses it again.
+            # Not rewrapped below: its own message names the limit, and the branch below
+            # would log a budget refusal as an unexpected error.
             raise
         except bashlex.errors.ParsingError as e:
-            # Preserve original bashlex error for debugging
-            raise ParseError(
-                f"Failed to parse bash command: {command!r}",
-                original_error=e,
-            )
+            raise ParseError(f"Failed to parse bash command: {_bashlex_failure(e)}", original_error=e)
         except Exception as e:
-            # Catch any other unexpected bashlex errors
-            logger.error(f"Unexpected error parsing command: {e}")
-            raise ParseError(
-                f"Unexpected parsing error for command: {command!r}",
-                original_error=e,
-            )
+            logger.error(f"Unexpected error parsing command: {_bashlex_failure(e)}")
+            raise ParseError(f"Unexpected parsing error ({_bashlex_failure(e)})", original_error=e)
         _recover_dropped_substitutions(command, ast)
     _mark_fd_variables(command, ast)
     return ast
@@ -580,7 +592,7 @@ def _recover_substitution(command: str, offset: int, word_end: int) -> Any:
     except ParseError:
         raise
     except Exception as e:  # noqa: BLE001 - any bashlex failure means the body is unknown
-        raise ParseError(f"Cannot parse the substitution at offset {offset}", original_error=e) from e
+        raise ParseError(f"Cannot parse the substitution at offset {offset}: {_bashlex_failure(e)}", original_error=e) from e
 
 
 def _recover_dropped_substitutions(command: str, nodes: "list[Any]") -> None:
@@ -1046,8 +1058,10 @@ def _redirect_words(node: Any, command: Optional[str]) -> list[tuple[str, Option
     return [(operator, None, []), (word, None, [])]
 
 
-def _unreadable(source: str, word: Any, cause: str) -> ParseError:
-    return ParseError(f"Cannot read the `{{varname}}` redirect prefix {word.word!r} in {source!r}: {cause}")
+def _unreadable(word: Any, cause: str) -> ParseError:
+    # Says where, not what: this text reaches the deny reason and the hook's ERROR log, and the
+    # word's subscript can hold the rest of the command.
+    return ParseError(f"Cannot read the `{{varname}}` redirect prefix at offset {word.pos[0]}: {cause}")
 
 
 def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
@@ -1094,18 +1108,18 @@ def _mark_fd_variables(source: str, ast_nodes: "list[Any]") -> None:
                     continue
                 raw = source[word.pos[0] : word.pos[1]]
                 if enclosing is None and raw.startswith("{") and re.search(r"\}[<>](?!\()", raw.replace("\\\n", "")):
-                    raise _unreadable(source, word, "a redirection operator bashlex folded into the word")
+                    raise _unreadable(word, "a redirection operator bashlex folded into the word")
                 if redirect is None or not _fd_variable_candidate(word, redirect):
                     continue
                 start, end = enclosing or word.pos
                 if "\\\n" in source[start:end]:
-                    raise _unreadable(source, word, "a line continuation in or around it")
+                    raise _unreadable(word, "a line continuation in or around it")
                 if not raw.startswith("{"):
                     continue  # quoted or escaped: an argument, as bash reads it
                 if source[redirect.pos[0] : redirect.pos[0] + 1] not in ("<", ">"):
-                    raise _unreadable(source, word, "its redirection is not where bashlex places it")
+                    raise _unreadable(word, "its redirection is not where bashlex places it")
                 if not _FD_VARIABLE_ALLOWED_RE.fullmatch(raw):
-                    raise _unreadable(source, word, "a spelling outside {name} and {name[0-9A-Za-z_]}")
+                    raise _unreadable(word, "a spelling outside {name} and {name[0-9A-Za-z_]}")
                 setattr(word, _FD_VARIABLE_TAG, True)
         child_enclosing = enclosing
         if enclosing is None and hasattr(node, "word") and getattr(node, "pos", None):

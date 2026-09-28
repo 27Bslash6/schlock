@@ -12,7 +12,9 @@ from typing import Optional
 class ParseError(Exception):
     """Raised when bash command parsing fails.
 
-    Preserves the original bashlex error message for debugging.
+    Preserves the original bashlex error for debugging, but ``str()`` is the message
+    alone: it reaches deny reasons and ERROR logs, and the original's text can hold
+    the command's words. A raise site that wants part of it says so in the message.
     Used by BashCommandParser when bashlex.parse() fails.
 
     Args:
@@ -33,12 +35,6 @@ class ParseError(Exception):
         self.message = message
         self.original_error = original_error
         super().__init__(self.message)
-
-    def __str__(self) -> str:
-        """Return string representation with original error context if available."""
-        if self.original_error:
-            return f"{self.message} (original: {self.original_error})"
-        return self.message
 
 
 class ParseBudgetError(ParseError):
