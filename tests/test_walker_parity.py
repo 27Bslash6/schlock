@@ -101,7 +101,7 @@ def bashlex_outputs(command: str) -> "dict[str, set] | None":
 
 #: Corpus rows this walker exists to exercise. Checked individually, not "any
 #: one of the corpus" — the `command`-kind and `compound`-kind sinks in
-#: `_here_string_program` are separate code paths, so a regression isolated to
+#: `_here_string_programs` are separate code paths, so a regression isolated to
 #: one would still leave the other producing a non-empty set and pass a
 #: corpus-wide vacuity check trivially.
 STDIN_PROGRAM_CORPUS_NAMES = ["here-string-stdin-program", "here-string-compound"]

@@ -319,7 +319,7 @@ class TestDataOperandsStayOut:
     """A `<<<` payload is data: it executes only when the command is a shell.
 
     Emitting it unsuppressed would over-block `cat <<< "rm -rf /"`, which prints text.
-    Deciding shell-vs-data is `_here_string_program`'s job (LAB-2768), not this set's.
+    Deciding shell-vs-data is `_here_string_programs`' job (LAB-2768), not this set's.
     """
 
     def test_here_string_payload_is_not_promoted(self, safety_rules_path):
