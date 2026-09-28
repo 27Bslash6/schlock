@@ -1263,13 +1263,24 @@ def heredoc_owner(node: Any) -> Optional[str]:
 _DECODERS = ("base64", "base32", "basenc")
 
 
+_BRACKET_CLASS = re.compile(r"\[.*\[[:=.]", re.DOTALL)
+
+
 def _named(name: str, names: "Collection[str]") -> "list[str]":
-    """The `names` that `name` is, or that bash could expand it to as a glob (`/usr/bin/bas?64`)."""
+    """The `names` that `name` is, or that bash could expand it to as a glob (`/usr/bin/bas?64`).
+
+    fnmatch is not bash: it reads `[^x]` as a set holding `^`, where bash negates it as `[!x]`,
+    and it knows no `[[:lower:]]`. So `[^` is matched as `[!`, and a word with a class, an
+    equivalence class or a collating symbol after a `[` may be any name: the fail-closed side.
+    A bare `[:upper:]`, as `tr` takes it, is a plain set to bash too.
+    """
     if name in names:
         return [name]
     if not any(c in name for c in "*?["):
         return []
-    return [n for n in names if fnmatch.fnmatchcase(n, name)]
+    if _BRACKET_CLASS.search(name):
+        return list(names)
+    return [n for n in names if fnmatch.fnmatchcase(n, name.replace("[^", "[!"))]
 
 
 def _is_decoder(name: str) -> bool:

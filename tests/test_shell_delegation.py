@@ -888,6 +888,9 @@ class TestBase64DecodeAtCommandPosition:
             "$(base64 *d x)",
             "$(/usr/bin/bas?64 -d x)",
             "$(/usr/bin/base6[4] -d x)",
+            # bash negates a bracket with `^` as with `!`, and knows POSIX classes: bash ran each.
+            "$(/usr/bin/bas[^x]64 -d x)",
+            "$(/usr/bin/base[[:digit:]]4 -d x)",
             # The other coreutils base-N decoders.
             "$(base32 -d x)",
             "$(basenc --base64 -d x)",
@@ -947,6 +950,9 @@ class TestBase64DecodeAtCommandPosition:
             "env é=1 $(base64 -d x)",
             # A wrapper named by a glob, or by a brace word that expands to it or vanishes.
             "/usr/bin/en? $(base64 -d x)",
+            "/usr/bin/[^x]nv $(base64 -d x)",
+            "/usr/bin/[[:lower:]]nv $(base64 -d x)",
+            "/usr/bin/[][:lower:]]nv $(base64 -d x)",
             "{env,} $(base64 -d x)",
             "{nohup,} $(base64 -d x)",
             "{,} $(base64 -d x)",
@@ -1028,6 +1034,8 @@ class TestBase64DecodeAtCommandPosition:
             # Only the subscript is arithmetic; the value, decode and all, is only stored.
             "out[$(basename f)]=$(base64 -d f)",
             'm["$(id -u)"]=$(base64 -d f)',
+            # A bare `[:upper:]` is a plain set to bash, not a class that may name a decoder.
+            "m[$(echo k | tr '[:upper:]' '[:lower:]')]=$(base64 -d f)",
             'for f in *; do out[$(basename "$f")]=$(base64 -d "$f"); done',
             # A `]=` inside the value is not the subscript's close.
             "a[0]=$(base64 -d x | grep '[k]=v')",
