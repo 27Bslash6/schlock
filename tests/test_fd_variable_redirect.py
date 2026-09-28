@@ -62,6 +62,7 @@ class TestPhantomWordNoLongerUnratesRules:
             ("chmod {fd}>out 777 ./x", "chmod_777"),
         ],
     )
+    @pytest.mark.usefixtures("clean_worktree")
     def test_rule_fires_through_the_prefix(self, command, rule, safety_rules_path):
         assert _verdict(command, safety_rules_path) == (RiskLevel.HIGH, (rule,))
 
