@@ -1,11 +1,14 @@
 """Top-level under-block fixes: pipe-to-shell + git -c exec (security)."""
 
+import time
+
 import pytest
 
 from schlock.core import validator as val_module
 from schlock.core.parser import BashCommandParser, _reads_stdin_as_program
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
+    awk_command_pipe,
     dangerous_find,
     dangerous_git_config,
     dangerous_kubectl,
@@ -101,6 +104,137 @@ class TestTopLevelGitC:
 
     def test_fsmonitor_boolean_not_blocked_top_level(self):
         assert validate_command("git -c core.fsmonitor=true status").risk_level != RiskLevel.BLOCKED
+
+
+class TestTopLevelAwkCommandPipe:
+    """awk `print | c` / `c | getline` runs a command; at top level that is BLOCKED."""
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk 'BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; c | getline l; print l}' 'id'",
+            'awk \'BEGIN{print "rm -rf /" | "sh"}\'',  # literal target: no backstop either
+            "awk '{printf \"%s\\n\", $0 | cmd}' f",
+            "awk '{print $0 |& c}' f",  # gawk coprocess
+            "gawk 'BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /'",
+            "/usr/bin/awk '{print | c}' f",
+            'awk \'/"/ {print 1 | c; x = "a"}\' f',  # quote in a regex must not pair with a later one
+            "awk '{print ($1+$2)/2 | c}' f",  # division, not a regex literal hiding the pipe
+            # `and` is a plain variable in mawk and nawk, so a `/` after it divides
+            "awk 'BEGIN{c=ARGV[1]; and=4; y = and / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            # the `)` closing an if/while/for condition ends no value: the `/` opens a regex
+            "awk 'BEGIN{c=ARGV[1]; if (1) /\"/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; while (0) /\"/; print 1 | c}' 'rm -rf /'",
+            # a newline ends the statement, so a `/` starting the next line opens a regex
+            "awk 'BEGIN{c=ARGV[1]; x = 1\n/\"/; print 1 | c}' 'rm -rf /'",
+            # a comment ends at its newline even after a trailing backslash
+            "awk 'BEGIN{c=ARGV[1] # x \\\n; print 1 | c}' 'rm -rf /'",
+            # `getline` is a value, so a `/` after it divides (was HIGH, not BLOCKED)
+            "awk 'BEGIN{c=ARGV[1]; ARGV[1]=\"\"; y = getline / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            # busybox (the `awk` on Alpine) opens a regex after break/continue
+            "awk 'BEGIN{c=ARGV[1]; while (1) { break /\"/ } print 1 | c; y = \"a\"}' 'rm -rf /'",
+            # a multicall applet must be checked as the applet, not the wrapper (parity with subst)
+            "busybox awk 'BEGIN{print 1 | \"id\"}'",
+            "toybox awk 'BEGIN{c=ARGV[1]; print 1 | c}' id",
+            # awks disagree on `/` after postfix ++/--: gawk and busybox divide, mawk and nawk read
+            # a regex. Each spelling hides the pipe from one reading, so both are lexed.
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = x++ / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = x-- / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = x++ /\"/; print 1 | c}' 'rm -rf /'",
+            # `case` is gawk's switch keyword (a regex follows) and a plain variable elsewhere
+            "awk 'BEGIN{c=ARGV[1]; case=4; y = case / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            "gawk 'BEGIN{c=ARGV[1]; switch (\"\\\"\") { case /\"/: print 1 | c }}' 'rm -rf /'",
+            # gawk opens a regex on `/=` after a non-lvalue value; mawk after a bare `length`
+            "awk 'BEGIN{c=ARGV[1]; y = 4 /=/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; y = length /\"/; print 1 | c}' 'rm -rf /'",
+            # busybox reads `\\]` in a bracket as a literal, closing the class where others escape it
+            "awk 'BEGIN{c=ARGV[1]; if ($0 ~ /[\\]/) x=1; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{x=/[\\]]/; c=ARGV[1]; print 1 | c}' 'rm -rf /'",
+            "busybox awk 'BEGIN{c=ARGV[1]; x=4; y = x++ / 2; print 1 | c; z = 4 / 1}' 'rm -rf /'",
+            # a class the awks end differently before a real pipe: every place its regex can end is lexed
+            "awk '{gsub(/[]]/,\"\")} BEGIN{c=ARGV[1]; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; c |& getline l}' id",  # gawk coprocess read
+            # gawk opens a regex on `/=` after a regex literal or a prefix-incremented operand
+            "awk 'BEGIN{c=ARGV[1]; y = /a/ /=/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; x=4; y = ++x /=/; print 1 | c}' 'rm -rf /'",
+            "awk 'BEGIN{c=ARGV[1]; ARGV[1]=\"\"; y = getline /=/; print 1 | c}' 'rm -rf /'",
+        ],
+    )
+    def test_command_pipe_blocks(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # a bracket class the awks end differently (`[\[\]]`, `[][]`, `[^\]]`): every reading
+            # ends its regex at the same `/`, so the later `"|"` string or `/a|b/` regex is data
+            'awk \'{gsub(/[\\[\\]]/,""); print $1 "|" $2}\' f',
+            "awk 'match($0, /\\[[^\\]]*\\]/) {print substr($0, RSTART, RLENGTH) \"|\" $1}' f",
+            "awk '{gsub(/[\\[\\]]/, \"\")} $1 ~ /^(GET|POST)$/ {print}' f",
+            'awk \'{gsub(/[][]/,""); print $1 "|" $2}\' f',
+            # gawk `case /re/`; where `case` is a variable, `case / foo|bar /` has no print before the `|`
+            "awk '{switch ($1) {case /foo|bar/: print; break}}' f",
+        ],
+    )
+    def test_ambiguous_lexing_without_a_pipe_is_safe(self, command):
+        """No reading of these runs a command, so nothing asks or blocks."""
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk -F'|' '{print $1}' f",
+            "awk '$1 || $2 {print}' f",
+            "awk '/error|warn/ {print}' f",
+            "awk '{if ($1 ~ /foo|bar/) print $2}' f",
+            "awk '{print $1 \"|\" $2}' f",
+            "awk '{print > \"out.txt\"}' f",  # file write: not an exec, out of scope at top level
+            "awk -f prog.awk f",
+            "awk '{while ((getline l < \"f\") > 0) print l}' f",  # getline from a file
+            "awk '{print $1} # x|y' f",  # a pipe inside a comment, not code
+            "awk '{n++} /a|b/ {print}' f",  # only a `/` directly after ++ is ambiguous
+            "awk 'NR == 1\n/a|b/ {print}' f",  # a regex pattern opening the second line
+            "awk '{gsub(/[ \\t]+/, \"|\"); print}' f",  # `\t` in a bracket does not move its end
+            "awk '{$1 /= 100; print $1 \"|\" $2}' f",  # a field is an lvalue: `/=` is compound-assign
+            "awk '{gsub(/[[:space:]]+/, \"|\"); print}' f",  # a POSIX class ends where all awks agree
+            "busybox awk '{print $1}' f",  # a benign multicall applet is not blocked
+        ],
+    )
+    def test_non_exec_awk_is_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    def test_system_stays_high(self):
+        """The command-pipe check must not change the existing system() rating (HIGH, ask)."""
+        assert validate_command("awk 'BEGIN{system(\"id\")}'").risk_level == RiskLevel.HIGH
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            '"' + '\\"' * 40000,
+            "(/" + "\\/" * 40000,
+            # an ambiguous class some awk leaves open: each used to rescan to its line end (81s)
+            "BEGIN{" + "x = /[\\]/; " * 5900 + "}",
+            "BEGIN{x = /[\\]" + "[:" * 30000 + "/}",  # each open `[:` used to search to the line end (8s)
+            "BEGIN{" + ("x = /[\\]/; " * 46 + "\n") * 128 + "}",  # many such classes on each line
+            "BEGIN{y = " + "x++ / 2; " * 7000 + "}",  # a fork per `/`: the readings agree again at `;`
+            # 16 readings, then ambiguous classes: each reading used to redo every class (17s, 34s in $())
+            "BEGIN{" + "a++ / 2 / 1;" * 4 + ("/[\\]/;" * 83 + "\n") * 128 + "}",
+            # readings that never agree again (different open parens and prints) each lex the rest
+            "BEGIN{y = x++ / if ( 1 /;y = x++ / print ( 1 /;y = x++ / ( 1 /;" + "x = y + 1; " * 5800 + "}",
+        ],
+    )
+    def test_literal_scan_is_linear(self, program):
+        """An unclosed literal must not rescan from every quote: the quadratic form took ~11s."""
+        start = time.perf_counter()
+        awk_command_pipe(["awk", program])
+        assert time.perf_counter() - start < 2
 
 
 class TestReadsStdinAsProgram:

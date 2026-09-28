@@ -819,7 +819,7 @@ WRAPPER_COMMANDS: frozenset[str] = _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMAN
 EXEC_CHILD_ATTRS = ("parts", "command", "list", "pipe", "compound", "redirects", "output")
 
 
-def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
+def resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
     """Resolve a multicall binary to its effective applet and that applet's args.
 
     `busybox sh -c x` -> ('sh', ['-c', 'x']); `busybox ls` -> ('ls', []); bare `busybox` or
@@ -1263,7 +1263,7 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     if not words:
         return None
 
-    name, args = _resolve_multicall(words[0].split("/")[-1], words[1:])
+    name, args = resolve_multicall(words[0].split("/")[-1], words[1:])
     if name in STDIN_EXEC_INTERPRETERS and _reads_stdin_as_program(name, args):
         return (name, here_string)
 
@@ -2476,7 +2476,7 @@ class BashCommandParser:
                     if cmd_name:
                         # Resolve multicall wrappers (busybox/toybox) to their applet so the
                         # stage is classified by what actually runs (`busybox sh` -> `sh`).
-                        stages.append(_resolve_multicall(cmd_name, _stage_args(stage_node)))
+                        stages.append(resolve_multicall(cmd_name, _stage_args(stage_node)))
 
             if len(stages) < 2:
                 return

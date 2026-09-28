@@ -32,9 +32,10 @@ from .parser import (
     has_compound_redirects,
     heredoc_owner,
     reset_parse_budget,
+    resolve_multicall,
 )
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
-from .substitution import SubstitutionValidationResult, SubstitutionValidator
+from .substitution import SubstitutionValidationResult, SubstitutionValidator, awk_command_pipe
 
 logger = logging.getLogger(__name__)
 
@@ -398,9 +399,12 @@ def _check_dangerous_command_flags(
     Returns:
         ValidationResult if dangerous combo found, None otherwise
     """
-    for cmd_name, args in commands_with_args:
-        # Strip path prefix (e.g., /usr/bin/nc -> nc)
-        base_name = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
+    for cmd_name, raw_args in commands_with_args:
+        # Strip path prefix (e.g., /usr/bin/nc -> nc), then resolve a multicall applet so
+        # `busybox awk '...'` is checked as `awk '...'` — parity with the substitution tier, which
+        # already normalises busybox/toybox. Without this, `busybox awk` skips the awk pipe check.
+        base_path_stripped = cmd_name.split("/")[-1] if "/" in cmd_name else cmd_name
+        base_name, args = resolve_multicall(base_path_stripped, raw_args)
 
         if base_name in DANGEROUS_COMMAND_FLAGS:
             flags, description, alternatives = DANGEROUS_COMMAND_FLAGS[base_name]
@@ -451,6 +455,29 @@ def _check_dangerous_command_flags(
                     exit_code=1,
                     error=None,
                     matched_rules=["ast_dangerous_combo:git"],
+                )
+
+        # awk piping to/from a command (`print | c`, `c | getline`) is an exec primitive; the
+        # payload rides in a quoted arg the YAML rules treat as data. BLOCKED like git -c, not
+        # HIGH like kubectl — this does deny the legitimate `print | "sort"` idiom, but the shell
+        # pipe (`awk '...' | sort`) is the plain alternative, and an arbitrary command from an awk
+        # arg has no defensible top-level use. system() stays a HIGH YAML rule, and -f /
+        # `print > file` stay allowed here. A pipe any awk would run is BLOCKED, including one only
+        # some awks see: they disagree on a few `/`s, and awk_command_pipe reads each way.
+        if base_name in ("awk", "gawk", "mawk", "nawk"):
+            awk_reason = awk_command_pipe(args)
+            if awk_reason:
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: {awk_reason}",
+                    alternatives=[
+                        "Pipe awk's output to the command in the shell: awk '...' | cmd",
+                        "Run the command directly instead of from inside awk",
+                    ],
+                    exit_code=1,
+                    error=None,
+                    matched_rules=["ast_dangerous_combo:awk"],
                 )
 
     return None
