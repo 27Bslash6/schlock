@@ -12,8 +12,6 @@ stay green under a mutation that moves both tiers together. ShellCheck is forced
 unavailable throughout -- it is optional, so its verdicts must never be what blocks these.
 """
 
-import shutil
-import subprocess
 import time
 
 import pytest
@@ -22,6 +20,7 @@ from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import MAX_SUBSTITUTION_DEPTH, SubstitutionValidator, _as_double_quoted
 from schlock.core.validator import _normalise_heredoc_delimiters, clear_caches, load_rules, validate_command
+from tests.conftest import run_bash_oracle
 
 # Every spelling of "command substitution smuggled through an unquoted heredoc body".
 # Each returned allowed=True risk=SAFE before the fix, and each really executes under bash.
@@ -367,14 +366,13 @@ class TestNestedHeredocsStayBounded:
         assert all(n.base_command is None for n in exhausted), "must be the fail-closed node"
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="differential check needs bash")
 class TestModelAgreesWithBash:
     """The load-bearing claim: `echo "<body>"` decodes exactly what bash expands.
 
     POSIX says an unquoted heredoc body is treated as a double-quoted string, which is why
     the wrapper is faithful rather than merely convenient. Pin it against the real shell so
-    a bashlex upgrade that drifts from bash fails here instead of silently allowing. The
-    payload only echoes a marker -- running these must have no side effect.
+    a bashlex upgrade that drifts from bash fails here instead of silently allowing. Bash
+    runs these inside scripts/bash-oracle, like every candidate command.
     """
 
     MARKER = "SCHLOCKMARKER"
@@ -396,17 +394,11 @@ class TestModelAgreesWithBash:
             (">(echo %s)", False),
         ],
     )
-    def test_decode_matches_expansion(self, body, bash_expands, sub_validator):
+    def test_decode_matches_expansion(self, body, bash_expands, sub_validator, oracle_home):
         body = body % self.MARKER
         script = f"cat <<EOF\n{body}\nEOF\n"
 
-        ran = subprocess.run(  # noqa: S603 - fixed argv, inert echo-only payload
-            ["bash", "-c", script],  # noqa: S607 - resolved via PATH by design; guarded by skipif
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        ran = run_bash_oracle(script, oracle_home)
         assert (self.MARKER in ran.stdout and "echo" not in ran.stdout) is bash_expands, (
             f"bash ground truth changed for {body!r}: {ran.stdout!r}"
         )

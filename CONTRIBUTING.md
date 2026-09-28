@@ -18,6 +18,25 @@ pre-commit install
 uv run pytest
 ```
 
+### Running candidate commands in real bash
+
+Never execute a test vector or evasion string in your own shell. Run it with
+`scripts/bash-oracle -- '<command>'` (`--help` describes the sandbox); the tests that compare
+schlock against bash use it too. It needs `bwrap` (`apt install bubblewrap`) and unprivileged user
+namespaces. Without them it refuses to run, and those tests skip locally (in CI they fail).
+
+Ubuntu 23.10 and later restrict unprivileged user namespaces through AppArmor
+(`kernel.apparmor_restrict_unprivileged_userns=1`). Rather than turning the restriction off, load
+the `bwrap-userns-restrict` profile AppArmor ships, which lets bwrap create its namespace but
+confines what runs inside it (on Ubuntu 25.04+ it is already in place):
+
+```bash
+sudo apt install apparmor-profiles
+sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+scripts/bash-oracle -- 'echo ok'   # prints ok, then "bash-oracle: exit=0"
+```
+
 ## Project Structure
 
 ```

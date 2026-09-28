@@ -1,0 +1,393 @@
+"""Tests for scripts/bash-oracle, the only sanctioned way to execute a candidate command.
+
+Two things are pinned. The oracle really runs bash, yet a destructive line cannot reach the
+caller's files. And no test spawns a real shell outside it unless the allowlist below says
+why.
+
+The destructive vectors run against a decoy HOME in tmp_path, never the developer's own.
+A test that would delete the real home directory if the sandbox regressed is the very
+failure the oracle exists to prevent. The real home is still checked, but only for
+visibility, and a visibility probe cannot destroy anything.
+"""
+
+import ast
+import os
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+from tests.conftest import run_bash_oracle as oracle
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="bubblewrap is Linux-only")
+
+
+@pytest.fixture
+def sandbox(oracle_home):
+    """The caller's HOME, holding the kind of files a stray `rm -rf ~` destroys."""
+    (oracle_home / ".ssh").mkdir()
+    (oracle_home / ".ssh" / "id_canary").write_text("canary\n")
+    (oracle_home / ".config").mkdir()
+    (oracle_home / ".config" / "canary").write_text("canary\n")
+    return oracle_home
+
+
+# Bash's own test, not ls: ls holds a directory fd of its own while it lists /proc/self/fd.
+LIST_OPEN_FDS = "for n in {3..63}; do [[ -e /proc/self/fd/$n ]] && echo OPEN:$n; done; true"
+
+
+def assert_canaries_intact(home: Path) -> None:
+    assert (home / ".ssh" / "id_canary").read_text() == "canary\n"
+    assert (home / ".config" / "canary").read_text() == "canary\n"
+
+
+class TestContainment:
+    @pytest.mark.parametrize(
+        "vector",
+        [
+            "$'\\u72'm -rf ~",  # ANSI-C-escaped rm: passes a substring guard for "rm -rf"
+            "rm -rf {home}",  # the literal absolute path to the home directory
+            "rm -rf ~/.ssh ~/.config",
+            "find ~ -delete",
+        ],
+    )
+    def test_destructive_vector_runs_and_leaves_caller_home_intact(self, sandbox, vector):
+        command = vector.format(home=shlex.quote(str(sandbox)))
+        # Refuse to run the vector at all if the decoy's files are visible inside.
+        seen = oracle(f"test -e {shlex.quote(str(sandbox / '.ssh' / 'id_canary'))}", sandbox)
+        assert seen.returncode == 1, f"caller's HOME is visible inside the sandbox:\n{seen.stderr}"
+
+        result = oracle(f"mkdir ~/.ssh && touch ~/.ssh/witness; {command}; test -e ~/.ssh/witness || echo RAN", sandbox)
+
+        assert "RAN" in result.stdout, f"the vector did not delete the sandbox's own home:\n{result.stderr}"
+        assert result.stderr.endswith(f"bash-oracle: exit={result.returncode}\n")
+        assert_canaries_intact(sandbox)
+
+    def test_exact_evasion_string_reports_it_ran(self, sandbox):
+        result = oracle("$'\\u72'm -rf ~", sandbox)
+
+        # rm empties the tmpfs HOME, then cannot unlink its mount point: bash ran rm.
+        assert re.search(r"^rm: cannot remove .*: Device or resource busy$", result.stderr, re.M), result.stderr
+        assert result.stderr.endswith("bash-oracle: exit=1\n")
+        assert result.returncode == 1
+        assert_canaries_intact(sandbox)
+
+    def test_host_paths_outside_the_allowlist_are_invisible(self, sandbox):
+        # Non-destructive on purpose: a probe that only looks cannot hurt a regressed sandbox.
+        paths = [pwd.getpwuid(os.getuid()).pw_dir, REPO_ROOT, "/home", "/mnt", "/run", "/media", "/var", "/root"]
+        probe = "; ".join(f"test -e {shlex.quote(str(p))} && echo VISIBLE:{shlex.quote(str(p))}" for p in paths)
+        result = oracle(f"{probe}; true", sandbox)
+        assert "VISIBLE" not in result.stdout
+
+    @pytest.mark.parametrize("mode", [os.O_RDWR, os.O_RDONLY], ids=["writable", "read-only"])
+    def test_an_inherited_file_descriptor_reaches_nothing(self, sandbox, tmp_path, mode):
+        host = tmp_path / "host-canary"
+        host.write_text("safe\n")
+        fd = os.open(host, mode)
+        try:
+            result = oracle(f"printf OWNED >&{fd}; cat /proc/self/fd/{fd} <&{fd}; {LIST_OPEN_FDS}", sandbox, pass_fds=(fd,))
+        finally:
+            os.close(fd)
+        assert "safe" not in result.stdout
+        assert "OPEN" not in result.stdout, result.stdout
+        assert host.read_text() == "safe\n"
+
+    def test_an_inherited_directory_descriptor_reaches_nothing(self, sandbox, tmp_path):
+        (tmp_path / "host-canary").write_text("safe\n")
+        fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            # Read-only probes: a regressed sandbox must not be handed a destructive line.
+            result = oracle(f"ls /proc/self/fd/{fd}/ /proc/self/fd/{fd}/../ 2>&1; true", sandbox, pass_fds=(fd,))
+        finally:
+            os.close(fd)
+        assert "host-canary" not in result.stdout
+        assert tmp_path.name not in result.stdout
+
+    def test_the_callers_stdout_file_is_not_reopened(self, sandbox, tmp_path):
+        log = tmp_path / "caller-log"
+        log.write_text("prior\n")
+        with log.open("a") as out:
+            result = oracle(": > /proc/self/fd/1; echo new", sandbox, stdout=out)
+        assert result.returncode == 0, result.stderr
+        assert log.read_text() == "prior\nnew\n"
+
+    def test_root_is_read_only_and_home_and_tmp_are_writable(self, sandbox):
+        result = oracle("touch /usr/x /etc/x /x 2>/dev/null || echo RO; touch ~/x /tmp/x && echo RW", sandbox)
+        assert result.stdout.split() == ["RO", "RW"]
+
+    def test_no_network(self, sandbox):
+        result = oracle("exec 3<>/dev/tcp/1.1.1.1/80", sandbox)
+        assert "Network is unreachable" in result.stderr
+
+    def test_environment_is_cleared_everywhere(self, sandbox):
+        # bwrap's own pid 1 keeps whatever environment bwrap was started with.
+        result = oracle("env; tr '\\0' '\\n' < /proc/1/environ", sandbox, extra_env={"ORACLE_SECRET": "leak-me"})
+        assert "leak-me" not in result.stdout
+        assert f"HOME={sandbox}" in result.stdout.splitlines()
+
+    def test_no_nested_user_namespace(self, sandbox):
+        # A nested namespace hands the command full capabilities over its own mounts.
+        result = oracle("unshare -Ur true 2>/dev/null && echo NESTED; true", sandbox)
+        assert "NESTED" not in result.stdout
+
+    def test_writable_mounts_are_bounded(self, sandbox):
+        result = oracle(
+            "head -c 70M /dev/zero > /tmp/a 2>/dev/null; echo tmp=$(( $(stat -c %s /tmp/a) >> 20 )); "
+            "for i in 1 2; do head -c 40M /dev/zero > ~/$i 2>/dev/null; done; echo home=$(du -sm ~ | cut -f1); "
+            "touch /dev/x 2>/dev/null || echo dev-ro",
+            sandbox,
+        )
+        sizes = re.fullmatch(r"tmp=(\d+)\nhome=(\d+)\ndev-ro\n", result.stdout)
+        assert sizes, (result.stdout, result.stderr)
+        assert int(sizes[1]) <= 64 and int(sizes[2]) <= 64, result.stdout
+
+    def test_process_count_is_bounded(self, sandbox):
+        result = oracle("ulimit -u", sandbox)
+        assert result.stdout.strip() == "1024"
+
+
+class TestReporting:
+    def test_stdout_stderr_and_status_pass_through(self, sandbox):
+        result = oracle("echo out; echo err >&2; exit 3", sandbox)
+        assert (result.returncode, result.stdout, result.stderr) == (3, "out\n", "err\nbash-oracle: exit=3\n")
+
+    def test_runs_as_bash_dash_c(self, sandbox):
+        result = oracle('echo "$0" "$#"; echo "${BASH_VERSION%%.*}"', sandbox)
+        assert result.stdout.split()[:2] == ["bash", "0"]
+        assert result.stdout.split()[2].isdigit()
+
+    @pytest.mark.parametrize("status", [124, 125])
+    def test_a_command_exiting_like_the_oracle_is_reported_as_itself(self, sandbox, status):
+        result = oracle(f"exit {status}", sandbox)
+        assert (result.returncode, result.stderr) == (status, f"bash-oracle: exit={status}\n")
+
+    def test_a_slow_reader_does_not_turn_exit_124_into_a_timeout(self, sandbox, tmp_path):
+        # 256 KiB overflows a pipe buffer, so replaying it blocks until the reader drains.
+        command = [shutil.which("bash") or "/bin/bash", str(REPO_ROOT / "scripts" / "bash-oracle"), "-t", "1", "--"]
+        proc = subprocess.Popen(
+            [*command, "head -c 262144 /dev/zero; exit 124"],
+            env={"PATH": os.environ["PATH"], "HOME": str(sandbox)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(1.5)
+        out, err = proc.communicate(timeout=30)
+        assert len(out) == 262144
+        assert err.decode().endswith("bash-oracle: exit=124\n"), err
+
+    def test_status_line_starts_its_own_line(self, sandbox):
+        result = oracle("printf partial >&2", sandbox)
+        assert result.stderr == "partial\nbash-oracle: exit=0\n"
+
+    def test_timeout_kills_the_command(self, sandbox):
+        # Unique per run, so another checkout running this suite cannot match it.
+        marker = f"sleep 97.{int(uuid.uuid4().hex[:8], 16)}"
+        started = time.monotonic()
+        result = oracle(marker, sandbox, "-t", "1")
+        assert time.monotonic() - started < 10
+        assert (result.returncode, result.stderr) == (124, "bash-oracle: timeout=1\n")
+        time.sleep(0.2)
+        leftover = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True, check=False)
+        assert leftover.stdout == "", "the sandboxed command outlived the oracle"
+
+
+class TestFailsClosed:
+    def test_without_bwrap_nothing_runs(self, tmp_path):
+        # Everything the oracle uses except bwrap, so the missing sandbox is the only fault.
+        tools = tmp_path / "no-bwrap-bin"
+        tools.mkdir()
+        for tool in ("realpath", "readlink", "mktemp", "env", "timeout", "cat", "tail", "rm", "bash"):
+            (tools / tool).symlink_to(shutil.which(tool))
+        witness = tmp_path / "witness"
+
+        result = oracle(f"touch {shlex.quote(str(witness))}", tmp_path, path=str(tools))
+
+        assert result.returncode == 125
+        assert "refusing to run unsandboxed" in result.stderr
+        assert not witness.exists()
+
+    @pytest.mark.parametrize(
+        ("home", "reason"),
+        [
+            ("/", "would hide"),
+            ("/usr", "would hide"),
+            ("/etc/x", "would hide"),
+            ("/tmp/../proc", "would hide"),  # noqa: S108 - a tmpfs over /proc would blind the fd check
+            ("//proc", "would hide"),
+            ("relative", "must be an absolute"),
+        ],
+    )
+    def test_rejects_a_home_it_cannot_mount_safely(self, home, reason):
+        result = oracle("true", Path(home))
+        assert result.returncode == 125
+        assert reason in result.stderr
+
+    def test_rejects_bad_usage(self, tmp_path):
+        assert oracle("true", tmp_path, "-t", "0").returncode == 2
+
+
+# --- No real shell outside the oracle -------------------------------------------------
+
+# A tripwire, not the boundary: it reads the common spawn shapes out of Python source, so it
+# cannot see a shell started by a helper script or by the code string of `python -c`. The
+# boundary is the rule in CLAUDE.md, and scripts/bash-oracle for anything run under it.
+# It fails closed on what it can see: an argv it cannot read is treated as a shell. Names
+# resolve through each module's imports, so `import subprocess as sp` is seen and a local
+# `run()` helper or `mock.call` is not mistaken for subprocess.
+
+# Every real-shell spawn site in test code: file -> (number of sites, why none of them runs
+# a candidate command). The count pins the sites, so a new spawn added to a listed file
+# fails here too. Add only fixed, test-authored commands; a candidate goes through the oracle.
+REAL_SHELL_ALLOWLIST = {
+    "tests/test_post_tool_use.py": (1, "run_bash: fixed git commit commands in a tmp repo; the hook reads git log"),
+    "tests/test_hook_manifest.py": (1, "runs hooks.json's own command line with HOME and cwd in tmp_path"),
+    "tests/conftest.py": (1, "run_bash_oracle: the oracle itself"),
+    "tests/test_bash_oracle.py": (1, "runs the oracle itself, reading its stdout slowly"),
+}
+
+_SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "busybox"}
+# Programs that run their operand as a command, so their argv hides the real program.
+_WRAPPERS = {
+    "env", "timeout", "nice", "nohup", "setsid", "stdbuf", "sudo", "doas", "su", "runuser", "xargs",
+    "parallel", "flock", "unshare", "nsenter", "chroot", "script", "time", "ionice", "taskset",
+    "chrt", "systemd-run", "watch", "strace", "ltrace", "unbuffer", "firejail", "fakeroot",
+}  # fmt: skip
+_SPAWNERS = {f"subprocess.{name}" for name in ("run", "call", "check_call", "check_output", "Popen")}
+_STRING_TO_SHELL = {
+    "os.system", "os.popen", "pty.spawn", "subprocess.getoutput", "subprocess.getstatusoutput",
+    "asyncio.create_subprocess_shell",
+}  # fmt: skip
+
+
+def _import_table(tree: ast.Module) -> dict:
+    """Local name -> dotted origin, for every import in the module (`sp` -> `subprocess`)."""
+    table = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                table[alias.asname or alias.name.split(".")[0]] = alias.name if alias.asname else alias.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                table[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return table
+
+
+def _call_name(call: ast.Call, imports: dict) -> str:
+    func = call.func
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return f"{imports.get(func.value.id, func.value.id)}.{func.attr}"
+    if isinstance(func, ast.Name):
+        return imports.get(func.id, func.id)
+    return ""
+
+
+def _program(node: ast.expr) -> str:
+    return Path(node.value).name if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
+
+
+def _argv_may_run_a_shell(argv: list) -> bool:
+    if not argv or any(isinstance(e, ast.Starred) or _program(e) in _SHELLS for e in argv):
+        return True
+    head = argv[0]
+    if _program(head) in _WRAPPERS:
+        return any(not isinstance(e, ast.Constant) for e in argv[1:])
+    # Python itself is not a shell; any other program the source does not spell out may be.
+    return not isinstance(head, ast.Constant) and ast.unparse(head) != "sys.executable"
+
+
+def _keyword_may_run_a_shell(k: ast.keyword) -> bool:
+    if k.arg is None:  # **kwargs may carry shell=True or executable=
+        return True
+    if k.arg == "shell":
+        return not (isinstance(k.value, ast.Constant) and k.value.value is False)
+    # executable= replaces argv[0] as the program actually run.
+    return k.arg == "executable" and _program(k.value) not in {"python", "python3"}
+
+
+def _spawns_real_shell(call: ast.Call, imports: dict) -> bool:
+    """A call that may hand a string to a shell: a shell anywhere in argv, shell=True, os.system..."""
+    name = _call_name(call, imports)
+    if name in _STRING_TO_SHELL or name.startswith(("os.exec", "os.spawn", "os.posix_spawn")):
+        return True
+    if name not in _SPAWNERS and name != "asyncio.create_subprocess_exec":
+        return False
+    if any(_keyword_may_run_a_shell(k) for k in call.keywords):
+        return True
+    if name == "asyncio.create_subprocess_exec":
+        return _argv_may_run_a_shell(list(call.args))
+    argv = call.args[0] if call.args else None
+    # An argv the source does not spell out may be a shell.
+    return not isinstance(argv, (ast.List, ast.Tuple)) or _argv_may_run_a_shell(argv.elts)
+
+
+def _spawn_sites(source: str) -> int:
+    tree = ast.parse(source)
+    imports = _import_table(tree)
+    return sum(isinstance(n, ast.Call) and _spawns_real_shell(n, imports) for n in ast.walk(tree))
+
+
+def _spawning_files() -> dict:
+    """Python file under tests/, tools/ or scripts/ -> its number of real-shell spawn sites."""
+    found = {}
+    for root in ("tests", "tools", "scripts"):
+        for source in sorted((REPO_ROOT / root).rglob("*.py")):
+            sites = _spawn_sites(source.read_text(encoding="utf-8"))
+            if sites:
+                found[source.relative_to(REPO_ROOT).as_posix()] = sites
+    return found
+
+
+def test_no_real_shell_outside_the_oracle():
+    allowed = {path: sites for path, (sites, _reason) in REAL_SHELL_ALLOWLIST.items()}
+    assert _spawning_files() == allowed, "real-shell spawn sites changed; see REAL_SHELL_ALLOWLIST"
+
+
+@pytest.mark.parametrize(
+    ("source", "spawns"),
+    [
+        ('subprocess.run(["bash", "-c", c])', True),
+        ('subprocess.Popen(["/bin/sh", "-c", c])', True),
+        ("subprocess.run(argv)", True),  # an argv the source does not spell out may be a shell
+        ("subprocess.run([shell, script])", True),
+        ('subprocess.run(["env", "bash", "-c", c])', True),
+        ('subprocess.run(["timeout", "5", "bash", "-c", c])', True),
+        ('subprocess.run(["/usr/bin/env", prog, "-c", c])', True),
+        ('subprocess.run(["sudo", "-u", "x", "--", *cmd])', True),
+        ('subprocess.run(["git", *args])', True),
+        ('subprocess.run(["env", "GIT_DIR=x", "git", "log"])', False),
+        ('import subprocess as sp\nsp.run(["bash", "-c", c])', True),
+        ('from subprocess import run\nrun(["bash", "-c", c])', True),
+        ("from subprocess import Popen as P\nP(c, shell=True)", True),
+        ("from os import system\nsystem(c)", True),
+        ('def run(c): ...\nrun("rm -rf /")', False),  # a local helper named run
+        ('from unittest.mock import call\ncall("bash", "-c")', False),
+        ('asyncio.create_subprocess_exec("bash", "-c", c)', True),
+        ("asyncio.create_subprocess_shell(c)", True),
+        ('asyncio.create_subprocess_exec("oracle", "-c", c, executable="/bin/bash")', True),
+        ('asyncio.create_subprocess_exec("oracle", "-c", c, **{"executable": "/bin/bash"})', True),
+        ('asyncio.create_subprocess_exec("git", "log", stdout=PIPE)', False),
+        ("asyncio.run(main())", False),
+        ('subprocess.run("x", shell=True)', True),
+        ('subprocess.check_output(["git", "log"])', False),
+        ('subprocess.run([sys.executable, "-c", code])', False),
+        ('subprocess.run(["oracle", "-c", c], executable="/bin/bash")', True),
+        ('subprocess.run(["x", "-c", c], executable=prog)', True),
+        ('subprocess.run(["x"], **{"shell": True})', True),
+        ("subprocess.run(argv_list, **opts)", True),
+        ("os.system(c)", True),
+        ("os.execvp(c, [c])", True),
+        ("cursor.execute(sql)", False),
+        ('assert parse(("find", [".", "-exec", "bash", "-c", "x"]))', False),
+    ],
+)
+def test_the_guard_reads_calls_not_text(source, spawns):
+    assert bool(_spawn_sites(source)) is spawns
