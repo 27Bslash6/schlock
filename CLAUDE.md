@@ -109,7 +109,7 @@ Command/process substitution (`$(cmd)`, `<(cmd)`) requires special handling beca
 | Command | Safe Usage | Dangerous Flags/Options |
 |---------|------------|------------------------|
 | `find` | `-name`, `-type`, `-maxdepth` | `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete` |
-| `git` | `status`, `log`, `diff` | `-c alias.X=!cmd`, `-c core.sshCommand`, `-c core.pager`, `-c credential.helper`, `-c diff.external`, `-c merge.tool` |
+| `git` | `status`, `log`, `diff` | `-c alias.X=!cmd`, `-c core.sshCommand`, `-c core.pager`, `-c credential.helper`, `-c diff.external`, `-c merge.tool`, `-c man.*`, `-c help.format`, `-c help.browser`, `-c web.browser`, `-c browser.*`; writing any of those keys with `git config`, including a `--rename-section` into or out of them (rated on the key, whatever the value, since they pick the program `git help` runs: HIGH at the top level, BLOCKED inside `$()`, and a worse value keeps its own verdict) |
 | `grep` | Pattern matching | (generally safe) |
 | `locate` | File search | (generally safe) |
 
