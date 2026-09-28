@@ -904,6 +904,10 @@ class TestBase64DecodeAtCommandPosition:
             "timeout 5 $(base64 -d x)",
             "nice -n 10 nohup $(base64 -d x)",
             "xargs $(base64 -d x)",
+            # WRAPPER_COMMANDS includes the launchers, and a launcher runs its operand too.
+            "npx $(base64 -d x)",
+            "firejail --net=none $(base64 -d x)",
+            "faketime 2020-01-01 $(base64 -d x)",
             # A wrapper's own flag word carries the decode: unquoted it word-splits into the
             # wrapper's argv, and `env -S` splits the string itself.
             'env -S"$(base64 -d p)"',
@@ -928,10 +932,14 @@ class TestBase64DecodeAtCommandPosition:
             "nohup $(echo aWQ= | base64 -d)",
             "env -u A $(echo aWQ= | base64 -d)",
             # A glob or brace word names the wrapper whose operand flags it takes; one that may
-            # name several takes any table flag's operand, and never the `command -v` exit.
+            # name several skips any table flag's operand, and never takes the `command -v` exit.
             "/usr/bin/en? -u A $(base64 -d x)",
             "{env,} -u A $(base64 -d x)",
             "{command,} -v $(base64 -d x)",
+            # It still reads that operand: the flag is boolean to another wrapper it may name, which
+            # runs the word (`entr -s` hands it to $SHELL, `parallel -k` runs it).
+            'ls | en*[rv] -s "$(base64 -d x)"',
+            'ls | /usr/bin/*l -k "$(base64 -d x)"',
             # GNU env takes any operand with a non-leading `=` as an assignment.
             "env A-B=1 $(base64 -d x)",
             "env a[0]=1 $(base64 -d x)",

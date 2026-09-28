@@ -757,7 +757,10 @@ _EXEC_BYPASS_SCAN_WRAPPERS: frozenset[str] = frozenset(
 # a screen command (`screen -X eval`), so membership in the set above would turn those benign
 # lines into an unappealable BLOCKED. Over-approximation is fail-closed (a benign tail behind a
 # member re-validates to its own verdict), so the bar for a new name is a SAFE-side pin, not
-# proof of pass-through. Covers the shell-on-argv forms only; a launcher's own string-executing
+# proof of pass-through. The decode check (_runs_decoded_output) is the exception: it reads a
+# launcher's first non-literal operand as the command it runs, and a wrong read there is BLOCKED,
+# so a name whose first operand is data (`faketime "$(…)" date`) over-blocks. Covers the
+# shell-on-argv forms only; a launcher's own string-executing
 # grammar (`tmux new -d 'PROG'`, `watchexec 'PROG'`, `npx -c PROG`) is the `watch PROG` shape
 # and tracked separately.
 _LAUNCHER_COMMANDS: frozenset[str] = frozenset(
@@ -807,7 +810,8 @@ _LAUNCHER_COMMANDS: frozenset[str] = frozenset(
 )
 
 # Every base name whose args the shell-delegation re-entry, the here-string sink classifier and
-# the heredoc owner scan for a shell. Public: validator imports it.
+# the heredoc owner scan for a shell, and, through _EXEC_WRAPPERS, the decode check scans for the
+# command it runs. Public: validator imports it.
 WRAPPER_COMMANDS: frozenset[str] = _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMANDS
 
 # Child attributes a walker descends to find commands in argument words AND redirection targets:
@@ -1330,9 +1334,8 @@ def _runs_decode(node: Any, seen: "dict[str, bool]") -> bool:
             return True
     if kind == "parameter":
         return _parameter_runs_decode(getattr(node, "value", None), seen)
-    # `output` and `redirects` reach a redirect's target, as the substitution validator's walk
-    # does: `$(cat < <(base64 -d x))` decodes inside one.
-    for attr in ("parts", "command", "list", "output", "redirects"):
+    # `output` and `redirects` reach a redirect's target: `$(cat < <(base64 -d x))` decodes inside one.
+    for attr in EXEC_CHILD_ATTRS:
         child = getattr(node, attr, None)
         children = child if isinstance(child, list) else [child] if child is not None else []
         if any(_runs_decode(c, seen) for c in children):
@@ -1381,8 +1384,10 @@ _WRAPPER_OPERAND_FLAGS = {
     "env": ("-u", "--unset", "-C", "--chdir"),
     "timeout": ("-s", "--signal", "-k", "--kill-after"),
 }
-# A wrapper word that may name more than one wrapper (`{env,}`, a glob matching two) takes any
-# table flag's operand as data, and never the `command -v` exit.
+# A wrapper word that may name more than one wrapper (`{env,}`, a glob matching two) skips any
+# table flag's operand, and never takes the `command -v` exit. It still reads that operand for a
+# decode: a flag one wrapper gives an operand is boolean to another, and that one runs the word
+# (`en*[rv]` names `env` and `entr`, and `entr -s` hands its first operand to $SHELL).
 _ANY_WRAPPER = ""
 _ANY_WRAPPER_OPERAND_FLAGS = tuple(flag for flags in _WRAPPER_OPERAND_FLAGS.values() for flag in flags)
 
@@ -1511,8 +1516,9 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]", command: Optional[s
     which needs `command`, the source the node's offsets address). `command -v`/`-V` only
     describes, and runs nothing.
     ponytail: any other literal wrapper operand ends the scan, so `flock /tmp/l $(base64 -d x)`
-    and `stdbuf -o L $(…)` stay at the substitution floor (HIGH). Full per-wrapper operand arity
-    would close that; only the table above models it.
+    and `stdbuf -o L $(…)` stay at the substitution floor (HIGH), as does a launcher's subcommand
+    (`uv run $(…)`, `pnpm exec $(…)`): _EXEC_WRAPPERS holds the launchers. Full per-wrapper
+    operand arity would close that; only the table above models it.
     """
     wrapper, operand = None, False
     words = _word_parts(getattr(node, "parts", None) or [])
@@ -1523,7 +1529,7 @@ def _runs_decoded_output(node: Any, seen: "dict[str, bool]", command: Optional[s
         text = word.word
         if operand:
             operand = False
-            if _may_word_split(word, command) and _runs_decode(word, seen):
+            if (wrapper == _ANY_WRAPPER or _may_word_split(word, command)) and _runs_decode(word, seen):
                 return True
             continue
         if wrapper is not None and _is_env_assignment(text):
