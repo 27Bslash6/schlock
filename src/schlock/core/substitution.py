@@ -31,7 +31,7 @@ from .parser import EXEC_CHILD_ATTRS, _resolve_multicall, without_fd_variables
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from .rules import RiskLevel
+    from .rules import RiskLevel, RuleMatch
 
 logger = logging.getLogger(__name__)
 
@@ -1014,6 +1014,8 @@ class SubstitutionNode:
     depth: int = 0  # Nesting depth
     # Spans of inner_command that are quoted arguments, for the rule engine's string_literals.
     literal_ranges: list[tuple[int, int]] = field(default_factory=list)
+    # The text ast_node's offsets index, when the extractor was given it.
+    source: str | None = None
 
 
 class _ListSegment:
@@ -1494,6 +1496,7 @@ class SubstitutionValidator:
             redirect_substitutions=redirect_nested,
             depth=depth,
             literal_ranges=literal_ranges,
+            source=command,
         )
 
     def _extract_inner_command_text(self, node: Any) -> tuple[str | None, list[tuple[int, int]]]:  # noqa: PLR0911, PLR0912
@@ -2091,7 +2094,7 @@ class SubstitutionValidator:
         worst_denial: SubstitutionValidationResult | None = None
 
         for segment in segments:
-            child = self._create_substitution_node(_ListSegment(segment), sub_node.substitution_type, depth)
+            child = self._create_substitution_node(_ListSegment(segment), sub_node.substitution_type, depth, sub_node.source)
             if child is None:
                 # Backstop: unreachable while _create_substitution_node keeps every node with a .command.
                 return SubstitutionValidationResult(
@@ -2377,9 +2380,15 @@ class SubstitutionValidator:
             return None
         literals = sub_node.literal_ranges if vetted else None
         rule_match = self.rule_engine.match_command(sub_node.inner_command, string_literals=literals)
-        if not (rule_match and rule_match.matched):
+        amplified_risk = self._amplify_risk(rule_match.risk_level) if rule_match and rule_match.matched else None
+        # A rule only the masked view reaches keeps its own level, as the top-level masked pass
+        # does. That view reads the source, which the word view has already decoded, so an
+        # amplified match there would make `$'\x72'` beside a `$(pwd)` deny and alone prompt.
+        masked_match = self._match_masked_body(sub_node, vetted=vetted)
+        if masked_match and masked_match.matched and (amplified_risk is None or masked_match.risk_level > amplified_risk):
+            rule_match, amplified_risk = masked_match, masked_match.risk_level
+        if amplified_risk is None:
             return None
-        amplified_risk = self._amplify_risk(rule_match.risk_level)
         return SubstitutionValidationResult(
             allowed=amplified_risk not in (RiskLevel.BLOCKED, RiskLevel.HIGH),
             risk_level=amplified_risk,
@@ -2389,6 +2398,32 @@ class SubstitutionValidator:
             inner_results=inner_results or [],
             matched_rules=[rule_match.rule.name] if rule_match.rule else [],
         )
+
+    def _match_masked_body(self, sub_node: SubstitutionNode, *, vetted: bool) -> RuleMatch | None:
+        """The rules matched against this body's source with its own nested bodies blanked.
+
+        The word view keeps a nested body as written, so a separator deep inside it ends
+        the rule's gap before the target: `echo $(cat $(printf %s $(dirname $(pwd)) |
+        head -1)/.env)` read SAFE. The top-level pass blanks this body whole, so only
+        here, one level down, is the reader beside its target. Each level masks its own
+        body once, so the cost is one rule scan per level, bounded by the depth limit.
+
+        Returns:
+            The rule match, or None when there is no source or nothing nested to blank.
+        """
+        cmd_node = getattr(sub_node.ast_node, "command", None)
+        pos = getattr(cmd_node, "pos", None)
+        source = sub_node.source
+        if not source or not pos or not sub_node.nested_substitutions:
+            return None
+        start, end = pos
+        masked = self.parser.mask_substitution_bodies(source, [cmd_node], start, end)
+        if masked == source[start:end]:
+            return None
+        literals = None
+        if vetted:
+            literals = self.parser._rebase(self.parser.extract_string_literals(source, [cmd_node]), start, end)
+        return self.rule_engine.match_command(masked, string_literals=literals)
 
     def _amplify_risk(self, risk_level: RiskLevel) -> RiskLevel:
         """Amplify risk level for substitution context.

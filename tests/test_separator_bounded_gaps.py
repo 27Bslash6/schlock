@@ -78,6 +78,18 @@ class TestTheNextCommandDoesNotCompleteTheRule:
             "shred -u tmp.txt && echo done > /dev/null",
             "chown -R me:me ./build && ls /",
             "source /tmp/venv/bin/activate && bash test.sh",
+            # A path under or beside a system dir is not the dir.
+            "chown -R $(printf %s $(dirname $(pwd)) | head -1) /etc/app;",
+            "chown -R $(printf %s $(dirname $(pwd)) | head -1) /etcetera;",
+            'chown -R $(printf %s $(dirname $(pwd)) | head -1) "/etc/app"',
+            'chown -R $(printf %s $(dirname $(pwd)) | head -1) "/etcetera"',
+            # A system dir named inside a substitution is that command's argument, not chown's target.
+            "chown -R $(stat -c %U /home) ./dir",
+            'chown -R "$(stat -c %U /home)" ./dir',
+            "chown -R `stat -c %U /home` ./dir",
+            "chown -R $(id -un):$(stat -c %G /var) ./cache",
+            'chown -R "$(stat -c %U /)" ./rootfs >log',
+            "chown -R $(ls /etc) ./d 2>&1",
         ],
     )
     def test_is_not_a_hard_deny(self, command, rules_dir_path):
@@ -277,3 +289,85 @@ class TestADeepSubstitutionIsOneWord:
     )
     def test_keeps_the_whitelist_and_heredoc_suppression(self, command, level, rules_dir_path):
         assert verdict(command, rules_dir_path).risk_level == level, command
+
+
+# `D` is three levels deep with a bare `|` in the outer body, every inner command whitelisted.
+D = "$(printf %s $(dirname $(pwd)) | head -1)"
+DEEP3 = "$(a $(b $(c)) | d)"
+
+# (rule, command): each reaches its target past a deep substitution some way the
+# top-level blanked-body pass does not: inside an outer body, which that pass blanks
+# whole, across a line break, or right before a separator.
+DEEP_RESIDUALS = [
+    # The reader and its target are both inside an outer body, which the pass blanks.
+    ("credential_exposure", f"echo $(cat {D}/.env)"),
+    ("credential_exposure", f'echo "$(cat {D}/id_rsa)"'),
+    ("privilege_escalation_variants", f"echo $(chroot {D} /bin/bash)"),
+    ("credential_exposure", f'echo "$(cat {DEEP3}/.env)"'),
+    ("credential_exposure", f'x="$(cat {DEEP3}/.env)"'),
+    ("credential_exposure", f"diff <(cat {DEEP3}/.env) /dev/null"),
+    # A line continuation, and a plain newline, before a body's closer.
+    ("credential_exposure", f"cat \\\n{D}/.env"),
+    ("credential_exposure", "cat $(pwd\n)/.ssh/id_rsa"),
+    ("credential_exposure", "cat $(printf %s $(dirname $(pwd)) | head -1\n)/.env"),
+    # A target the rule ends with `(\s|$)`, followed straight by a separator.
+    ("recursive_permission_system_dirs", f"chown -R {D} /etc; true"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /etc&&true"),
+    # The target ends the command, a group or a subshell, or meets a redirect.
+    ("recursive_permission_system_dirs", f"chown {D} -R /etc;"),
+    ("recursive_permission_system_dirs", f"{{ chown {D} -R /etc; }}"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /etc;"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /usr&"),
+    ("recursive_permission_system_dirs", f"(chown -R {D} /)"),
+    ("recursive_permission_system_dirs", f"chown -R {D} /home>/dev/null"),
+    ("recursive_permission_system_dirs", f"for i in 1; do chown -R {D} /etc; done"),
+    ("recursive_permission_system_dirs", f"nohup chown -R {D} /etc&"),
+    # A quoted or escaped target: the blanked view reads the quote as written.
+    ("recursive_permission_system_dirs", f"chown {D} -R '/etc'"),
+    ("recursive_permission_system_dirs", f'chown -R {D} "/etc"'),
+    ("recursive_permission_system_dirs", f"chown -R {D} \\/etc"),
+    ("recursive_permission_system_dirs", f'chown -R {D} "/home"'),
+    ("recursive_permission_system_dirs", f'echo $(chown {D} -R "/etc")'),
+    # A subshell whose output is redirected.
+    ("recursive_permission_system_dirs", f"(chown -R {D} /etc)>/dev/null"),
+    ("recursive_permission_system_dirs", f"(chown -R {D} /etc) 2>&1"),
+    # A substitution inside an unquoted heredoc body runs when the heredoc is read.
+    ("credential_exposure", f"cat <<EOF\n$(cat {D}/.env)\nEOF\necho ok"),
+]
+
+
+class TestADeepSubstitutionResidual:
+    @pytest.mark.parametrize(("rule", "command"), DEEP_RESIDUALS)
+    def test_is_blocked_by_its_rule(self, rule, command, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED, command
+        assert rule in result.matched_rules, (rule, result.matched_rules)
+
+    @pytest.mark.parametrize(
+        ("command", "rule"),
+        [
+            ("cat $(printf %s $(dirname $(pwd)) | head -1\\\n)/.env", "credential_exposure"),
+            # BLOCKED only because bashlex cannot parse the arithmetic: the rule itself
+            # misses this, so a bashlex that parses `$((…))` would make it SAFE.
+            ("cat $(ls; echo $((1)))/.env", None),
+        ],
+    )
+    def test_stays_blocked(self, command, rule, rules_dir_path):
+        result = verdict(command, rules_dir_path)
+        assert result.risk_level == RiskLevel.BLOCKED, command
+        if rule:
+            assert rule in result.matched_rules, (rule, result.matched_rules)
+
+    def test_a_rule_only_the_blanked_body_reaches_keeps_its_level(self, rules_dir_path):
+        # hex_octal_encoding is HIGH on its own, and a nested `$(pwd)` must not make it deny.
+        result = verdict("echo $(echo $(pwd) $'\\x72\\x6d')", rules_dir_path)
+        assert result.risk_level == RiskLevel.HIGH, result.matched_rules
+
+
+# Every one-command payload, run inside a substitution instead of on its own.
+WRAPPED = [wrapper % command for _, command in PAYLOADS + DEEP_PAYLOADS for wrapper in ("echo $(%s)", 'ls "$(%s)"')]
+
+
+@pytest.mark.parametrize("command", WRAPPED)
+def test_a_wrapped_payload_still_blocks(command, rules_dir_path):
+    assert verdict(command, rules_dir_path).risk_level == RiskLevel.BLOCKED, command
