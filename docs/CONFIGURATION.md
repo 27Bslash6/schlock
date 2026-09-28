@@ -49,6 +49,12 @@ formatter:
 # Individual features can be fine-tuned below
 ```
 
+A config file must be a regular file of at most 16 KiB of UTF-8. It must not use YAML anchors
+or aliases (`&name`, `*name`, `<<: *name`), or nest flow collections (`[...]`, `{...}`) more
+than 16 deep. A file that breaks any of these is skipped with a
+warning on stderr, and schlock falls back to the layer below it. A config that overrides every
+shipped rule and category is about 10 KB.
+
 ## Safety Rules Customization
 
 Safety rules are defined in `data/safety_rules.yaml`. You cannot directly edit plugin defaults, but you can override them in user/project config.
