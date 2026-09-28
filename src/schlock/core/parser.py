@@ -4,21 +4,22 @@ This module provides bashlex-based parsing for command safety validation.
 It extracts commands from bash syntax and detects dangerous constructs.
 
 The parser is security-critical and REQUIRES bashlex for proper AST parsing.
-Regex-based parsing is explicitly NOT supported due to security risks. Three readers
+Regex-based parsing is explicitly NOT supported due to security risks. Four readers
 here work on single words whose boundaries bashlex has already fixed, _redirect_words,
-_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE) and _quote_pairs;
-CLAUDE.md lists them as approved exceptions and the constraints each must keep.
+_mark_fd_variables (one allowlist regex, _FD_VARIABLE_ALLOWED_RE), _quote_pairs and
+_subscript_parts; CLAUDE.md lists them as approved exceptions and the constraints each must keep.
 """
 
 import bisect
 import contextlib
+import fnmatch
 import json
 import logging
 import re
 import shlex
 import signal
 import threading
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
@@ -756,7 +757,10 @@ _EXEC_BYPASS_SCAN_WRAPPERS: frozenset[str] = frozenset(
 # a screen command (`screen -X eval`), so membership in the set above would turn those benign
 # lines into an unappealable BLOCKED. Over-approximation is fail-closed (a benign tail behind a
 # member re-validates to its own verdict), so the bar for a new name is a SAFE-side pin, not
-# proof of pass-through. Covers the shell-on-argv forms only; a launcher's own string-executing
+# proof of pass-through. The decode check (_runs_decoded_output) is the exception: it reads a
+# launcher's first non-literal operand as the command it runs, and a wrong read there is BLOCKED,
+# so a name whose first operand is data (`faketime "$(…)" date`) over-blocks. Covers the
+# shell-on-argv forms only; a launcher's own string-executing
 # grammar (`tmux new -d 'PROG'`, `watchexec 'PROG'`, `npx -c PROG`) is the `watch PROG` shape
 # and tracked separately.
 _LAUNCHER_COMMANDS: frozenset[str] = frozenset(
@@ -806,7 +810,8 @@ _LAUNCHER_COMMANDS: frozenset[str] = frozenset(
 )
 
 # Every base name whose args the shell-delegation re-entry, the here-string sink classifier and
-# the heredoc owner scan for a shell. Public: validator imports it.
+# the heredoc owner scan for a shell, and, through _EXEC_WRAPPERS, the decode check scans for the
+# command it runs. Public: validator imports it.
 WRAPPER_COMMANDS: frozenset[str] = _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMANDS
 
 # Child attributes a walker descends to find commands in argument words AND redirection targets:
@@ -1142,7 +1147,7 @@ def without_fd_variables(parts: "list[Any]") -> "list[Any]":
     """A command node's parts less every redirection's `{varname}` prefix.
 
     For each word view that walks `.parts` itself: this module's argv views
-    (_command_words) and substitution.py's inner-command views.
+    (_word_parts) and substitution.py's inner-command views.
     """
     return [part for part in parts if not _is_fd_variable(part)]
 
@@ -1204,17 +1209,30 @@ def _stdin_here_string(parts: "list[Any]") -> Optional[str]:
     return by_fd.get(0)
 
 
+# A word bash takes as an assignment when it comes before the command name. bashlex types a plain
+# `FOO=1` as an assignment node only when no redirect precedes it, and a subscripted `a[0]=1` never.
+# The subscript match runs to the LAST `]=` because bashlex has already dropped the quotes that can
+# hide a `]` (`a["]"]=1`).
+_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=", re.DOTALL)
+
+
+def _word_parts(parts: "list[Any]") -> "list[Any]":
+    """A command node's word parts: no assignment, no redirection, no `{varname}` prefix."""
+    return [
+        part
+        for part in without_fd_variables(parts)
+        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
+    ]
+
+
 def _command_words(node: Any) -> "list[str]":
     """Word tokens (command name + args) of a command node.
 
     Skips assignments, redirections and a redirection's `{varname}` prefix. Every argv
-    view in this module reads a command through here.
+    view in this module reads a command through here, or through _word_parts when it
+    needs the nodes.
     """
-    return [
-        part.word
-        for part in without_fd_variables(getattr(node, "parts", None) or [])
-        if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
-    ]
+    return [part.word for part in _word_parts(getattr(node, "parts", None) or [])]
 
 
 def heredoc_owner(node: Any) -> Optional[str]:
@@ -1237,6 +1255,311 @@ def heredoc_owner(node: Any) -> Optional[str]:
     if words[0] in WRAPPER_COMMANDS:
         return next((word for word in words[1:] if word in SHELL_COMMANDS), words[0])
     return words[0]
+
+
+# coreutils' base-N decoders. `basenc` takes the encoding as a flag, so its `-d` alone decides.
+# ponytail: named decoders only; `openssl enc -d -a`, `xxd -r` and friends keep the substitution
+# validator's unknown-command floor (HIGH). Add a name here when one earns a BLOCKED of its own.
+_DECODERS = ("base64", "base32", "basenc")
+
+
+_BRACKET_CLASS = re.compile(r"\[.*\[[:=.]", re.DOTALL)
+
+
+def _named(name: str, names: "Collection[str]") -> "list[str]":
+    """The `names` that `name` is, or that bash could expand it to as a glob (`/usr/bin/bas?64`).
+
+    fnmatch is not bash: it reads `[^x]` as a set holding `^`, where bash negates it as `[!x]`,
+    and it knows no `[[:lower:]]`. So `[^` is matched as `[!`, and a word with a class, an
+    equivalence class or a collating symbol after a `[` may be any name: the fail-closed side.
+    A bare `[:upper:]`, as `tr` takes it, is a plain set to bash too.
+    """
+    if name in names:
+        return [name]
+    if not any(c in name for c in "*?["):
+        return []
+    if _BRACKET_CLASS.search(name):
+        return list(names)
+    return [n for n in names if fnmatch.fnmatchcase(n, name.replace("[^", "[!"))]
+
+
+def _is_decoder(name: str) -> bool:
+    """A decoder's basename, or a glob that bash could expand to one."""
+    return bool(_named(name, _DECODERS))
+
+
+def _is_decode_flag(arg: str) -> bool:
+    """`-d`, `-D` (BSD), a bundle carrying either (`-di`), a `--decode` prefix, or a word bash rewrites.
+
+    A word bash rewrites (`$F`, `` `echo -d` ``, `{-d,f}`, `[-]d`, `~-`) is read as a decode flag
+    because its value is unknowable here, and the only cost of guessing wrong is blocking an
+    encode whose output is run as a command.
+    """
+    if any(c in arg for c in "$`{*?[~"):
+        return True
+    if arg.startswith("--"):
+        return arg != "--" and "--decode".startswith(arg)
+    return arg.startswith("-") and ("d" in arg or "D" in arg)
+
+
+def _parameter_runs_decode(value: Any, seen: "dict[str, bool]") -> bool:
+    """True if a `${…}` body runs a base-N decode: `${v:-$(base64 -d x)}`, when `v` is unset.
+
+    bashlex leaves a parameter node childless, so the body is parsed here as the substitution
+    validator parses it (LAB-1731): `#` is not a comment inside `${…}`, so it is blanked. A body
+    that will not parse counts as a decode. That validator already refuses a truly unparseable
+    one, so this costs nothing there, but `parse` also reports running out of stack as a
+    ParseError: under `{ ` nested 243 deep this parse failed where the validator's succeeded,
+    and reading that as "no decode" let the payload through at HIGH. `seen` holds the answer
+    per body text, because every enclosing command walks the same body again: without it a
+    body nested N substitutions deep was parsed and walked N times.
+    """
+    if not isinstance(value, str) or ("$(" not in value and "`" not in value):
+        return False
+    if value not in seen:
+        try:
+            nodes = BashCommandParser().parse(value.replace("#", "_"))
+        except ParseError:
+            seen[value] = True
+        else:
+            seen[value] = any(_runs_decode(n, seen) for n in nodes)
+    return seen[value]
+
+
+def _runs_decode(node: Any, seen: "dict[str, bool]") -> bool:
+    """True if a base-N decode runs anywhere under `node`, nested and `${…}` substitutions included.
+
+    Matches the decoder anywhere in a command's words, not only as its name, so a wrapper
+    (`env base64 -d`, `busybox base64 -d`) is not a way around it. That also reads a decoder
+    merely named as an argument (`printf '%s' base64 -d`), deliberately: no list of commands
+    that run their operands is complete (`fakeroot`, `numactl`, a shell function), and no list of
+    ones that do not survives the same line redefining a name (`printf(){ "$@"; }`).
+    """
+    kind = getattr(node, "kind", None)
+    if kind == "command":
+        # Basename only to find the decoder: its arguments stay raw, so `${D%/}` keeps its `$`
+        # and `/tmp/-d` stays a file.
+        words = _command_words(node)
+        at = next((i for i, w in enumerate(words) if _is_decoder(w.split("/")[-1])), None)
+        if at is not None and any(_is_decode_flag(w) for w in words[at + 1 :]):
+            return True
+    if kind == "parameter":
+        return _parameter_runs_decode(getattr(node, "value", None), seen)
+    # `output` and `redirects` reach a redirect's target: `$(cat < <(base64 -d x))` decodes inside one.
+    for attr in EXEC_CHILD_ATTRS:
+        child = getattr(node, attr, None)
+        children = child if isinstance(child, list) else [child] if child is not None else []
+        if any(_runs_decode(c, seen) for c in children):
+            return True
+    return False
+
+
+def _is_bare_expansion(word: Any) -> bool:
+    """True if a word is nothing but unquoted expansions, which bash drops when they are empty.
+
+    `$(true) $(base64 -d f)` runs the decode as the command: the empty first word vanishes.
+    The word's parts covering its whole span is what rules out literal text and quotes.
+    """
+    parts = getattr(word, "parts", None) or []
+    if not parts or any(getattr(p, "kind", None) not in ("commandsubstitution", "parameter") for p in parts):
+        return False
+    start, end = word.pos
+    return sum(p.pos[1] - p.pos[0] for p in parts) == end - start
+
+
+def _may_word_split(word: Any, command: Optional[str]) -> bool:
+    """True if an expansion in `word` is unquoted, so its output may split into more words.
+
+    `env -u a$(…) cmd` unsets `a` plus the first decoded field, and runs the rest as the command;
+    `env -u a"$(…)" cmd` passes one word. bashlex's word has lost its quotes, so they are read
+    from the source with _quote_pairs. Without the source, or where that scan cannot read the
+    word or its part offsets may be shifted, every expansion counts as unquoted: fail closed.
+    """
+    parts = [p for p in getattr(word, "parts", None) or [] if p.kind in ("commandsubstitution", "parameter")]
+    if not parts:
+        return False
+    if command is None or _part_offsets_may_shift(command, word.pos):
+        return True
+    pairs = _quote_pairs(command, word.pos, word.parts)
+    if pairs is None:
+        return True
+    doubles = [(open_, close) for open_, close in pairs if command[open_] == '"']
+    return any(not any(open_ < p.pos[0] and p.pos[1] <= close for open_, close in doubles) for p in parts)
+
+
+_EXEC_WRAPPERS = WRAPPER_COMMANDS | {"builtin"}
+
+# Wrapper flags whose operand is the NEXT word, data the wrapper never runs: `env -u NAME cmd`
+# unsets NAME and runs cmd. Only the common ones; any other takes the ponytail ceiling below.
+_WRAPPER_OPERAND_FLAGS = {
+    "env": ("-u", "--unset", "-C", "--chdir"),
+    "timeout": ("-s", "--signal", "-k", "--kill-after"),
+}
+# A wrapper word that may name more than one wrapper (`{env,}`, a glob matching two) skips any
+# table flag's operand, and never takes the `command -v` exit. It still reads that operand for a
+# decode: a flag one wrapper gives an operand is boolean to another, and that one runs the word
+# (`en*[rv]` names `env` and `entr`, and `entr -s` hands its first operand to $SHELL).
+_ANY_WRAPPER = ""
+_ANY_WRAPPER_OPERAND_FLAGS = tuple(flag for flags in _WRAPPER_OPERAND_FLAGS.values() for flag in flags)
+
+
+def _wrapper_named(word: str) -> Optional[str]:
+    """The exec wrapper a word names; _ANY_WRAPPER when it may name several; None when none.
+
+    A glob is resolved to the one wrapper it matches (`/usr/bin/en?` is `env`). A word that may
+    brace-expand may expand to any wrapper, or vanish (`{env,}`, `{,}`).
+    """
+    matches = _named(word.split("/")[-1], _EXEC_WRAPPERS)
+    if len(matches) == 1:
+        return matches[0]
+    if matches or _may_brace_expand(word):
+        return _ANY_WRAPPER
+    return None
+
+
+def _is_env_assignment(word: str) -> bool:
+    """`NAME=value` as a wrapper operand (`env NAME=value cmd`): assigned, never executed.
+
+    GNU env takes any operand with a non-leading `=` as an assignment, so `A-B=1`, `a[0]=1` and
+    `é=1` all are; a leading `-` is a flag (`--split-string=…`), read as one by the caller. The
+    name must be literal: base64 padding puts an `=` inside `$(echo aWQ= | base64 -d)`, and that
+    word is the command `env` runs.
+    """
+    name, eq, _ = word.partition("=")
+    return bool(eq and name) and not name.startswith("-") and not any(c in name for c in "$`")
+
+
+def _may_brace_expand(word: str) -> bool:
+    """True if a word may be brace-expanded: `{env,}` becomes `env`, and `{,}` vanishes.
+
+    bashlex has removed quotes, so a quoted `"{a,b}"` reads the same; costs only a longer scan.
+    """
+    opens = any(c == "{" and (i == 0 or word[i - 1] != "$") for i, c in enumerate(word))
+    return opens and "}" in word and ("," in word or ".." in word)
+
+
+def _subscript_parts(word: Any) -> "Optional[list[Any]]":
+    """The parts of an assignment word inside its `name[…]` subscript; None when that is unsure.
+
+    bashlex keeps a substitution's text verbatim in `.word` and lists the parts in order, so the
+    walk steps over each part by its span length and matches `[`/`]` only in what is left. That
+    keeps a `]=` inside the value (`a[0]=$(… | grep '[k]=v')`) out of the subscript. It returns
+    None when the parts run out, when a substitution's span does not end in `)` or a backtick,
+    or when the close is not followed by `=`/`+=`.
+    It works on `.word` rather than the source, which is not at hand here, and bashlex's quote
+    removal makes that lossy: a quoted `]` reads as a close (`a["]="$(…)]=1` closes after `a[`),
+    and a literal `$` can take a part that is not its own. Neither has been turned into a decode
+    that runs: for the early close, the subscript bash evaluates is `]=<decoded>`, an arithmetic
+    syntax error before any decoded `$(…)` is reached (bash 5.3 witness).
+    """
+    text, parts = word.word, iter(sorted(getattr(word, "parts", None) or [], key=lambda p: p.pos))
+    inside: list[Any] = []
+    i, depth = text.index("[") + 1, 1
+    while i < len(text):
+        c = text[i]
+        if c in "$`" or text.startswith(("<(", ">("), i):
+            part = next(parts, None)
+            if part is None:
+                return None
+            end = i + part.pos[1] - part.pos[0]
+            if part.kind in ("commandsubstitution", "processsubstitution") and text[end - 1 : end] not in (")", "`"):
+                return None
+            inside.append(part)
+            i = end
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        depth += {"[": 1, "]": -1}.get(c, 0)
+        if depth == 0:
+            return inside if text.startswith(("=", "+="), i + 1) else None
+        i += 1
+    return None
+
+
+def _assignment_runs_decode(word: Any, seen: "dict[str, bool]") -> bool:
+    """True if a leading assignment word's subscript runs a base-N decode: `a[$(base64 -d x)]=1`.
+
+    bash evaluates the subscript as arithmetic, and that runs any `$(…)` the decode prints. The
+    value on the right of `=` is only assigned, so it is data (`out[$(basename f)]=$(base64 -d f)`).
+    A subscript the walk cannot delimit is read whole, decode and value alike: the fail-closed side.
+    """
+    if "[" not in word.word.partition("=")[0]:
+        return False
+    inside = _subscript_parts(word)
+    if inside is None:
+        return _runs_decode(word, seen)
+    return any(_runs_decode(part, seen) for part in inside)
+
+
+def _runs_decoded_output(node: Any, seen: "dict[str, bool]", command: Optional[str] = None) -> bool:
+    """True if a command node executes the output of a base-N decode as a command.
+
+    `$(base64 -d x)` runs the decoded bytes as a command — the decode-and-execute shape
+    `base64_shell_execution` exists for, reached without any `| sh` or `<<<` for a regex to see.
+    The substitution validator alone rates it an unknown command (HIGH), because it does not
+    know where the substitution sits, and position is the whole difference: the same decode in
+    an argument or assignment (`TOKEN=$(echo "$S" | base64 -d)`) only produces data (LAB-4702).
+
+    "The command" is every word bash may execute, not just the first: a leading bare expansion
+    can vanish, and a wrapper (`env`, `nohup`, `timeout 5`, `builtin`) executes an operand. So the
+    scan walks words until the first literal one, the command that actually runs; past a wrapper
+    it also continues past flags, `NAME=value` and numeric operands. It deliberately does NOT scan
+    every wrapper operand the way `_classify_sink` does: there a false hit only re-validates a
+    payload, here it is an un-promptable BLOCKED, and `timeout 30 curl -H "$(… | base64 -d)"`
+    or `sudo mysql -p"$(base64 -d pw)"` pass the decode as DATA to the command the wrapper runs.
+
+    Words come from _word_parts, as argv does, so a `{fd}` redirect prefix is never the command.
+    Nor is a leading assignment-shaped word, which bashlex types as a word after a redirect or
+    when subscripted: bash assigns it, or rejects it (`not a valid identifier`), and either way
+    runs the next word, so `a[$(true)]=1 $(base64 -d x)` runs the decode. Only its subscript is
+    read for a decode (_assignment_runs_decode); its value is data.
+    A wrapper's own flag is read for a decode before the scan moves on: an unquoted
+    `nice -n$(…)` word-splits into the wrapper's argv, and `env -S"$(…)"` splits the string itself.
+    The cost: bashlex has dropped the quotes, so a quoted decode used only as a flag's value is
+    BLOCKED too, attached (`timeout -s"$(…)" 5 cmd`) or detached from a flag the table below
+    does not model (`nice -n "$(…)" true`, `sudo -u "$(…)" true`).
+    A wrapper name is resolved as _wrapper_named does (`/usr/bin/en?` is `env`; `{env,}` may be
+    any wrapper, or vanish).
+    A flag's detached operand (_WRAPPER_OPERAND_FLAGS) is data, so `env -u A $(base64 -d x)` runs
+    the decode and `env -u "$(base64 -d x)" cmd` does not. An unquoted expansion in it may
+    word-split into argv (`env -u a$(…)`), so an operand that may split is read (_may_word_split,
+    which needs `command`, the source the node's offsets address). `command -v`/`-V` only
+    describes, and runs nothing.
+    ponytail: any other literal wrapper operand ends the scan, so `flock /tmp/l $(base64 -d x)`
+    and `stdbuf -o L $(…)` stay at the substitution floor (HIGH), as does a launcher's subcommand
+    (`uv run $(…)`, `pnpm exec $(…)`): _EXEC_WRAPPERS holds the launchers. Full per-wrapper
+    operand arity would close that; only the table above models it.
+    """
+    wrapper, operand = None, False
+    words = _word_parts(getattr(node, "parts", None) or [])
+    start = next((i for i, w in enumerate(words) if not _ASSIGNMENT_WORD.match(w.word)), len(words))
+    if any(_assignment_runs_decode(word, seen) for word in words[:start]):
+        return True
+    for word in words[start:]:
+        text = word.word
+        if operand:
+            operand = False
+            if (wrapper == _ANY_WRAPPER or _may_word_split(word, command)) and _runs_decode(word, seen):
+                return True
+            continue
+        if wrapper is not None and _is_env_assignment(text):
+            continue
+        if _runs_decode(word, seen):
+            return True
+        if wrapper is not None and (text.startswith("-") or text[:1].isdigit()):
+            if wrapper == "command" and text.startswith("-") and ("v" in text or "V" in text):
+                return False
+            flags = _ANY_WRAPPER_OPERAND_FLAGS if wrapper == _ANY_WRAPPER else _WRAPPER_OPERAND_FLAGS.get(wrapper, ())
+            operand = text in flags
+            continue
+        named = _wrapper_named(text)
+        if named is not None:
+            wrapper = named
+            continue
+        if not _is_bare_expansion(word):
+            return False
+    return False
 
 
 def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
@@ -2285,7 +2608,7 @@ class BashCommandParser:
             kept.append((start, stop))
         return kept
 
-    def has_dangerous_constructs(self, ast_nodes: list[Any]) -> list[str]:
+    def has_dangerous_constructs(self, ast_nodes: list[Any], command: Optional[str] = None) -> list[str]:
         """Detect dangerous shell constructs in AST.
 
         Checks for constructs that enable arbitrary code execution:
@@ -2301,6 +2624,8 @@ class BashCommandParser:
 
         Args:
             ast_nodes: List of bashlex AST nodes from parse()
+            command: The source the nodes were parsed from. Without it, the decode check reads
+                every wrapper operand holding an expansion as if unquoted (fail closed).
 
         Returns:
             List of warning messages for detected dangerous constructs
@@ -2312,6 +2637,7 @@ class BashCommandParser:
             ['eval command detected']
         """
         dangers = []
+        decode_seen: dict[str, bool] = {}  # per `${…}` body text, see _parameter_runs_decode
 
         # Check for dangerous pipelines (curl | sh patterns)
         pipeline_dangers = self._detect_dangerous_pipelines(ast_nodes)
@@ -2339,6 +2665,9 @@ class BashCommandParser:
                 # SECURITY: kubectl exec, docker exec use "exec" as argument
                 # We must NOT flag those - they're container tools, not shell exec.
                 if node.kind == "command":
+                    if _runs_decoded_output(node, decode_seen, command):
+                        dangers.append("base-N decoded output executed as a command")
+
                     cmd_name = self._get_command_name(node)
 
                     # Direct eval/exec invocation

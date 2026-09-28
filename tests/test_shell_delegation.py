@@ -15,7 +15,16 @@ with "option requires an argument", so an attached payload is not a thing.
 import pytest
 
 from schlock.core import validator
-from schlock.core.parser import _EXEC_BYPASS_SCAN_WRAPPERS, _LAUNCHER_COMMANDS, WRAPPER_COMMANDS, BashCommandParser
+from schlock.core.parser import (
+    _EXEC_BYPASS_SCAN_WRAPPERS,
+    _LAUNCHER_COMMANDS,
+    WRAPPER_COMMANDS,
+    BashCommandParser,
+    _assignment_runs_decode,
+    _may_word_split,
+    _parameter_runs_decode,
+    _subscript_parts,
+)
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import (
     MAX_DELEGATOR_TOKENS,
@@ -827,6 +836,257 @@ class TestHereStringBenignUnchanged:
         assert here.risk_level == RiskLevel.SAFE
         assert here.risk_level == dash_c.risk_level
         assert here.allowed == dash_c.allowed
+
+
+class TestBase64DecodeAtCommandPosition:
+    """LAB-4702: a `$(base64 -d …)` run as a command is BLOCKED however it reaches the shell.
+
+    Pre-fix on `main` @ `1871815`, ShellCheck absent: only `bash <<< "$(base64 -d x)"` was
+    BLOCKED, by the line-bound `base64_shell_execution` regex. A real newline in the payload
+    dropped the here-string spellings to HIGH / allowed=False and the `-c` spellings to
+    HIGH / allowed=True, and the bare `$(base64 -d x)` was HIGH - the substitution validator
+    scored the decode as merely an unknown command. The fix is positional, not a wider regex:
+    the decode is dangerous where its output becomes the command name, or where bash evaluates
+    it as arithmetic in a leading assignment's subscript, and only there.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The ticket's table.
+            'bash <<< "$(base64 -d x)"',
+            "bash <<< $'\n$(base64 -d x)'",
+            'bash <<< "\n$(base64 -d x)"',
+            "bash -c '$(base64 -d x)'",
+            "bash -c '\n$(base64 -d x)'",
+            # Directly, and the other spellings of the same command word.
+            "$(base64 -d x)",
+            "`base64 -d x`",
+            '"$(base64 -d x)"',
+            "X=1 $(base64 -d x)",
+            "ls; $(base64 -d x)",
+            "$(echo aGk= | base64 -d)",
+            "$(base64 --decode x | gunzip)",
+            "$(echo $(base64 -d x))",
+            # Flag and name spellings.
+            "$(base64 -D x)",
+            "$(base64 -di x)",
+            "$(base64 --dec x)",
+            "$(/usr/bin/base64 -d x)",
+            "$(env base64 -d x)",
+            # A non-literal flag is read as a decode, and a glob that bash expands to a decoder.
+            "$(base64 $F x)",
+            '$(base64 "$F" x)',
+            "$(base64 ${D%/} x)",
+            "$(base64 {-d,x})",
+            "$(base64 {x/-d,-d})",
+            "$(base64 `echo -d` x)",
+            "$(base64 `basename /x/-d` x)",
+            "$(base64 [-]d x)",
+            "$(base64 ?d x)",
+            "$(base64 ~- x)",
+            "$(base64 *d x)",
+            "$(/usr/bin/bas?64 -d x)",
+            "$(/usr/bin/base6[4] -d x)",
+            # bash negates a bracket with `^` as with `!`, and knows POSIX classes: bash ran each.
+            "$(/usr/bin/bas[^x]64 -d x)",
+            "$(/usr/bin/base[[:digit:]]4 -d x)",
+            # The other coreutils base-N decoders.
+            "$(base32 -d x)",
+            "$(basenc --base64 -d x)",
+            # The decode moves off the first word and bash still runs it. An empty
+            # bare expansion is dropped, and a wrapper executes its operand.
+            "$(true) $(base64 -d x)",
+            "$EMPTY $(base64 -d x)",
+            "${EMPTY} $(base64 -d x)",
+            "command $(base64 -d x)",
+            "builtin $(base64 -d x)",
+            "env $(base64 -d x)",
+            "env -i FOO=1 $(base64 -d x)",
+            "nohup $(base64 -d x)",
+            "timeout 5 $(base64 -d x)",
+            "nice -n 10 nohup $(base64 -d x)",
+            "xargs $(base64 -d x)",
+            # WRAPPER_COMMANDS includes the launchers, and a launcher runs its operand too.
+            "npx $(base64 -d x)",
+            "firejail --net=none $(base64 -d x)",
+            "faketime 2020-01-01 $(base64 -d x)",
+            # A wrapper's own flag word carries the decode: unquoted it word-splits into the
+            # wrapper's argv, and `env -S` splits the string itself.
+            'env -S"$(base64 -d p)"',
+            'env --split-string="$(base64 -d p)"',
+            "nice -n$(base64 -d p) true",
+            "timeout -$(base64 -d p) 5 true",
+            # A flag's detached operand is data, so the next word is the command bash runs;
+            # unquoted, the operand word-splits and can carry the command itself.
+            "env -u A $(base64 -d x)",
+            "env -C /tmp $(base64 -d x)",
+            "timeout -s KILL 5 $(base64 -d x)",
+            "env -u $(base64 -d x)",
+            # A prefixed unquoted operand splits too: `a` is unset and the rest is the command.
+            "env -u a$(base64 -d p)",
+            "env -C /tmp$(base64 -d p)",
+            "env -u a${X:-$(base64 -d p)}",
+            # Only `command -v`/`-V` describes: other flags of `command` and `env` still run it.
+            "command -p $(base64 -d x)",
+            "env -v $(base64 -d x)",
+            # base64 padding puts an `=` inside the substitution: it is the command, not `NAME=`.
+            "env $(echo aWQ= | base64 -d)",
+            "nohup $(echo aWQ= | base64 -d)",
+            "env -u A $(echo aWQ= | base64 -d)",
+            # A glob or brace word names the wrapper whose operand flags it takes; one that may
+            # name several skips any table flag's operand, and never takes the `command -v` exit.
+            "/usr/bin/en? -u A $(base64 -d x)",
+            "{env,} -u A $(base64 -d x)",
+            "{command,} -v $(base64 -d x)",
+            # It still reads that operand: the flag is boolean to another wrapper it may name, which
+            # runs the word (`entr -s` hands it to $SHELL, `parallel -k` runs it).
+            'ls | en*[rv] -s "$(base64 -d x)"',
+            'ls | /usr/bin/*l -k "$(base64 -d x)"',
+            # GNU env takes any operand with a non-leading `=` as an assignment.
+            "env A-B=1 $(base64 -d x)",
+            "env a[0]=1 $(base64 -d x)",
+            "env A.B=1 $(base64 -d x)",
+            "env é=1 $(base64 -d x)",
+            # A wrapper named by a glob, or by a brace word that expands to it or vanishes.
+            "/usr/bin/en? $(base64 -d x)",
+            "/usr/bin/[^x]nv $(base64 -d x)",
+            "/usr/bin/[[:lower:]]nv $(base64 -d x)",
+            "/usr/bin/[][:lower:]]nv $(base64 -d x)",
+            "{env,} $(base64 -d x)",
+            "{nohup,} $(base64 -d x)",
+            "{,} $(base64 -d x)",
+            # A decode inside a redirect's process substitution.
+            "$(cat < <(base64 -d x))",
+            "bash -c '\nenv $(base64 -d x)'",
+            'bash <<< "\nnohup $(base64 -d x)"',
+            # A runner no list names still runs the decoder it is handed, and a name that
+            # only prints can be redefined on the same line: why the decoder is matched anywhere.
+            "$(fakeroot base64 -d x)",
+            "$(numactl -N0 base64 -d x)",
+            'f(){ "$@"; }; $(f base64 -d x)',
+            'printf(){ "$@"; }; $(printf base64 -d x)',
+            # bashlex leaves `${…}` childless; bash runs the fallback's decode when `v` is unset.
+            "${v:-$(base64 -d x)}",
+            '"${v:-$(base64 -d x)}"',
+            "${v:+$(base64 -d x)}",
+            "${v-`base64 -d x`}",
+            "env ${v:-$(base64 -d x)}",
+            "$(echo ${v:-$(base64 -d x)})",
+            # `#` is not a comment inside `${…}`: flock locks `#<first word>` and runs the rest.
+            "${v:-flock #$(base64 -d x)}",
+            # A `{varname}` redirect prefix is never argv, so the decode is the command: bash ran each.
+            "{fd}>out $(base64 -d x)",
+            "{fd}>out {g}>o2 $(base64 -d x)",
+            "$(true) {fd}>out $(base64 -d x)",
+            "env {fd}>out $(base64 -d x)",
+            # bashlex types these assignments as words, but bash still assigns them first.
+            "{fd}>out X=1 $(base64 -d x)",
+            "2>/dev/null X+=1 $(base64 -d x)",
+            "{fd}>out a[0]=1 $(base64 -d x)",
+            "a[0]=1 $(base64 -d x)",
+            # bash rejects this assignment (`not a valid identifier`) and still runs the next word.
+            "a[$(true)]=1 $(base64 -d x)",
+            # With no command after it, a subscript is arithmetic: bash runs a `b[$(…)]` it decodes.
+            "a[$(base64 -d x)]=1",
+            "2>/dev/null a[`base64 -d x`]=1",
+        ],
+    )
+    def test_decode_run_as_a_command_is_blocked(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is False
+
+    @pytest.mark.parametrize("command", ["bash <<< $'\necho hi'", "bash -c '\nls'"])
+    def test_newline_payload_without_a_decode_stays_safe(self, command):
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"{command!r} -> {result.risk_level.name}"
+        assert result.allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The decode's output is data here, not a command: HIGH (unknown), as before.
+            "echo $(base64 -d x)",
+            "x=$(base64 -d x)",
+            'TOKEN=$(echo "$S" | base64 -d)',
+            # Encoding at command position is not the decode-and-execute shape.
+            "$(base64 x)",
+            "$(base64 /tmp/-d)",
+            # A wrapper assigns a decode, or passes it as data to a literal command it runs.
+            'env TOKEN=$(echo "$S" | base64 -d) ./run',
+            'timeout 30 curl -H "Authorization: Basic $(echo "$T" | base64 -d)" https://x',
+            'nohup ./server --key "$(base64 -d k)"',
+            # A quoted empty word is not dropped, so the decode stays an argument.
+            '"" $(base64 -d x)',
+            # Also inside a `${…}` fallback.
+            "echo ${v:-$(base64 -d x)}",
+            "X=${v:-$(base64 -d x)}",
+            # Dropping a `{varname}` prefix does not promote the next word's argument.
+            "{fd}>out echo $(base64 -d x)",
+            # An assignment after a redirect only assigns, as it does anywhere before the command.
+            '2>/dev/null TOKEN=$(echo "$S" | base64 -d) ./run',
+            '{fd}>/dev/null TOKEN=$(echo "$S" | base64 -d) ./run',
+            # Only BEFORE the command name: here bash runs a command named `X=1`, not the decode.
+            "$(true) X=1 $(base64 -d x)",
+            # A subscript without a substitution is still skipped: this assigns the decode.
+            "a[0]=$(base64 -d x)",
+            # Only the subscript is arithmetic; the value, decode and all, is only stored.
+            "out[$(basename f)]=$(base64 -d f)",
+            'm["$(id -u)"]=$(base64 -d f)',
+            # A bare `[:upper:]` is a plain set to bash, not a class that may name a decoder.
+            "m[$(echo k | tr '[:upper:]' '[:lower:]')]=$(base64 -d f)",
+            'for f in *; do out[$(basename "$f")]=$(base64 -d "$f"); done',
+            # A `]=` inside the value is not the subscript's close.
+            "a[0]=$(base64 -d x | grep '[k]=v')",
+            # A flag's quoted operand is data, and `command -v` only describes its operands.
+            'env -u "$(base64 -d p)" /usr/bin/printf AFTER_ENV',
+            'env -u a"$(base64 -d p)" /usr/bin/printf AFTER',
+            'timeout -s "$(base64 -d s)" 5 true',
+            'command -v "$(base64 -d p)"',
+            "command -V $(base64 -d p)",
+            # `--` ends the flags: no decode flag, so this encodes.
+            "$(base64 -- x)",
+        ],
+    )
+    def test_decode_as_data_is_not_escalated(self, command):
+        assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    @staticmethod
+    def _first_word(command):
+        return BashCommandParser().parse(command)[0].parts[0]
+
+    def test_subscript_walk_stops_at_the_bracket_that_closes_it(self):
+        # A `]=` inside the value is not the close: only the subscript's own part is returned.
+        word = self._first_word("a[$(x)]=$(base64 -d x | grep '[k]=v') ls")
+        assert [part.pos for part in _subscript_parts(word)] == [word.parts[0].pos]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "a[0]x]=$(base64 -d x) ls",  # the close is not followed by `=`
+            "a[\\$]=$(base64 -d x) ls",  # an escaped `$` has no part: the walk runs out of parts
+        ],
+    )
+    def test_subscript_walk_refuses_what_it_cannot_delimit(self, command):
+        word = self._first_word(command)
+        assert _subscript_parts(word) is None
+        # ...and the whole word is then read, value included: the over-block side.
+        assert _assignment_runs_decode(word, {}) is True
+
+    def test_an_operand_without_its_source_counts_as_splittable(self):
+        # The quotes are only in the source; without it a quoted expansion must not read as data.
+        command = 'env -u "$(base64 -d p)" ls'
+        word = BashCommandParser().parse(command)[0].parts[2]
+        assert _may_word_split(word, command) is False
+        assert _may_word_split(word, None) is True
+
+    def test_a_body_that_will_not_parse_counts_as_a_decode(self):
+        # Running out of stack inside bashlex is a ParseError too: under `{ ` nested ~243 deep the
+        # body's parse failed where the substitution validator's shallower one did not, and
+        # reading that as "no decode" left `${v:-$(base64 -d x)}` at HIGH. Pinned on a body that
+        # never parses, since the stack depth that trips it depends on the caller.
+        assert _parameter_runs_decode("v:-$(base64 -d x) )", {}) is True
 
 
 class TestHereStringGuardSeams:
