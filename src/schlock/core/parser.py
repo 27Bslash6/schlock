@@ -1209,12 +1209,18 @@ def _command_words(node: Any) -> "list[str]":
 
     Skips assignments, redirections and a redirection's `{varname}` prefix. Every argv
     view in this module reads a command through here.
+
+    A leading `builtin` (and its `--`) is dropped too: `builtin NAME ARGS` runs exactly
+    `NAME ARGS`, and only NAME is ever run.
     """
-    return [
+    words = [
         part.word
         for part in without_fd_variables(getattr(node, "parts", None) or [])
         if getattr(part, "kind", None) not in ("assignment", "redirect") and hasattr(part, "word")
     ]
+    while words[:1] == ["builtin"]:
+        words = words[2:] if words[1:2] == ["--"] else words[1:]
+    return words
 
 
 def heredoc_owner(node: Any) -> Optional[str]:

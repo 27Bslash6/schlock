@@ -96,6 +96,25 @@ class TestShellCheckExecution:
             assert isinstance(findings, list)
 
 
+class TestShellCheckIgnoresUserConfig:
+    """No rc file or SHELLCHECK_OPTS can switch off the codes a verdict rests on."""
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    def test_a_shellcheckrc_is_not_read(self, tmp_path, monkeypatch):
+        (tmp_path / ".shellcheckrc").write_text("disable=SC2034,SC2114\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        codes = {f.code for f in run_shellcheck("x=1\nrm -rf /usr") or []}
+        assert {2034, 2114} <= codes
+
+    @pytest.mark.skipif(not is_shellcheck_available(), reason="ShellCheck not installed")
+    def test_shellcheck_opts_is_not_read(self, monkeypatch):
+        monkeypatch.setenv("SHELLCHECK_OPTS", "-e SC2034,SC2114")
+        codes = {f.code for f in run_shellcheck("x=1\nrm -rf /usr") or []}
+        assert {2034, 2114} <= codes
+
+
 class TestShellCheckFinding:
     """Test ShellCheckFinding dataclass."""
 

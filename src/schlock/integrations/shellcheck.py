@@ -20,6 +20,7 @@ Usage:
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -270,10 +271,13 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
         return []
 
     try:
-        # Run shellcheck with JSON output, reading from stdin
+        # Run shellcheck with JSON output, reading from stdin. A `.shellcheckrc` (project, home
+        # or XDG) or SHELLCHECK_OPTS could disable the codes this verdict rests on - a security
+        # code, or the SC2034 the trap-handler sentinel needs - so neither is read.
         result = subprocess.run(
             [
                 path,
+                "--norc",
                 f"--shell={shell}",
                 "--format=json",
                 f"--severity={severity}",
@@ -284,6 +288,7 @@ def run_shellcheck(  # noqa: PLR0911 - Multiple exit points for error handling
             capture_output=True,
             text=True,
             timeout=timeout,
+            env={k: v for k, v in os.environ.items() if k != "SHELLCHECK_OPTS"},
         )
 
         # Exit 0 or 1 is a verdict (1 = findings). Anything else - exit 2+, or a negative
