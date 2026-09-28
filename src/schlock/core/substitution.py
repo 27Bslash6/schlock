@@ -646,9 +646,17 @@ def dangerous_find(args: list[str]) -> str | None:
 # comparison like `$1 > "m"` inside a substitution is acceptable; missing system()/pipe-to-command/
 # file writes is not. Known ceiling: a pipe/redirect target held in a VARIABLE (`print | c`) evades
 # this text scan — the parser's pipe-to-shell layer and YAML rules remain as backstops. See #104.
+#
+# AWK_SYSTEM_CALL is shared with the top-level check. Real awks run `system \<newline> ("cmd")`
+# (a line continuation before the `(`, where mawk also allows blanks and gawk a CR between the
+# backslash and the newline) and `x=1system("cmd")` (no word boundary before the name), so the gap
+# admits continuations and there is no `\b` before `system`. A backslash with no newline after it
+# is not a continuation: `system\(` is a syntax error in code and the literal `system(` in an awk
+# regex (`/system\(/`), so it does not match.
+AWK_SYSTEM_CALL = r"system(?:\s|\\[^\S\n]*\n)*\("
 _AWK_DANGEROUS_TEXT = re.compile(
-    r"system\s*\("  # system("cmd") — arbitrary exec
-    r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
+    AWK_SYSTEM_CALL  # system("cmd") — arbitrary exec
+    + r"|getline"  # "cmd" | getline — exec; blunt: all getline forms blocked
     r'|\|\s*"'  # print | "cmd" — pipe to a command
     r'|"\s*\|'  # "cmd" | … — command string on the left of a pipe
     r"|\|&"  # gawk |& coprocess

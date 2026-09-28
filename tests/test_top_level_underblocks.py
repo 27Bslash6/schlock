@@ -1,17 +1,21 @@
 """Top-level under-block fixes: pipe-to-shell + git -c exec (security)."""
 
+import time
+
 import pytest
 
 from schlock.core import validator as val_module
+from schlock.core.native_bridge import MAX_COMMAND_SIZE
 from schlock.core.parser import BashCommandParser, _reads_stdin_as_program
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import (
+    dangerous_awk,
     dangerous_find,
     dangerous_git_config,
     dangerous_kubectl,
     git_config_exec_payload,
 )
-from schlock.core.validator import validate_command
+from schlock.core.validator import _check_contextual_high_risk, validate_command
 
 
 @pytest.fixture
@@ -732,3 +736,114 @@ class TestWholeCommandRulesInAList:
     def test_segment_verdict_stands_when_it_is_higher(self):
         result = validate_command("git commit -m x; rm -rf /")
         assert result.risk_level == RiskLevel.BLOCKED, result.risk_level
+
+
+@pytest.mark.usefixtures("no_shellcheck_underblocks")
+class TestTopLevelAwkSystem:
+    """awk system() runs a shell command wherever it sits in the program, so it is HIGH at the top
+    level in every block, line and length of the program, as the BEGIN form already was.
+
+    Read per awk command from its own arguments, so a `system(` in a later, separate command is
+    not attributed to awk. The substitution path stays BLOCKED.
+    """
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk '{system($0)}' f",
+            "awk 'END{system(\"id\")}' f",
+            "awk '/x/{system(\"id\")}' f",
+            "gawk '{system($0)}' f",
+            "mawk '{system($0)}' f",
+            "nawk '{system($0)}' f",
+            "/usr/bin/awk '{system($0)}' f",
+        ],
+    )
+    def test_system_outside_begin_is_high(self, command):
+        assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk 'function f(){system(\"id\")} {f()}' f",
+            "awk '{ system ($0) }' f",
+            "awk 'NR>0\n{system($0)}' f",
+            "awk 'BEGIN{\nsystem(\"id\")}'",
+            "awk '" + "x=1;" * 60 + 'BEGIN{system("id")}\'',
+            "awk '" + "x=1;" * 60 + "{system($0)}' f",
+            "awk 'BEGIN{" + " " * 120 + 'system("id")}\'',
+            # Each of these runs the command under at least one of mawk, busybox awk and gawk: a
+            # backslash-newline continuation before the `(` (also CR-LF), and a name glued to a
+            # number or behind a continuation, where the number or variable ends at `system`.
+            "awk '{system\\\n($0)}' f",
+            "awk '{system \\\r\n($0)}' f",
+            "awk '{system\\ \n($0)}' f",
+            "awk 'BEGIN{x=1system(\"id\")}'",
+            "awk '{x=1system($0)}' f",
+            "awk 'BEGIN{x\\\nsystem(\"id\")}'",
+            "cat f | awk '{system($0)}'",
+            "gawk -e '{system($0)}' f",
+        ],
+    )
+    def test_system_anywhere_in_the_program_is_high(self, command):
+        assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    @pytest.mark.parametrize(
+        "command",
+        ["awk 'BEGIN{system(\"id\")}'", "awk 'BEGIN{system(ARGV[1])}' 'rm -rf /'"],
+    )
+    def test_system_in_begin_stays_high(self, command):
+        assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    def test_a_later_blocked_segment_still_wins(self):
+        assert validate_command("awk '{system($0)}' f; rm -rf /").risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk '{print $1}' f",
+            "awk -F: '{print $1}' /etc/passwd",
+            # The `system(` belongs to a separate command, not to awk.
+            "awk '{print}' f; echo 'system(x)'",
+            # awk is an argument here, not a command.
+            "echo awk '{system($0)}'",
+            # An awk string ends before the `(`, so neither awk nor this check sees a call.
+            "awk '{print \"Filesystem\" (NR)}' f",
+            "x=$(awk '{print \"system\" ($1)}' f)",
+            "x=$(awk '{print $1 \" filesystem\" (NR)}' f)",
+            # An awk string that reads like a flag is not a flag.
+            "x=$(awk '\"-l\" == $1' f)",
+            # `\(` is a literal paren in an awk regex or string, not a continuation before a call.
+            "awk '/system\\(/ {print}' f",
+            "x=$(awk '/system\\(/ {print}' /dev/null)",
+            "x=$(awk '{print \"system\\(\"}' /dev/null)",
+        ],
+    )
+    def test_benign_awk_stays_safe(self, command):
+        assert validate_command(command).risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize("command", ["awk '{print \"system(x)\"}' f", "awk '{print $1} # system(' f"])
+    def test_system_in_a_string_or_comment_over_reads_high(self, command):
+        assert validate_command(command).risk_level == RiskLevel.HIGH
+
+    def test_continuation_before_the_paren_is_blocked_in_a_substitution(self):
+        assert dangerous_awk(["{system\\\n($0)}"]) is not None
+        assert validate_command("x=$(awk '{system\\\n($0)}' f)").risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "commands_with_args",
+        [
+            [("awk", ["{}"])] * (MAX_COMMAND_SIZE // 8),
+            [("awk", ["system" * (MAX_COMMAND_SIZE // 6)])],
+            [("awk", ["system" + " \\\n" * (MAX_COMMAND_SIZE // 3)])],
+            [("awk", [("system" + " " * 58) * (MAX_COMMAND_SIZE // 64)])],
+            [("awk", [("system\\" + " " * 58) * (MAX_COMMAND_SIZE // 65)])],
+        ],
+        ids=["awk_dense", "system_dense", "system_one_long_gap", "system_many_gaps", "system_backslash_blanks"],
+    )
+    def test_check_is_linear_on_64kb(self, commands_with_args):
+        start = time.process_time()
+        assert _check_contextual_high_risk(commands_with_args) is None
+        assert all(dangerous_awk(args) is None for _, args in commands_with_args)
+        elapsed = time.process_time() - start
+        assert elapsed < 1.0, f"{elapsed:.3f}s"
