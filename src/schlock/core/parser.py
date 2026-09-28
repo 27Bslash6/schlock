@@ -400,26 +400,22 @@ class TieredParser:
         logger.warning(f"native parser tier failed{contract}: {exc}; {action}", exc_info=not in_contract)
 
 
-# Interpreters that EXECUTE their standard input as a program when given no program source.
-# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
-# those run a *named* command, not stdin-as-program, and are covered by the download->shell
-# and wrapper-command checks.
 # A heredoc body is inert text to `cat` and source code to `bash`, which decides
 # both whether its matches are suppressed (extract_heredoc_ranges) and whether a
 # segment has to carry it (extract_command_segments). One set, so the two answers
 # cannot drift apart. Both ask `heredoc_owner`, which sees past a wrapper.
 #
-# `rbash` is here for the reason it is in STDIN_EXEC_INTERPRETERS below: restricted
-# bash still executes its stdin, and a heredoc IS stdin. Without it this set and that
-# one disagree about one interpreter - `rbash <<< X` blocks while `rbash <<EOF` does
-# not - which is exactly the drift the paragraph above says cannot happen.
+# It is also the shell subset of STDIN_EXEC_INTERPRETERS below - that set is built FROM
+# it - and the validator's `-c` and heredoc-owner shell set, so a shell can never sit in
+# one surface and not the others. `python3 <<EOF` does execute its body, but as Python:
+# scanning it with bash rules is nonsense, for the reason the `-c` and `<<<` payload
+# rechecks cover shells only.
 #
-# `csh`/`tcsh` are here for the same reason: like every Bourne-family shell, invoking
-# either with no program source (no `-c`, no script operand) makes it read and execute
-# its stdin as a command script - a heredoc or here-string included. LAB-2754 already
-# put both in _SHELL_COMMANDS for the `-c` surface; leaving them out here just repeats
-# the rbash drift with a different interpreter.
-_HEREDOC_SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
+# `rbash`, `csh` and `tcsh` belong for the reason every shell here does: invoked with
+# no program source (no `-c`, no script operand) each reads and executes its stdin, a
+# heredoc or here-string included. Separate copies of this list are how `rbash <<< X`
+# once blocked while `rbash <<EOF` did not, and how csh/tcsh repeated that drift.
+SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "ksh", "dash", "ash", "fish", "rbash", "csh", "tcsh"})
 
 # Redirection operators whose operand is DATA rather than a path, and so must stay
 # out of the reconstruction that _redirect_words feeds (LAB-2760).
@@ -616,18 +612,12 @@ def _recover_dropped_substitutions(command: str, nodes: "list[Any]") -> None:
             stack.extend(child for child in children if isinstance(child, bashlex.ast.node))
 
 
-STDIN_EXEC_INTERPRETERS = frozenset(
+# Interpreters that EXECUTE their standard input as a program when given no program source.
+# Used to detect top-level pipe-to-shell (cmd | bash). DELIBERATELY EXCLUDES xargs/env:
+# those run a *named* command, not stdin-as-program, and are covered by the download->shell
+# and wrapper-command checks.
+STDIN_EXEC_INTERPRETERS = SHELL_COMMANDS | frozenset(
     {
-        "bash",
-        "sh",
-        "zsh",
-        "dash",
-        "ksh",
-        "ash",
-        "fish",
-        "rbash",  # restricted bash still execs its stdin; `rbash -c` is already in _SHELL_COMMANDS
-        "csh",  # execs stdin as a script like every other shell here; `csh -c` is in _SHELL_COMMANDS
-        "tcsh",  # same as csh - tcsh is its interactive superset, not a different stdin model
         "python",
         "python2",
         "python3",
@@ -710,7 +700,11 @@ _MULTICALL_BINARIES = frozenset({"busybox", "toybox"})
 # - Execution: env, command, xargs, parallel (modify execution context)
 # - Multicall: busybox, toybox (can invoke any applet)
 # - Namespace: chroot, nsenter, unshare (container/namespace operations)
-WRAPPER_COMMANDS: frozenset[str] = frozenset(
+# Also the set the `exec`/`eval` wrapper-bypass scan in `_detect_dangerous_constructs` keys on,
+# frozen at its membership before the launchers below: that scan TREATS a bare `exec`/`eval` word
+# after one of these as the shell builtin (an over-approximation - `sudo pnpm exec vitest` blocks),
+# so any name whose own subcommand vocabulary is `exec`/`eval` must go in _LAUNCHER_COMMANDS below.
+_EXEC_BYPASS_SCAN_WRAPPERS: frozenset[str] = frozenset(
     {
         # Privilege escalation
         "sudo",  # Run as superuser
@@ -752,6 +746,75 @@ WRAPPER_COMMANDS: frozenset[str] = frozenset(
         "linux64",  # 64-bit mode
     }
 )
+
+# Launchers that run a caller-supplied command inside an environment, session or sandbox:
+# `uv run bash -c PROG`, `pnpm exec sh -c PROG`, `firejail --net=none bash -c PROG`.
+# Same job as the set above for the shell-delegation re-entry, the here-string sink and the
+# heredoc owner, which scan EVERY arg position for a shell, so a launcher's own subcommand words
+# are skipped for free.
+# Kept apart because they are NOT in the `exec`/`eval` bypass scan: after one of these `exec` is
+# the tool's subcommand (`pnpm exec vitest`, `npm exec -- tsc`, `direnv exec . make`) and `eval`
+# a screen command (`screen -X eval`), so membership in the set above would turn those benign
+# lines into an unappealable BLOCKED. Over-approximation is fail-closed (a benign tail behind a
+# member re-validates to its own verdict), so the bar for a new name is a SAFE-side pin, not
+# proof of pass-through. Covers the shell-on-argv forms only; a launcher's own string-executing
+# grammar (`tmux new -d 'PROG'`, `watchexec 'PROG'`, `npx -c PROG`) is the `watch PROG` shape
+# and tracked separately.
+_LAUNCHER_COMMANDS: frozenset[str] = frozenset(
+    {
+        # Package/environment runners
+        "uv",  # uv run CMD
+        "poetry",  # poetry run CMD
+        "pipenv",  # pipenv run CMD
+        "pdm",  # pdm run CMD
+        "hatch",  # hatch run CMD
+        "rye",  # rye run CMD
+        "conda",  # conda run -n ENV CMD
+        "npx",  # npx CMD
+        "npm",  # npm exec -- CMD
+        "pnpm",  # pnpm exec CMD
+        "yarn",  # yarn exec CMD
+        "bunx",  # bunx CMD
+        "bundle",  # bundle exec CMD
+        "direnv",  # direnv exec DIR CMD
+        "devbox",  # devbox run -- CMD
+        "nix",  # nix develop -c CMD / nix shell ... -c CMD
+        # Version managers
+        "mise",  # mise exec -- CMD
+        "asdf",  # asdf exec CMD
+        "pyenv",  # pyenv exec CMD
+        "rbenv",  # rbenv exec CMD
+        "nvm",  # nvm exec VERSION CMD
+        "volta",  # volta run --node VERSION CMD
+        # Session/terminal multiplexers
+        "screen",  # screen [-dmS NAME] CMD
+        "tmux",  # tmux new-session [-d] CMD
+        # Sandboxes and namespaces
+        "firejail",  # firejail [--opts] CMD
+        "bwrap",  # bubblewrap: bwrap [--binds] CMD
+        "proot",  # proot -r ROOTFS CMD
+        "chpst",  # runit: chpst -u USER CMD
+        # Environment shims and daemonizers
+        "xvfb-run",  # xvfb-run [-a] CMD
+        "faketime",  # faketime TIMESTAMP CMD
+        "caffeinate",  # macOS: caffeinate -i CMD
+        "dbus-run-session",  # dbus-run-session -- CMD
+        "daemonize",  # daemonize /path/to/CMD
+        # File watchers that re-run a command
+        "entr",  # ... | entr [-r] CMD
+        "watchexec",  # watchexec [-e EXT] -- CMD
+    }
+)
+
+# Every base name whose args the shell-delegation re-entry, the here-string sink classifier and
+# the heredoc owner scan for a shell. Public: validator imports it.
+WRAPPER_COMMANDS: frozenset[str] = _EXEC_BYPASS_SCAN_WRAPPERS | _LAUNCHER_COMMANDS
+
+# Child attributes a walker descends to find commands in argument words AND redirection targets:
+# "redirects"/"output" reach `wc <<< "$(cat x | sh)"` and `( : ) < "$(…)"` (LAB-4838).
+# Deliberately NOT used by the string-literal, heredoc-range and segment walkers: their ranges
+# suppress rule matches, so widening them can lower a verdict.
+EXEC_CHILD_ATTRS = ("parts", "command", "list", "pipe", "compound", "redirects", "output")
 
 
 def _resolve_multicall(cmd_name: str, args: list[str]) -> tuple[str, list[str]]:
@@ -821,6 +884,8 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
     (NOT a script), so it cannot exempt — this closes the value-taking-flag bypass
     (`bash --rcfile X`, `python3 -W ignore`, `perl -I /tmp`, `node -r fs`, ...).
     Explicit stdin paths ('-', '/dev/stdin', ...) -> True. No unambiguous program -> True.
+    A `+`-prefixed word is an option too (`bash +o pipefail`, `sh +e`: set(1) syntax every
+    POSIX shell accepts on its command line), not a script operand.
     """
     inline = _INLINE_CODE_FLAGS.get(cmd_name, frozenset())
     saw_option = False
@@ -831,7 +896,7 @@ def _reads_stdin_as_program(cmd_name: str, args: list[str]) -> bool:
         # Explicit stdin designator -> reads stdin.
         if arg in _STDIN_PATHS:
             return True
-        if not arg.startswith("-"):
+        if not arg.startswith(("-", "+")):
             # A leading positional (before any option) is a script file -> runs it.
             # A non-dash token AFTER an option is that option's value, NOT a script -> ignore it.
             if not saw_option:
@@ -1184,7 +1249,7 @@ def heredoc_owner(node: Any) -> Optional[str]:
     if not words:
         return None
     if words[0] in WRAPPER_COMMANDS:
-        return next((word for word in words[1:] if word in _HEREDOC_SHELL_COMMANDS), words[0])
+        return next((word for word in words[1:] if word in SHELL_COMMANDS), words[0])
     return words[0]
 
 
@@ -1721,7 +1786,7 @@ class BashCommandParser:
                         results.append((words[0], words[1:]))
 
                 # Recursively visit child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                for attr in EXEC_CHILD_ATTRS:
                     if hasattr(node, attr):
                         child = getattr(node, attr)
                         if isinstance(child, list):
@@ -1740,8 +1805,8 @@ class BashCommandParser:
 
         SECURITY CRITICAL (LAB-2768): `bash <<< "rm -rf /"` feeds the here-string to bash's
         stdin, and a bare shell runs its stdin as a program - the same "argument is code, not
-        data" sink as `bash -c PROG`, but the here-string hangs off a *redirect* node that
-        `extract_commands_with_args` skips. So `_shell_delegated_payloads` sees `('bash', [])`,
+        data" sink as `bash -c PROG`, but the here-string is a *redirect* word that
+        `extract_commands_with_args` never reads as a payload. So `_shell_delegated_payloads` sees `('bash', [])`,
         no payload, no recursion, and the delegated `rm -rf /` degrades to HIGH (allowed by the
         permissive preset).
 
@@ -1764,7 +1829,7 @@ class BashCommandParser:
                 found = _here_string_program(node)
                 if found is not None:
                     results.append(found)
-            for attr in ["parts", "command", "list", "pipe", "compound"]:
+            for attr in EXEC_CHILD_ATTRS:
                 child = getattr(node, attr, None)
                 if isinstance(child, list):
                     for item in child:
@@ -1797,7 +1862,7 @@ class BashCommandParser:
         as the slice was, so a CRLF opener cannot desync from its terminator and
         fail closed on a legitimate command.
         """
-        executes_body = heredoc_owner(node) in _HEREDOC_SHELL_COMMANDS
+        executes_body = heredoc_owner(node) in SHELL_COMMANDS
 
         for part in node.parts:
             heredoc = getattr(part, "heredoc", None)
@@ -2233,7 +2298,7 @@ class BashCommandParser:
                     heredoc = node.heredoc
                     if hasattr(heredoc, "pos"):
                         start, end = heredoc.pos
-                        is_shell = in_process or (parent_cmd in _HEREDOC_SHELL_COMMANDS if parent_cmd else False)
+                        is_shell = in_process or parent_cmd in SHELL_COMMANDS
                         heredoc_ranges.append((start, end, is_shell))
 
                 # Recursively visit child nodes
@@ -2411,6 +2476,73 @@ class BashCommandParser:
                 )
         return bodies
 
+    def mask_substitution_bodies(self, command: str, ast_nodes: list[Any]) -> str:
+        """`command` with each outermost substitution body blanked, every offset kept.
+
+        SECURITY: a rule's gap stops at `;`, `|`, `&` and newlines so the
+        whole-command scan cannot pair one command's reader with the next command's
+        word. A separator inside a substitution is data, but a regex can only
+        balance so many paren levels, so a separator in a body nested deeper than
+        the gap balances ends it: `cat $(printf %s $(dirname $(pwd)) | head -1)/.env`
+        reads a `.env` and rated SAFE. bashlex already knows where each body ends,
+        at any depth. Blanking the bodies turns each substitution into one opaque
+        word and leaves every top-level separator in place, so a rule matched
+        against this text reaches past a substitution and still cannot cross into
+        another command.
+
+        Redirect targets are walked too (`cat < $(…)/.env`). A `parameter` node
+        has no children, so a `${…}` holding a substitution has its whole
+        interior blanked from the node's own span.
+
+        This reaches a target OUTSIDE every body. A target inside one is blanked
+        with it, so reaching that stays the rule's own gap's job.
+
+        Length-preserving, so the caller's literal and heredoc ranges still index
+        it. A span is blanked only when its opener is at the node's start and its
+        closer where _body_end looks: a `\\<newline>` earlier in the word moves
+        bashlex's offsets, and a span left as written only costs this pass a match.
+        """
+        from schlock.core.substitution import _SUBSTITUTION_INTRODUCERS  # noqa: PLC0415 - avoids an import cycle
+
+        spans: list[tuple[int, int]] = []
+
+        def visit(node: Any) -> None:
+            if not hasattr(node, "kind"):
+                return
+            pos = getattr(node, "pos", None)
+            if node.kind in ("commandsubstitution", "processsubstitution") and pos:
+                end = self._body_end(command, pos)
+                if end is not None and command.startswith(_SUBSTITUTION_INTRODUCERS, pos[0]):
+                    spans.append((self._body_start(command, pos[0]), end))
+                return  # An inner body is inside this one, blanked with it.
+            if node.kind == "parameter" and pos:
+                interior = command[pos[0] + 2 : pos[1] - 1]
+                if (
+                    command.startswith("${", pos[0])
+                    and command[pos[1] - 1 : pos[1]] == "}"
+                    and any(opener in interior for opener in _SUBSTITUTION_INTRODUCERS)
+                ):
+                    spans.append((pos[0] + 2, pos[1] - 1))
+                return
+            for attr in ("parts", "command", "list", "pipe", "compound", "redirects", "output"):
+                child = getattr(node, attr, None)
+                if isinstance(child, list):
+                    for item in child:
+                        visit(item)
+                elif child:
+                    visit(child)
+
+        for node in ast_nodes or []:
+            visit(node)
+        # One join, not a splice per body: 64 KB of `$(x)` is thousands of bodies.
+        pieces: list[str] = []
+        done = 0
+        for start, end in sorted(spans):  # Outermost bodies never overlap.
+            pieces += (command[done:start], " " * (end - start))
+            done = end
+        pieces.append(command[done:])
+        return "".join(pieces)
+
     @staticmethod
     def _body_start(command: str, part_start: int) -> int:
         """Where a substitution's body begins: past a backtick, or past `$(`, `<(` or `>(`."""
@@ -2500,7 +2632,7 @@ class BashCommandParser:
 
         def visit_children(node, visitor):
             """Recursively visit child nodes of an AST node."""
-            for attr in ("parts", "command", "list", "pipe", "compound"):
+            for attr in EXEC_CHILD_ATTRS:
                 if hasattr(node, attr):
                     child = getattr(node, attr)
                     if isinstance(child, list):
@@ -2544,7 +2676,8 @@ class BashCommandParser:
                     # Scan all words looking for exec/eval as a command (not as arg to another tool)
                     # Allow: sudo kubectl exec (kubectl handles exec as subcommand)
                     # Block: sudo exec bash (exec IS the command)
-                    elif cmd_name in WRAPPER_COMMANDS:
+                    # Not the launchers: their `exec` is a subcommand, see _LAUNCHER_COMMANDS.
+                    elif cmd_name in _EXEC_BYPASS_SCAN_WRAPPERS:
                         words = _get_all_words(node)
                         # Container tools that use "exec" as a subcommand (not shell exec)
                         container_tools = {"kubectl", "docker", "podman", "nerdctl", "crictl", "ctr"}
@@ -2672,7 +2805,7 @@ class BashCommandParser:
                     check_pipeline(node)
 
                 # Recurse into child nodes
-                for attr in ["parts", "command", "list", "pipe", "compound"]:
+                for attr in EXEC_CHILD_ATTRS:
                     if hasattr(node, attr):
                         child = getattr(node, attr)
                         if isinstance(child, list):

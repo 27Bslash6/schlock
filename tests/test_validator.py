@@ -1249,6 +1249,16 @@ class TestHeredocSurroundings:
             # Pinned with the danger after the opener: `rm -rf / <<'EOF' \ ` is
             # denied on the base command alone and never reaches the fallback.
             ("chmod -R 777 <<'EOF' / \\ \nx\nEOF", "the dangerous command itself ends in an escaped space"),
+            # An ESCAPED blank is word text to bash, not a word boundary, so a `#`
+            # glued to it opens no comment: the logical line runs on, and the
+            # backslash-newline after the `#` joins the payload onto the command
+            # line, where bash runs it (sentinel-confirmed). Reading the `#` as a
+            # comment ends the line early and hands the payload to the heredoc
+            # body instead. Every character in _WORD_START_AFTER can be escaped
+            # this way.
+            ("cat <<'EOF' \\ #\\\n; rm -rf /\nbody\nEOF", "escaped blank before a glued `#`, one line"),
+            ("cat <<'EOF' \\\t#\\\n; rm -rf /\nbody\nEOF", "escaped tab before a glued `#`, one line"),
+            ("cat <<'EOF' \\;#\\\n; rm -rf /\nbody\nEOF", "escaped `;` before a glued `#`, one line"),
             # LAB-4270: bash never reads `<<` as a redirection inside a parameter
             # or arithmetic expansion - `${x:-q<<b }` expands to the literal
             # `q<<b`, `$((1<<2))` is a left shift. Reading one as an opener
@@ -1960,6 +1970,7 @@ class TestHeredocSurroundings:
             ('a["]"<<b ]=1', [], "a quoted `]` does not close a subscript"),
             ("a[${x:-]}<<b ]=1", [], "a `]` inside `${…}` does not close a subscript"),
             ('echo "`date`" ; cat <<c', ["c"], "a backtick closes its own frame, it does not reopen it"),
+            ('echo "`cat <<b`" <<E', ["E"], 'a backtick inside `"…"` is a frame, not a context the refusal sees'),
             ("x=`ls | sort` y[1<<b]=1", [], "an operator inside a backtick is the backtick's, so the word is one assignment"),
             ("echo `ls | sort` y[1<<b]", ["b]"], "…but the word after one still follows `echo` into command-name position"),
             # A `#` is a comment only where a word could start. These ran real
@@ -1969,6 +1980,9 @@ class TestHeredocSurroundings:
             ("echo a#b <<c", ["c"], "…and a `#` glued to plain word text is text as well"),
             ("( echo )#c <<b", [], "but a subshell's `)` ends a command, so there `#` really is a comment"),
             ("cat 2>#f <<b", [], "and after a redirection operator, where the word is open but `prefix` is not"),
+            ("cat <<'A' \\ #x <<b", ["A", "b"], "an escaped blank is word text, so a `#` glued to it is text"),
+            ("cat <<'A' #x <<b", ["A"], "…where after a real blank it is a comment"),
+            ("cat <<'A' \\\\ #x <<b", ["A"], "an escaped backslash ends one column early, so the blank after it is real"),
         ],
     )
     def test_expansion_boundaries_match_bash(self, line, delimiters, description):
@@ -2262,6 +2276,35 @@ class TestHeredocSurroundings:
         neutered, _ = val_module._neuter_heredocs("ls <<'A'\nz\nA\nx=`ls | sort` y[1<<b]=1\nrm -rf /")
 
         assert "rm -rf /" in neutered
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ` <<b `\nrm -rf /\nb",
+            "echo `cat <<b`\nrm -rf /\nb",
+            "echo `echo $(cat <<b)`\nrm -rf /\nb",  # the backtick is not the innermost context
+            "x=$(echo `cat <<b`)\nrm -rf /\nb",  # nor the outermost
+            "echo `cat <<b\n`\nrm -rf /\nb\n`",  # closes on a later line: parsed clean, and was allowed
+        ],
+    )
+    def test_a_heredoc_inside_a_backtick_is_refused(self, command):
+        """Bash ends a backtick at its first unescaped `` ` `` and reads the heredoc body from that text alone (LAB-4275).
+
+        Every row ran its `rm` in real bash (canary). On main the last row was
+        allowed LOW with ShellCheck off; the rest denied only by accident -
+        bashlex choked on the rewrite, or the delimiter swallowed the closing
+        backtick and never found a terminator. Pinned on the refusal's own
+        message so that neither accident can pass for it.
+        """
+        with pytest.raises(ParseError, match="inside a backtick"):
+            val_module._neuter_heredocs(command)
+
+    def test_a_heredoc_inside_a_backtick_is_denied_end_to_end(self, safety_rules_path, no_shellcheck):
+        """The row that got through: allowed LOW, the `rm` deleted before validation."""
+        result = validate_command("echo `cat <<b\n`\nrm -rf /\nb\n`", config_path=safety_rules_path)
+
+        assert not result.allowed
+        assert "inside a backtick" in result.message
 
     @pytest.mark.parametrize(
         "opener,tail",
@@ -2566,6 +2609,62 @@ class TestHeredocSurroundings:
         assert result.risk_level == RiskLevel.BLOCKED
         assert result.allowed is False
         assert "unexpected token ';'" in (result.error or "")
+
+    def test_a_dash_does_not_rebuild_the_open_word(self, monkeypatch):
+        """A `-` asks `_FD_CLOSE_RE` only when the open word ends in `&`.
+
+        The regex can match nothing else, and asking it rebuilds the whole open
+        word, carried prefix included. Asked for every `-`, a 60 KB command held
+        the hook for 22 s. The row with a carried `2>&` is the `\\`-continued
+        `cat 2>&\\<newline>-`, where the `&` is in ``prefix`` and not on the line.
+        """
+        pattern = val_module._FD_CLOSE_RE
+        calls = []
+
+        class CountingPattern:
+            def fullmatch(self, *args):
+                calls.append(args)
+                return pattern.fullmatch(*args)
+
+        monkeypatch.setattr(val_module, "_FD_CLOSE_RE", CountingPattern())
+
+        line = "cat 2>&- x" + "-" * 5000 + " <<b"
+        _, openers = val_module._rewrite_openers(line, val_module._ScanState(), 0, val_module._DoubleParen(line))
+        assert [delimiter for delimiter, _, _, _ in openers] == ["b"]
+        assert len(calls) == 1, "only the `-` after `2>&` may reach the regex"
+
+        calls.clear()
+        scan = val_module._ScanState()
+        scan.contexts[-1].prefix = "2>&"
+        _, openers = val_module._rewrite_openers("- <<b", scan, 0, val_module._DoubleParen("- <<b"))
+        assert [delimiter for delimiter, _, _, _ in openers] == ["b"]
+        assert len(calls) == 1, "a `&` carried in the prefix still closes the fd"
+
+    def test_a_heredoc_opener_does_not_walk_the_open_contexts(self):
+        """A `<<` reads whether it is inside a backtick from the innermost context alone.
+
+        Walking every open context per opener cost 36 million steps on a 54 KB
+        command. Each context inherits the flag when it is pushed, so a `$(…)` or
+        a subshell inside a backtick still refuses its heredoc.
+        """
+
+        class CountingList(list):
+            walks = 0
+
+            def __iter__(self):
+                CountingList.walks += 1
+                return super().__iter__()
+
+        line = "( " * 200 + "cat " + "<<a " * 50
+        scan = val_module._ScanState()
+        scan.contexts = CountingList(scan.contexts)
+        _, openers = val_module._rewrite_openers(line, scan, 0, val_module._DoubleParen(line))
+        assert [delimiter for delimiter, _, _, _ in openers] == ["a"] * 50
+        assert CountingList.walks == 0
+
+        for nested in ("echo `( cat <<a )`", "echo `$(cat <<a)`", "echo $(`cat <<a`)"):
+            with pytest.raises(ParseError, match="inside a backtick"):
+                val_module._rewrite_openers(nested, val_module._ScanState(), 0, val_module._DoubleParen(nested))
 
 
 class TestInputSizeCeiling:
@@ -2927,8 +3026,8 @@ class TestParseFailureFailsClosed:
 
 
 class TestCshTcshHeredocAgreesWithHereString:
-    """LAB-4442: csh/tcsh were in _SHELL_COMMANDS (the `-c` surface) but neither
-    _HEREDOC_SHELL_COMMANDS nor STDIN_EXEC_INTERPRETERS - the same drift rbash had before it
+    """LAB-4442: csh/tcsh were in the `-c` shell set but neither
+    the heredoc shell set nor STDIN_EXEC_INTERPRETERS - the same drift rbash had before it
     was added to all three. Pins the heredoc-spelling verdict to match `csh <<< ...` and the
     `bash <<EOF` control above.
     """
@@ -3411,7 +3510,9 @@ class TestHeredocBoundariesOnTheNativePath:
     """What moving quoted heredocs onto the native parse must not lose (LAB-3094).
 
     Boundaries here are checked against an independent bash parser (mvdan/sh, the parser
-    behind the native tier) rather than against bashlex's own view of them.
+    behind the native tier) rather than against bashlex's own view of them. mvdan/sh does
+    not end a body at a backslash-joined terminator (`EO\\` then `F`) where bash does, so
+    rows with one are pinned against bash in TestAnUnquotedBodyIsReadThroughItsBackslashNewlines.
     """
 
     @pytest.mark.parametrize(
@@ -3774,16 +3875,6 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
         assert result.allowed is False
         assert "substitution" in result.message.lower()
 
-    def test_a_kept_body_whose_last_line_ends_in_a_backslash_fails_closed(self, safety_rules_path):
-        """bash joins it onto the terminator - and bashlex onto the placeholder, reading past it."""
-        result = validate_command(
-            "cat <<'A;B'\nx\nA;B\ncat <<EOF\nfoo\\\nEOF\nEOF\nrm -rf /\ncat <<'C;D'\ny\nC;D",
-            config_path=safety_rules_path,
-        )
-
-        assert result.allowed is False
-        assert "ends in a backslash" in (result.error or "")
-
     @pytest.mark.parametrize(
         "opener,line", [("<<EOF", "SCHLOCK_HEREDOC"), ("<<-EOF", "\tSCHLOCK_HEREDOC")], ids=["plain", "tab-stripped"]
     )
@@ -3829,3 +3920,169 @@ class TestTheFallbackRefusesEveryProgramItCouldNotRead:
         )
 
         assert result.allowed is True, result.message
+
+
+class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
+    """An unquoted heredoc ends at the JOINED line bash reads (LAB-5272; see `_body_line`).
+
+    Every row here was decided by running bash 5.3 first, with `touch PWNED` in the
+    payload's place.
+    """
+
+    @staticmethod
+    def _shell_after_rewrite(neutered: str) -> list[str]:
+        """The commands bashlex reads outside every heredoc body when it re-parses the rewrite."""
+        bash_parser = parser.BashCommandParser()
+        return bash_parser.extract_command_segments(neutered, bash_parser.parse(neutered))
+
+    @pytest.mark.parametrize(
+        "command,neutered",
+        [
+            (
+                "cat <<'A;B' <<EOF\nq\nA;B\nEO\\\nF\nrm -rf /\nEOF",
+                "cat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /\nEOF",
+            ),
+            (
+                "cat <<'A;B' <<-EOF\nq\nA;B\n\tEO\\\nF\nrm -rf /\nEOF",
+                "cat <<SCHLOCK_HEREDOC <<-SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /\nEOF",
+            ),
+            (
+                "cat <<'A;B' <<EOF\nq\nA;B\nE\\\nO\\\nF\nrm -rf /\nEOF",
+                "cat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\nrm -rf /\nEOF",
+            ),
+            (
+                "cat <<'A;B'\nx\nA;B\ncat <<EOF\nfoo\\\nEOF\nEOF\nrm -rf /\ncat <<'C;D'\ny\nC;D",
+                "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC\n\nfoo\\\nEOF\nSCHLOCK_HEREDOC\nrm -rf /\n"
+                "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC",
+            ),
+        ],
+        ids=["joined-terminator", "tabs-stripped-from-the-joined-line", "three-physical-lines", "a-body-line-joined-into-EOF"],
+    )
+    def test_the_fallback_ends_the_body_at_the_line_bash_ends_it(self, command, neutered):
+        """Bash ran the payload in every row, so it must be shell in the rewrite as bashlex reads it.
+
+        Pinned on the rewrite, not on a verdict: a payload swallowed as body is gone from the
+        text escalation sees, so a verdict can pass for an unrelated reason. The last row is
+        the reverse join - `foo\\` onto `EOF` is the body line `fooEOF`, so the body ends at
+        the NEXT `EOF`.
+        """
+        assert val_module._neuter_heredocs(command)[0] == neutered
+        assert "rm -rf /" in self._shell_after_rewrite(neutered)
+
+    @pytest.mark.parametrize(
+        "command,neutered",
+        [
+            (
+                "cat <<'A;B' <<-EOF\nq\nA;B\n\tEO\\\n\tF\nrm -rf /\nEOF",
+                "cat <<SCHLOCK_HEREDOC <<-SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\n\tEO\\\n\tF\nrm -rf /\nSCHLOCK_HEREDOC",
+            ),
+            (
+                "cat <<'A;B' <<EOF\nq\nA;B\nEO\\\\\nF\nrm -rf /\nEOF",
+                "cat <<SCHLOCK_HEREDOC <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\n\nEO\\\\\nF\nrm -rf /\nSCHLOCK_HEREDOC",
+            ),
+            (
+                "cat <<'A;B'\nq\nA;B\ncat <<EOF > s.sh\na \\\n  b\nEOF",
+                "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC > s.sh\n\na \\\n  b\nSCHLOCK_HEREDOC",
+            ),
+            (
+                "cat <<'A;B'\nq\nA;B\ncat <<EOF\nx\\\\\ny\nEOF",
+                "cat <<SCHLOCK_HEREDOC\n\nSCHLOCK_HEREDOC\ncat <<SCHLOCK_HEREDOC\n\nx\\\\\ny\nSCHLOCK_HEREDOC",
+            ),
+        ],
+        ids=[
+            "a-tab-after-the-join-is-kept",
+            "an-escaped-backslash-does-not-join",
+            "benign-continued-body",
+            "an-escaped-backslash-mid-body",
+        ],
+    )
+    def test_a_line_bash_reads_as_body_stays_body(self, command, neutered):
+        """The other direction: bash ran nothing here, and printed every line as body text.
+
+        `<<-` strips tabs from the front of the JOINED line only, so `\\tEO\\` then `\\tF`
+        is `EO\\tF`, not `EOF`. An even run of backslashes is escaped backslashes, not a join,
+        and one that is not on the last body line leaves bashlex's reading of the end alone.
+        """
+        assert val_module._neuter_heredocs(command)[0] == neutered
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<EOF\na\\\\\nEO\\\nF\nrm -rf ~\ncat <<'Q'\nQ",
+            "cat <<'A;B'\nq\nA;B\ncat <<EOF\nx\\\\\nEOF\nrm -rf ~\ncat <<'C;D'\ny\nC;D",
+        ],
+        ids=["before-a-joined-terminator", "before-a-plain-terminator"],
+    )
+    def test_a_kept_body_ending_in_an_escaped_backslash_fails_closed(self, safety_rules_path, command):
+        """Bash ends the body at the terminator and runs the `rm`; bashlex would read it as body.
+
+        bashlex deletes every backslash-newline, escaped or not, so the kept last line `x\\\\`
+        joins onto the placeholder and the body runs on past it. The first row scored LOW and
+        allowed, ShellCheck on or off, once the joined terminator was read; the second did on
+        `main`, where only an odd run was refused.
+        """
+        with pytest.raises(ParseError, match="ends in a backslash"):
+            val_module._neuter_heredocs(command)
+
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert "ends in a backslash" in (result.error or "")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<'A;B' <<EOF\nq\nA;B\nEO\\\nF\nrm -rf /\nEOF",
+            "cat <<'Q' <<EOF \\\n> /dev/null\nq\nQ\nEO\\\nF\nrm -rf /\nEOF",
+            "cat <<EOF\nEO\\\nF\ncat <<'Q'\nx\nQ\nrm -rf /\nEOF",
+        ],
+        ids=["no-bare-spelling", "continued-opener", "ordinary-quoted-delimiter"],
+    )
+    def test_the_command_after_a_joined_terminator_is_denied(self, safety_rules_path, command):
+        """Bash runs the `rm` in each. The first and last were LOW and allowed.
+
+        The second is denied whichever way it is read: as an opener line that continues, which
+        is refused outright, or, once such a line is joined, as a body with a joined terminator.
+        """
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        ["cat <<EOF > s.sh\na \\\n  b\nEOF", "cat <<'A;B'\nq\nA;B\ncat <<EOF > s.sh\na \\\n  b\nEOF"],
+        ids=["native", "fallback"],
+    )
+    def test_a_benign_continued_body_is_not_over_blocked(self, safety_rules_path, command):
+        """Bash writes `a   b` to s.sh and runs nothing else."""
+        result = validate_command(command, config_path=safety_rules_path)
+
+        assert result.allowed is True, result.message
+
+    @pytest.mark.parametrize(
+        "command,bodies",
+        [
+            ("cat <<EOF\nEO\\\nF\ncat <<'Q'\nx\nQ\nrm -rf /\nEOF", ["x"]),
+            ("cat <<EOF\na\\\nEOF\n: <<'X'\n$(rm -rf /)\nX\nEOF", []),
+        ],
+        ids=["a-real-opener-after-a-joined-terminator", "an-opener-inside-a-joined-body"],
+    )
+    def test_the_normaliser_blanks_only_the_quoted_bodies_bash_reads(self, command, bodies):
+        """The pre-parse rewrite reads bodies the same way, and its spans decide what is blanked.
+
+        In the first row bash ends the `<<EOF` body at the joined `EOF` and reads `<<'Q'` as
+        a real heredoc; read physically, it went unseen. In the second, `a\\` joins onto `EOF`,
+        so `: <<'X'` is text inside an unquoted body that bash expands - `$(rm -rf /)` and
+        all - and blanking it as a quoted body would erase that expansion from the rewrite.
+        Pinned against bash, not the vendored mvdan/sh parser, which reads the first row's
+        joined terminator as a body line.
+        """
+        normalised = val_module._normalise_heredoc_delimiters(command)
+
+        assert [command[start:end] for _, start, end in normalised.blanked] == bodies
+
+    def test_a_placeholder_spelled_across_a_join_fails_closed(self):
+        """bashlex joins the kept body's lines too, so this line ends its body at the placeholder."""
+        with pytest.raises(ParseError, match="rewrite delimiter"):
+            val_module._neuter_heredocs("cat <<'A;B'\nq\nA;B\ncat <<EOF\nSCHLOCK_\\\nHEREDOC\nEOF")
