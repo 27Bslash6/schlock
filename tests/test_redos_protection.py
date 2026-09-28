@@ -159,6 +159,37 @@ class TestReDoSProtection:
 
         assert elapsed < 0.5, f"blank run after {head!r} took {elapsed:.3f}s"
 
+    @pytest.mark.parametrize(
+        ("line", "lines"),
+        [
+            ("rm -f" + " " * 200, 200),
+            ("rm -rf" + " " * 200, 50),
+            ('rm -f "x' + " " * 200 + '"', 200),
+            ("rm -rf it's" + " " * 200, 50),
+        ],
+    )
+    def test_multiline_rm_is_linear_in_line_count(self, safety_rules_path, line, lines):
+        r"""The `rm` operand spans stop at a bare newline, so N lines cost N line scans, not N tails.
+
+        At the regex layer 200 `rm -f` lines cost 2s on the two
+        vcs_directory_deletion twins and 50 `rm -rf` lines cost 2s on
+        hidden_glob_destruction, about 8x per doubling; with the spans stopping at
+        a bare newline both are far under the bound. The quoted and unpaired-quote
+        lines keep a quote from reopening the tail. Regex layer because
+        the whole validator spends ~0.4s on this input in per-segment passes, which
+        would hide the twins.
+        """
+        engine = RuleEngine(safety_rules_path)
+        patterns = engine.compiled_patterns["vcs_directory_deletion"] + engine.compiled_patterns["hidden_glob_destruction"]
+        text = (line + "\n") * lines
+
+        start = time.perf_counter()
+        for pattern in patterns:
+            pattern.search(text)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.5, f"{lines} lines of {line!r} took {elapsed:.3f}s"
+
     @pytest.mark.parametrize("text", ["IFS=" + " " * 50_000 + "read", "IFS=" + "x" * 50_000, "I" + "\\\n" * 25_000])
     def test_ifs_override_pattern_is_linear(self, safety_rules_path, text):
         """The IFS-override pattern scans a blank run or a `\\<newline>` run once, not once per backtrack."""
