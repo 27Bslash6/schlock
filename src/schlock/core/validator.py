@@ -5,10 +5,12 @@ rule engine, and cache. It provides the main validate_command() API and
 handles configuration layering (plugin defaults → user → project).
 """
 
+import copy
 import logging
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
@@ -1643,8 +1645,8 @@ def _read_delimiter(text: str, pos: int) -> tuple[str, int]:
 
 
 def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; splitting it hides the state machine
-    line: str, scan: _ScanState, at: int, dparen: _DoubleParen
-) -> tuple[str, list[tuple[str, bool, int, int]]]:
+    line: str, scan: _ScanState, at: int, dparen: "_DoubleParen | _JoinedParen"
+) -> tuple[str, list[tuple[str, bool, int, int]], bool]:
     """Replace this line's heredoc delimiters with the placeholder, in shell order.
 
     Only an *unquoted, unexpanded* `<<` opens a heredoc. Bash reads `echo "x << y"`,
@@ -1670,11 +1672,19 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
     because a `((` is decided by text that may lie on later lines.
 
     Returns ``(rewritten line, [(delimiter, strips_tabs, start, end)] in opener
-    order)``; each ``start`` is where its `<<` sits, which is the only honest
-    source for "what command owns this heredoc" - a second regex looking for the
-    first `<<` would find the quoted ones this deliberately skipped. ``end`` is
-    just past the delimiter word, so `_normalise_heredoc_delimiters` can splice
-    the opener without re-lexing it.
+    order, ends with a continuation)``; each ``start`` is where its `<<` sits,
+    which is the only honest source for "what command owns this heredoc" - a
+    second regex looking for the first `<<` would find the quoted ones this
+    deliberately skipped. ``end`` is just past the delimiter word, so
+    `_normalise_heredoc_delimiters` can splice the opener without re-lexing it.
+
+    The flag is exactly "an unescaped `\\` ends this line". It is reported
+    rather than refused because the two callers need different answers: bash
+    deletes a backslash-newline before it tokenizes, so the newline there is not
+    the newline token that starts a heredoc body, and `_neuter_heredocs` reads
+    the command on by joining the next line - while
+    `_normalise_heredoc_delimiters`, which rewrites in place and must keep every
+    offset, declines it (LAB-2781).
     """
     frames = scan.frames
     out: list[str] = []
@@ -1933,19 +1943,20 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
         ctx.fold(line, len(line))
         ctx.prefix += "\n"  # inside a quote or expansion the word continues, newline and all
 
-    if openers and (continued or frames or scan.contexts[-1].serial > min(opener_serials)):
-        # A trailing `\`, a quote or expansion still open, or a `$(` opened
-        # after an opener and not yet closed, means this line does not finish
-        # the command, so bash starts the body after a later line. Consuming it
-        # from the next one would delete the commands between.
+    if openers and (frames or scan.contexts[-1].serial > min(opener_serials)):
+        # A quote or expansion still open, or a `$(` opened after an opener and
+        # not yet closed, means this line does not finish the command, so bash
+        # starts the body after a later line. Consuming it from the next one
+        # would delete the commands between. A trailing `\` means the same, but
+        # is the caller's to decide (see the return value).
         # The test is identity, not depth: `$(cat <<'A') ; $(echo` closes one
         # substitution and opens another at the same depth, so a depth
         # comparison sees nothing while the line plainly does not end. A later
         # serial still open is exactly `something opened after an opener`.
-        why = "trailing backslash" if continued else "unclosed " + (frames[-1] if frames else _open_context_name(scan))
+        why = "unclosed " + (frames[-1] if frames else _open_context_name(scan))
         raise ParseError(f"Heredoc opener on a line that continues ({why}); the body's start is unknown")
 
-    return "".join(out), openers
+    return "".join(out), openers, continued
 
 
 # A delimiter that can be written bare: no blank, no metacharacter, nothing that
@@ -2228,7 +2239,15 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
     try:
         while index < len(lines):
             line = lines[index]
-            _, openers = _rewrite_openers(line, scan, at, dparen)
+            _, openers, continued = _rewrite_openers(line, scan, at, dparen)
+            if openers and continued:
+                # The body starts after a later line, and reading on means
+                # joining lines - which this length-preserving rewrite cannot
+                # do without moving every offset after the join. Declining
+                # keeps the route it had: bashlex reads the command as written,
+                # and whatever reaches the fallback is decided by
+                # `_neuter_heredocs`, which does join (LAB-2781).
+                raise ParseError("Heredoc opener on a continued line")
             line_start = at
             opener_starts.update(line_start + start for _, _, start, _ in openers)
             at += len(line) + 1
@@ -2277,7 +2296,70 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
     return _Normalised("\n".join(out) if changed else command, blanked, frozenset(opener_starts))
 
 
-def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one refusal per uncertain body reading
+class _JoinedParen:
+    """`_DoubleParen` seen through a logical line assembled from physical ones.
+
+    `_rewrite_openers` asks the oracle about an offset in the text it was handed.
+    Once `_neuter_heredocs` has deleted backslash-newlines to build that text, an
+    offset past a join no longer lands where it did in the command, so each is
+    mapped back to the physical line it came from - the oracle then decides a
+    `((` exactly as it does for text that was never joined.
+    """
+
+    def __init__(self, dparen: _DoubleParen, pieces: list[tuple[int, int]]) -> None:
+        self._dparen = dparen
+        self._pieces = pieces  # (offset in the logical line, offset in the command), ascending
+
+    def is_arithmetic(self, pos: int) -> bool:
+        logical_start, command_start = next(piece for piece in reversed(self._pieces) if piece[0] <= pos)
+        return self._dparen.is_arithmetic(command_start + pos - logical_start)
+
+
+# CPU seconds `_neuter_heredocs` may spend, per command, reading the lines that end in `\`.
+# Whether such a line continues is known only once it has been lexed, so the state it starts in
+# is copied first, and a join lexes the whole logical line again from that copy: only the joined
+# text reads the bytes bash reads across the seam. K joins are K reads of a growing line, and
+# each read also pays what its constructs cost against the state carried into it (open contexts,
+# a word's carried text, the joins so far), which no count of characters or copies sees in full.
+# So the charge is the CPU time the reads take, in the calling thread: load elsewhere mostly
+# slows a read without adding to it. It is checked between reads, so the read that crosses it
+# still finishes, and running out denies. Eighty continued 80-column lines take about 0.1 s on
+# Python 3.14 and 0.2 s on 3.9.
+_JOIN_CPU_BUDGET = 0.5
+
+
+class _JoinBudget(threading.local):
+    """CPU seconds left in the command's join budget.
+
+    Per thread, so concurrent callers of this lock-guarded module neither spend nor refill each
+    other's budget.
+    """
+
+    left = _JOIN_CPU_BUDGET
+
+
+_join_budget = _JoinBudget()
+
+
+def _reset_join_budget() -> None:
+    """Give the join its budget back. Called beside `reset_parse_budget`, once per command."""
+    _join_budget.left = _JOIN_CPU_BUDGET
+
+
+def _charge_join(since: float) -> float:
+    """Charge the CPU time used since ``since`` to the command's join budget, and return the time now.
+
+    Raises:
+        ParseError: when the budget is spent. Reading on would hold the hook before bash runs.
+    """
+    now = time.thread_time()
+    _join_budget.left -= now - since
+    if _join_budget.left < 0:
+        raise ParseError("Lines ending in `\\` took too long to read: the heredoc scan ran past its join budget")
+    return now
+
+
+def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912, PLR0915 - one refusal per uncertain body reading; the join and body loops share one cursor
     """Rewrite a heredoc into something bashlex parses, keeping the rest verbatim.
 
     bashlex reads a quoted heredoc delimiter as written, quotes and all, so it
@@ -2305,6 +2387,8 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
             all in a command bashlex rejected *as* a heredoc. Each means the
             body boundaries are unknown, so which text is shell and which is
             inert data is unknown too. The caller denies rather than guess.
+            Also when its lines ending in `\\` take more CPU to read than the
+            command's join budget allows (`_charge_join`).
     """
     lines = command.split("\n")
     rewritten: list[str] = []
@@ -2315,25 +2399,69 @@ def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one re
     index = 0
 
     while index < len(lines):
-        line, openers = _rewrite_openers(lines[index], scan, at, dparen)
-        rewritten.append(line)
-        at += len(lines[index]) + 1
+        # Assemble the whole LOGICAL line, then lex that - never the physical
+        # lines it is made of. A heredoc body starts after the newline that ENDS
+        # THE COMMAND, and bash deletes a backslash-newline before it tokenizes,
+        # so that newline is not the one that starts a body: the command, and
+        # the body's start with it, runs on (LAB-2781).
+        #
+        # Joining before lexing is what keeps this honest, not tidy. A construct
+        # that straddles the join reads one way per physical line and another
+        # way joined: `<` + `<<` is a `<<<` here-string to bash but two openers
+        # to a per-line scan, and the phantom opener's body swallows the
+        # commands after it. Lexing the assembled line reads the bytes bash
+        # reads, so the class cannot recur one construct over.
+        #
+        # A trailing `|` or `&&` does NOT continue a line: bash emits a newline
+        # token there and starts the body on the very next line even though the
+        # command carries on.
+        logical = lines[index]
+        pieces = [(0, at)]  # (offset in logical, offset in command) of each physical line
+        at += len(logical) + 1
         index += 1
+        # Only a line ending in `\` can continue - `_rewrite_openers` sets the flag only
+        # for such a line - so only it can be read again, and only it needs the state it
+        # began in. Copying that state for every line cost lines times the depth carried
+        # in. Reading these lines is what the join budget charges.
+        may_continue = logical.endswith("\\")
+        clock = time.thread_time() if may_continue else 0.0
+        start_scan = copy.deepcopy(scan) if may_continue else scan
+        while True:
+            line, openers, continued = _rewrite_openers(logical, scan, 0, _JoinedParen(dparen, pieces))
+            if not continued:
+                break
+            if index >= len(lines):
+                # No line left to continue onto. A pending opener then finds no
+                # terminator below and is denied; with none pending, bashlex
+                # refuses the trailing escape itself.
+                break
+            pieces.append((len(logical) - 1, at))
+            logical = logical[:-1] + lines[index]
+            at += len(lines[index]) + 1
+            index += 1
+            clock = _charge_join(clock)  # before the next read, so a spent budget reads no more
+            scan = copy.deepcopy(start_scan)  # re-read from where this logical line began
+        if may_continue:
+            _charge_join(clock)  # the last read, and the copy made for a line that did not continue
+        rewritten.append(line)
 
         if base_command is None and openers:
-            base_command = lines[index - 1][: openers[0][2]].strip()
+            # Offsets index the assembled line, so this is the head of the whole
+            # command, not of whichever physical line the opener landed on.
+            base_command = logical[: openers[0][2]].strip()
 
         # Bodies are consumed in opener order. `<<-` strips leading tabs from the
         # terminator line as well as the body, and an unquoted body's lines are
         # joined across backslash-newlines first (`_body_line`), so the comparison
         # has to match bash's or a body line would be mistaken for the terminator -
         # or the terminator for a body line, swallowing the shell after it.
-        opener_line = lines[index - 1]
         for delimiter, strips_tabs, start, end in openers:
             # A dropped (or empty) body still leaves one blank line: bashlex rejects
             # an empty heredoc inside a compound statement, which would deny every
             # `for … do cat <<'EOF' … EOF done`.
-            quoted = _delimiter_is_quoted(opener_line, delimiter, strips_tabs, start, end)
+            # Read at `logical`, the joined text the offsets index - not `line`, whose
+            # placeholder moved them, nor the last physical line, as for `base_command`.
+            quoted = _delimiter_is_quoted(logical, delimiter, strips_tabs, start, end)
             body_lines: list[str] = []
             while index < len(lines):
                 body, physical = _body_line(lines, index, quoted)
@@ -2705,6 +2833,7 @@ def validate_command(
         # A new command gets a fresh parse budget; re-entries for its payloads and heredoc
         # rewrites share the one it is spending (LAB-5659).
         reset_parse_budget()
+        _reset_join_budget()  # the heredoc join's budget, shared the same way
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
         command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
