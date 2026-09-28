@@ -94,6 +94,15 @@
      quoting the scan cannot follow makes recovery raise `ParseError`, whether or not bashlex's
      offsets moved. Recovery shares the parse's CPU budget.
      The same bash-first rule applies.
+   - **AST refusal — the arithmetic-`((` misparse** (`_double_paren_misparse`, called from
+     `parse_bashlex` in `src/schlock/core/parser.py`, so every tree schlock builds is checked,
+     substitution bodies included). bashlex reads `(( 1<<b ))` as nested subshells whose `<<b`
+     opens a heredoc, hiding the lines bash runs after it. The parser raises `ParseError` on a
+     subshell whose inner `(` is flush with its own and holds a heredoc of its own; no caller
+     turns that into an allow. It keys on the tree, not the text (a text scan for `((` was
+     bypassed), and only on the opening side (a `#` inside arithmetic moves bashlex's closer).
+     Real subshells written `((…) )` with a heredoc are over-denied, by design. It covers this
+     one tree only: other constructs bashlex misreads as heredoc openers are separate issues.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
 4. **Simplicity First**: Plugin bundles all dependencies. Three commands to install.

@@ -260,7 +260,8 @@ def parse_bashlex(command: str) -> list[Any]:
     LAB-4950), whichever caller asked, so no tier can hand a consumer a tree missing either.
     The parse and the substitution recovery share one CPU budget (_parse_budget), because
     recovery re-enters bashlex's parser for each body; running out raises ParseBudgetError,
-    passed through unwrapped.
+    passed through unwrapped. A tree holding the arithmetic-`((` misread raises ParseError
+    (_double_paren_misparse).
     """
     with _parse_budget():
         try:
@@ -283,8 +284,95 @@ def parse_bashlex(command: str) -> list[Any]:
                 original_error=e,
             )
         _recover_dropped_substitutions(command, ast)
+        # A heredoc needs a `<` in the text, so most commands skip the walk. No "heredoc" in the
+        # message: the validator routes those to the heredoc fallback, which would parse this
+        # same tree again. This is a plain parse refusal.
+        if "<" in command and _double_paren_misparse(ast):
+            raise ParseError(_MISPARSE_MESSAGE)
     _mark_fd_variables(command, ast)
     return ast
+
+
+_MISPARSE_MESSAGE = (
+    "`(( … ))` arithmetic containing `<<` is misread as nested subshells; the lines after it would run without validation."
+    " For nested subshells, write `( (`"
+)
+
+
+def _double_paren_misparse(nodes: list[Any]) -> bool:
+    """True when bashlex read a `(( … ))` arithmetic command as two nested subshells with a heredoc.
+
+    bash reads `(( 1<<b ))` as arithmetic, so its `<<` is a left shift. bashlex reads the same
+    text as `( ( 1 <<b ) )`, where `<<b` opens a heredoc whose body swallows the lines that
+    follow: no rule sees them, and bash runs them. The misread tree is a subshell whose inner
+    subshell's `(` starts where the outer `(` ends, with a `<<` redirect of its own inside. A
+    flush `((` is necessary for bash to read arithmetic; a separator there makes two real
+    subshells. bashlex folds a `\\<newline>` splice into the opening reservedword, so `(`,
+    splice, `(` counts as flush, as bash splices it into `((`.
+
+    Only the opening side is checked. bash does not read `#` as a comment inside `(( … ))` and
+    bashlex does, so in `(( 1<<b # ))` bashlex skips that `))` and closes both subshells on a
+    later `) )` the author chose: where bashlex closes them says nothing about where bash does.
+
+    It is checked here, where every tree schlock builds is made, rather than in one caller:
+    substitution bodies are parsed through this too, and a guard that only read the top-level
+    tree missed the same misread one `$( … )` deep. A pre-parse text scan for `((` was tried
+    and bypassed by splices, comments and quotes; the tree carries none of those questions.
+
+    Known over-deny: real subshells written with no space after the first `(` and a heredoc
+    inside, such as `((cat <<E … E) )`. bash runs the heredoc for real there, so the only cost
+    is a refusal; `( (cat <<E … E) )` is allowed.
+    """
+
+    def opener(compound: Any) -> Optional[Any]:
+        kids = getattr(compound, "list", None)
+        if not kids or getattr(kids[0], "kind", None) != "reservedword" or kids[0].word != "(":
+            return None
+        return kids[0]
+
+    # `owns[id(n)]`: does `n` hold a heredoc of its own? Settled once per node, children first
+    # (an iterative post-order, memoised), so the walk is linear. Asking it per compound instead
+    # re-walked each subtree once per level of `((((…` nesting - quadratic, 5 s of CPU at 25 KB.
+    owns: dict[int, bool] = {}
+    compounds: list[Any] = []
+    stack: list[tuple[Any, bool]] = [(node, False) for node in nodes]
+    while stack:
+        node, settled = stack.pop()
+        if id(node) in owns:
+            continue
+        if not settled:
+            stack.append((node, True))
+            stack.extend((child, False) for child in _misparse_children(node) if id(child) not in owns)
+            continue
+        kind = getattr(node, "kind", None)
+        if kind == "compound":
+            compounds.append(node)
+        # A heredoc inside a substitution belongs to that substitution's own command and hides
+        # nothing outside it: `(( 1 + $(cat <<E … E) ))` is ordinary arithmetic. A misparse
+        # inside one is still found, because the walk enters substitutions.
+        owns[id(node)] = (kind == "redirect" and getattr(node, "type", None) in ("<<", "<<-")) or any(
+            owns[id(child)]
+            for child in _misparse_children(node)
+            if getattr(child, "kind", None) not in ("commandsubstitution", "processsubstitution")
+        )
+
+    for node in compounds:
+        outer = opener(node)
+        if outer is None:
+            continue
+        for child in node.list:
+            inner = opener(child) if getattr(child, "kind", None) == "compound" else None
+            if inner is not None and inner.pos[0] == outer.pos[1] and owns[id(child)]:
+                return True
+    return False
+
+
+def _misparse_children(node: Any) -> Iterator[Any]:
+    """The AST nodes directly under ``node``, from every attribute."""
+    for value in vars(node).values():
+        for child in value if isinstance(value, list) else (value,):
+            if hasattr(child, "kind"):
+                yield child
 
 
 # --- Parser tiers: `SCHLOCK_PARSER` switch + fail-closed state machine (spec §6, LAB-409 T5) ---
@@ -1468,9 +1556,11 @@ class BashCommandParser:
 
         Raises:
             ValueError: If command is empty or whitespace-only
-            ParseError: If bashlex fails to parse the command syntax, or a
+            ParseError: If bashlex fails to parse the command syntax, a
                 `{varname}` redirect prefix cannot be read with certainty
-                (see _mark_fd_variables)
+                (see _mark_fd_variables), or bashlex misread a `(( … ))`
+                arithmetic command as subshells hiding a heredoc
+                (see _double_paren_misparse)
             ParseBudgetError: If the parse uses more than PARSE_CPU_BUDGET of CPU
 
         Example:
