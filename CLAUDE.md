@@ -82,10 +82,17 @@
      already delimited and only locates quote pairs and code openers. Bodies are still parsed by
      bashlex. A body it cannot place raises `ParseError`, and a word it cannot read earns no
      literal range. In a word holding a line continuation bashlex's part offsets are shifted, so
-     every code part there is rebuilt from the source and parameter parts are never skip targets.
-     When such a word's quoting cannot be followed after its code parts were dropped (a `"`
-     nested in `${x#"'"}`), recovery raises `ParseError` rather than risk losing one. Recovery
-     shares the parse's CPU budget.
+     every code part there is rebuilt from the source. A `${…}` is never skipped by bashlex's
+     span, which ends at the first `}` even when quoted: `_group_end` finds where bash ends it,
+     following bash's `parse_matched_pair` through quotes, escapes, `$$` and nested `${` groups
+     (LAB-5719). A `'` inside a double-quoted `${…}` is read differently by bash, bash
+     `--posix` and zsh, so the scan computes the end under all three readings and fails closed
+     unless they agree. A `$(…)`/backquote inside is measured by bashlex, which places one past
+     a heredoc body; one it cannot place (a comment or `case` inside, say) fails closed. The scan
+     also fails closed on a `<(`/`>(` in a `${…}` operand, because bash may run it, and on a
+     `$[` or a `$${` inside a group, because shells count those differently. Any word whose
+     quoting the scan cannot follow makes recovery raise `ParseError`, whether or not bashlex's
+     offsets moved. Recovery shares the parse's CPU budget.
      The same bash-first rule applies.
 2. **User Autonomy**: Risk presets let users choose their protection level. Document risks, respect decisions.
 3. **Plugin-First**: Purpose-built for Claude Code. No PyPI hybrid complexity.
