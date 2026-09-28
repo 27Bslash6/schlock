@@ -3,6 +3,7 @@
 Targeted tests to improve coverage on uncovered code paths.
 """
 
+import logging
 import time
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ from schlock.core.substitution import (
     dangerous_sed,
 )
 from schlock.core.validator import load_rules, validate_command
+from schlock.exceptions import QuotedSubstitutionCeilingError
 
 
 @pytest.fixture
@@ -1868,10 +1870,38 @@ class TestQuotedSubstitutionBodies:
         # Nine levels stay under the substitution depth limit, so only the budget can raise.
         parser = BashCommandParser()
         shallow = "echo " + '"$(echo ' * 9 + "x" + ')"' * 9
-        with pytest.raises(ValueError, match="exceed"):
+        with pytest.raises(QuotedSubstitutionCeilingError, match="exceed"):
             parser.extract_quoted_substitution_bodies(shallow, parser.parse(shallow))
         honest = 'echo "$(basename "$(dirname "$(readlink -f "$(which python)")")")"'
         assert validate_command(honest).risk_level == RiskLevel.SAFE
+
+    def test_the_body_budget_denies_without_routing_through_the_catch_all(self, caplog):
+        """Past the budget the deny is purpose-built, not an internal error.
+
+        It used to raise into validate_command's catch-all, which set `error`, emptied
+        `alternatives`, set its message to `Unexpected validation error: ValueError`, and ran
+        `logger.exception(f"... {command!r}")`, writing the whole command and a traceback to
+        the log. The command is benign on purpose: a dangerous body is denied earlier by the
+        substitution check, so the budget would never be what this test exercises.
+        """
+        command = 'echo "$(' * 12 + "echo hi" + ')"' * 12
+        # DEBUG, not ERROR: the property is level-independent. Capturing only ERROR would
+        # pass vacuously if a later edit logged the command at WARNING or below.
+        with caplog.at_level(logging.DEBUG):
+            result = validate_command(command)
+
+        # The fail-closed deny is kept, not relaxed.
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+        assert result.error is None
+        assert "Quoted substitution bodies exceed" in result.message
+        assert result.alternatives
+
+        # caplog.text includes formatted tracebacks. The catch-all logged `{command!r}`, which
+        # differs from the command once it holds a `'` or `\`, so check both spellings.
+        assert command not in caplog.text
+        assert repr(command) not in caplog.text
 
 
 class TestGroupedAndRedirectedSubstitutions:

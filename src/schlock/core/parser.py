@@ -29,7 +29,7 @@ import bashlex.subst
 
 from schlock.core.ast_view import UnmappedNodeError
 from schlock.core.native_bridge import NativeBridge, NativeBridgeError
-from schlock.exceptions import ParseBudgetError, ParseError
+from schlock.exceptions import ParseBudgetError, ParseError, QuotedSubstitutionCeilingError
 
 logger = logging.getLogger(__name__)
 
@@ -2118,9 +2118,10 @@ class BashCommandParser:
         body and never a missed payload.
 
         Raises:
-            ValueError: past _MAX_BODY_TEXT_FACTOR times the command's length in
-                body text. Nested bodies are scanned once per enclosing body, and
-                a hook that outlives its timeout fails open (fail closed).
+            QuotedSubstitutionCeilingError: past _MAX_BODY_TEXT_FACTOR times the
+                command's length in body text. Nested bodies are scanned once per
+                enclosing body, and a hook that outlives its timeout fails open (fail
+                closed).
         """
         bodies: list[CommandSegment] = []
         whole_until = -1  # end of the last multi-line word, already one body
@@ -2162,7 +2163,9 @@ class BashCommandParser:
             for start, end, literals, heredocs in spans:
                 budget -= end - start
                 if budget < 0:
-                    raise ValueError(f"Quoted substitution bodies exceed {_MAX_BODY_TEXT_FACTOR}x the command's length")
+                    raise QuotedSubstitutionCeilingError(
+                        f"Quoted substitution bodies exceed {_MAX_BODY_TEXT_FACTOR}x the command's length"
+                    )
                 bodies.append(
                     CommandSegment(
                         text=command[start:end],

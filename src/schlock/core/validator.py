@@ -16,7 +16,7 @@ from typing import Any, NamedTuple, Optional
 import yaml
 
 from schlock.core.native_bridge import MAX_COMMAND_SIZE
-from schlock.exceptions import ConfigurationError, ParseError
+from schlock.exceptions import ConfigurationError, ParseError, QuotedSubstitutionCeilingError
 from schlock.integrations.shellcheck import (
     get_security_findings,
     is_shellcheck_available,
@@ -3148,7 +3148,21 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
             # word list is in no segment, and a body only ever raises the verdict those
             # checks reached, never takes part in reaching it. No whitelist: a body can be
             # a whole list, and whitelist patterns are prefix matches.
-            for body in parser.extract_quoted_substitution_bodies(command, ast):
+            try:
+                bodies = parser.extract_quoted_substitution_bodies(command, ast)
+            except QuotedSubstitutionCeilingError as e:
+                # Fail closed INLINE, like MAX_SHELL_DELEGATION_DEPTH and _over_size_ceiling. The
+                # catch-all would deny as an internal error, with no alternative, and log the
+                # command with its traceback.
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=str(e),
+                    alternatives=['Assign each nested "$(...)" to a variable first instead of nesting quoted substitutions'],
+                    exit_code=1,
+                    error=None,
+                )
+            for body in bodies:
                 body_match = engine.match_command(
                     body.text,
                     string_literals=body.string_literals,
