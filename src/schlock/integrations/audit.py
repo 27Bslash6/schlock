@@ -13,7 +13,8 @@ Log Format (JSONL):
     Each line is a JSON object with:
     - timestamp: ISO 8601 UTC timestamp
     - event_type: "validation" | "block" | "allow" | "warn"
-    - command: The bash command that was validated (secrets redacted)
+    - command: The bash command that was validated (secrets redacted, size-capped)
+    - command_truncated: true when the cap cut the command (false = logged in full)
     - risk_level: Risk level (SAFE, LOW, MEDIUM, HIGH, BLOCKED)
     - violations: List of rule violations (if any)
     - decision: "allow" | "block" | "warn"
@@ -22,8 +23,9 @@ Log Format (JSONL):
 
 Security:
     Secrets (passwords, tokens, API keys) are automatically redacted before logging.
-    Patterns like password=secret, --token VALUE, Authorization: Bearer TOKEN are scrubbed,
-    as are HTTP credentials in curl -u/--user user:pass and URL userinfo (scheme://user:pass@host).
+    Patterns like password=secret, "password": "secret" JSON fields, --token VALUE and
+    Authorization: <scheme> CREDENTIAL are scrubbed, as are HTTP credentials in curl -u/--user user:pass
+    and URL userinfo (scheme://user:pass@host).
 
 Thread Safety:
     File writes are atomic (append mode with single write call).
@@ -48,6 +50,24 @@ from pathlib import Path
 from typing import Any, Optional
 
 from platformdirs import user_data_dir
+
+from schlock.integrations.commit_filter import MAX_COMMAND_SIZE
+
+# How many of the command's own bytes an entry logs, redacted - a marker longer than the secret it replaced
+# makes the entry longer. Entries the commit filter judged keep the whole command up to the filter's own
+# bound (MAX_COMMAND_SIZE, 64 KiB) so the log shows what the filter saw - a `git commit -F - <<'EOF'` body
+# lives past byte 500 and is the very part that after-the-fact analysis needs. Everything else keeps this.
+COMMAND_LOG_LIMIT = 500
+
+# Key names that mark the following value as a secret, shared by the key=value and JSON-field scrub rules.
+_CREDENTIAL_KEY_NAMES = r"(?:password|passwd|pwd|token|secret|api[-_]?key)"
+
+# One character of a value the Authorization and JSON-field rules redact: never whitespace, a shell operator
+# (; | & < > ( )), a backtick or the `$` of `$(`, even escaped. Whitespace and operators split shell words only
+# outside quotes, and a regex cannot tell whether a `"` opens a string or closes one; quotes themselves never split
+# a word. So a run of these stays inside the one word it starts in however the quotes pair up, and redacting it
+# cannot hide a chained command - `echo "a"token": "; rm -rf ~; echo "b"` reads as a JSON field to a regex.
+_WORD_CHAR = r"""(?:\\[^\s;|&<>()`$]|\$(?!\()|[^\s'"\\;|&<>()`$])"""
 
 
 def get_null_device() -> str:
@@ -81,6 +101,7 @@ class AuditEvent:
     decision: str  # "allow", "block", "warn"
     context: dict[str, Any]
     execution_time_ms: Optional[float] = None
+    command_truncated: bool = False
 
     def to_json(self) -> str:
         """Serialize to JSON string."""
@@ -106,10 +127,30 @@ class AuditLogger:
 
     # Secret patterns to redact (compiled once for performance)
     SECRET_PATTERNS = [
+        # Authorization: <scheme> <credential>, bare or quoted: -H "Authorization: Bearer x", Authorization:"Bearer x".
+        # The credential is a _WORD_CHAR run, so it crosses adjacent quote segments - `'Authorization: Basic '"$S"`
+        # is one shell word - and the quotes that open and close it stay in the log. Runs before the token=/secret=
+        # rule, whose \S+ would eat a closing quote. Each piece starts on a different character, so the scan is
+        # linear. ponytail: a quoted value holding a space (Digest's response=, AWS4's Signature=) keeps what follows
+        # its first space; telling a quoted space from a word break takes a shell tokenizer, not another regex.
+        (
+            re.compile(rf"""(Authorization:[ \t]*["']?[\w-]+[ \t]+["']*){_WORD_CHAR}(?:["']*{_WORD_CHAR})*""", re.I),
+            r"\1***REDACTED***",
+        ),
+        # "password": "VALUE", "authToken":"VALUE" - a JSON field whose key name contains a key=value key word
+        # anywhere: single-quoted request bodies and JSON written through a heredoc (JSON escaped inside a
+        # double-quoted shell string waits for the tokenizer). Runs before the key=value rule, whose \S+ would eat
+        # the closing quote. The value is a _WORD_CHAR run that must reach its closing quote, so a value holding a
+        # space, an operator or a substitution is left whole: in `grep '"token": "' f; rm -rf ~/w; echo "x"` the next
+        # `"` belongs to a later shell word. The key word is found by a lookahead: Python does not backtrack into
+        # one, whereas [\w.-]* on both sides of the key word re-scans the key once per repeat and goes quadratic on
+        # a long run of repeated key words.
+        (
+            re.compile(rf"""("(?=[\w.-]*{_CREDENTIAL_KEY_NAMES})[\w.-]+"[ \t]*:[ \t]*"){_WORD_CHAR}*(?=")""", re.I),
+            r"\1***REDACTED***",
+        ),
         # password=VALUE, token=VALUE, api-key=VALUE, secret=VALUE
-        (re.compile(r"(password|passwd|pwd|token|secret|api[-_]?key)=\S+", re.I), r"\1=***REDACTED***"),
-        # Authorization: Bearer TOKEN
-        (re.compile(r"(Authorization:\s*Bearer\s+)\S+", re.I), r"\1***REDACTED***"),
+        (re.compile(rf"({_CREDENTIAL_KEY_NAMES})=\S+", re.I), r"\1=***REDACTED***"),
         # --password VALUE, --token VALUE, --api-key VALUE
         (re.compile(r"(--(password|passwd|token|secret|api[-_]?key)\s+)\S+", re.I), r"\1***REDACTED***"),
         # -p PASSWORD (but not -p in other contexts like docker -p for ports)
@@ -144,11 +185,16 @@ class AuditLogger:
         self.log_file = log_file
         self._ensure_log_directory()
 
-    def _scrub_secrets(self, command: str) -> str:
+    def _scrub_secrets(self, command: str, cut: Optional[int] = None) -> str:
         """Redact secrets from command before logging.
 
         Args:
             command: Original command string
+            cut: Return only the redacted form of the command's first `cut` characters (default: all).
+                Every rule still sees the whole command, because a rule anchored AFTER its secret - URL
+                userinfo ends at `@` - cannot see a secret the cut has split from its anchor. The cut is
+                carried through each pass rather than taken on the result: a marker outgrows a short
+                secret, so enough of them would push a chained command inside the window out of the log.
 
         Returns:
             Command with secrets redacted as ***REDACTED***
@@ -159,8 +205,30 @@ class AuditLogger:
         """
         scrubbed = command
         for pattern, replacement in self.SECRET_PATTERNS:
+            if cut is not None:
+                cut = self._follow_cut(pattern, replacement, scrubbed, cut)
             scrubbed = pattern.sub(replacement, scrubbed)
-        return scrubbed
+        return scrubbed if cut is None else scrubbed[:cut]
+
+    @staticmethod
+    def _follow_cut(pattern: re.Pattern[str], replacement: str, text: str, cut: int) -> int:
+        """Where `cut` lands in `text` once `pattern.sub(replacement, text)` has run.
+
+        It moves by the growth of every replacement before it, and stops at the first match that ends past it.
+        A cut before that match, or inside text its replacement copies unchanged (a header name, a JSON key,
+        whitespace - unbounded runs), maps one to one; a cut inside the redacted part moves past the whole
+        replacement, so a split secret is logged as its whole marker.
+        """
+        growth = 0
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            replaced = match.expand(replacement)
+            if end > cut:
+                if cut - start <= len(os.path.commonprefix([match.group(), replaced])):
+                    return cut + growth
+                return start + growth + len(replaced)
+            growth += len(replaced) - (end - start)
+        return cut + growth
 
     def _get_default_log_path(self) -> Path:
         """Get default audit log path.
@@ -226,16 +294,20 @@ class AuditLogger:
         decision: str,
         execution_time_ms: Optional[float] = None,
         context: Optional[AuditContext] = None,
+        *,
+        is_git_commit: bool = False,
     ):
         """Log a command validation event.
 
         Args:
-            command: The bash command that was validated (will be scrubbed)
+            command: The bash command that was validated (its first bytes, up to the cap, are logged redacted)
             risk_level: Risk level (SAFE, LOW, MEDIUM, HIGH, BLOCKED)
             violations: List of rule violations
             decision: "allow", "block", or "warn"
             execution_time_ms: Validation duration in milliseconds
             context: Optional context metadata
+            is_git_commit: True when the command was recognized as a `git commit`; selects the
+                MAX_COMMAND_SIZE cap instead of COMMAND_LOG_LIMIT.
         """
         if context is None:
             context = AuditContext()
@@ -244,8 +316,24 @@ class AuditLogger:
         event_type_map = {"allow": "allow", "block": "block", "warn": "warn"}
         event_type = event_type_map.get(decision, "validation")
 
-        # Scrub secrets before logging
-        scrubbed_command = self._scrub_secrets(command)
+        # The cap picks the COMMAND's first bytes and the entry is their redacted form (see _scrub_secrets), so
+        # it runs past the cap by the markers' growth - a few times the cap at the adversarial worst. The scrub
+        # reads the whole command; it is linear, and a command is model output, so the model's output budget
+        # bounds it. Both caps bound BYTES, which is what a log line costs and what MAX_COMMAND_SIZE is named
+        # for - a 40k-character CJK command is 120 KB, near twice the 64 KiB budget, and a character count let
+        # all of it through; the cut backs off to a code-point boundary. "surrogatepass" is load-bearing, not
+        # tidiness: these lines sit OUTSIDE log_event's suppress, so a lone surrogate under a plain encode or
+        # decode would raise out of a hook that must fail open.
+        cap = MAX_COMMAND_SIZE if is_git_commit else COMMAND_LOG_LIMIT
+        encoded = command.encode("utf-8", "surrogatepass")
+        command_truncated = len(encoded) > cap
+        cut = None
+        if command_truncated:
+            boundary = cap
+            while encoded[boundary] & 0xC0 == 0x80:  # a UTF-8 continuation byte: the cap is inside a code point
+                boundary -= 1
+            cut = len(encoded[:boundary].decode("utf-8", "surrogatepass"))
+        scrubbed_command = self._scrub_secrets(command, cut)
 
         event = AuditEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -261,6 +349,7 @@ class AuditLogger:
                 "environment": context.environment,
             },
             execution_time_ms=execution_time_ms,
+            command_truncated=command_truncated,
         )
 
         self.log_event(event)
