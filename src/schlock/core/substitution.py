@@ -623,22 +623,38 @@ def git_config_exec_payload(args: list[str]) -> str | None:
     return None
 
 
-# find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir) or delete files (-delete).
-_DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
+# find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir), delete files (-delete), or
+# write a file the caller names (-fprint/-fprint0/-fprintf/-fls; -fprintf also sets the content).
+_DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"})
 
 
 def dangerous_find(args: list[str]) -> str | None:
-    """Return a reason if a find arg list runs commands or deletes files, else None.
+    """Return a reason if a find arg list runs commands, deletes files or writes files, else None.
 
-    Used by the SubstitutionValidator, which is conservative: ANY -exec*/-ok*/-delete inside a
-    substitution is dangerous regardless of the command run. (Top-level find stays command-aware
-    via the find_exec_dangerous / recursive_delete YAML rules, so read-only `find -exec grep` is
-    still allowed there.) Order-independent and indifferent to a leading "find" token. See #97.
+    Used by the SubstitutionValidator, which is conservative: ANY -exec*/-ok*/-delete, and ANY
+    file-writing -fprint/-fprint0/-fprintf/-fls, inside a substitution is dangerous regardless of
+    the command run or the file written. (Top-level find stays command- and target-aware via the
+    find_exec_dangerous / recursive_delete / write_via_arg_persistence YAML rules, so read-only
+    `find -exec grep` and `find -fprint files.txt` are still allowed there.) Order-independent and
+    indifferent to a leading "find" token. See #97.
+
+    An arg that the shell may still expand is not emulated. One that holds a `-` together with a
+    brace, `$` or backtick is denied outright, which covers a flag whose `-` is written literally
+    in the source, however the rest of it is split up. A value the shell supplies only at run
+    time is outside what this check can see. `find {src,lib}` and `find dir{1..3}` stay allowed.
+    The cost is real: an ordinary expanded path or pattern that holds a `-`, such as
+    `"$HOME/.config/my-app"`, is denied here too.
     """
     for arg in args:
         if arg in _DANGEROUS_FIND_FLAGS:
             return f"find {arg} executes commands or modifies files"
+        if "-" in arg and _FIND_EXPANSION_CHARS.search(arg):
+            return f"find argument {arg!r} may expand to a flag that executes commands or modifies files"
     return None
+
+
+# Characters that let bash turn a find arg into a different word before find sees it.
+_FIND_EXPANSION_CHARS = re.compile(r"[{$`]")
 
 
 # awk constructs that execute commands or write files from inside the program text. Blunt regex
@@ -1887,9 +1903,10 @@ class SubstitutionValidator:
                 if git_reason:
                     return True, git_reason
 
-            # find (-exec*/-ok*/-delete) and kubectl (state-modifying subcommands) via shared
-            # helpers. dangerous_kubectl is reused at the top level (HIGH); top-level find stays
-            # command-aware via the find_exec_dangerous / recursive_delete YAML rules. See #97.
+            # find (-exec*/-ok*/-delete/-fprint*/-fls) and kubectl (state-modifying subcommands) via
+            # shared helpers. dangerous_kubectl is reused at the top level (HIGH); top-level find stays
+            # command- and target-aware via the find_exec_dangerous / recursive_delete /
+            # write_via_arg_persistence YAML rules. See #97.
             if base_command == "find" and args:
                 find_reason = dangerous_find(args)
                 if find_reason:

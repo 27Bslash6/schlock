@@ -20,6 +20,7 @@ from schlock.core.substitution import (
     SubstitutionValidationResult,
     SubstitutionValidator,
     dangerous_awk,
+    dangerous_find,
     dangerous_sed,
 )
 from schlock.core.validator import load_rules, validate_command
@@ -271,29 +272,80 @@ class TestDangerousInnerStructure:
             assert not has_danger or reason != ""
 
 
+@pytest.mark.usefixtures("no_shellcheck")
 class TestFindDangerousFlags:
-    """Test find command with dangerous flags."""
+    """find flags that run commands, delete or write files are blunt-blocked inside a substitution."""
 
-    def test_find_exec_blocked(self, validator, parser):
-        """find -exec should be blocked."""
-        ast = parser.parse('echo "$(find . -exec rm {} \\;)"')
-        results = validator.validate_all_substitutions(ast)
-        if results:
-            assert not results[0].allowed
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(find . -exec rm {} \\;)"',
+            'echo "$(find . -name *.tmp -delete)"',
+            "echo $(find . -fprint /tmp/list.txt)",
+            'echo "$(find . -fprint0 out.txt)"',
+            "X=$(find . -fprintf out.txt %p)",
+            "cat <(find . -fls out.txt)",
+            # Brace and ANSI-C spellings: bash hands find a plain flag, bashlex does not.
+            "echo $(find . {-fprint,/tmp/l})",
+            "echo $(find . -fprint{,} /tmp/l)",
+            "echo $(find . -fp{r,r}int /tmp/l)",
+            "echo $(find . $'-fprint' /tmp/l)",
+            "echo $(find . -fp$'r'int /tmp/l)",
+            "echo $(find . -ex{e,e}c id \\;)",
+            "echo $(find . -del{e,e}te)",
+            "echo $(find . -ex{e..e}c id \\;)",
+            "echo $(find . -fprin{s..u} /tmp/l)",
+            "echo $(find . -fprint{0..0} /tmp/l)",
+            # Spellings bash still turns into a flag: a `}` before the comma, escaped or quoted
+            # braces, `${...}` in a list, a signed step and a signed start, parameter expansions
+            # (empty and default-value), and command substitution.
+            "echo $(find . -name {x},-fprint} /tmp/l)",
+            "echo $(find . -name {x\\},-o,-fprint} /tmp/l)",
+            'echo $(find . {-fls,"/tmp/{l"})',
+            "echo $(find . {-fprint,${x}} /tmp/l)",
+            "echo $(find . -maxdepth 0 -ex{e..e..+1}c echo \\;)",
+            "echo $(find . -fprint{+0..0} /tmp/l)",
+            "echo $(find . -fprint${x} /tmp/l)",
+            "echo $(find . -fp${x:-r}int /tmp/l)",
+            "echo $(find . -del${x}ete)",
+            "echo $(find . -ex`echo e`c id \\;)",
+        ],
+    )
+    def test_dangerous_flag_in_substitution_blocked(self, command):
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
-    def test_find_delete_blocked(self, validator, parser):
-        """find -delete should be blocked."""
-        ast = parser.parse('echo "$(find . -name *.tmp -delete)"')
-        results = validator.validate_all_substitutions(ast)
-        if results:
-            assert not results[0].allowed
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "$(find . -name *.py)"',
+            "echo $(find . -name '*.py' -print0)",
+            "echo $(find {src,lib} -name x)",
+            "echo $(find . -name '*.{py,js}')",
+            "echo $(find dir{1..3} -name x)",
+        ],
+    )
+    def test_read_only_find_in_substitution_allowed(self, command):
+        assert validate_command(command).allowed is True
 
-    def test_find_name_only_allowed(self, validator, parser):
-        """find without dangerous flags is allowed."""
-        ast = parser.parse('echo "$(find . -name *.py)"')
-        results = validator.validate_all_substitutions(ast)
-        if results:
-            assert results[0].allowed
+    @pytest.mark.parametrize("flag", ["-fprint", "-fprint0", "-fprintf", "-fls"])
+    def test_helper_flags_write_flag(self, flag):
+        assert dangerous_find([".", flag, "out.txt"]) is not None
+
+    def test_helper_leaves_exec_placeholder_literal(self):
+        # `{}` holds no `-`: find's placeholder expands to nothing bash could turn into a flag.
+        assert dangerous_find(["-name", "{}", "-print"]) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(find . -name '*-{a,b}')",
+            'x=$(find "$HOME/.config/my-app" -name "*.json")',
+        ],
+    )
+    def test_expandable_arg_with_a_dash_over_blocks_by_design(self, command):
+        # The check does not emulate the shell: these read nothing but are denied. At top level
+        # the target-aware rule applies instead, so the denied command can be rerun there.
+        assert validate_command(command).risk_level == RiskLevel.BLOCKED
 
 
 class TestGitConfigBypass:

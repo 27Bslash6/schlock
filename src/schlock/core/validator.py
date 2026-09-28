@@ -741,7 +741,8 @@ def _check_contextual_high_risk(
     NOTE: find is deliberately NOT handled here. The substitution path blocks *any* `find -exec`
     (conservative), but at the top level read-only `find -exec grep/cat/...` is legitimate, so
     top-level find stays command-aware via the `find_exec_dangerous` / `recursive_delete` YAML
-    rules (extended to cover -execdir/-ok/-okdir). See #97.
+    rules (extended to cover -execdir/-ok/-okdir), and target-aware for its file-writing flags
+    (-fprint/-fprint0/-fprintf/-fls) via `write_via_arg_persistence`. See #97.
     """
     from schlock.core.substitution import dangerous_kubectl  # noqa: PLC0415
 
