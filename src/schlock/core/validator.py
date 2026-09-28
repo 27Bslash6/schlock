@@ -480,6 +480,18 @@ _DASH_C_PROGRAM_COMMANDS: frozenset[str] = SHELL_COMMANDS | _DASH_C_RUNNERS
 # not a hot path. Exceeding it fails closed. Pinned by test_depth_cap_fails_closed.
 MAX_SHELL_DELEGATION_DEPTH = 4
 
+# Heredoc body text one top-level command may re-validate as a shell program, all levels
+# together. Unlike a `-c` payload, a heredoc nests without any quoting to collapse, so each
+# level re-validates nearly all the text below it and the depth cap alone lets a 64 KiB input
+# cost five validations of itself. Every body is charged, but only a nested one (found at
+# depth > 0) is refused for want of budget: first-level bodies lie inside the command, so they
+# are bounded by it already, and refusing one because an earlier sibling's nested bodies spent
+# the budget would deny a body that nests nothing. A nested body past the budget fails closed
+# rather than spend another full pass. Shared across re-entries and reset per command, like the
+# parse budget; the list is the box.
+MAX_HEREDOC_REVALIDATION = MAX_COMMAND_SIZE
+_heredoc_revalidation_left = [MAX_HEREDOC_REVALIDATION]
+
 # Ceiling on strings schlock DERIVES from an admitted command and re-validates: the heredoc
 # rewrite (_neuter_heredocs) and its segments, and delegated payloads. The rewrite inflates —
 # each heredoc gains the 15-char placeholder twice plus a blank body line — measured at worst
@@ -2026,6 +2038,16 @@ class _BashlexHeredoc(NamedTuple):
     in_substitution: bool
 
 
+class _HeredocBody(NamedTuple):
+    """One heredoc body as `_normalise_heredoc_delimiters` read it; offsets are in the ORIGINAL command."""
+
+    opener: int  # where its `<<` sits
+    start: int
+    end: int  # the newline before the terminator
+    quoted: bool
+    strips_tabs: bool  # `<<-`
+
+
 def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHeredoc]:
     """Every heredoc bashlex reads, anywhere in the tree.
 
@@ -2089,16 +2111,94 @@ def _phantom_heredoc(heredocs: list[_BashlexHeredoc], opener_starts: frozenset[i
     return None
 
 
-def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], heredocs: list[_BashlexHeredoc]) -> list[str]:
-    """The real text of every blanked heredoc body that may be executed as code.
+_HEREDOC_BACKSLASH_RE = re.compile(r"\\([\\$`])")
 
-    `bash <<'EOF'` hands its body to bash as a program, which is the same relationship
+
+def _heredoc_program(body: str, quoted: bool, strips_tabs: bool) -> str:
+    """The program a shell consumer reads from a heredoc ``body``, as bash hands it over.
+
+    Validating the text as written is not enough, because bash rewrites it twice before
+    the consumer reads a byte, and the consumer then parses the RESULT:
+
+    - The heredoc reader reads it line by line (`_body_line`): in an unquoted body an odd
+      run of trailing backslashes joins the next line, and under `<<-` each line it reads
+      then loses its leading tabs. So `<<-'EOF'` over a tab-indented `r\\` / `m -rf /`
+      pair hands the shell `r\\` + newline + `m -rf /`, which it joins into `rm`; with
+      the tabs left on, the join yields `r`, a tab and `m`, two harmless words.
+    - An unquoted body is then expanded, and there a backslash quotes only `\\`, `$` and
+      `` ` ``. An even run is not joined by the reader, but expansion halves it: `r\\\\`
+      + newline + `m -rf /` reaches the shell as `r\\` + newline + `m -rf /` - `rm` again.
+
+    Only backslashes are expanded: parameter and command expansion are not performed. A
+    `$( … )` left in the text is then validated as code, which is the fail-closed direction.
+    One left-to-right pass is exact - each pair is consumed once, as bash consumes it.
+    """
+    lines = body.split("\n")
+    read: list[str] = []
+    index = 0
+    while index < len(lines):
+        line, physical = _body_line(lines, index, quoted)
+        index += len(physical)
+        read.append(line.lstrip("\t") if strips_tabs else line)
+    program = "\n".join(read)
+    return program if quoted else _HEREDOC_BACKSLASH_RE.sub(r"\1", program)
+
+
+_HEREDOC_BODY_MESSAGE = "Heredoc body run as a shell program: "
+
+
+def _delegated_payload_message(payload: str, inner: ValidationResult, is_heredoc_body: bool) -> str:
+    """The message for a payload that out-scored its command in Step 5c.
+
+    A heredoc body is not echoed. It is a whole script - up to `MAX_COMMAND_SIZE` of it -
+    and the inner verdict's own message can quote it: a parse failure quotes the text it
+    could not read, and a `-c` payload inside the body is echoed by the branch below. So
+    the detail is the inner rule names, or a nested body's own echo-free message, or -
+    when neither exists - the inner message, which then comes from a fixed refusal.
+    """
+    if not is_heredoc_body:
+        return f"Shell-delegated payload {payload!r}: {inner.message}"
+    if inner.error is not None:
+        detail = "it could not be validated as bash"
+    elif inner.message.startswith(_HEREDOC_BODY_MESSAGE):
+        detail = inner.message[len(_HEREDOC_BODY_MESSAGE) :]
+    elif inner.matched_rules:
+        detail = ", ".join(inner.matched_rules)
+    else:
+        detail = inner.message
+    return _HEREDOC_BODY_MESSAGE + detail
+
+
+def _delegated_payload_match(inner: ValidationResult, message: str) -> RuleMatch:
+    """Step 5c's verdict when a delegated payload out-scores its command."""
+    return RuleMatch(
+        matched=True,
+        rule=SecurityRule(
+            name="shell_delegated_payload",
+            description="Argument executed as shell code by the invoking command",
+            risk_level=inner.risk_level,
+            patterns=[],
+            alternatives=inner.alternatives,
+        ),
+        risk_level=inner.risk_level,
+        message=message,
+        alternatives=inner.alternatives,
+    )
+
+
+def _shell_heredoc_bodies(command: str, bodies: list[_HeredocBody], heredocs: list[_BashlexHeredoc]) -> Optional[list[str]]:
+    """The text a shell consumer runs, for every heredoc body that may be executed as code.
+
+    `bash <<EOF` hands its body to bash as a program, which is the same relationship
     `bash -c "…"` has with its argument - so the body is routed to the same
     shell-delegation merge, and inherits its depth cap and worst-verdict-wins rule
-    rather than growing a second one.
+    rather than growing a second one. That holds whether the delimiter is quoted or
+    not. What is validated is the program as the shell receives it (`_heredoc_program`),
+    not the text as written. Read only by the raw-text rules, an unquoted `"rm" -rf /` body
+    scored SAFE: a quoted command name defeats every one of them.
 
-    ``blanked`` is `_normalise_heredoc_delimiters`' own record of what it blanked:
-    ``(opener_start, body_start, body_end)`` in ``command``. Its spans locate the body;
+    ``bodies`` is `_normalise_heredoc_delimiters`' own record of what it read, in
+    ``command``. Its spans locate the body;
     bashlex is consulted only for the CONSUMER, and is looked up by where the opener
     sits. Neither of bashlex's own body offsets can be trusted for this: inside a
     compound statement (`for`/`if`/a function body) it starts the range a line late,
@@ -2109,24 +2209,34 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     it does not see, or a compound's own redirect (`while …; done <<'EOF'`), counts as
     code: validating a body that is data costs a false positive, trusting one that is a
     program costs the control.
+
+    Returns None when bashlex reads a heredoc that may be code and the scan placed no body
+    for it - the scan refused the command (`<<\\` + newline, an opener on a line that opens
+    a multi-line quote) and recorded nothing, while bashlex parsed it anyway. That body is a
+    program nothing would read, so the caller denies rather than validate the rest.
     """
+    read = {body.opener for body in bodies}
+    if any((h.owner is None or h.owner in SHELL_COMMANDS) and h.opener not in read for h in heredocs):
+        return None
     owners = {heredoc.opener: heredoc.owner for heredoc in heredocs}
-    bodies: list[str] = []
-    for opener_start, body_start, body_end in blanked:
-        owner = owners.get(opener_start)
+    programs: list[str] = []
+    for body in bodies:
+        owner = owners.get(body.opener)
         if owner is not None and owner not in SHELL_COMMANDS:
             continue
-        if command[body_start:body_end].strip():
-            bodies.append(command[body_start:body_end])
-    return bodies
+        program = _heredoc_program(command[body.start : body.end], body.quoted, body.strips_tabs)
+        if program.strip():
+            programs.append(program)
+    return programs
 
 
 class _Normalised(NamedTuple):
     """What `_normalise_heredoc_delimiters` hands back, beyond the rewritten text."""
 
     text: str
-    # (opener_start, body_start, body_end) in the ORIGINAL command, one per body blanked.
-    blanked: list[tuple[int, int, int]]
+    # One per body read. Only the quoted ones are blanked in `text`; every one is located for
+    # `_shell_heredoc_bodies`.
+    bodies: list[_HeredocBody]
     # Where each `<<` the scan found sits, quoted or not (see `_phantom_heredoc`).
     opener_starts: frozenset[int]
 
@@ -2202,8 +2312,8 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
 
     Only opener lines are scanned: a `<<` inside a body is data, not a heredoc.
 
-    Returns a `_Normalised`: the text, the body spans it blanked, and where each opener
-    it found sits. When it cannot read the command - a delimiter with no bare spelling,
+    Returns a `_Normalised`: the text, every body span it read (quoted or not), and where
+    each opener it found sits. When it cannot read the command - a delimiter with no bare spelling,
     a body with no terminator, an opener on a continued line, a frame still open at the
     end - it returns the command unchanged and records nothing. Those keep exactly the
     route they had: bashlex rejects them and the fallback decides, failing closed where
@@ -2222,7 +2332,7 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
     at = 0  # where lines[index] starts in command
     index = 0
     changed = False
-    blanked: list[tuple[int, int, int]] = []  # (opener_start, body_start, body_end) in command
+    bodies: list[_HeredocBody] = []
     opener_starts: set[int] = set()
 
     try:
@@ -2252,10 +2362,9 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
                     index += len(physical)
                     if _is_terminator(body, delimiter, strips_tabs):
                         out.extend(physical)  # terminator stays verbatim
-                        if quoted:
-                            # The body runs up to the newline before the terminator; an
-                            # empty one slices to "" and is never delegated.
-                            blanked.append((line_start + start, body_start, line_at - 1))
+                        # The body runs up to the newline before the terminator; an empty
+                        # one slices to "" and is never delegated.
+                        bodies.append(_HeredocBody(line_start + start, body_start, line_at - 1, quoted, strips_tabs))
                         break
                     out.extend(_blank_body_line(part) if quoted else part for part in physical)
                 else:
@@ -2274,7 +2383,7 @@ def _normalise_heredoc_delimiters(command: str) -> _Normalised:
         # rewrite is an optimisation of the parse, never a decision about safety.
         return _Normalised(command, [], frozenset())
 
-    return _Normalised("\n".join(out) if changed else command, blanked, frozenset(opener_starts))
+    return _Normalised("\n".join(out) if changed else command, bodies, frozenset(opener_starts))
 
 
 def _neuter_heredocs(command: str) -> tuple[str, str]:  # noqa: PLR0912 - one refusal per uncertain body reading
@@ -2705,6 +2814,7 @@ def validate_command(
         # A new command gets a fresh parse budget; re-entries for its payloads and heredoc
         # rewrites share the one it is spending (LAB-5659).
         reset_parse_budget()
+        _heredoc_revalidation_left[0] = MAX_HEREDOC_REVALIDATION
     deferred: list[SubstitutionValidationResult] = []
     result = _validate_command(
         command, config_path, _depth=_depth, _deferred=deferred, _shellcheck=_shellcheck, _derived=_derived
@@ -3217,21 +3327,39 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
         # outlives its timeout fails OPEN. Identical payloads collapse first, whichever spelling
         # surfaced them.
         #
-        # A shell heredoc's body is delegated code too - `bash <<'EOF'` is `bash -c` with the
-        # program on stdin - and it is blanked in `parse_target` so the outer parse cannot
-        # misread it, so this is where its real text is validated (LAB-3094). It re-enters
-        # exactly as a here-string does, so it counts against the same ceiling.
+        # A shell heredoc's body is delegated code too - `bash <<EOF` is `bash -c` with the
+        # program on stdin - quoted delimiter or not. Bashlex keeps either body as text, and
+        # a quoted one is blanked in `parse_target`, so this is where the program is validated
+        # (LAB-3094). It re-enters exactly as a here-string does, so it counts against the same
+        # ceiling. A heredoc nested in the body re-enters one level deeper; MAX_HEREDOC_REVALIDATION
+        # bounds the total text those re-entries validate, and the depth cap how deep they go.
         payloads: list[str] = []
+        heredoc_bodies: set[str] = set()
         if match.risk_level < RiskLevel.BLOCKED:
+            programs = _shell_heredoc_bodies(command, normalised.bodies, bashlex_heredocs)
+            if programs is None:
+                unread = ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message="its body could not be located, so it was not validated",
+                    alternatives=["Use a plain-word heredoc delimiter (<<'EOF') on a line of its own"],
+                    exit_code=1,
+                    error=None,
+                )
+                match = _delegated_payload_match(unread, _HEREDOC_BODY_MESSAGE + unread.message)
+                if all_matched_rules and match.rule:
+                    all_matched_rules.append(match.rule.name)
+                programs = []
+            heredoc_bodies = set(programs)
             # Distinct payloads, as the here-string count already is: 257 copies of one body
             # are one program to validate, not 257.
-            stdin_payloads = list(
-                dict.fromkeys(herestring_payloads + _shell_heredoc_bodies(command, normalised.blanked, bashlex_heredocs))
-            )
+            stdin_payloads = list(dict.fromkeys(herestring_payloads + programs))
             if len(stdin_payloads) > MAX_DELEGATOR_TOKENS:
                 raise ValueError(f"Stdin program re-validation exceeded {MAX_DELEGATOR_TOKENS} distinct payloads")
-            payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
+            if match.risk_level < RiskLevel.BLOCKED:
+                payloads = list(dict.fromkeys(_shell_delegated_payloads(commands_with_args) + stdin_payloads))
         for payload in payloads:
+            is_heredoc_body = payload in heredoc_bodies
             if _depth >= MAX_SHELL_DELEGATION_DEPTH:
                 # Fail closed. Reached by chaining `watch`, not by nesting `bash -c`:
                 # shell quoting collapses before the payload can nest this far.
@@ -3243,22 +3371,21 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     exit_code=1,
                     error=None,
                 )
+            elif is_heredoc_body and _depth > 0 and _heredoc_revalidation_left[0] < len(payload):
+                inner = ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message="Heredoc bodies nest past what can be validated in one command",
+                    alternatives=["Write the inner script to a file and run it"],
+                    exit_code=1,
+                    error=None,
+                )
             else:
+                if is_heredoc_body:
+                    _heredoc_revalidation_left[0] -= len(payload)
                 inner = validate_command(payload, config_path, _depth=_depth + 1)
             if inner.risk_level > match.risk_level:
-                match = RuleMatch(
-                    matched=True,
-                    rule=SecurityRule(
-                        name="shell_delegated_payload",
-                        description="Argument executed as shell code by the invoking command",
-                        risk_level=inner.risk_level,
-                        patterns=[],
-                        alternatives=inner.alternatives,
-                    ),
-                    risk_level=inner.risk_level,
-                    message=f"Shell-delegated payload {payload!r}: {inner.message}",
-                    alternatives=inner.alternatives,
-                )
+                match = _delegated_payload_match(inner, _delegated_payload_message(payload, inner, is_heredoc_body))
                 if all_matched_rules and match.rule:
                     all_matched_rules.append(match.rule.name)
             if match.risk_level == RiskLevel.BLOCKED:

@@ -3557,7 +3557,7 @@ class TestHeredocBoundariesOnTheNativePath:
         command = "for i in 1; do bash <<'EOF'\necho a\n\nrm -rf /\nEOF\ndone"
         normalised = val_module._normalise_heredoc_delimiters(command)
 
-        assert [command[start:end] for _, start, end in normalised.blanked] == ["echo a\n\nrm -rf /"]
+        assert [command[body.start : body.end] for body in normalised.bodies] == ["echo a\n\nrm -rf /"]
 
     @pytest.mark.parametrize(
         "command",
@@ -3599,25 +3599,26 @@ class TestHeredocBoundariesOnTheNativePath:
         ],
     )
     @pytest.mark.skipif(not _native_parser_available(), reason="no vendored schlock-parse binary for this platform")
-    def test_blanked_bodies_are_exactly_the_quoted_ones_bash_reads(self, command):
-        """The spans blanked must equal an independent bash parser's QUOTED heredoc bodies.
+    def test_body_spans_are_exactly_the_ones_bash_reads(self, command):
+        """The body spans, and which are quoted, must equal an independent bash parser's.
 
-        Equality, not a subset: an extra span blanks a body bash expands (a `<< EOF` counted
-        as quoted), a missing one leaves a literal body to be re-read as shell. mvdan/sh
-        marks a heredoc quoted exactly as bash does - by any quote or backslash in the
-        delimiter word. The opener is compared too, since a body's consumer is looked up by
-        where its `<<` sits. ASCII inputs only, since mvdan reports byte offsets.
+        Equality, not a subset: an extra quoted span blanks a body bash expands (a `<< EOF`
+        counted as quoted), a missing one leaves a literal body to be re-read as shell, and a
+        missing unquoted one is a shell's program never validated as code. mvdan/sh marks a
+        heredoc quoted exactly as bash does - by any quote or backslash in the delimiter
+        word. The opener is compared too, since a body's consumer is looked up by where its
+        `<<` sits. ASCII inputs only, since mvdan reports byte offsets.
         """
         ast = json.loads(NativeBridge().parse_json(command))
-        quoted: set[tuple[int, int, int]] = set()
+        spans: set[tuple[int, int, int, bool]] = set()
 
         def walk(node: object) -> None:
             if isinstance(node, dict):
                 if isinstance(node.get("Hdoc"), dict):
                     word = command[node["Word"]["Pos"]["Offset"] : node["Word"]["End"]["Offset"]]
-                    if any(ch in word for ch in "'\"\\"):
-                        terminator_start = command.rfind("\n", 0, node["Hdoc"]["End"]["Offset"]) + 1
-                        quoted.add((node["OpPos"]["Offset"], node["Hdoc"]["Pos"]["Offset"], terminator_start - 1))
+                    terminator_start = command.rfind("\n", 0, node["Hdoc"]["End"]["Offset"]) + 1
+                    quoted = any(ch in word for ch in "'\"\\")
+                    spans.add((node["OpPos"]["Offset"], node["Hdoc"]["Pos"]["Offset"], terminator_start - 1, quoted))
                 for value in node.values():
                     walk(value)
             elif isinstance(node, list):
@@ -3625,7 +3626,8 @@ class TestHeredocBoundariesOnTheNativePath:
                     walk(value)
 
         walk(ast)
-        assert set(val_module._normalise_heredoc_delimiters(command).blanked) == quoted
+        bodies = val_module._normalise_heredoc_delimiters(command).bodies
+        assert {(body.opener, body.start, body.end, body.quoted) for body in bodies} == spans
 
     def test_an_unquoted_opener_is_left_byte_for_byte(self):
         command = "cat << EOF\n$(date)\nEOF"
@@ -4094,7 +4096,7 @@ class TestAnUnquotedBodyIsReadThroughItsBackslashNewlines:
         """
         normalised = val_module._normalise_heredoc_delimiters(command)
 
-        assert [command[start:end] for _, start, end in normalised.blanked] == bodies
+        assert [command[body.start : body.end] for body in normalised.bodies if body.quoted] == bodies
 
     def test_a_placeholder_spelled_across_a_join_fails_closed(self):
         """bashlex joins the kept body's lines too, so this line ends its body at the placeholder."""

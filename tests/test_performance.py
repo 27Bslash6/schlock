@@ -14,6 +14,7 @@ skips it. Run it with `pytest tests/test_performance.py` or `make test`.
 
 import pytest
 
+from schlock.core import validator
 from schlock.core.cache import ValidationCache
 from schlock.core.rules import RuleEngine
 from schlock.core.validator import validate_command
@@ -212,6 +213,40 @@ class TestEndToEndPerformance:
         benchmark(validate_command, cmd, config_path=safety_rules_path)
 
         grade_median(benchmark, 0.01, "Cached validation")
+
+
+@requires_benchmark
+class TestShellHeredocBodyPerformance:
+    """A shell heredoc body is validated twice: as text in its command, then as the program.
+
+    Body shape: `echo step 0` repeated. One distinct command, so the body stays under
+    MAX_DELEGATOR_TOKENS and allowed; and `echo` is the worst line for the raw-text scan,
+    whose `echo[^;|&]*>>` rules backtrack across the whole body. A canary: the budget
+    leaves room over what the change measured, and CI reports the timing without judging it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_shellcheck(self, monkeypatch):
+        # The body re-entry spawns ShellCheck, and a spawn measures the host, not schlock.
+        monkeypatch.setattr(validator, "is_shellcheck_available", lambda: False)
+
+    @pytest.mark.parametrize("opener", ["<<EOF", "<<'EOF'"], ids=["unquoted", "quoted"])
+    def test_shell_heredoc_body(self, benchmark, safety_rules_path, opener):
+        lines, budget_ms = 600, 1_000.0
+        command = f"bash {opener}\n" + "\n".join(["echo step 0"] * lines) + "\nEOF"
+        validate_command("echo warm", config_path=safety_rules_path)
+
+        result = benchmark.pedantic(
+            validate_command,
+            args=(command,),
+            kwargs={"config_path": safety_rules_path},
+            setup=validator._global_cache.clear,
+            rounds=5,
+            iterations=1,
+        )
+
+        assert result.allowed is True, result.message
+        assert_median_under(benchmark, budget_ms, f"bash {opener} with {lines} lines")
 
 
 @requires_benchmark
