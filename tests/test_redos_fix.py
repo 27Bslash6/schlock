@@ -7,17 +7,13 @@ Note: With bounded quantifiers, extremely pathological inputs (1000s of flags) m
 not match patterns - this is acceptable tradeoff for DoS protection.
 """
 
-import os
 import time
 
 import pytest
 
 from schlock.core.rules import RiskLevel
 from schlock.core.validator import validate_command
-
-# Skip timing-sensitive tests in CI - they're inherently flaky
-_IN_CI = os.environ.get("CI", "").lower() == "true" or os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
-skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI environments")
+from tests.conftest import skip_in_ci
 
 
 @skip_in_ci

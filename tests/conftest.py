@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,13 @@ def no_shellcheck(monkeypatch):
     clear_caches()
     yield
     clear_caches()
+
+
+# For wall-clock checks whose budgets were never calibrated on the CI runner: there
+# they would grade the runner, not schlock. test_performance's budgets are
+# calibrated on it, so they grade in CI and do not use this.
+_IN_CI = os.environ.get("CI", "").lower() == "true" or os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+skip_in_ci = pytest.mark.skipif(_IN_CI, reason="Timing tests are flaky in CI environments")
 
 
 @pytest.fixture
