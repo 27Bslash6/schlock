@@ -107,7 +107,7 @@ ShellCheck catches command injection, format string vulnerabilities, and the inf
 2. **Parse**: When Claude calls `Bash()`, schlock parses the command using [bashlex](https://github.com/idank/bashlex) (proper AST, not regex)
 3. **Match**: The parsed command is checked against 40+ security rules
 4. **Decide**: Commands are allowed, warned, or blocked based on risk level
-5. **Log**: Every decision is logged to `~/.config/schlock/audit.jsonl`
+5. **Log**: Every decision is logged to `~/.local/share/schlock/audit-YYYY-MM-DD.jsonl` (Linux; see [Configuration](docs/CONFIGURATION.md#log-location))
 
 **Why AST parsing matters**: Regex-based blockers are trivially bypassed. `rm -rf /` is easy to catch, but what about `r\m -rf /` or `$(echo rm) -rf /`? bashlex parses the actual shell semantics, not string patterns.
 

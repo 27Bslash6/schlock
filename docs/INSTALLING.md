@@ -194,7 +194,7 @@ After installation, verify schlock is working:
 - [ ] `/plugin` shows schlock as enabled
 - [ ] `.claude/hooks/schlock-config.yaml` exists (after wizard)
 - [ ] Test blocked command: Claude should refuse `Bash(rm -rf /)`
-- [ ] Audit log created: `~/.config/schlock/audit.jsonl` exists after command validation
+- [ ] Audit log created: `~/.local/share/schlock/audit-YYYY-MM-DD.jsonl` exists after command validation (Linux)
 - [ ] (If enabled) Advertising blocker works: Try committing with "Generated with Claude Code" in message
 
 ---
@@ -282,7 +282,7 @@ python -m json.tool .claude/settings.json
 **Check audit log:**
 ```bash
 # Should show validation attempts
-cat ~/.config/schlock/audit.jsonl
+cat ~/.local/share/schlock/audit-*.jsonl
 ```
 
 If empty, hook isn't running. File a bug at: https://github.com/27b-io/schlock/issues
@@ -304,7 +304,7 @@ If empty, hook isn't running. File a bug at: https://github.com/27b-io/schlock/i
 
 **What's kept:**
 - Configuration files: `.claude/hooks/schlock-config.yaml`, `~/.config/schlock/config.yaml`
-- Audit logs: `~/.config/schlock/audit.jsonl`
+- Audit logs: `~/.local/share/schlock/audit-*.jsonl` (Linux)
 
 ### Clean Configuration
 
@@ -317,7 +317,7 @@ rm .claude/hooks/schlock-config.yaml.backup.*
 rm ~/.config/schlock/config.yaml
 
 # Remove audit logs (optional)
-rm ~/.config/schlock/audit.jsonl
+rm ~/.local/share/schlock/audit-*.jsonl
 ```
 
 ### Remove Marketplace

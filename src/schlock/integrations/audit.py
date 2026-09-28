@@ -5,9 +5,12 @@ Logs are written in JSONL (JSON Lines) format for easy parsing and analysis.
 
 Log Location:
     Default (daily timestamped files):
-        Unix/Linux/macOS: ~/.local/share/27b.io/schlock/audit-YYYY-MM-DD.jsonl
+        Linux: ~/.local/share/schlock/audit-YYYY-MM-DD.jsonl
+        macOS: ~/Library/Application Support/schlock/audit-YYYY-MM-DD.jsonl
         Windows: %LOCALAPPDATA%/27b.io/schlock/audit-YYYY-MM-DD.jsonl
-    Can be overridden via SCHLOCK_AUDIT_LOG environment variable (single file)
+    Can be overridden by an absolute SCHLOCK_AUDIT_LOG in the `env` block of the user's own
+    ~/.claude/settings.json. The process environment is not consulted (see
+    schlock.core.user_settings), so a shell `export` or a project settings file has no effect.
 
 Log Format (JSONL):
     Each line is a JSON object with:
@@ -32,11 +35,12 @@ Thread Safety:
 Retention:
     Daily timestamped files prevent unbounded growth.
     No automatic cleanup (user responsibility).
-    Cleanup example (Unix): rm ~/.local/share/27b.io/schlock/audit-2024-*.jsonl
+    Cleanup example (Linux): rm ~/.local/share/schlock/audit-2024-*.jsonl
     Cleanup example (Windows): Remove-Item "$env:LOCALAPPDATA/27b.io/schlock/audit-2024-*.jsonl"
 """
 
 import json
+import logging
 import os
 import re
 import sys
@@ -49,6 +53,10 @@ from typing import Any, Optional
 
 from platformdirs import user_data_dir
 
+from schlock.core.user_settings import user_settings_env
+
+logger = logging.getLogger(__name__)
+
 
 def get_null_device() -> str:
     """Get platform-specific null device.
@@ -57,6 +65,22 @@ def get_null_device() -> str:
         "/dev/null" on Unix/Linux/macOS, "NUL" on Windows.
     """
     return "NUL" if sys.platform == "win32" else "/dev/null"
+
+
+def _configured_log_path(value: Any, today: str) -> Optional[Path]:
+    """The log file named by the user's SCHLOCK_AUDIT_LOG value, or None when it is unusable."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    if value == get_null_device() or (sys.platform == "win32" and value.upper() == "NUL"):
+        return Path(value)
+    try:
+        os.fsencode(value)  # a lone surrogate would raise later, inside mkdir or open
+        path = Path(value).expanduser()  # "~unknown-user/..." raises RuntimeError
+    except (RuntimeError, ValueError):
+        return None
+    if not path.is_absolute():
+        return None
+    return path if path.suffix == ".jsonl" else path / f"audit-{today}.jsonl"
 
 
 @dataclass
@@ -169,34 +193,29 @@ class AuditLogger:
             Path to audit log file.
 
         Logic:
-        - If SCHLOCK_AUDIT_LOG is set and ends in .jsonl: use as-is (single file)
-        - If SCHLOCK_AUDIT_LOG is set but is a directory: append timestamped filename
-        - Otherwise: Platform-specific data dir with timestamped filename
+        - SCHLOCK_AUDIT_LOG is read from the `env` block of ~/.claude/settings.json only, never
+          from the process environment (see schlock.core.user_settings).
+        - If the value is the null device: use it (logging disabled)
+        - If the value is not an absolute path after `~` expansion: ignore it. A relative path
+          resolves against the working directory, which is whatever checkout is open.
+        - If the value ends in .jsonl: use as-is (single file)
+        - Any other absolute value: treat as a directory and append a timestamped filename
+        - A missing or unusable value falls back to the platform default, with a warning when
+          a value was present. This runs before the hook's error handling, so it never raises.
 
-        Platform-specific defaults:
-        - Unix/Linux/macOS: ~/.local/share/27b.io/schlock/audit-YYYY-MM-DD.jsonl
+        Platform-specific defaults (platformdirs user_data_dir):
+        - Linux: ~/.local/share/schlock/audit-YYYY-MM-DD.jsonl
+        - macOS: ~/Library/Application Support/schlock/audit-YYYY-MM-DD.jsonl
         - Windows: %LOCALAPPDATA%/27b.io/schlock/audit-YYYY-MM-DD.jsonl
         """
-        env_path = os.environ.get("SCHLOCK_AUDIT_LOG")
-        if env_path:
-            path = Path(env_path).expanduser()
-            # Special case: null device is always a file (platform-specific)
-            null_dev = get_null_device()
-            if str(path) == null_dev or str(path).upper() == "NUL":
-                return path
-            # If it ends in .jsonl, treat as explicit file path
-            if path.suffix == ".jsonl":
-                return path
-            # Otherwise treat as directory and append timestamped filename
-            today = datetime.now().strftime("%Y-%m-%d")
-            return path / f"audit-{today}.jsonl"
-
-        # Default: Platform-specific data directory with timestamped filename
-        # Unix/macOS: ~/.local/share/27b.io/schlock
-        # Windows: %LOCALAPPDATA%\27b.io\schlock
-        data_dir = Path(user_data_dir("schlock", "27b.io"))
         today = datetime.now().strftime("%Y-%m-%d")
-        return data_dir / f"audit-{today}.jsonl"
+        configured = user_settings_env("SCHLOCK_AUDIT_LOG")
+        path = _configured_log_path(configured, today)
+        if path is not None:
+            return path
+        if configured is not None:
+            logger.warning(f"Ignoring SCHLOCK_AUDIT_LOG={configured!r} in user settings; using the default audit log")
+        return Path(user_data_dir("schlock", "27b.io")) / f"audit-{today}.jsonl"
 
     def _ensure_log_directory(self):
         """Create log directory if it doesn't exist."""
