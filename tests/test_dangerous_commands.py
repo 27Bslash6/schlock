@@ -8,6 +8,7 @@ import pytest
 
 from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.validator import validate_command
+from schlock.integrations.shellcheck import is_shellcheck_available
 
 
 class TestDiskDestructionCommands:
@@ -258,48 +259,58 @@ class TestEdgeCasesAndEscapes:
         "command,description,should_block",
         [
             # Heredocs with dangerous content
-            ("cat << EOF\nrm -rf /\nEOF", "Heredoc with rm -rf", False),  # Heredoc content shouldn't execute
-            ("bash << 'EOF'\nrm -rf /\nEOF", "Bash heredoc", True),  # This WILL execute
+            ("cat << EOF\nrm -rf /\nEOF", "Heredoc with rm -rf (inert body)", False),
+            ("bash << EOF\nrm -rf /\nEOF", "Unquoted shell heredoc (body is code)", True),
+            ("bash << 'EOF'\nrm -rf /\nEOF", "Quoted-delimiter shell heredoc (body is code)", True),
             # Command substitution
             ("echo $(rm -rf /)", "Command substitution with rm", True),
             ("echo `rm -rf /`", "Backtick substitution", True),
             ("VAR=$(sudo rm file)", "Variable assignment with sudo", True),
-            # Escaped characters
+            # Escaped characters — bash unescapes both; blocking is correct (migration spec §93,189)
             ("rm\\ -rf\\ /", "Escaped spaces", True),
-            ("r\\m -rf /", "Escaped command chars", False),  # Won't work as rm
+            ("r\\m -rf /", "Escaped command name (bash unescapes to rm)", True),
             # Quoted strings
-            ('echo "rm -rf /"', "Dangerous pattern in string", False),  # Just echoing
+            ('echo "rm -rf /"', "Dangerous pattern in string", False),
             ('echo "Would delete: rm -rf /"', "Description with pattern", False),
-            ('eval "rm -rf /"', "Eval with dangerous string", True),  # Will execute
+            ('eval "rm -rf /"', "Eval with dangerous string", True),
             # Pipes and chains
             ("ls | rm -rf /", "Pipe to dangerous command", True),
             ("echo test && rm -rf /", "Chain with dangerous command", True),
             ("echo test || sudo rm file", "OR chain with sudo", True),
-            # Obfuscation attempts
-            ("rm -rf /", "Empty string insertion", True),
-            ("rm -r$''f /", "Bash empty expansion", True),
-            ("rm -r$(echo f) /", "Command substitution for flag", True),
+            # Obfuscation — ShellCheck escalation is the only guard on these two
+            pytest.param(
+                "rm -r$''f /",
+                "Bash empty expansion",
+                True,
+                marks=pytest.mark.xfail(
+                    not is_shellcheck_available(),
+                    strict=True,
+                    reason="LAB-4381: without shellcheck, bash empty expansion bypasses rule engine",
+                ),
+            ),
+            pytest.param(
+                "rm -r$(echo f) /",
+                "Command substitution for flag",
+                True,
+                marks=pytest.mark.xfail(
+                    not is_shellcheck_available(),
+                    strict=True,
+                    reason="LAB-4381: without shellcheck, cmd-sub flag construction bypasses rule engine",
+                ),
+            ),
         ],
     )
     def test_edge_cases_and_escapes(self, safety_rules_path, command, description, should_block):
-        """Edge cases should be handled correctly."""
+        """Edge cases must fail, not skip, on a safety disagreement."""
         result = validate_command(command, config_path=safety_rules_path)
 
         if should_block:
-            # These SHOULD be blocked
-            if not result.allowed:
-                # Good, it's blocked
-                pass
-            else:
-                # Currently not blocked, mark for rule update
-                pytest.skip(f"Edge case not yet handled: {description}")
-        # These should NOT be blocked (false positives to avoid)
-        elif result.allowed:
-            # Good, it's allowed
-            pass
+            assert not result.allowed, f"Expected blocked but allowed: {description}"
         else:
-            # False positive - might need rule refinement
-            pytest.skip(f"False positive on: {description}")
+            assert result.allowed, f"False positive: {description} (risk={result.risk_level}, msg={result.message})"
+            assert result.risk_level in (RiskLevel.SAFE, RiskLevel.LOW), (
+                f"Allowed but risk too high: {description} (risk={result.risk_level} — HIGH is ask/deny on balanced/paranoid)"
+            )
 
 
 class TestPatternPriority:
