@@ -59,11 +59,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        fetch-depth: 0
+        fetch-depth: 0  # full history: the gitleaks step scans every commit, not just the tip
 
     - name: Set up uv
       uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
@@ -88,16 +87,28 @@ jobs:
       # embedded in a uvx run-string (unlike the SHA-pinned `uses:` actions above).
       run: uvx semgrep@1.165.0 scan --config p/security-audit --config p/python
 
-    - name: gitleaks
-      # v3.0.0 hard-exits 1 on any event outside push/pull_request/
-      # workflow_dispatch/schedule, so on a merge_group run it fails `security`
-      # and the queue ejects every pull request. Skipped rather than version-
-      # bumped: the action still does not accept the event upstream. Nothing is
-      # lost - this same commit's content was already scanned on the pull
-      # request, and main is scanned on push.
-      if: github.event_name != 'merge_group'
-      uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+    - name: Install gitleaks
+      # The MIT-licensed CLI, pinned and checksum-verified. It needs no license key and accepts
+      # every event, so fork and Dependabot pull requests and merge queue runs scan like push.
+      # To bump: take the sha256 from the release's gitleaks_<version>_checksums.txt.
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Required on organization-owned repositories; the action exits 1 without it.
-        GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        VERSION: 8.30.1
+        SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      run: |
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+        echo "${SHA256}  gitleaks.tar.gz" | sha256sum -c -
+        tar -xzf gitleaks.tar.gz gitleaks
+        install -D -m 0755 gitleaks "$RUNNER_TEMP/bin/gitleaks"
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+    - name: gitleaks
+      # Every commit reachable from HEAD, with the rules in .gitleaks.toml. --redact keeps
+      # secret values out of the log; --verbose still names the rule, file and commit.
+      # The canary first: a config that loads no rules would report every scan clean.
+      run: |
+        if printf 'ghp_%s%s\n' Ab3dE6gH9jK2mN5pQ8 sT1vW4yZ7bC0eF3hJ6 | gitleaks stdin --redact --no-banner --log-level error; then
+          echo "::error::gitleaks missed its canary token, so .gitleaks.toml loaded no rules (check its [extend] block)"
+          exit 1
+        fi
+        gitleaks git --redact --verbose --log-opts=HEAD
