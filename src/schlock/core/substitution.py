@@ -516,13 +516,120 @@ _DANGEROUS_GIT_CONFIGS = frozenset(
 )
 
 
+# git global options whose value is the NEXT word, so the exec-path walk below must step over it
+# rather than read it as the subcommand (`git -C --exec-path=x status` is a directory named that).
+_GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+        "--super-prefix",
+        "--attr-source",
+        "--shallow-file",
+    }
+)
+
+GIT_EXEC_PATH_REASON = "git --exec-path=DIR runs git's subcommands and helpers from DIR"
+
+
+def _git_exec_path_override(args: list[str]) -> str | None:
+    """Return a reason if a git global option `--exec-path=DIR` precedes the subcommand.
+
+    git runs non-builtin subcommands as DIR/git-<name> and puts DIR first on PATH for every
+    child it spawns (helpers, hooks, nested git), so DIR supplies the code whatever the
+    subcommand. Only the global-option position counts: after the subcommand the same word is
+    an operand (`git grep -e --exec-path=x`). `--exec-path` alone is git's query form — it
+    prints the path and exits, even with a word after it — so the walk stops there.
+    """
+    i = 0
+    # SubstitutionValidator passes every word, command name included; the top level does not.
+    if args and args[0].rsplit("/", 1)[-1] == "git":
+        i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--exec-path="):
+            return GIT_EXEC_PATH_REASON
+        if arg in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            i += 2
+        elif arg.startswith("-") and arg not in ("-", "--exec-path"):
+            i += 1
+        else:
+            return None
+    return None
+
+
+# git's isspace() (sane_ctype, ctype.c): space, tab, LF and CR. Not \v or \f.
+_GIT_ALIAS_SPACE = " \t\n\r"
+
+
+def _split_git_alias(value: str) -> list[str] | None:
+    """Split an alias value into words as git's split_cmdline() (alias.c) does, or return
+    None where git refuses it (an unclosed quote or a trailing backslash).
+
+    Not shlex: git lets a backslash escape the next character inside double quotes too, so it
+    reads `"--exec-\\path=DIR"` as `--exec-path=DIR` where shlex keeps the backslash. Every
+    whitespace run ends a word, so leading whitespace gives an empty first word, as in git.
+    """
+    words = [""]
+    quote = ""
+    i = 0
+    while i < len(value):
+        c = value[i]
+        if not quote and c in _GIT_ALIAS_SPACE:
+            words.append("")
+            while i + 1 < len(value) and value[i + 1] in _GIT_ALIAS_SPACE:
+                i += 1
+        elif not quote and c in "'\"":
+            quote = c
+        elif c == quote:
+            quote = ""
+        else:
+            if c == "\\" and quote != "'":
+                i += 1
+                if i == len(value):
+                    return None
+                c = value[i]
+            words[-1] += c
+        i += 1
+    return None if quote else words
+
+
+def _git_alias_reason(alias_value: str) -> str | None:
+    """Return a reason if a non-! alias VALUE arms an exec, else None.
+
+    git feeds the alias's words back through its global-option parser, so the value can carry
+    `--exec-path=DIR`, an RCE `-c` key, or a nested alias. An alias git itself cannot split
+    fails in git too; refuse it rather than guess at its words.
+
+    Nothing here trusts word position: bashlex has already dropped the quotes inside the value,
+    so a nested `-c 'alias.y=... --exec-path=DIR'` arrives split at the wrong places. So any
+    word containing `--exec-path=` is refused, and every word is judged as if it were a `-c`
+    value. Each word is a strict substring of the value, so the recursion ends.
+    """
+    words = _split_git_alias(alias_value)
+    if words is None or any("--exec-path=" in word for word in words):
+        return GIT_EXEC_PATH_REASON
+    for word in words:
+        reason = dangerous_git_config(["-c", word])
+        if reason:
+            return reason
+    return None
+
+
 def dangerous_git_config(args: list[str]) -> str | None:
     """Return a reason string if `args` (a git command's word-args) sets a -c config that
-    executes arbitrary commands, else None. Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
-    `alias.` is dangerous only when the alias VALUE starts with `!` (shell-command alias);
-    a `!` elsewhere (e.g. a `--grep` pattern) is an ordinary git alias. Pure; the single
-    source of truth shared by SubstitutionValidator and top-level validation.
+    executes arbitrary commands or redirects git's exec path (`--exec-path=DIR`), else None.
+    Handles `-c KEY=VAL` and attached `-cKEY=VAL`.
+    `alias.` is dangerous when the alias VALUE starts with `!` (shell-command alias) or its
+    words arm an exec (see `_git_alias_reason`); a `!` elsewhere (e.g. a `--grep` pattern) is an
+    ordinary git alias. Pure; the single source of truth shared by SubstitutionValidator and top-level validation.
     """
+    exec_path_reason = _git_exec_path_override(args)
+    if exec_path_reason:
+        return exec_path_reason
     for i, arg in enumerate(args):
         config_val = None
         if arg == "-c" and i + 1 < len(args):
@@ -539,6 +646,9 @@ def dangerous_git_config(args: list[str]) -> str | None:
                     # (alias.<name>=!cmd). A '!' elsewhere is a normal git-subcommand alias.
                     _, _, alias_value = config_val.partition("=")
                     if not alias_value.lstrip().startswith("!"):
+                        alias_reason = _git_alias_reason(alias_value)
+                        if alias_reason:
+                            return alias_reason
                         continue
                 else:
                     # A boolean value selects a built-in and names no executable

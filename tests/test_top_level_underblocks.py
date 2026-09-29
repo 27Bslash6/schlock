@@ -103,6 +103,144 @@ class TestTopLevelGitC:
         assert validate_command("git -c core.fsmonitor=true status").risk_level != RiskLevel.BLOCKED
 
 
+@pytest.mark.usefixtures("no_shellcheck_underblocks")
+class TestGitExecPathOverride:
+    """`git --exec-path=DIR` makes DIR supply git's non-builtin subcommands and every child git
+    spawns, whatever the subcommand, so it is blocked like `-c core.pager=CMD` at both tiers.
+    `--exec-path` with no `=VALUE` is git's query form: it prints the path and exits."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git --exec-path=/tmp/evil status",
+            "git --exec-path=/tmp/evil frobnicate",
+            "git --exec-path=/tmp/evil fetch origin",
+            "git -C repo --exec-path=/tmp/evil fetch",
+            "git --exec-path=./x log",
+            'echo "$(git --exec-path=/tmp/evil status)"',
+            'echo "$(git --exec-path=/tmp/evil fetch)"',
+        ],
+    )
+    def test_value_form_blocks(self, command):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False), command
+        assert "--exec-path" in result.message, result.message
+
+    def test_top_level_alternative_names_exec_path(self):
+        alternatives = validate_command("git --exec-path=/tmp/evil status").alternatives
+        assert any("--exec-path" in alt for alt in alternatives), alternatives
+        assert "Remove the -c config override" not in alternatives
+
+    @pytest.mark.parametrize(
+        ("command", "risk_level"),
+        [
+            # Query forms: git prints its exec path and runs nothing.
+            ("git --exec-path", RiskLevel.SAFE),
+            ("git --exec-path /tmp/evil status", RiskLevel.SAFE),
+            ('echo "$(git --exec-path)"', RiskLevel.SAFE),
+            ('ls "$(git --exec-path)"', RiskLevel.SAFE),
+            # After the subcommand the same word is an operand, not a global option.
+            ("git grep -e --exec-path=x", RiskLevel.SAFE),
+            ("git log --grep --exec-path=x", RiskLevel.SAFE),
+            ("git status", RiskLevel.SAFE),
+            ("git commit -m 'document --exec-path=DIR'", RiskLevel.LOW),
+        ],
+    )
+    def test_query_forms_and_operands_unchanged(self, command, risk_level):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (risk_level, True), command
+
+    def test_git_c_control_still_blocks(self):
+        result = validate_command("git -c core.pager=/tmp/evil/p log")
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False)
+        assert "ast_dangerous_combo:git" in result.matched_rules
+
+    # Every git global option that takes the NEXT word as its value (git.c handle_options).
+    @pytest.mark.parametrize(
+        "option",
+        [
+            "-C",
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "--config-env",
+            "--super-prefix",
+            "--attr-source",
+            "--shallow-file",
+        ],
+    )
+    def test_helper_steps_over_option_values(self, option):
+        # The walk must step over the value, not stop at it as if it were the subcommand...
+        assert dangerous_git_config([option, "v", "--exec-path=x", "log"]) is not None
+        assert dangerous_git_config(["git", option, "v", "--exec-path=x", "log"]) is not None
+        # ...and a value that merely looks like the option is still just a value.
+        assert dangerous_git_config([option, "--exec-path=x", "status"]) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git --attr-source HEAD --exec-path=/tmp/evil frobnicate",
+            "git --shallow-file x --exec-path=/tmp/evil frobnicate",
+            'echo "$(git --attr-source HEAD --exec-path=/tmp/evil status)"',
+            # git re-parses a non-! alias's global options, so the alias carries the override.
+            "git -c alias.x='--exec-path=/tmp/evil gc' x",
+            "git -calias.x='--exec-path=/tmp/evil gc' x",
+            "git -c alias.x='--exec-path=/tmp/evil commit' x -m m",
+            "echo \"$(git -c alias.x='--exec-path=/tmp/evil gc' x)\"",
+            # git drops a backslash inside the alias's double quotes: this is --exec-path=.
+            r"""git -c alias.x='"--exec-\path=/tmp/evil" gc' x""",
+        ],
+    )
+    def test_value_options_and_aliases_block(self, command):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False), command
+
+    def test_alias_helper(self):
+        assert dangerous_git_config(["-c", "alias.x=-C d --exec-path=x gc", "x"]) is not None
+        # git splits an alias with its own rules, not shlex's (verified, git 2.43): a backslash
+        # escapes the next character outside quotes and inside "...", and is literal in '...'.
+        assert dangerous_git_config(["-c", 'alias.x="--exec-\\path=x" gc', "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x=--exec-\\path=x gc", "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x='--exec-\\path=x' gc", "x"]) is None
+        # An alias git cannot split is refused rather than guessed at.
+        assert dangerous_git_config(["-c", "alias.x=log 'unclosed", "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x=log x\\", "x"]) is not None
+        # A plain alias stays allowed.
+        assert dangerous_git_config(["-c", "alias.x=log --oneline", "x"]) is None
+        # By design an alias word shaped like the option blocks even as an operand: bashlex has
+        # dropped the quotes inside the value, so word positions there cannot be trusted.
+        assert dangerous_git_config(["-c", "alias.x=grep -e --exec-path=x", "x"]) is not None
+        # A nested ! alias is caught by the same recursion.
+        assert dangerous_git_config(["-c", "alias.x=-c alias.y=!sh y", "x"]) is not None
+        # Words split off their -c are still judged as -c values.
+        assert dangerous_git_config(["-c", "alias.x=-c alias.y=-c core.pager=/tmp/p log y", "x"]) is not None
+        assert dangerous_git_config(["-c", "alias.x=-c alias.y=-c alias.z=--exec-path=/tmp/e z y", "x"]) is not None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A nested alias carries the override one or more levels down.
+            """git -c alias.x='-c alias.y="--exec-path=/tmp/evil gc" y' x""",
+            """git -c alias.x='-calias.y="--exec-path=/tmp/evil gc" y' x""",
+            r"""git -c alias.x='-c alias.y="-c alias.z=\"--exec-path=/tmp/evil gc\" z" y' x""",
+            'echo "$(git -c alias.x=\'-c alias.y="--exec-path=/tmp/evil gc" y\' x)"',
+            # An alias carries an RCE -c key, like the one the top-level -c check blocks.
+            "git -c alias.x='-c core.pager=/tmp/evil/p log' x",
+            "echo \"$(git -c alias.x='-c core.pager=/tmp/evil/p log' x)\"",
+            "git -c alias.x='-c core.fsmonitor=/tmp/evil/p status' x",
+            # ...or one nested a level down, where bashlex's lost quotes split it off its -c.
+            """git -c alias.x='-c alias.y="-c core.pager=/tmp/evil/p log" y' x""",
+            # Quotes inside the value are lost before the split, so position cannot hide it.
+            """git -c alias.x='-c "k=a b" --exec-path=/tmp/evil gc' x""",
+            'echo "$(git -c alias.x=\'-c "k=a b" --exec-path=/tmp/evil gc\' x)"',
+        ],
+    )
+    def test_alias_nesting_keys_and_lossy_words_block(self, command):
+        result = validate_command(command)
+        assert (result.risk_level, result.allowed) == (RiskLevel.BLOCKED, False), command
+
+
 class TestReadsStdinAsProgram:
     def _f(self):
         return _reads_stdin_as_program
