@@ -35,6 +35,7 @@ from .parser import (
     has_compound_redirects,
     heredoc_owner,
     reset_parse_budget,
+    stdin_interpreter,
 )
 from .rules import RiskLevel, RuleEngine, RuleMatch, SecurityRule
 from .substitution import SubstitutionValidationResult, SubstitutionValidator
@@ -2235,7 +2236,12 @@ def _rewrite_openers(  # noqa: PLR0912, PLR0915 - one branch per lexical state; 
 # delimiter (`<<'-q'` ends at a line reading `-q`), but emitting it bare gives
 # `<<-q`, which bash reads as the `<<-` operator plus delimiter `q`. The body then
 # ends at the wrong line and the commands in between are filed as inert text.
-_BARE_DELIMITER_RE = re.compile(r"\A[\w.+][\w.+-]*\Z")
+#
+# A trailing `\r` is a CRLF line ending. Bash reads it as part of the word, so
+# `<<'EOF'` there ends at a line reading `EOF\r`, and bashlex reads the bare
+# `<<EOF\r` the same way. Refusing it sent a CRLF heredoc to the fallback, which
+# drops a quoted body and so refuses every shell heredoc it cannot read.
+_BARE_DELIMITER_RE = re.compile(r"\A[\w.+][\w.+-]*\r?\Z")
 
 
 def _blank_body_line(line: str) -> str:
@@ -2297,7 +2303,12 @@ class _BashlexHeredoc(NamedTuple):
     """One heredoc as bashlex read it, located by its opener rather than its body."""
 
     opener: int  # offset of its `<<` in the text that was walked
-    owner: Optional[str]  # what runs the body (`heredoc_owner`); None when it has none
+    # The command the heredoc feeds, seen past a wrapper to a shell (`heredoc_owner`); None
+    # when it has none. It decides whether a body is shell code to validate.
+    owner: Optional[str]
+    # The program that runs the body from stdin (`stdin_interpreter`), shell or not; None when
+    # the body is data to a named script or inline program. Only the fallback reads it.
+    interpreter: Optional[str]
     word: str  # the delimiter as bashlex took it: AS WRITTEN, quotes and all
     in_substitution: bool
 
@@ -2312,30 +2323,34 @@ def _bashlex_heredocs(parse_target: str, nodes: list[Any]) -> list[_BashlexHered
     runs, not the wrapper - and None for a compound's own redirect, a redirect with no
     command word, or any heredoc inside a process substitution. What reads `<( … )` may
     run what it prints (`bash < <(cat <<'EOF' … )`), and nothing here knows the reader,
-    so the command inside is not what decides whether the body is code.
+    so the command inside is not what decides whether the body is code. The interpreter
+    is `stdin_interpreter`, None in those same places: it also names a non-shell program
+    such as `python3`, and leaves out a shell reading a script (`bash x.sh`).
     """
     found: list[_BashlexHeredoc] = []
 
-    def visit(node: Any, owner: Optional[str], in_substitution: bool, in_process: bool) -> None:
+    def visit(node: Any, owner: Optional[str], interpreter: Optional[str], in_substitution: bool, in_process: bool) -> None:
         kind = getattr(node, "kind", None)
         if kind == "command":
             owner = None if in_process else heredoc_owner(node)
+            interpreter = None if in_process else stdin_interpreter(node)
         elif kind == "compound":
-            owner = None
+            owner = interpreter = None
         elif kind == "commandsubstitution":
             in_substitution = True
         elif kind == "processsubstitution":
             in_substitution = in_process = True
         if kind == "redirect" and getattr(node, "heredoc", None) is not None:
             start, end = node.pos
-            found.append(_BashlexHeredoc(parse_target.find("<<", start, end), owner, node.output.word, in_substitution))
+            opener = parse_target.find("<<", start, end)
+            found.append(_BashlexHeredoc(opener, owner, interpreter, node.output.word, in_substitution))
         for value in vars(node).values():
             for child in value if isinstance(value, list) else (value,):
                 if hasattr(child, "kind"):
-                    visit(child, owner, in_substitution, in_process)
+                    visit(child, owner, interpreter, in_substitution, in_process)
 
     for node in nodes:
-        visit(node, None, False, False)
+        visit(node, None, None, False, False)
     return found
 
 
@@ -2385,6 +2400,10 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
     it does not see, or a compound's own redirect (`while …; done <<'EOF'`), counts as
     code: validating a body that is data costs a false positive, trusting one that is a
     program costs the control.
+
+    Each body is returned with the newline bash feeds after its last line. Without it a
+    CRLF body ends in a bare `\\r`, on which ShellCheck aborts its parse (SC1017, SC1072)
+    and reports nothing it counts, so the payload's only ShellCheck pass went silent.
     """
     owners = {heredoc.opener: heredoc.owner for heredoc in heredocs}
     bodies: list[str] = []
@@ -2393,7 +2412,7 @@ def _shell_heredoc_bodies(command: str, blanked: list[tuple[int, int, int]], her
         if owner is not None and owner not in SHELL_COMMANDS:
             continue
         if command[body_start:body_end].strip():
-            bodies.append(command[body_start:body_end])
+            bodies.append(command[body_start:body_end] + "\n")
     return bodies
 
 
@@ -2672,16 +2691,14 @@ def _validate_heredoc_command(
     bashlex reads a quoted heredoc delimiter as written (e.g. `<< 'EOF'` ends at a
     line reading `'EOF'`). Since LAB-3094 `_normalise_heredoc_delimiters` rewrites the
     well-formed ones, and what still arrives here is: a heredoc it cannot rewrite (a
-    delimiter with no bare spelling - `<<'A;B'`, or `<<'EOF'` under CRLF, whose word
-    ends in `\r` - a body with no terminator, a frame still open at the end), together
-    with every other quoted delimiter in the same command, since the rewrite is all or
-    nothing; an opener the scan cannot see (inside a double-quoted `$( … )`); and a
-    rewrite bashlex still rejects (an empty heredoc inside a compound). It arrives
-    either because bashlex rejected it or because bashlex read a delimiter as written
-    (see `validate_command`). This
-    validates the command in front of the heredoc, then the shell the heredoc
-    does not swallow as the separate commands bash will run, taking the worse
-    of the two verdicts.
+    delimiter with no bare spelling - `<<'A;B'` - a body with no terminator, a frame
+    still open at the end), together with every other quoted delimiter in the same
+    command, since the rewrite is all or nothing; an opener the scan cannot see (inside
+    a double-quoted `$( … )`); and a rewrite bashlex still rejects (an empty heredoc
+    inside a compound). It arrives either because bashlex rejected it or because bashlex
+    read a delimiter as written (see `validate_command`). This validates the command in
+    front of the heredoc, then the shell the heredoc does not swallow as the separate
+    commands bash will run, taking the worse of the two verdicts.
 
     SECURITY: the heredoc head vouches only for itself. A whitelisted `ls` does
     not make `rm -rf /` after the terminator safe (LAB-2765).
@@ -2726,23 +2743,28 @@ def _validate_heredoc_command(
         return None
 
 
-def _unreadable_program(owner: Optional[str]) -> ValidationResult:
+def _unreadable_program(program: Optional[str]) -> ValidationResult:
     """Refuse a heredoc whose body was discarded when that body may run as a program.
 
-    ``owner`` is the shell that runs it, or None when the heredoc has no named command -
-    a compound's own redirect, whose body feeds a loop that may run it, a bare redirect,
-    or one inside a process substitution, whose reader may run what it prints.
+    ``program`` is the shell or interpreter that runs it, or None when the heredoc has no
+    named command - a compound's own redirect, whose body feeds a loop that may run it, a
+    bare redirect, or one inside a process substitution, whose reader may run what it prints.
     """
-    runner = f"'{owner}'" if owner else "the command it feeds"
+    runner = f"'{program}'" if program else "the command it feeds"
+    # A denial is read by an agent that may act on it, so its advice must not be a route
+    # around the control that issued it. The plain-word advice holds only where a readable
+    # body is checked as shell code - a shell's, or one with no named command - so any
+    # other program gets none.
+    readable_is_validated = program is None or program in SHELL_COMMANDS
     return ValidationResult(
         allowed=False,
         risk_level=RiskLevel.BLOCKED,
         message=f"BLOCKED: Cannot read the program {runner} would run from this heredoc",
-        # One alternative, deliberately. A denial is read by an agent that may act on it,
-        # so its advice must not be a route around the control that issued it.
-        alternatives=["Use a plain-word heredoc delimiter (<<'EOF'), which is read and validated"],
+        alternatives=(
+            ["Use a plain-word heredoc delimiter (<<'EOF'), which is read and validated"] if readable_is_validated else []
+        ),
         exit_code=1,
-        error=f"Unreadable heredoc delimiter in front of {f'shell interpreter {runner}' if owner else runner}",
+        error=f"Unreadable heredoc delimiter in front of {f'interpreter {runner}' if program else runner}",
         matched_rules=[],
     )
 
@@ -2751,9 +2773,9 @@ def _heredoc_base_result(engine: "RuleEngine", base_command: str) -> ValidationR
     """Verdict for the heredoc's own command, ignoring everything around it."""
     first_word = base_command.split()[0]
 
-    # A heredoc whose body a shell executes is refused in `_escalate_past_heredoc`, for
-    # every heredoc and by the command bashlex attaches it to - not here, where only the
-    # first opener's head is known, as written.
+    # A heredoc whose body a shell or interpreter executes is refused in
+    # `_escalate_past_heredoc`, for every heredoc and by the command bashlex attaches it
+    # to - not here, where only the first opener's head is known, as written.
     if engine.is_whitelisted(first_word):
         return ValidationResult(
             allowed=True,
@@ -2866,14 +2888,15 @@ def _escalate_past_heredoc(
             )
     # A quoted body here was dropped, so a heredoc whose body runs as a program is a program
     # nothing read - a shell anywhere (in a loop, a group, a substitution, behind another
-    # heredoc or a wrapper), or a heredoc with no named command, whose body may feed one.
-    # Refused ahead of every verdict below, including the whitelist: whitelisting is a
-    # statement about the command, and here the command is not what runs. The owner is
-    # `_bashlex_heredocs`' reading; an unquoted shell body is refused too, for simplicity,
-    # though it was kept.
+    # heredoc or a wrapper), an interpreter reading it from stdin (`python3`, `env perl`),
+    # or a heredoc with no named command, whose body may feed one. Refused ahead of every
+    # verdict below, including the whitelist: whitelisting is a statement about the command,
+    # and here the command is not what runs. Both readings are `_bashlex_heredocs`'; a shell
+    # owner is refused even when it reads a script, and an unquoted body is refused too, for
+    # simplicity, though it was kept.
     for heredoc in heredocs:
-        if heredoc.owner is None or heredoc.owner in SHELL_COMMANDS:
-            return _unreadable_program(heredoc.owner)
+        if heredoc.owner is None or heredoc.owner in SHELL_COMMANDS or heredoc.interpreter is not None:
+            return _unreadable_program(heredoc.interpreter or heredoc.owner)
     segments = parser.extract_command_segments(neutered, nodes)
 
     # `neutered != command` keeps the recursion finite: re-validating an
@@ -3147,8 +3170,8 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                 # bashlex keeps a delimiter's quotes, so it ends this body at a line
                 # reading the delimiter AS WRITTEN - not where bash ends it. The normaliser
                 # rewrites all or nothing, so this means one opener defeated it (no bare
-                # spelling, a `$'…'` escape, a CRLF line) and every quoted delimiter came
-                # through as written - or the scan never saw the opener. That reading is not
+                # spelling, a `$'…'` escape) and every quoted delimiter came through as
+                # written - or the scan never saw the opener. That reading is not
                 # bash's, so the command goes to the heredoc fallback, which bounds bodies
                 # with the scan instead (LAB-3094). Routed by the except branch below, which
                 # keys on "heredoc" in this message.

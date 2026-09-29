@@ -1433,6 +1433,17 @@ def _classify_sink(sink: Any, here_string: str) -> "Optional[tuple[str, str]]":
     return None
 
 
+def stdin_interpreter(node: Any) -> Optional[str]:
+    """The interpreter that runs command node ``node``'s stdin as a program, else None.
+
+    `_classify_sink`'s answer, wrapper operands included, so a heredoc and a here-string
+    on the same command are judged by one reading: `python3 <<X` and `env python3 <<X`
+    run the body, `python3 script.py <<X` and `python3 -c … <<X` read it as data.
+    """
+    found = _classify_sink(node, "")
+    return found[0] if found else None
+
+
 def _here_string_program(node: Any) -> "Optional[tuple[str, str]]":
     """Return (interpreter, here-string) if `node` runs its `<<<` here-string as a program.
 

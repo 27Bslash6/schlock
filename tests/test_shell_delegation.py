@@ -499,6 +499,11 @@ class TestWrappedRunnerAndWatchDelegation:
         ):
             assert validate_command(command).risk_level == RiskLevel.BLOCKED, command
 
+    def test_a_wrapped_dash_c_shell_is_caught_by_its_rule(self):
+        result = validate_command('env bash -c "rm -rf /"')
+        assert result.allowed is False
+        assert "nested_shell_execution" in result.matched_rules
+
     def test_nested_wrapper_is_blocked(self):
         # A wrapper wrapping a wrapper threads to the innermost delegator. Pre-fix: SAFE.
         assert validate_command('timeout 5 sudo watch "mkswap /dev/sda"').risk_level == RiskLevel.BLOCKED
