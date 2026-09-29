@@ -96,7 +96,8 @@ class TestBinaryResolution:
 class TestBinaryIntegrity:
     """Spec §7: never exec a binary whose SHA-256 is not the one MANIFEST.json records."""
 
-    STAND_IN = b"#!/bin/sh\necho '{}'\n"
+    # Drains stdin before answering, like the real CLI and the `fake_binary` stand-ins.
+    STAND_IN = b"#!/bin/sh\ncat >/dev/null\necho '{}'\n"
 
     @needs_binary
     def test_bit_flipped_vendored_binary_raises(self, tmp_path):
@@ -254,7 +255,7 @@ class TestExitContract:
             NativeBridge(binary_path=binary).parse_json("if; then")
 
     def test_command_reaches_the_binary_on_stdin(self, fake_binary):
-        binary = fake_binary("sys.stdout.write(sys.stdin.read())\n")
+        binary = fake_binary("sys.stdout.write(data)\n")
         assert NativeBridge(binary_path=binary).parse_json("echo unique-marker") == "echo unique-marker"
 
 
@@ -355,7 +356,7 @@ class TestSizeGuards:
             NativeBridge().parse_json(command)
 
     def test_input_at_the_bound_is_accepted(self, fake_binary):
-        binary = fake_binary("sys.stdout.write(str(len(sys.stdin.buffer.read())))\n")
+        binary = fake_binary("sys.stdout.write(str(len(data.encode())))\n")
         assert NativeBridge(binary_path=binary).parse_json("a" * MAX_COMMAND_SIZE) == str(MAX_COMMAND_SIZE)
 
     def test_unencodable_input_routes_to_fallback(self, monkeypatch):

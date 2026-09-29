@@ -112,11 +112,15 @@ def fake_binary(tmp_path):
     Shared by the bridge tests and the tier state-machine tests so each spec §6
     failure row can be scripted (exit codes, hangs, garbage output) without
     the real vendored binary.
+
+    Like the real CLI, the stand-in reads stdin to EOF before anything else, and
+    `body` sees it as `data`. A stand-in that exits without reading would let the
+    bridge's stdin write hit a closed pipe whenever the test process is slow.
     """
 
     def _make(body: str) -> Path:
         script = tmp_path / "fake-schlock-parse"
-        script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+        script.write_text("#!/usr/bin/env python3\nimport sys\ndata = sys.stdin.read()\n" + body, encoding="utf-8")
         script.chmod(0o755)
         return script
 
