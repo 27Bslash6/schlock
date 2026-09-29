@@ -2293,6 +2293,47 @@ def _is_terminator(line: str, delimiter: str, strips_tabs: bool) -> bool:
     return (line.lstrip("\t") if strips_tabs else line) == delimiter
 
 
+def _joins_into_a_delimiter(text: str, delimiters: set[str]) -> bool:
+    """Whether some backslash-newline join in ``text`` forms a line reading as one of ``delimiters``.
+
+    An unquoted heredoc body is read through its joins (`_body_line`), so `EO\\` then `F`
+    ends an `<<EOF` body. ShellCheck does not join, and reads the shell after it as body.
+    This answers from the raw text alone, without finding a single body: the heredoc
+    readers stop at the first line they cannot vouch for, and a join past that point is
+    exactly as live. So every physical line a joined line could start on is tried, whoever's
+    body it sits in. That over-refuses a joined delimiter in a quoted string or a comment,
+    which fails closed. Leading tabs are always stripped, as if every opener were `<<-`.
+
+    Linear in ``text``: a joined line bash could end a body on is a suffix of one maximal
+    run of continued lines, so each run is walked back from its end once, and a suffix is
+    compared only when it is as long as a delimiter and longer than the last one compared
+    (a line of tabs alone leaves it unchanged). Hook time is a bypass (a timeout fails open),
+    so trying every start with `_body_line` - quadratic in a long run - is not an option.
+    """
+    delimiters = {word for word in delimiters if word}
+    if not delimiters or "\\\n" not in text:
+        return False
+    lengths = {len(word) for word in delimiters}
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines):
+        joined, physical = _body_line(lines, index, quoted=False)
+        index += len(physical)
+        suffix = len(physical[-1])  # of `joined`, starting where the current physical line does
+        tabs = suffix - len(physical[-1].lstrip("\t"))  # leading tabs of that suffix
+        compared = -1
+        for part in reversed(physical[:-1]):
+            piece = part[:-1]  # the backslash-newline goes
+            suffix += len(piece)
+            content = piece.lstrip("\t")
+            tabs = tabs + len(piece) if not content else len(piece) - len(content)
+            length = suffix - tabs
+            if length != compared and length in lengths and joined[len(joined) - length :] in delimiters:
+                return True
+            compared = length
+    return False
+
+
 class _BashlexHeredoc(NamedTuple):
     """One heredoc as bashlex read it, located by its opener rather than its body."""
 
@@ -3168,6 +3209,28 @@ def _validate_command(  # noqa: PLR0911, PLR0912, PLR0915 - Complex validation f
                     error=error,
                 )
                 # Not cached: a parse-level refusal, like the parse errors below.
+            if _joins_into_a_delimiter(parse_target, {h.word for h in bashlex_heredocs}):
+                # bash and bashlex end an unquoted body at a terminator formed by joining lines,
+                # so the AST passes read this command right. ShellCheck reads `parse_target`,
+                # whose unquoted bodies and terminator lines are verbatim, does not join, and
+                # files everything up to a later literal terminator (or the end) as body: every
+                # finding only it makes there is lost. Refused rather than handed a joined copy,
+                # which would re-implement bash's parity-aware join for one consumer. A quoted
+                # body is blanked in `parse_target`, so a join inside one refuses nothing.
+                # A command bashlex rejects never gets here; the fallback reads the join itself.
+                error = (
+                    "a heredoc terminator is spelled across a backslash-newline; bash joins the lines and "
+                    "ends the body there, but ShellCheck does not and would read the commands after it as body"
+                )
+                return ValidationResult(
+                    allowed=False,
+                    risk_level=RiskLevel.BLOCKED,
+                    message=f"BLOCKED: Cannot check the commands after this heredoc: {error}",
+                    alternatives=["Write the heredoc terminator on one line"],
+                    exit_code=1,
+                    error=error,
+                )
+                # Not cached, like the phantom refusal above.
 
             # Check for dangerous constructs (eval/exec, dangerous pipelines)
             dangerous_constructs = parser.has_dangerous_constructs(ast)
