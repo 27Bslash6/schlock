@@ -4,7 +4,8 @@ Two BLOCKED-level rules matched a command keyword as a *substring* inside a
 longer flag/word, blocking benign commands:
 
   * linux_keyring_theft (#100): ``pass`` matched inside ``bypass``/``compass``
-    and paired with any later ``-c`` in the segment.
+    and paired with any later ``-c`` in the segment - even one inside a word,
+    such as a UUID group (``-cdf8``) or ``--cleanup``.
   * source_remote_script (#105): ``source`` matched inside ``--source`` (and a
     bare ``.`` matched a sentence-ending period), pairing with any ``://``
     within 200 chars - so ``--source <localdir>`` plus an unrelated URL
@@ -43,9 +44,43 @@ class TestKeyringPassFalsePositives:
     @pytest.mark.parametrize(
         "command",
         [
+            'multica issue create --title "adversarial pass on the guard" --project e3bc66a0-58de-4b2e-95d8-cdf829e72c0f',
+            'git commit -m "make the 3.9 tests pass again" --cleanup=strip',
+            'multica issue update X --title "doc-clarity pass" --description-file ./groom-doc-clarity.md',
+        ],
+    )
+    def test_dash_c_inside_a_word_allowed(self, command, safety_rules_path):
+        """A `-c` inside a longer word after `pass` is not the clip flag."""
+        result = validate_command(command, config_path=safety_rules_path)
+        assert result.allowed, f"benign command blocked: {command} ({result.matched_rules})"
+        assert "linux_keyring_theft" not in result.matched_rules
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "pass show github/token",
             "pass -c github/token",
             "pass show -c mysecret",
+            # Every clip spelling in pass(1): -c[line] and --clip[=line].
+            "pass -c2 github/token",
+            "pass --clip github/token",
+            "pass --clip=2 github/token",
+            "pass show --clip github/token",
+            # ls/list reach the same show command without the word `show`.
+            "pass ls -c github/token",
+            "pass list --clip=3 github/token",
+            # GNU getopt permutes arguments and accepts --clip abbreviations.
+            "pass github/token -c",
+            "pass --cl github/token",
+            # The flag ends at a shell operator, and quoting or expansion can still spell it.
+            "x=$(pass github/token -c)",
+            "pass github/token -c;echo",
+            'pass github/token "-c"',
+            "pass github/token \\-c",
+            "pass github/token -c$LINE",
+            # A substitution body is matched as written, so the pattern itself must read past the quote.
+            'x=$(pass github/token "-c")',
+            "echo $(pass github/token \\-c)",
         ],
     )
     def test_pass_manager_theft_still_blocked(self, command, safety_rules_path):
@@ -53,6 +88,7 @@ class TestKeyringPassFalsePositives:
         result = validate_command(command, config_path=safety_rules_path)
         assert not result.allowed, f"keyring theft not blocked: {command}"
         assert result.risk_level == RiskLevel.BLOCKED
+        assert "linux_keyring_theft" in result.matched_rules
 
 
 class TestSourceRemoteFalsePositives:
