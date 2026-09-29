@@ -256,6 +256,17 @@ class TestHookHandler:
         assert output["permissionDecision"] == "deny"
         assert output["permissionDecisionReason"].startswith("BLOCKED: Command exceeds size limit")
 
+    def test_substitution_nested_past_the_horizon_is_denied(self):
+        """A 12-deep quoted redirect chain gives ShellCheck nothing to flag; the depth guard denies it."""
+        command = "$(bash)"
+        for _ in range(11):
+            command = f'$(cat < "{command}")'
+        response = handle_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": f"x={command}"}})
+
+        output = response["hookSpecificOutput"]
+        assert output["permissionDecision"] == "deny"
+        assert "Substitution nesting depth exceeded" in output["permissionDecisionReason"]
+
 
 @pytest.mark.usefixtures("no_shellcheck")
 class TestAmplifiedMediumSubstitutionThroughTheHook:

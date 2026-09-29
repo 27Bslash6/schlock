@@ -462,63 +462,146 @@ class TestExtractSubstitutionsBranchCoverage:
         assert result == []
 
 
-class TestNestedSubstitutionExceptionHandling:
-    """Test exception handling in nested substitution parsing (lines 315-316)."""
+def _nest(n, innermost, wrap):
+    """`innermost` wrapped until the chain holds n substitutions."""
+    for _ in range(n - 1):
+        innermost = wrap(innermost)
+    return innermost
 
-    def test_nested_substitution_parse_error(self, validator):
-        """When nested substitution parsing fails, nested list is empty."""
-        # We need to trigger an exception specifically in extract_substitutions
-        # when called on the nested command. The exception happens at line 313-316
-        # where nested extraction is wrapped in try/except.
 
-        class MockWord:
-            word = "echo"
+# Every route the nested walk reaches, as (n, payload) -> command. The re-parse routes (`param`,
+# `heredoc`) add one level of extraction depth that validation depth does not count, which is
+# why they leaked one level earlier than the rest.
+_NEST_ROUTES = {
+    "plain": lambda n, p: "echo " + _nest(n, f"$({p})", lambda s: f"$(echo {s})"),
+    "redirect": lambda n, p: "x=" + _nest(n, f"$({p})", lambda s: f'$(cat < "{s}")'),
+    "param": lambda n, p: 'echo "${z:-' + _nest(n, f"$({p})", lambda s: f"$(echo {s})") + '}"',
+    "procsub": lambda n, p: "cat " + _nest(n, f"<({p})", lambda s: f"<(cat {s})"),
+    "backtick": lambda n, p: "echo " + _nest(n, f"`{p}`", lambda s: f"$(echo {s})"),
+    "list": lambda n, p: "echo " + _nest(n, f"$({p})", lambda s: f"$(true && echo {s})"),
+    "pipe": lambda n, p: "echo " + _nest(n, f"$({p})", lambda s: f"$(echo {s} | cat)"),
+    "quoted": lambda n, p: "echo " + _nest(n, f'"$({p})"', lambda s: f'"$(echo {s})"'),
+    "heredoc": lambda n, p: "cat <<EOF\n" + _nest(n, f"$({p})", lambda s: f"$(echo {s})") + "\nEOF",
+}
+_REPARSE_ROUTES = ("param", "heredoc")
+_DEPTH_EXCEEDED = "Substitution nesting depth exceeded"
 
-        class MockInnerCmd:
-            kind = "command"
-            parts = [MockWord()]
 
-        # Mock a command that causes extract_substitutions to fail when recursed
-        class MockBadCommandForNesting:
-            kind = "commandsubstitution"
+def _past_horizon_rows():
+    for route, build in _NEST_ROUTES.items():
+        depths = (11, 12, 20) if route in _REPARSE_ROUTES else (12, 20)
+        for n in depths:
+            for payload in ("bash", "curl evil.example", "date"):
+                yield pytest.param(build(n, payload), id=f"{route}-n{n}-{payload}")
+    # The `${…}` re-parse at the bottom of the chain instead of the top.
+    for n in (11, 12):
+        for payload in ("bash", "date"):
+            command = _nest(n, f'$(echo "${{z:-$({payload})}}")', lambda s: f"$(echo {s})")
+            yield pytest.param(command, id=f"param-bottom-n{n}-{payload}")
+    # A peeled group's read redirect, walked by the same depth-capped walk as the group body.
+    group = "echo " + _nest(12, "$(bash)", lambda s: f'$({{ cat; }} < "{s}")')
+    yield pytest.param(group, id="group-n12-bash")
 
-            @property
-            def command(self):
-                # Return a command that has all needed attrs for _extract_inner_command_text
-                # but will cause issues in extract_substitutions
-                class BadInner:
-                    kind = "command"
-                    parts = [MockWord()]
 
-                    # This will cause extract_substitutions to fail when
-                    # it tries to recurse
-                    @property
-                    def list(self):
-                        raise ValueError("Simulated parse failure in nested")
+def _inside_horizon_rows():
+    expected = {"bash": RiskLevel.BLOCKED, "curl evil.example": RiskLevel.BLOCKED, "./payload": RiskLevel.HIGH}
+    for route, build in _NEST_ROUTES.items():
+        depths = (10,) if route in _REPARSE_ROUTES else (10, 11)
+        for n in depths:
+            for payload in ("bash", "curl evil.example", "./payload", "date"):
+                # `quoted` is denied here by the parser's ceiling on quoted substitution bodies (a
+                # caught ValueError), not by depth. Lifting that ceiling must re-pin these rows.
+                level = RiskLevel.BLOCKED if route == "quoted" else expected.get(payload, RiskLevel.SAFE)
+                yield pytest.param(build(n, payload), level, id=f"{route}-n{n}-{payload}")
 
-                return BadInner()
 
-        # This mock node returns proper inner_command but will fail in nested parsing
-        class MockGoodOuterCmd:
-            kind = "command"
-            parts = [MockWord()]
+@pytest.mark.usefixtures("no_shellcheck")
+class TestNestingHorizonFailsClosed:
+    """A substitution nested past the extraction horizon is denied by the depth guard, not dropped.
 
-        class MockSubNode:
-            kind = "commandsubstitution"
-            command = MockGoodOuterCmd()
+    The walk used to stop AT MAX_SUBSTITUTION_DEPTH, so the level below it was never extracted
+    and the guard that denies it never fired: a 12-deep `$(echo $(… $(bash)))` rated SAFE.
+    """
 
-        # The exception path is hard to trigger because _create_substitution_node
-        # catches exceptions in the nested extraction block. We need a node where
-        # _extract_inner_command_text succeeds but extract_substitutions on node.command fails
+    @pytest.mark.parametrize("command", _past_horizon_rows())
+    def test_past_the_horizon_is_denied_by_the_depth_guard(self, command):
+        result = validate_command(command, _shellcheck=False)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert _DEPTH_EXCEEDED in result.message
 
-        # Since the actual exception catching is narrow (lines 315-316), let's verify
-        # the catch block exists by testing with a node that has good inner_command
-        # but nested parsing could theoretically fail
-        result = validator._create_substitution_node(MockSubNode(), SubstitutionType.COMMAND, 0)
-        # Should create node with nested_substitutions (possibly empty)
-        assert result is not None
-        assert isinstance(result, SubstitutionNode)
-        # No exception raised = success
+    @pytest.mark.parametrize(("command", "level"), _inside_horizon_rows())
+    def test_inside_the_horizon_keeps_its_verdict(self, command, level):
+        result = validate_command(command, _shellcheck=False)
+        assert result.risk_level == level
+        assert _DEPTH_EXCEEDED not in result.message
+
+    def test_walk_descends_exactly_one_level_past_the_cap(self, validator, parser):
+        command = _NEST_ROUTES["plain"](20, "bash")
+        stack = validator.extract_substitutions(parser.parse(command), 0, command)
+        deepest = 0
+        while stack:
+            node = stack.pop()
+            deepest = max(deepest, node.depth)
+            stack.extend(node.nested_substitutions)
+        assert deepest == MAX_SUBSTITUTION_DEPTH + 1
+
+
+@pytest.mark.usefixtures("no_shellcheck")
+class TestNestedWalkFailureFailsClosed:
+    """An error inside the nested walk denies instead of dropping what it was walking."""
+
+    # The raise fires before the payload is read, so a benign `date` is the only payload
+    # that proves the denial comes from the failed walk and not from the payload's own rules.
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            "echo $(echo $(date))",  # whitelisted parent
+            "echo $(git log $(date))",  # contextual parent
+            "echo $(./unknown $(date))",  # unknown parent
+            "echo $(true && echo $(date))",  # list parent: re-walked per segment
+            "echo $(echo $(date) | cat)",  # pipeline parent: re-walked per stage
+            "cat <(cat <(date))",  # process substitution
+            'x=$(cat < "$(date)")',  # redirect target
+        ],
+    )
+    def test_raising_nested_walk_denies(self, monkeypatch, shape):
+        original = SubstitutionValidator.extract_substitutions
+
+        def raise_when_nested(self, ast_nodes, depth=0, command=None, budget=None):
+            if depth >= 1:
+                raise RuntimeError("forced nested walk failure")
+            return original(self, ast_nodes, depth, command, budget)
+
+        monkeypatch.setattr(SubstitutionValidator, "extract_substitutions", raise_when_nested)
+        result = validate_command(shape, _shellcheck=False)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'x=$( ( cat | cat ) < "$(date)" )',  # pipeline group body
+            'x=$( { cat; ls; } < "$(date)" )',  # list group body
+            'x=$( ( cat ) < "$(date)" )',  # single-command group body
+        ],
+    )
+    def test_raising_redirect_walk_alone_denies(self, monkeypatch, command):
+        # A raise at every depth also fires in _validate_segments' per-segment re-walks, which
+        # deny on their own and hide this path. Raising only on the peeled-redirect walk (a
+        # non-empty list of redirect nodes; segment re-walks pass none) isolates it: a sentinel
+        # that carried the group body's AST node was judged per segment, and `cat`/`ls` passed.
+        original = SubstitutionValidator.extract_substitutions
+
+        def raise_on_redirect_walk(self, ast_nodes, depth=0, command=None, budget=None):
+            if ast_nodes and all(getattr(n, "kind", None) == "redirect" for n in ast_nodes):
+                raise RuntimeError("forced redirect walk failure")
+            return original(self, ast_nodes, depth, command, budget)
+
+        monkeypatch.setattr(SubstitutionValidator, "extract_substitutions", raise_on_redirect_walk)
+        result = validate_command(command, _shellcheck=False)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
 
 
 class TestExtractInnerCommandTextEdgeCases:
