@@ -80,6 +80,8 @@ apt-get install shellcheck  # or: dnf install ShellCheck
 
 ShellCheck catches command injection, format string vulnerabilities, and the infamous "MongoDB disaster" pattern (`rm -rf $EMPTY_VAR/*` → `rm -rf /*`). schlock integrates automatically when ShellCheck is available.
 
+If you install ShellCheck, use 0.7.0 or newer. schlock runs it with `--norc` and without `SHELLCHECK_OPTS` or `GHCRTS`, so a repository's `.shellcheckrc` cannot switch off the checks schlock relies on. Older versions reject `--norc`: schlock then gets no ShellCheck findings and blocks commands with a quoted heredoc or a shell payload such as `bash -c`. Upgrade ShellCheck or take it off `PATH`; `shellcheck.enabled: false` does not change this.
+
 **Zero friction**: <1ms validation on most commands. You won't notice it's there.
 
 **Team installation**: Add to `.claude/settings.json` and commit — teammates get it automatically when they trust the repo. See [docs/INSTALLING.md](docs/INSTALLING.md).
