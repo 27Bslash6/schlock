@@ -970,6 +970,396 @@ rules:
         assert any(r.name == "schlock_config_write" for r in engine.rules)
 
 
+class TestSelfProtectionArchiveExtraction:
+    """Extracting an archive into a config directory overwrites the config file without its
+    name ever appearing in the command, so the hard-coded layer keys on the directory too."""
+
+    @pytest.fixture(autouse=True)
+    def _hermetic(self, tmp_path, monkeypatch):
+        """No real user config and no ShellCheck: verdicts come from rules alone."""
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(val_module, "is_shellcheck_available", lambda: False)
+        clear_caches()
+        yield
+        clear_caches()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Measured MEDIUM (allowed) before the fix
+            "tar -xf evil.tar -C .claude/hooks",
+            "tar -xf evil.tar -C ~/.claude/hooks",
+            "unzip -o evil.zip -d ~/.claude/hooks",
+            "tar -xf evil.tar -C ~/.config/schlock",
+            "tar --extract -f evil.tar --directory=.claude/hooks",
+            "tar -xf evil.tar --directory .config/schlock",
+            "unzip -o evil.zip -d .config/schlock",
+            "7z x evil.7z -o.claude/hooks -y",
+            'tar -xzf evil.tgz -C "$HOME/.config/schlock"',
+            "tar -xf evil.tar -C ./.claude/hooks",
+            # Measured SAFE before the fix: the YAML rule is order- and spelling-sensitive
+            "tar -C .claude/hooks -xf evil.tar",
+            "tar xf evil.tar -C .claude/hooks/",
+            "bsdtar -xf evil.tar -C .claude/hooks",
+            # Other spellings of the same operation
+            "tar -xf evil.tar -C.claude/hooks",
+            "tar -xf evil.tar -C /home/u/project/.claude/hooks/",
+            "unzip evil.zip -d.claude/hooks",
+            "7z e evil.7z -o/home/u/.config/schlock",
+            "gtar -xf evil.tar -C .claude/hooks",
+            "7za x evil.7z -o.claude/hooks",
+            # Pass-through wrappers do not hide the extractor; a subshell exposes it as a word
+            "sudo tar -xf evil.tar -C .claude/hooks",
+            "ls && tar -xf evil.tar -C .claude/hooks",
+            "echo $(tar -xf evil.tar -C .claude/hooks)",
+            # Member filter: extracts .claude/hooks/* into the project root
+            "tar -xf evil.tar .claude/hooks",
+            # No visible mode (supplied via TAR_OPTIONS) counts as an extraction
+            "TAR_OPTIONS=-x tar -f evil.tar -C .claude/hooks",
+            # An option value that looks like a read-only mode must not mask the extraction
+            "TAR_OPTIONS=-x tar -f -t -C .claude/hooks",
+            "tar --get -f evil.tar --exclude -t -C .claude/hooks",
+            "tar -x --file -t -C .claude/hooks",
+            "unzip -P -l evil.zip -d .claude/hooks",
+            # A quoted, escaped, or dot/double-slash spelling resolves to the same dir
+            "tar -xf evil.tar -C .claude//hooks",
+            "tar -xf evil.tar -C .claude/./hooks",
+            'tar -xf evil.tar -C ".claude/hooks"',
+            'tar -xf evil.tar --directory=".claude/hooks"',
+            "tar -xf evil.tar -C .claude/'hooks'",
+            r"tar -xf evil.tar -C .claude/hook\s",
+            "unzip -o evil.zip -d ~/.config//schlock",
+            # Reading an archive stored inside the config dir is over-blocked, and that is safe
+            "tar -xf .claude/hooks/x.tar -C /tmp/out",
+            # The command word as bash runs it, however it is spelled or prefixed
+            "t'ar' -xf evil.tar -C .claude/hooks",
+            "t''ar -xf evil.tar -C .claude/hooks",
+            r"\tar -xf evil.tar -C .claude/hooks",
+            "env tar -xf evil.tar -C .claude/hooks",
+            "nohup tar -xf evil.tar -C .claude/hooks",
+            "timeout 5 tar -xf evil.tar -C .claude/hooks",
+            "nice -n 19 tar -xf evil.tar -C .claude/hooks",
+            "command -p tar -xf evil.tar -C .claude/hooks",
+            "echo evil.tar | xargs -I{} tar -xf {} -C .claude/hooks",
+            r"find . -name '*.tar' -exec tar -xf {} -C .claude/hooks \;",
+            "{ tar -xf evil.tar -C .claude/hooks; }",
+            "( tar -xf evil.tar -C .claude/hooks )",
+            "if true; then tar -xf evil.tar -C .claude/hooks; fi",
+            "! tar -xf evil.tar -C .claude/hooks",
+            ">/dev/null tar -xf evil.tar -C .claude/hooks",
+            "tar -xf evil.tar 2>&1 -C .claude/hooks",
+            "tar -xf evil.tar \\\n -C .claude/hooks",
+            'cat "$(tar -xf evil.tar -C .claude/hooks)"',
+            # Case-insensitive filesystems (APFS, NTFS) resolve these to the config dir
+            "tar -xf evil.tar -C .Claude/Hooks",
+            "tar -xf evil.tar -C .CLAUDE/HOOKS",
+            "TAR -xf evil.tar -C .claude/hooks",
+            # Expansions that produce the config dir
+            "tar -xf evil.tar -C $'.claude/hooks'",
+            "tar -xf evil.tar -C .claude/hoo*",
+            "tar -xf evil.tar -C .c*/h?oks",
+            "tar -xf evil.tar -C .claude/{hooks,x}",
+            "tar -xf evil.tar -C {/tmp,.claude/hooks}",
+            'tar -xf evil.tar -C "$(echo .claude/hooks)"',
+            # -C is cumulative
+            "tar -xf evil.tar -C .claude -C hooks",
+            "tar -xf evil.tar --directory=.claude --dir hooks",
+            # Member-name rewrites that land members in the config dir
+            "tar -xf evil.tar --transform 's,^,.claude/hooks/,'",
+            "tar -xf evil.tar --xform=s,^,.config/schlock/,",
+            "bsdtar -xf evil.tar -s ',^,.claude/hooks/,'",
+            # A quoted mode is still the mode
+            "7z 'x' evil.7z -o.claude/hooks",
+            "7z X evil.7z -o.claude/hooks",
+            # An optional-argument option does not consume the next word, and a required-argument
+            # one hides a mode-looking value, so neither masks the extraction
+            "tar --one-top-level -x -f evil.tar --suffix -t -C .claude/hooks",
+            "TAR_OPTIONS=-x tar --suffix -t -f evil.tar -C .claude/hooks",
+            "TAR_OPTIONS=-x tar -f evil.tar --exclude-ignore -t -C .claude/hooks",
+            "TAR_OPTIONS=-x tar -f evil.tar --exclude-ignore-recursive -d .config/schlock",
+            "TAR_OPTIONS=-x tar -f evil.tar --some-future-option -t -C .claude/hooks",
+            # Old-style key letters take the following words as their values, in order
+            "TAR_OPTIONS=-x tar -f evil.tar -C .claude/hooks",
+            "tar Cxf .claude/hooks evil.tar",
+            # A value-less option does not take the member filter after it, and an exclude
+            # option that may itself be a value does not hide the word after it
+            "tar -xf evil.tar --exclude-vcs .claude/hooks",
+            "TAR_OPTIONS=-x tar --suffix -X .claude/hooks -f evil.tar",
+            "TAR_OPTIONS=-x tar --suffix --exclude .claude/hooks -f evil.tar",
+            # unzip reads a `--`-prefixed word as cancelling the mode after it, so any `--` word
+            # makes the mode unknown and the command fails closed to an extraction
+            "unzip -l --l -o evil.zip -d .claude/hooks",
+            "unzip --x -o evil.zip -d .claude/hooks",
+            # unzip -I CHARSET takes a value, so its cluster is not read as a mode
+            "unzip -Iutf8 a.zip -d .claude/hooks",
+            "unzip -I UTF-8 a.zip -d .claude/hooks",
+            # bsdtar -W carries a long option; -s is a member rewrite whose value is not a mode
+            "bsdtar -xf a.tar -Wdirectory=.claude/hooks",
+            "bsdtar -xf a.tar -W directory=.config/schlock",
+            "bsdtar -xf a.tar -s,^,.claude/hooks/,",
+            "bsdtar -W extract -s/t/t/ -f a.tar -C .claude/hooks",
+            # An archive option carried in TAR_OPTIONS/UNZIP is folded into the extractor's argv
+            "TAR_OPTIONS=-C.claude/hooks tar -xf a.tar",
+            "env TAR_OPTIONS=-C.claude/hooks tar -xf a.tar",
+            "UNZIP=-d.config/schlock unzip a.zip",
+            "TAR_OPTIONS=--transform=s,^,.claude/hooks/, tar -xf a.tar",
+            'TAR_OPTIONS="-C .claude/hooks" tar -xf a.tar',
+            # Any non-reader command is a possible runner, so a runner allowlist cannot be evaded
+            "fakeroot tar -xf a.tar -C .claude/hooks",
+            "eatmydata tar -xf a.tar -C .claude/hooks",
+            "faketime now tar -xf a.tar -C .claude/hooks",
+            "builtin exec tar -xf a.tar -C .claude/hooks",
+            # Cumulative -C also folds into the vendored parser directories, not just config
+            "tar -xf a.tar -C .claude-plugin -C bin",
+            "tar -xf a.tar -C .claude-plugin -C vendor",
+            # An extractor inside a redirect's process-substitution target is still reached
+            # (the check walks the parser's full child set, redirects included)
+            "cat a.tar > >(tar -x -C .claude/hooks)",
+            "echo ok > >(7z x e.7z -o.claude/hooks)",
+            'wc < "$(tar -xf a.tar -C .claude/hooks)"',
+            # GNU tar's `-s` (value-less --same-order) must not swallow the following -C; the
+            # ambiguous GNU-vs-bsdtar arity fails closed instead of guessing
+            "tar -xs -C .claude -C hooks -f e.tar",
+            "tar -sC .claude -C hooks -xf a.tar",
+            # `-O`/`--to-command` no longer downgrades an extraction that still writes the dir
+            "tar -xf e.tar -C .claude/hooks --exclude -O",
+            "tar -xf e.tar -C .claude/hooks --suffix -O",
+            # Env carriers set in a separate statement still reach the extractor's environment
+            "export TAR_OPTIONS=-C.claude/hooks; tar -xf e.tar",
+            "declare -x UNZIP=-d.config/schlock; unzip a.zip",
+            "printf -v TAR_OPTIONS %s -C.claude/hooks; export TAR_OPTIONS; tar -xf e.tar",
+            # ANSI-C / locale quoting is stripped to the path bash runs, including a cumulative -C
+            "tar -xf e.tar -C .claude -C $'hooks'",
+            "unzip e.zip -d .cl$'a'ude/hooks",
+            "tar -xf e.tar -C .claude/ho$'o'ks",
+            "$'tar' -xf e.tar -C .claude/hooks",
+            "7z x e.7z -o.claude/ho$'o'ks",
+            # An unquoted shell heredoc body that extracts into a config dir
+            "bash <<EOF\ntar -xf e.tar -C .claude/hooks\nEOF",
+            "sh <<END\nunzip a.zip -d .config/schlock\nEND",
+            # An env carrier is matched by the config-dir VALUE, so the variable name may be spelled
+            # any way bash accepts — quoted, escaped, computed, or via env -S
+            'export TAR_""OPTIONS=-C.claude/hooks; tar -xf e.tar',
+            'export "TAR_$(echo OPTIONS)=-C.claude/hooks"; tar -xf e.tar',
+            "env -S 'TAR_OPTIONS=-C.claude/hooks tar -xf e.tar'",
+            "env -S 'tar -xf e.tar -C .claude/hooks'",
+            # A launcher that runs an extractor named in a glued --command= value
+            "flatpak run --command=tar org.x -xf e.tar -C .claude/hooks",
+        ],
+    )
+    def test_extraction_into_config_dir_is_blocked(self, command):
+        """AC-1: extraction naming a config directory is BLOCKED by the hard-coded layer."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -xf release.tar -C /opt/app",
+            "unzip -o release.zip -d ./build",
+            # Look-alike paths are not config directories
+            "tar -xf evil.tar -C .claude/hooks-backup",
+            "tar -xf .claude/hooks.tar -C /tmp/out/",
+        ],
+    )
+    def test_extraction_elsewhere_keeps_its_verdict(self, command):
+        """AC-2: extraction outside the config directories stays MEDIUM archive_operations."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.MEDIUM
+        assert result.matched_rules == ["archive_operations"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -tf evil.tar -C .claude/hooks",
+            "unzip -l evil.zip -d .claude/hooks",
+            "tar -cf backup.tar .claude/hooks",
+            "tar -cf backup.tar -C .claude/hooks .",
+            "tar --create -f backup.tar .claude/hooks",
+            "7z l evil.7z -o.claude/hooks",
+            # getopt accepts an unambiguous abbreviation of a long mode
+            "tar --creat -f backup.tar .claude/hooks",
+            "tar --dif -f backup.tar -C .claude/hooks",
+            # A certain option value is not read as a mode
+            "tar -C .claude/hooks -czf backup.tgz .",
+            "tar --exclude '*.log' -czf backup.tgz .claude/hooks",
+            # A known value-less long option before the mode does not swallow it, so a backup
+            # naming a config dir as a source stays a create, not a misread extraction
+            "tar --gzip --create --file b.tgz .claude/hooks",
+            "tar --numeric-owner --dereference -cf b.tar .config/schlock",
+            "tar --exclude-vcs -cf b.tar .claude/hooks",
+        ],
+    )
+    def test_read_only_operation_stays_safe(self, command):
+        """AC-2: read-only archive operations naming a config directory stay SAFE."""
+        result = validate_command(command)
+        assert result.allowed, f"Should allow: {command}"
+        assert result.risk_level == RiskLevel.SAFE
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A bare reader that names an extractor and a config dir is not a runner: allowed.
+            "grep -rn tar .claude/hooks",
+            "cat .claude/hooks/schlock-config.yaml",
+            # The extractor name inside a quoted argument is not a command word.
+            "printf '%s\\n' 'example; tar -xf a.tar -C .claude/hooks'",
+            "cat <<'EOF'\nnote; tar -xf a.tar -C .claude/hooks\nEOF",
+            # Installing a skill archive under ~/.claude/skills is not a config-dir write.
+            "unzip skill.zip -d ~/.claude/skills/foo",
+            # -x excludes the config dir, so the extraction targets only /opt.
+            "unzip a.zip -x '.claude/hooks/*' -d /opt",
+        ],
+    )
+    def test_config_dir_mention_stays_safe(self, command):
+        """AC-2: readers and quoted text naming a config dir stay SAFE, not blocked."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.SAFE, f"Should stay SAFE: {command}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An extraction ELSEWHERE that merely mentions the config dir (redirect target) keeps
+            # its normal archive verdict, and excluding the config dir targets only /opt.
+            "tar -xf a.tar -C /opt > .claude/hooks/extract.log",
+            "tar --exclude=.claude/hooks -xf a.tar -C /opt",
+            "tar -xf a.tar --exclude .claude/hooks -C /opt",
+            # A glob that cannot match a config dir.
+            "tar -xzf schlock-*.tgz -C /tmp/out",
+        ],
+    )
+    def test_config_dir_mention_stays_medium(self, command):
+        """AC-2: an extraction elsewhere that only names the dir keeps MEDIUM archive_operations."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.MEDIUM
+        assert result.matched_rules == ["archive_operations"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The extractor name inside a commit message is one quoted arg, not a command word, and
+            # a commit with no argv extraction never triggers the carrier scan, so it is not blocked.
+            'git commit -m "Add unzip step for .claude/hooks"',
+            'git commit -m "docs: note that; tar -xf a.tar -C .claude/hooks is blocked"',
+            # A config dir mentioned with no extraction anywhere on the line is left to the
+            # Write/Edit hook, not the archive check.
+            "chmod +x .claude/hooks/pre.sh",
+            "git add .claude/hooks/settings.json",
+        ],
+    )
+    def test_config_dir_mention_is_not_self_protection_blocked(self, command):
+        """AC-2: the hard-coded block never fires on a config dir that only appears as text."""
+        result = validate_command(command)
+        assert result.risk_level != RiskLevel.BLOCKED, f"False block: {command}"
+        assert result.matched_rules != ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A config dir named by a non-reader command sharing a line with a real extraction is
+            # over-blocked on purpose: a carrier could inject that dir into the extractor's env, and
+            # the check keys on the config-dir value, not on which command wrote it. The same class
+            # Check 2 already imposes on protected file names.
+            "tar -xzf tool.tgz -C /opt\nchmod +x .claude/hooks/pre.sh",
+            "tar -xf a.tar -C build && git add .claude/hooks/x.sh",
+        ],
+    )
+    def test_extraction_line_naming_config_dir_over_blocks(self, command):
+        """The carrier scan's accepted cost: a config dir on an extracting line blocks."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A `-s`/`-W` of ambiguous GNU/bsdtar arity no longer fails closed when no word could
+            # name a protected dir, so a package install, a member rewrite into /opt, or an
+            # old-style bundle stays at its normal verdict.
+            "apt-get install -y tar xz-utils",
+            "tar -xpsf backup.tar -C /opt/app",
+            "tar -xf release.tar -s ,^,out/, -C /opt/app",
+            "tar xvsf a.tar",
+            # A bare mention or an unset of the carrier variable, with the extraction elsewhere, is
+            # not a config write (the check keys on the config-dir value, which is absent here).
+            "echo TAR_OPTIONS; tar -xf release.tar -C /opt/app",
+            "unset TAR_OPTIONS; tar -xf a.tar -C build",
+            "env -u TAR_OPTIONS tar -xf a.tar -C build",
+        ],
+    )
+    def test_ambiguous_and_bare_mention_not_over_blocked(self, command):
+        """AC-2: the arity and carrier guards do not fire without a protected-dir word."""
+        result = validate_command(command)
+        assert result.risk_level != RiskLevel.BLOCKED, f"False block: {command}"
+        assert result.matched_rules != ["self_protection:config_write"]
+
+    def test_self_protection_dirs_cover_all_paths(self):
+        """The explicit file/tree split stays in sync with SELF_PROTECTION_PATHS (a desync would
+        silently misclassify a path, and a module-level raise would crash the hook)."""
+        covered = set(val_module._CONFIG_FILE_PATHS) | set(val_module._CONFIG_TREE_PATHS)
+        assert covered == set(val_module.SELF_PROTECTION_PATHS)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A non-reader that names an extractor before a config dir is a possible runner, so it
+            # is over-blocked on purpose — a runner allowlist can never be complete, and the same
+            # line through a bare reader is allowed above. git's search/format flags carry an
+            # extractor word as data, so they land here too.
+            "rg unzip .claude/hooks",
+            "git grep unzip .claude/hooks",
+            "echo tar -xf a.tar -C .claude/hooks",
+            "git log -G tar -- .claude/hooks",
+            "git archive --format tar -o hooks.tar HEAD .claude/hooks",
+        ],
+    )
+    def test_runner_naming_extractor_is_over_blocked(self, command):
+        """The look-through's accepted cost: a non-reader naming an extractor + config dir blocks."""
+        result = validate_command(command)
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -c 'tar -xf evil.tar -C .claude/hooks'",
+            "bash <<'EOF'\ntar -xf evil.tar -C .claude/hooks\nEOF",
+        ],
+    )
+    def test_extraction_run_by_a_shell_is_blocked(self, command):
+        """AC-1: an extraction handed to a shell as its program is re-validated and blocks."""
+        result = validate_command(command)
+        assert not result.allowed, f"Should block: {command}"
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    def test_wrapper_scan_past_its_ceiling_fails_closed(self):
+        """Each extractor word behind a wrapper rescans the rest of the argv; past the cap, block."""
+        limit = val_module._MAX_WRAPPED_EXTRACTORS
+        assert not val_module._extracts_into_config_dir([("sudo", ["tar"] * limit)])
+        assert val_module._extracts_into_config_dir([("sudo", ["tar"] * (limit + 1))])
+
+    def test_cumulative_directory_chain_past_its_ceiling_fails_closed(self):
+        """Each -C refolds the whole chain; past the cap an extraction blocks, a listing does not."""
+        chain = ["-C", "a"] * (val_module._MAX_TAR_DIRS + 1)
+        assert not val_module._extracts_into_config_dir([("tar", ["-x", *chain[:-2]])])
+        assert val_module._extracts_into_config_dir([("tar", ["-x", *chain])])
+        assert not val_module._extracts_into_config_dir([("tar", ["-t", *chain])])
+
+    def test_extraction_block_ignores_overrides(self, tmp_path, monkeypatch):
+        """AC-3: the block survives a user config that disables archive_operations."""
+        config = tmp_path / ".config" / "schlock" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("rule_overrides:\n  archive_operations:\n    enabled: false\n")
+        monkeypatch.chdir(tmp_path)
+        clear_caches()
+        assert validate_command("tar -xf release.tar -C /opt/app").risk_level == RiskLevel.SAFE
+        result = validate_command("tar -xf evil.tar -C .claude/hooks")
+        assert result.risk_level == RiskLevel.BLOCKED
+        assert result.matched_rules == ["self_protection:config_write"]
+
+
 class TestMultiSegmentWhitelistBypass:
     """LAB-2752: a whitelisted PREFIX must not vouch for a whole chained command.
 
