@@ -6,12 +6,15 @@ from schlock.core import validator as val_module
 from schlock.core.parser import BashCommandParser, _reads_stdin_as_program
 from schlock.core.rules import RiskLevel, RuleEngine
 from schlock.core.substitution import (
+    SubstitutionNode,
+    SubstitutionType,
+    SubstitutionValidator,
     dangerous_find,
     dangerous_git_config,
     dangerous_kubectl,
     git_config_exec_payload,
 )
-from schlock.core.validator import validate_command
+from schlock.core.validator import load_rules, validate_command
 
 
 @pytest.fixture
@@ -266,6 +269,26 @@ class TestRedirectTargetSubstitution:
         assert parser.has_dangerous_constructs(parser.parse('wc -l <<< "$(eval x)"'))
         dangers = parser.has_dangerous_constructs(parser.parse('wc -l <<< "$(cat x | /bin/sh)"'))
         assert "data piped into shell interpreter: sh" in dangers
+
+
+class TestAssignmentOnlySubstitution:
+    """A substitution of only assignments runs no program, so its value is not the program:
+    `$(X=/bin/rm)` sets X and rates as an unknown command, not as `rm`."""
+
+    @pytest.mark.parametrize(
+        "command",
+        ['echo "$(X=/bin/rm)"', 'echo "$(PAGER=/usr/bin/sh)"', 'echo "$(X=/bin/rm {fd}>/dev/null)"'],
+    )
+    def test_assignment_value_is_not_the_program(self, command):
+        assert validate_command(command, _shellcheck=False).risk_level == RiskLevel.HIGH
+
+    def test_node_without_a_command_falls_back_to_base_command(self):
+        # With no command node to read, base_command is all there is, so `sh` must still block.
+        node = SubstitutionNode(
+            substitution_type=SubstitutionType.COMMAND, inner_command="sh -c id", base_command="sh", ast_node=None
+        )
+        result = SubstitutionValidator(BashCommandParser(), load_rules()).validate_substitution(node)
+        assert (result.risk_level, result.message) == (RiskLevel.BLOCKED, "Dangerous command in substitution: sh")
 
 
 class TestTopLevelFindKubectl:
