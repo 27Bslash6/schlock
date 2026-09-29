@@ -94,6 +94,21 @@ def _as_double_quoted(body: str) -> str:
 # segment/operator and ends on a segment; anything else is a malformed AST -> fail closed.
 _LIST_OPERATORS: frozenset[str] = frozenset({"&&", "||", ";", "&"})
 
+
+class _Separator(str):
+    """A `|`, `&&`, `||`, `;` or `&` the renderer put between two commands.
+
+    Only the renderer knows where the real boundaries are. A quoted argument that spells one
+    (`git x ';' CMD`) is the same string, so _join_tokens tells them apart by this type, never by
+    value: splitting on the value let a `';'` argument cut a command that fails closed in two.
+
+    Any str operation (`+`, `.strip()`, slicing, an f-string) returns a plain `str` and drops the
+    tag. The two segments either side then merge and are judged by the first one's leading word,
+    so a lost tag fails OPEN. Build separator tokens only at the render sites and hand them to
+    _join_tokens untouched.
+    """
+
+
 # Commands that are ALWAYS safe inside substitution
 # These are read-only, pure, or security-critical tools that don't modify state
 SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset(
@@ -620,6 +635,25 @@ def git_config_exec_payload(args: list[str]) -> str | None:
     return None
 
 
+# Characters bashlex leaves in a token when the word carries an expansion: `$` (parameter,
+# command and ANSI-C `$'…'`), a backtick, and the braces of a brace expansion. A word holding any
+# of them may expand at runtime to something other than its text, so a keyword check on its text
+# is not to be trusted. bashlex strips quotes, and quoting only PREVENTS expansion, so a quoted
+# `run` reads as the literal `run` and is correctly matched.
+_EXPANSION_MARKERS = ("$", "`", "{", "}")
+
+
+def _is_plain_literal(word: str) -> bool:
+    """True if ``word`` cannot expand to anything but itself, so its text may be matched."""
+    return not any(marker in word for marker in _EXPANSION_MARKERS)
+
+
+# op subcommands that only read or edit the vault — they run no shell command. `op run` executes,
+# so it is absent; so is anything unlisted, which fails closed. An expanded subcommand (`op $'run'`,
+# `op {run,}`) is not one of these literals, so it fails closed too.
+_OP_INERT_SUBCOMMANDS = frozenset({"read", "item", "document", "vault", "whoami", "account", "inject"})
+
+
 # find flags that run arbitrary commands (-exec/-execdir/-ok/-okdir) or delete files (-delete).
 _DANGEROUS_FIND_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete"})
 
@@ -635,6 +669,13 @@ def dangerous_find(args: list[str]) -> str | None:
     for arg in args:
         if arg in _DANGEROUS_FIND_FLAGS:
             return f"find {arg} executes commands or modifies files"
+        # A word that expands (`{-exec,}`, `$'-exec'`, `${E:--exec}`) is read for the flag text it
+        # carries: bash would hand find the flag the literal scan above cannot see. A plain literal
+        # holding the same text (`-name '*-exec*'`) is one argument find never reads as a flag.
+        if not _is_plain_literal(arg):
+            for flag in _DANGEROUS_FIND_FLAGS:
+                if flag in arg:
+                    return f"find {flag} executes commands or modifies files"
     return None
 
 
@@ -939,7 +980,11 @@ def _leading_part(node: Any) -> Any:
 
 
 # Shapes that hand one of their own arguments to a shell. These take the command as a SEPARATE
-# word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD.
+# word; the `--flag=command` spellings are already disqualified by _STRUCTURED_WORD. Matched
+# exactly and against EVERY command: a command-agnostic floor beneath the git buckets and the
+# non-git option table below. _executes_an_argument checks it BEFORE the git buckets, so if an
+# inert subcommand were ever admitted with one of these options, `git log --tree-filter CMD` still
+# fails closed: two independent structures, not one list trusted twice.
 _ARGUMENT_EXECUTING_FLAGS = frozenset(
     {
         "--tree-filter", "--index-filter", "--msg-filter", "--commit-filter", "--env-filter",
@@ -948,33 +993,199 @@ _ARGUMENT_EXECUTING_FLAGS = frozenset(
         "--authors-prog", "--compress-program", "--diff-program", "--pager",
     }
 )  # fmt: skip
-# `-x` is paired with its subcommand rather than listed flat. It runs a command for `git rebase`
-# and `git difftool`, but `grep -x` matches whole lines, `diff -x` excludes a pattern and `ls -x`
-# sorts across — a flat entry is matched against every command and over-blocks all three.
-_ARGUMENT_EXECUTING_GIT = (
-    ("submodule", "foreach"),
-    ("bisect", "run"),
-    ("filter-branch",),
-    ("rebase", "-x"),
-    ("difftool", "-x"),
+# getopt_long and git's parse-options both accept an unambiguous prefix, so `git fetch --upload`
+# IS `--upload-pack`, and a short form may end a cluster of booleans (`git clone -qu`). Resolving
+# either is only safe inside the namespace the parser actually searches, so the exec options below
+# are keyed per command, and for git per SUBCOMMAND. A flat prefix match over one set was tried and
+# reverted because `git log --author` resolved to `--authors-prog`.
+#
+# Non-git commands whose value-taking option runs a program. Scanned at every word, so a wrapper
+# or a path (`/usr/bin/sort`) still reaches it.
+_EXEC_OPTIONS = {
+    "sort": frozenset({"--compress-program"}),
+    "sdiff": frozenset({"--diff-program"}),
+}
+# git subcommands that are safe to suppress UNLESS one of these options is present — the transport
+# and diff/rebase family, whose other arguments (URLs, refspecs, refs, paths) are inert, and `grep`,
+# whose `-O` / `--open-files-in-pager` runs a pager and so keeps it off the inert list. The pager
+# is only ever an attached value (`-O<cmd>`, `--open-files-in-pager=<cmd>`); a separate word after
+# `-O` is the search pattern, so keying `-O` over-blocks `git grep -O PATTERN` by design. `-u` is
+# `--upload-pack` on clone but `--update-head-ok` on fetch, and `-x` runs a command on rebase and
+# difftool while `grep -x` / `diff -x` / `git clean -x` mean something ordinary — hence per
+# subcommand. Reached only by the literal builtin name: an alias cannot shadow a non-deprecated
+# builtin (git.c looks builtins up first), so an alias for one of these lands in the fail-closed
+# default below, not here.
+_GIT_EXEC_OPTIONS = {
+    "clone": frozenset({"-u", "--upload-pack"}),
+    "fetch": frozenset({"--upload-pack"}),
+    "pull": frozenset({"--upload-pack"}),
+    "ls-remote": frozenset({"--upload-pack", "--exec"}),
+    "push": frozenset({"--receive-pack", "--exec"}),
+    "send-pack": frozenset({"--receive-pack", "--exec"}),
+    "archive": frozenset({"--exec"}),
+    "rebase": frozenset({"-x", "--exec"}),
+    "difftool": frozenset({"-x", "--extcmd"}),
+    "grep": frozenset({"-O", "--open-files-in-pager"}),
+}
+# git subcommands whose separate-word arguments are NEVER handed to a shell: read-only queries, and
+# the porcelain whose only free-text argument is a message (`commit -m`, `tag -m`). Their arguments
+# are opaque data, so a substitution may suppress them. EVERY OTHER git subcommand fails closed
+# (_runs_an_exec_option), which is the whole point: git resolves an unknown name as an exec-path
+# script, an alias, or a help.autocorrect guess (run_argv in git.c), and a builtin may itself run a
+# command it is handed — `for-each-repo` re-dispatches a git command line, `submodule--helper
+# foreach` and `remote-ext` take one positionally, `submodule foreach` / `bisect run` /
+# `filter-branch` / `daemon` likewise. None of those can be trusted from the name, so only this
+# audited allowlist is. A name is admitted only if it is a non-deprecated builtin (so no alias can
+# shadow it) with no argument that names a program, pager, editor or tool. `config` runs nothing it
+# is handed; the value a write persists for later execution is judged by its own guard
+# (_git_config_payload_reason here, the validator at the top level), which honours the payload's
+# quoting — scanning the whole line instead would deny reads and quoted payloads the top level
+# allows. Omitting a safe name costs at most an over-block on a dangerous-LOOKING quoted argument;
+# admitting an unsafe one is a bypass, so when in doubt it stays out.
+_GIT_INERT_SUBCOMMANDS = frozenset(
+    {
+        "log", "show", "diff", "diff-tree", "diff-index", "diff-files", "status", "blame",
+        "annotate", "shortlog", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file",
+        "describe", "name-rev", "show-ref", "show-branch", "for-each-ref", "symbolic-ref",
+        "merge-base", "cherry", "count-objects", "var", "version", "commit", "tag", "reflog",
+        "config",
+    }
+)  # fmt: skip
+# git's own options that take their value as the NEXT word (git.c handle_options); matched exactly,
+# so the subcommand walk does not misread a value as the subcommand.
+_GIT_OPTIONS_WITH_VALUE = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source", "--shallow-file"}
 )
 
 
-def _executes_an_argument(words: list[str]) -> bool:
-    """Does this command hand one of its own arguments to a shell?
+def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
+    """Split the words after ``git`` into the subcommand and the subcommand's own arguments."""
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        index += 2 if args[index] in _GIT_OPTIONS_WITH_VALUE else 1
+    if index >= len(args):
+        return "", []
+    return args[index], args[index + 1 :]
 
-    Then NOTHING it receives is opaque data, however it was quoted, and the whole-text rule
-    pass has to see all of it. ``git`` is the case that matters: it is whitelisted per BASE
-    command, but its risk lives in the subcommand, and the structural guard enumerates only
-    ``-c KEY=VAL`` — so ``git submodule foreach 'rm -rf /'`` would otherwise have its payload
-    suppressed as an argument (LAB-4234).
 
-    Deliberately coarse: a match disables suppression for the whole rendered command, which
-    only ever costs a false positive on an exotic spelling, never a missed denial.
-    """
-    if any(word in _ARGUMENT_EXECUTING_FLAGS for word in words):
+def _names_option(word: str, options: frozenset[str]) -> bool:
+    """Does ``word`` spell one of ``options`` the way getopt_long and git's parse-options read it?"""
+    name = word.partition("=")[0]
+    if name in options:
         return True
-    return "git" in words and any(all(part in words for part in shape) for shape in _ARGUMENT_EXECUTING_GIT)
+    if name.startswith("--"):
+        return len(name) > 2 and any(option.startswith(name) for option in options)
+    # A short option may end a cluster of boolean flags (`-qu 'cmd'`). Finding the letter anywhere
+    # in the word can only over-match.
+    return name.startswith("-") and any(len(option) == 2 and option[1] in name[1:] for option in options)
+
+
+def _op_executes_an_argument(args: list[str]) -> bool:
+    """Does this ``op`` invocation run a shell command (`op run`) rather than read the vault?
+
+    `op run` executes its argument and no delegation path re-validates it. It suppresses nothing
+    unless all three hold: every word is a plain literal (so no `$'run'` / `{run,}` expands past the
+    check), no word is ``run`` (so a global flag's value cannot be misread as the subcommand while
+    the real ``run`` sits later, e.g. ``op --account read run``), and the first non-flag word is a
+    known read-only subcommand. The cost is an over-block on an expanded read (`op read op://…/$X`)
+    only when it also carries a dangerous-looking argument.
+    """
+    if any(not _is_plain_literal(word) for word in args) or "run" in args:
+        return True
+    for word in args:
+        if word.startswith("-"):
+            continue
+        return word not in _OP_INERT_SUBCOMMANDS
+    return False  # bare `op`, or only flags: runs nothing
+
+
+def _runs_an_exec_option(words: list[str]) -> bool:
+    """Does the command at the head of ``words`` hand one of its own arguments to a shell?
+
+    ``words`` is one command segment (``_join_tokens`` splits on the list/pipeline separators
+    first). For git, only the SEGMENT-LEADING word is read as the invocation: a bare ``git`` sitting
+    in someone else's argument list (``grep -rn git src``) names no subcommand. A wrapped git
+    (``sudo git fetch --upload-pack``) is re-validated by the delegation path, so it need not be
+    caught a second time here. ``op`` is the exception: it is whitelisted but not a delegation
+    wrapper, so nothing re-validates the command ``op run`` executes, and its arguments are code.
+
+    Three buckets for git: an inert subcommand suppresses nothing extra; the transport/diff family
+    executes only when it carries one of its keyed options; every other subcommand — unknown builtin,
+    positional-command builtin, script, alias, autocorrect target — fails closed.
+    """
+    leader = words[0].rsplit("/", 1)[-1] if words else ""
+    if leader == "op":
+        return _op_executes_an_argument(words[1:])
+    if leader == "git":
+        subcommand, args = _git_subcommand(words[1:])
+        if not subcommand or subcommand in _GIT_INERT_SUBCOMMANDS:
+            return False
+        options = _GIT_EXEC_OPTIONS.get(subcommand)
+        if options is None:
+            return True
+        return any(_names_option(arg, options) for arg in args)
+    # Non-git: the keyed option table, at every word so a wrapper or a path still reaches it.
+    for index, word in enumerate(words):
+        options = _EXEC_OPTIONS.get(word.rsplit("/", 1)[-1])
+        if options and any(_names_option(arg, options) for arg in words[index + 1 :]):
+            return True
+    return False
+
+
+# The positive signals that a git subcommand runs one of its own arguments, used to catch a git
+# command a wrapper hands off (`op run -- git …`, `find … -exec git …`) wherever it sits in the
+# segment, not only at its head. Restores the command-agnostic floor main had before the head-only
+# rule, but by these signals alone — never the head rule's fail-closed default — so an ordinary
+# `git` argument (`grep -rn git src`) is not read as a subcommand. `submodule foreach`,
+# `submodule--helper foreach` and `bisect run` take the command as the word after the subcommand;
+# `remote-ext`, `for-each-repo` and `filter-branch` execute what they are given by name alone.
+_GIT_POSITIONAL_EXEC = frozenset({"remote-ext", "for-each-repo", "filter-branch"})
+_GIT_POSITIONAL_EXEC_PAIRS = {"submodule": "foreach", "submodule--helper": "foreach", "bisect": "run"}
+
+
+def _git_exec_shape_anywhere(words: list[str]) -> bool:
+    """Does a ``git`` anywhere in the segment carry a shape that runs one of its arguments?"""
+    for index, word in enumerate(words):
+        if word.rsplit("/", 1)[-1] != "git":
+            continue
+        subcommand, args = _git_subcommand(words[index + 1 :])
+        if not subcommand:
+            continue
+        options = _GIT_EXEC_OPTIONS.get(subcommand)
+        if options and any(_names_option(arg, options) for arg in args):
+            return True
+        if subcommand in _GIT_POSITIONAL_EXEC:
+            return True
+        if _GIT_POSITIONAL_EXEC_PAIRS.get(subcommand) in args:
+            return True
+    return False
+
+
+def _executes_an_argument(words: list[str]) -> bool:
+    """Does this command segment hand one of its own arguments to a shell?
+
+    Then NOTHING it receives is opaque data, however it was quoted, and the whole-text rule pass
+    has to see all of it (LAB-4234: ``git submodule foreach 'rm -rf /'`` would otherwise have its
+    payload suppressed). Deliberately coarse — a match disables suppression for its own segment,
+    which only ever costs a false positive on a dangerous-looking argument, never a missed denial.
+    """
+    return (
+        any(word in _ARGUMENT_EXECUTING_FLAGS for word in words)
+        or _runs_an_exec_option(words)
+        or _git_exec_shape_anywhere(words)
+    )
+
+
+def _collect_spans(segment: list[tuple[int, str, bool]], text: str, ranges: list[tuple[int, int]]) -> None:
+    """Append one segment's opaque-data spans to ``ranges`` — unless that segment executes an
+    argument, in which case nothing it holds is data. Scoped to the segment so an executing command
+    does not strip the quoted data of the next one across a `&&` or a `|` (each is SAFE on its own).
+    """
+    if _executes_an_argument([token for _, token, _ in segment]):
+        return
+    for start, token, is_data in segment:
+        if is_data:
+            ranges.append((max(0, start - 1), min(len(text), start + len(token) + 1)))
 
 
 def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, int]]]:
@@ -983,16 +1194,22 @@ def _join_tokens(tokens: list[tuple[str, bool]]) -> tuple[str, list[tuple[int, i
     Each span widens by one onto the separators that stand where the quoting used to.
     Rules anchored with ``(\\s|$)`` consume the separator, and ``_is_in_string_literal``
     demands the WHOLE match sit inside a span, so an unwidened span misses the suppression.
+
+    The exec check runs per command segment: suppression is decided independently for the tokens
+    between each pair of :class:`_Separator` tokens the renderer inserted.
     """
     text = " ".join(token for token, _ in tokens)
-    if _executes_an_argument([token for token, _ in tokens]):
-        return text, []
     ranges: list[tuple[int, int]] = []
     position = 0
+    segment: list[tuple[int, str, bool]] = []
     for token, is_data in tokens:
-        if is_data:
-            ranges.append((max(0, position - 1), min(len(text), position + len(token) + 1)))
+        if isinstance(token, _Separator):
+            _collect_spans(segment, text, ranges)
+            segment = []
+        else:
+            segment.append((position, token, is_data))
         position += len(token) + 1
+    _collect_spans(segment, text, ranges)
     return text, ranges
 
 
@@ -1527,7 +1744,7 @@ class SubstitutionValidator:
                         if part.kind == "command" and hasattr(part, "parts"):
                             tokens.extend(_command_tokens(part))
                         elif part.kind == "pipe":
-                            tokens.append(("|", False))
+                            tokens.append((_Separator("|"), False))
             return _join_tokens(tokens) if tokens else (None, [])
 
         # Handle command list: $(cmd1; cmd2), $(cmd1 && cmd2), $(cmd1 | cmd2 || cmd3), ...
@@ -1542,7 +1759,7 @@ class SubstitutionValidator:
                     if kind == "operator":
                         if not hasattr(part, "op"):
                             return None, []
-                        tokens.append((part.op, False))
+                        tokens.append((_Separator(part.op), False))
                         continue
                     rendered = self._render_segment_tokens(part)
                     if rendered is None:
@@ -1601,7 +1818,7 @@ class SubstitutionValidator:
             for part in getattr(node, "parts", []):
                 part_kind = getattr(part, "kind", None)
                 if part_kind == "pipe":
-                    rendered.append(("|", False))
+                    rendered.append((_Separator("|"), False))
                 elif part_kind == "command":
                     tokens = _command_tokens(part)
                     if not tokens:

@@ -333,6 +333,32 @@ class TestFindDangerousFlags:
         if results:
             assert not results[0].allowed
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # bash expands the flag before find sees it, so the literal scan cannot read it
+            "echo \"$(find . {-exec,} git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . $'-exec' git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . ${E:--exec} git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . {-execdir,} git difftool -x 'rm -rf /')\"",
+            'echo "$(find . {-delete,})"',
+        ],
+    )
+    def test_find_obfuscated_exec_blocked(self, command):
+        """An expanding word carrying a dangerous find flag is read for that flag."""
+        assert validate_command(command).allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # a path variable and a literal name that merely contains flag text stay SAFE
+            "echo \"$(find /src -type f -name '*.log')\"",
+            "echo \"$(find . -name '*-exec*')\"",
+        ],
+    )
+    def test_find_plain_words_stay_allowed(self, command):
+        assert validate_command(command).allowed is True
+
     def test_find_name_only_allowed(self, validator, parser):
         """find without dangerous flags is allowed."""
         ast = parser.parse('echo "$(find . -name *.py)"')
@@ -1760,6 +1786,219 @@ class TestWhitelistedSubstitutionYamlRules:
         result = validate_command(command)
         assert result.allowed is False
         assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # the parser resolves an unambiguous prefix, so these ARE the listed options
+            "echo \"$(git fetch --upload 'rm -rf /' .)\"",
+            "echo \"$(git rebase --exe 'rm -rf /' main)\"",
+            "echo \"$(git ls-remote --upload 'rm -rf /' .)\"",
+            "echo \"$(git push --receive 'rm -rf /' origin)\"",
+            "echo \"$(sort --compress 'rm -rf /' f)\"",
+            "echo \"$(sdiff --diff 'rm -rf /' a b)\"",
+            # documented short form, alone or ending a cluster of boolean flags
+            "echo \"$(git clone -u 'rm -rf /' https://x/y)\"",
+            "echo \"$(git clone -qu 'rm -rf /' https://x/y)\"",
+            "echo \"$(git difftool -yx 'rm -rf /' HEAD)\"",
+            # the subcommand sits behind git's own value-taking options
+            "echo \"$(git -C /repo --git-dir /repo/.git fetch --upload 'rm -rf /' .)\"",
+            "echo \"$(git -c color.ui=never clone -u 'rm -rf /' https://x/y)\"",
+            "echo \"$(git --shallow-file /x difftool -x 'rm -rf /' HEAD)\"",
+            # the exact floor, for a command no key reaches
+            "echo \"$(git daemon --access-hook 'rm -rf /')\"",
+        ],
+    )
+    def test_abbreviated_and_short_exec_options_suppress_nothing(self, command):
+        """An abbreviation or short form must reach the verdict its canonical spelling does."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # `--author` prefixes `--authors-prog` — an option of `git svn`, not of `git log`.
+            # This is the shape that reverted the first, flat prefix match.
+            "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
+            "echo \"$(git -C /repo log --author 'Ray Walker' --grep 'rm -rf')\"",
+            # `-u` is `--upload-pack` on clone only; on fetch it is --update-head-ok
+            "echo \"$(git fetch -u origin --negotiation-tip 'rm -rf /')\"",
+        ],
+    )
+    def test_exec_options_resolve_only_within_their_own_command(self, command):
+        """Prefix resolution is safe only inside the namespace the parser actually searches."""
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # an alias for a keyed builtin, defined inline or in a gitconfig schlock never reads
+            "echo \"$(git -c alias.ff=fetch ff --upload 'rm -rf /' .)\"",
+            "echo \"$(git -c alias.cl=clone cl -u 'rm -rf /' https://x/y)\"",
+            "echo \"$(git -c alias.rb=rebase rb --exe 'rm -rf /' main)\"",
+            "echo \"$(git ff --upload 'rm -rf /' .)\"",
+            # the alias carries the exec option or subcommand itself, so no option is left to see
+            "echo \"$(git -c 'alias.rx=rebase --exec' rx 'rm -rf /' main)\"",
+            "echo \"$(git -c 'alias.sf=submodule foreach' sf 'rm -rf /')\"",
+            # help.autocorrect runs the builtin a typo is closest to
+            "echo \"$(git -c help.autocorrect=immediate fetc --upload 'rm -rf /' .)\"",
+            # git lets an alias override a DEPRECATED builtin
+            "echo \"$(git -c 'alias.whatchanged=rebase --exec' whatchanged 'rm -rf /' main)\"",
+            # scripts git finds after builtins: an alias takes the name where the package is absent
+            "echo \"$(git send-email --sendmail 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git send-email --SENDMAIL-CMD 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git send-email +Header 'rm -rf /' HEAD~1)\"",
+            "echo \"$(git svn clone --authors-p 'rm -rf /' svn://host/r)\"",
+            # a builtin that runs a command by a route no option key reaches, so failing closed on
+            # every non-inert subcommand is the only thing that catches it. `for-each-repo`
+            # re-dispatches a whole git command line, and its own `-c KEY=VAL` supplies the repo
+            # list, so the exec option is on a subcommand the walk never reaches.
+            "echo \"$(git -c x.y=. for-each-repo --config=x.y rebase -x 'rm -rf /' main)\"",
+            "echo \"$(git -c x.y=. for-each-repo --config=x.y clone -u 'rm -rf /' https://x/y)\"",
+            # `submodule--helper foreach` and `remote-ext` take the command as a positional word
+            "echo \"$(git submodule--helper foreach 'rm -rf /')\"",
+            "echo \"$(git remote-ext o 'rm -rf /')\"",
+            # `git grep -O` runs a pager, so grep is keyed rather than inert. The pager is only an
+            # attached value; the separate word here is a pattern, over-blocked by design.
+            "echo \"$(git grep --open-files-in 'rm -rf /' HEAD)\"",
+            # a fail-closed git in a LATER segment still leads its own segment
+            "echo \"$(true && git remote-ext o 'rm -rf /')\"",
+            # `op` is whitelisted but no delegation wrapper, so nothing re-validates what `op run`
+            # executes: its arguments are code, however the git inside them is spelled
+            "echo \"$(op run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op run -- git bisect run 'rm -rf /')\"",
+            "echo \"$(op run --env-file=.env -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(ls | op run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op --account a run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op run -- git frobnicate 'rm -rf /')\"",
+            "echo \"$(op plugin run -- git submodule foreach 'rm -rf /')\"",
+            # bash expands the subcommand before op sees it, so an expanded `run` fails closed too
+            "echo \"$(op $'run' -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op {run,} -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op ${X:-run} -- git submodule foreach 'rm -rf /')\"",
+        ],
+    )
+    def test_unresolvable_git_subcommand_suppresses_nothing(self, command):
+        """git resolves a non-inert subcommand at run time, so its arguments are never proven data."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A segment that fails closed must not strip the quoted data of the next one: each is
+            # SAFE bare, so the pair must stay SAFE. One row per separator the renderer inserts.
+            "echo \"$(git submodule status && grep -rn 'rm -rf' docs)\"",
+            "echo \"$(git submodule status || grep -rn 'rm -rf' docs)\"",
+            "echo \"$(git submodule status ; grep -rn 'rm -rf' docs)\"",
+            "echo \"$(git lfs ls-files | grep -c 'rm -rf')\"",
+            "echo \"$(git remote-ext o safe & grep -rn 'rm -rf' docs)\"",
+            # a pipeline inside a list goes through _render_segment_tokens, the third render site
+            "echo \"$(true && git lfs ls-files | grep -c 'rm -rf')\"",
+            # `git` sitting in another command's argument list names no subcommand, and a plain
+            # git word with no exec shape after it must not trip the anywhere floor.
+            "echo \"$(grep -rn git src 'rm -rf')\"",
+            "echo \"$(grep -rn git -e 'rm -rf' src)\"",
+            'echo "$(echo git status)"',
+            'echo "$(ls -d git)"',
+            'echo "$(cat git/config)"',
+        ],
+    )
+    def test_fail_closed_is_scoped_to_the_git_segment(self, command):
+        """Failing closed on a git subcommand suppresses that segment only, and only when git leads it."""
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A git command a wrapper runs executes wherever it sits, not only at the segment head.
+            # op reaches it through a flag value that spells an inert subcommand with the real `run`
+            # later; find reaches it through an expansion that carries no flag text.
+            "echo \"$(op --account read run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(op --config read run -- git submodule foreach 'rm -rf /')\"",
+            "echo \"$(find . $E git submodule foreach 'rm -rf /' ';')\"",
+            "echo \"$(find . ${E} git submodule foreach 'rm -rf /' ';')\"",
+            # the floor is positive-signal, so it covers keyed options and every positional shape
+            "echo \"$(op run -- git fetch --upload-pack 'rm -rf /' origin)\"",
+            "echo \"$(op run -- git remote-ext o 'rm -rf /')\"",
+            "echo \"$(xargs git submodule--helper foreach 'rm -rf /')\"",
+            "echo \"$(find . -exec git for-each-repo --config=x rebase -x 'rm -rf /' main ';')\"",
+            # op run executes a non-git command too; the flag-value shape must not hide the `run`
+            "echo \"$(op --account read run -- watch 'rm -rf /')\"",
+        ],
+    )
+    def test_a_wrapped_git_exec_shape_is_caught_anywhere(self, command):
+        """A git exec shape a wrapper hands off executes wherever it sits in the segment."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An ARGUMENT that spells a separator is not a segment boundary. Split by value, each of
+            # these cut the command in two and the payload landed in a fake segment led by nothing
+            # that fails closed, so it was suppressed as data and read SAFE.
+            "echo \"$(git submodule--helper foreach ';' 'rm -rf /')\"",
+            "echo \"$(git submodule foreach ';' 'rm -rf /')\"",
+            "echo \"$(git remote-ext o '&&' 'rm -rf /')\"",
+            "echo \"$(git frobnicate '||' 'rm -rf /')\"",
+            "echo \"$(git frobnicate '|' 'rm -rf /')\"",
+            "echo \"$(git frobnicate '&' 'rm -rf /')\"",
+            # every quoting spelling reaches the same argv
+            "echo \"$(git frobnicate \\; 'rm -rf /')\"",
+            'echo "$(git frobnicate ";" \'rm -rf /\')"',
+        ],
+    )
+    def test_a_quoted_separator_is_not_a_segment_boundary(self, command):
+        """Only the renderer's own separators split a segment, never an argument that spells one."""
+        result = validate_command(command)
+        assert result.allowed is False
+        assert result.risk_level == RiskLevel.BLOCKED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo \"$(git log --grep ';' --grep 'rm -rf')\"",
+            "echo \"$(grep -e '|' -e 'rm -rf' f)\"",
+        ],
+    )
+    def test_a_quoted_separator_in_an_inert_command_stays_data(self, command):
+        """The same argument inside a command that suppresses its arguments is ordinary data."""
+        assert validate_command(command).allowed is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An inert subcommand carrying a dangerous-LOOKING message is over-blocked when it is
+            # NOT on the allowlist — the deliberate cost of not trusting a runtime subcommand.
+            "echo \"$(git lg --grep 'rm -rf')\"",
+            "echo \"$(git send-email --to 'Ray Walker' --subject 'rm -rf / fix' p)\"",
+        ],
+    )
+    def test_accepted_overblock_on_unlisted_subcommands(self, command):
+        """schlock cannot tell an alias of `log` from an alias of `rebase --exec`, so it fails closed."""
+        assert validate_command(command).allowed is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # An allowlisted subcommand's message IS inert data, so a dangerous-looking one stays SAFE.
+            "echo \"$(git commit -m '- remove rm -rf / from install script')\"",
+            "echo \"$(git tag -a v1 -m 'cleanup: rm -rf the old build dir')\"",
+            "echo \"$(git log --author 'Ray Walker' --grep 'rm -rf')\"",
+            # `op` without `run` reads a secret; it runs nothing, so a variable in a later arg is data
+            'echo "$(op read op://vault/item/field)"',
+            'echo "$(op read op://vault/$ITEM/field)"',
+            "echo \"$(op item get 'My Login' --fields username)\"",
+            'echo "$(op vault list)"',
+        ],
+    )
+    def test_inert_subcommands_keep_their_arguments_as_data(self, command):
+        """An audited read-only or message-taking subcommand may suppress its own arguments."""
+        assert validate_command(command).allowed is True
 
     @pytest.mark.parametrize(
         ("command", "expected_ranges"),
