@@ -13,20 +13,28 @@ rules:
     description: AWS credential retrieval and exfiltration
     risk_level: BLOCKED
     patterns:
+      # Runs here and in gcp_credential_theft and azure_credential_theft are
+      # `[^;|&]{0,200}` so each reader word costs a bounded scan; why 200:
+      # database_credential_theft in 03_credential_theft.yaml.
+      #
       # aws configure credential access
       - 'aws\s+configure\s+get\s+(aws_access_key_id|aws_secret_access_key|aws_session_token)'
       - 'aws\s+configure\s+list'
       # STS credential operations
       - 'aws\s+sts\s+get-session-token'
-      - 'aws\s+sts\s+assume-role(?!\s+[^;|&]*--role-session-name)'  # assume-role without session name is suspicious
+      # assume-role without session name is suspicious. The run inside this
+      # negative lookahead is wider, 1000, because a bound here cuts the other
+      # way: a session name past it reads as missing and the command is denied.
+      # MFA, external-id, tag and duration flags ahead of it pass 200 easily.
+      - 'aws\s+sts\s+assume-role(?!\s+[^;|&]{0,1000}--role-session-name)'
       # Direct credential file access
-      - 'cat\s+[^;|&]*~/\.aws/credentials'
-      - 'cat\s+[^;|&]*\$HOME/\.aws/credentials'
-      - 'cat\s+[^;|&]*/root/\.aws/credentials'
+      - 'cat\s+[^;|&]{0,200}~/\.aws/credentials'
+      - 'cat\s+[^;|&]{0,200}\$HOME/\.aws/credentials'
+      - 'cat\s+[^;|&]{0,200}/root/\.aws/credentials'
       # Credential file copy/exfil
-      - 'cp\s+[^;|&]*~/\.aws/credentials'
-      - 'scp\s+[^;|&]*\.aws/credentials'
-      - 'rsync\s+[^;|&]*\.aws/credentials'
+      - 'cp\s+[^;|&]{0,200}~/\.aws/credentials'
+      - 'scp\s+[^;|&]{0,200}\.aws/credentials'
+      - 'rsync\s+[^;|&]{0,200}\.aws/credentials'
     alternatives:
       - "AWS credential access requires explicit approval"
       - "Use IAM roles instead of long-lived credentials"
@@ -131,7 +139,7 @@ rules:
       - 'gcloud\s+auth\s+print-identity-token'
       # Credential file access
       - 'gcloud\s+auth\s+application-default\s+print-access-token'
-      - 'cat\s+[^;|&]*application_default_credentials\.json'
+      - 'cat\s+[^;|&]{0,200}application_default_credentials\.json'
       # Service account key creation
       - 'gcloud\s+iam\s+service-accounts\s+keys\s+create'
       - 'gcloud\s+iam\s+service-accounts\s+keys\s+list'
@@ -177,8 +185,8 @@ rules:
       # Access token retrieval
       - 'az\s+account\s+get-access-token'
       # Credential file access
-      - 'cat\s+[^;|&]*\.azure/accessTokens\.json'
-      - 'cat\s+[^;|&]*\.azure/azureProfile\.json'
+      - 'cat\s+[^;|&]{0,200}\.azure/accessTokens\.json'
+      - 'cat\s+[^;|&]{0,200}\.azure/azureProfile\.json'
       # Service principal credential access
       - 'az\s+ad\s+sp\s+credential\s+list'
       - 'az\s+ad\s+sp\s+credential\s+reset'
